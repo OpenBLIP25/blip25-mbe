@@ -1,0 +1,52 @@
+# TIA-102.BABA-A annex_s_interleave.csv — Half-Rate Bit Frame Format
+# Source: TIA-102.BABA-A PDF, page 143 (Annex S)
+# Columns: symbol (0..35), bit1_vector, bit1_index, bit0_vector, bit0_index
+# Vector encoding from coverage: 0=c0 (24 bits), 1=c1 (23 bits), 2=c2 (11 bits in table),
+#   3=c3 (14 bits in table); total=72. The c2/c3 split reflects the PDF's own labeling of
+#   the bit-stream segments and does not directly map to the u2/u3 codeword boundaries.
+# OCR correction applied: symbol 34 bit1 PDF printed "c0(5)" — corrected to "c0(6)".
+#   The even-symbol bit1 lane follows c0(23) down to c0(6) across symbols 0,2,...,34.
+#   c0(5) is covered at symbol 0 bit0; c0(6) would otherwise be missing entirely.
+#   This is the same class of PDF typo as the Annex H "c9(5)"→"c0(5)" correction.
+# Cross-validated against TIA-102.BBAC-1 Annex E (burst symbol 44 = frame symbol 34):
+#   BBAC-1 prints "c0(6) | c1(11)" — matches the post-fix value here. The typo is
+#   local to the BABA-A PDF; BBAC-1 (PyMuPDF-extracted) prints this table correctly.
+# Extracted from pdftotext -layout output with verification: count=36 (PASS);
+#   bit coverage after OCR fix: all 72 bit positions appear exactly once (PASS)
+symbol,bit1_vector,bit1_index,bit0_vector,bit0_index
+0,0,23,0,5
+1,1,10,2,3
+2,0,22,0,4
+3,1,9,2,2
+4,0,21,0,3
+5,1,8,2,1
+6,0,20,0,2
+7,1,7,2,0
+8,0,19,0,1
+9,1,6,3,13
+10,0,18,0,0
+11,1,5,3,12
+12,0,17,1,22
+13,1,4,3,11
+14,0,16,1,21
+15,1,3,3,10
+16,0,15,1,20
+17,1,2,3,9
+18,0,14,1,19
+19,1,1,3,8
+20,0,13,1,18
+21,1,0,3,7
+22,0,12,1,17
+23,2,10,3,6
+24,0,11,1,16
+25,2,9,3,5
+26,0,10,1,15
+27,2,8,3,4
+28,0,9,1,14
+29,2,7,3,3
+30,0,8,1,13
+31,2,6,3,2
+32,0,7,1,12
+33,2,5,3,1
+34,0,6,1,11
+35,2,4,3,0

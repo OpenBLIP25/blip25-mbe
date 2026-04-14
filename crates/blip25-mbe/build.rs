@@ -22,6 +22,7 @@ fn main() {
     gen_annex_g(&out_dir);
     gen_annex_i(&out_dir);
     gen_annex_j(&out_dir);
+    gen_annex_s(&out_dir);
     gen_imbe_bit_prioritization(&out_dir);
     gen_ambe_bit_prioritization(&out_dir);
 }
@@ -452,6 +453,85 @@ fn gen_annex_j(out_dir: &PathBuf) {
     out.push_str("];\n");
 
     fs::write(out_dir.join("annex_j_blocks.rs"), out).expect("write annex_j_blocks.rs");
+}
+
+/// Parse `spec_tables/annex_s_interleave.csv` into
+/// `$OUT_DIR/annex_s.rs`, emitting the 36-entry `ANNEX_S` table for
+/// half-rate interleaving.
+///
+/// Half-rate code vectors have widths c₀=24, c₁=23, c₂=11, c₃=14
+/// (total 72 bits = 36 dibits). Validates that every
+/// `(vector, bit_index)` across all four vectors appears exactly
+/// once.
+fn gen_annex_s(out_dir: &PathBuf) {
+    let csv_path = "spec_tables/annex_s_interleave.csv";
+    println!("cargo:rerun-if-changed={csv_path}");
+
+    let content = fs::read_to_string(csv_path)
+        .unwrap_or_else(|e| panic!("failed to read {csv_path}: {e}"));
+
+    let mut entries: Vec<(u8, u8, u8, u8)> = Vec::with_capacity(36);
+    for (lineno, raw) in content.lines().enumerate() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with("symbol") {
+            continue;
+        }
+        let cols: Vec<&str> = line.split(',').map(str::trim).collect();
+        assert_eq!(
+            cols.len(),
+            5,
+            "Annex S line {}: expected 5 columns, got {}: {raw:?}",
+            lineno + 1,
+            cols.len()
+        );
+        let symbol: usize = cols[0].parse().expect("symbol");
+        let bit1_vec: u8 = cols[1].parse().expect("bit1_vector");
+        let bit1_idx: u8 = cols[2].parse().expect("bit1_index");
+        let bit0_vec: u8 = cols[3].parse().expect("bit0_vector");
+        let bit0_idx: u8 = cols[4].parse().expect("bit0_index");
+        assert_eq!(symbol, entries.len(), "Annex S symbols must be sequential 0..36");
+        assert!(bit1_vec < 4 && bit0_vec < 4, "vector index out of range");
+        entries.push((bit1_vec, bit1_idx, bit0_vec, bit0_idx));
+    }
+    assert_eq!(entries.len(), 36, "Annex S must have 36 symbols");
+
+    // Half-rate code vector widths. c₀ and c₁ are FEC-protected;
+    // c₂ and c₃ are uncoded bit streams (not FEC codewords despite the
+    // `c_i` naming).
+    const AMBE_CODE_WIDTHS: [u8; 4] = [24, 23, 11, 14];
+    let mut seen = [[false; 24]; 4];
+    for (bit1_vec, bit1_idx, bit0_vec, bit0_idx) in &entries {
+        for &(v, i) in &[(*bit1_vec, *bit1_idx), (*bit0_vec, *bit0_idx)] {
+            assert!(
+                i < AMBE_CODE_WIDTHS[v as usize],
+                "Annex S: vec {v} idx {i} exceeds width"
+            );
+            assert!(!seen[v as usize][i as usize], "Annex S: ({v}, {i}) twice");
+            seen[v as usize][i as usize] = true;
+        }
+    }
+    for (v, row) in seen.iter().enumerate() {
+        for (i, &b) in row.iter().enumerate().take(AMBE_CODE_WIDTHS[v] as usize) {
+            assert!(b, "Annex S: ({v}, {i}) never appears");
+        }
+    }
+
+    let mut out = String::new();
+    out.push_str("// Auto-generated from spec_tables/annex_s_interleave.csv\n");
+    out.push_str("// Do not edit — regenerated each build.\n");
+    out.push_str("pub(crate) const ANNEX_S: [AnnexSEntry; 36] = [\n");
+    for (bit1_vec, bit1_idx, bit0_vec, bit0_idx) in &entries {
+        out.push_str(&format!(
+            "    AnnexSEntry {{ bit1_vec: {bit1_vec}, bit1_idx: {bit1_idx}, \
+             bit0_vec: {bit0_vec}, bit0_idx: {bit0_idx} }},\n"
+        ));
+    }
+    out.push_str("];\n");
+
+    fs::write(out_dir.join("annex_s.rs"), out).expect("write annex_s.rs");
 }
 
 /// Parse `spec_tables/imbe_bit_prioritization.csv` into

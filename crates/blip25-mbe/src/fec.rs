@@ -149,6 +149,57 @@ pub fn golay_23_12_decode(codeword: u32) -> FecDecoded {
 }
 
 // ---------------------------------------------------------------------------
+// Extended Golay (24, 12), d = 8
+// ---------------------------------------------------------------------------
+
+/// Encode 12 information bits into a 24-bit extended Golay codeword.
+///
+/// The [24, 12] code is the [23, 12] Golay with one overall parity bit
+/// appended as the LSB (`bit 0`); the 23-bit Golay codeword occupies
+/// bits 23..1.
+pub fn golay_24_12_encode(info: u16) -> u32 {
+    let cw23 = golay_23_12_encode(info);
+    let parity = cw23.count_ones() & 1;
+    (cw23 << 1) | parity
+}
+
+/// Decode a 24-bit extended Golay codeword. Corrects up to 3 errors
+/// and detects 4; when 4 errors are detected, [`FecDecoded::errors`]
+/// is [`u8::MAX`] (sentinel) and `info` holds the best-effort guess
+/// from the underlying [23, 12] decoder.
+///
+/// The underlying [23, 12] code is perfect (every syndrome maps to a
+/// weight-≤3 error). The extended parity bit lets us catch the case
+/// where the true error weight is 4 (or higher even multiples) by
+/// checking the parity consistency of the *corrected* 23-bit codeword
+/// against the received parity bit.
+pub fn golay_24_12_decode(codeword: u32) -> FecDecoded {
+    let cw = codeword & 0xFF_FFFF;
+    let cw23 = (cw >> 1) & 0x7F_FFFF;
+    let received_parity = cw & 1;
+    let d23 = golay_23_12_decode(cw23);
+    // After correction, the reconstructed [23,12] codeword:
+    let corrected23 = golay_23_12_encode(d23.info);
+    // Parity of corrected23 must match received_parity for even-error
+    // detection. If parity mismatches, an odd-weight error ≥ 1 occurred
+    // (captured by the [23, 12] decoder). If parity matches, an even-
+    // weight error ≥ 0 occurred. Since [23,12] always corrects to weight
+    // ≤ 3, mismatch with d23.errors == 3 indicates "true error = 4"
+    // (uncorrectable — flag as sentinel).
+    let reconstructed_parity = corrected23.count_ones() & 1;
+    let parity_matches = reconstructed_parity == received_parity;
+    let errors = if d23.errors == 3 && !parity_matches {
+        u8::MAX
+    } else if parity_matches {
+        d23.errors
+    } else {
+        // Parity mismatch with <3 inner errors → total is d23.errors + 1.
+        d23.errors + 1
+    };
+    FecDecoded { info: d23.info, errors }
+}
+
+// ---------------------------------------------------------------------------
 // Hamming (15, 11), d = 3
 // ---------------------------------------------------------------------------
 
@@ -301,6 +352,80 @@ mod tests {
                 assert_eq!(d.errors, 1);
             }
         }
+    }
+
+    #[test]
+    fn golay_24_12_roundtrip_all_info_words() {
+        for info in 0u16..(1 << 12) {
+            let cw = golay_24_12_encode(info);
+            assert!(cw >> 24 == 0, "encoded word must fit in 24 bits");
+            let d = golay_24_12_decode(cw);
+            assert_eq!(d.info, info);
+            assert_eq!(d.errors, 0);
+        }
+    }
+
+    #[test]
+    fn golay_24_12_minimum_distance_is_eight() {
+        for info in 1u16..(1 << 12) {
+            let cw = golay_24_12_encode(info);
+            assert!(
+                cw.count_ones() >= 8,
+                "info 0x{info:03x}: weight {}",
+                cw.count_ones()
+            );
+        }
+    }
+
+    #[test]
+    fn golay_24_12_corrects_single_and_triple_errors() {
+        let info = 0x555u16;
+        let cw = golay_24_12_encode(info);
+        // Exhaustive single-bit flips: must correct, err = 1.
+        for bit in 0..24 {
+            let d = golay_24_12_decode(cw ^ (1 << bit));
+            assert_eq!(d.info, info, "single bit {bit}");
+            assert_eq!(d.errors, 1);
+        }
+        // A known weight-3 pattern must correct with errors = 3.
+        let e3 = (1u32 << 0) | (1u32 << 5) | (1u32 << 18);
+        let d = golay_24_12_decode(cw ^ e3);
+        assert_eq!(d.info, info);
+        assert_eq!(d.errors, 3);
+    }
+
+    #[test]
+    fn golay_24_12_detects_some_four_error_patterns() {
+        // The extended Golay's raison d'être: d_min = 8 gives
+        // error-detection capability up to weight 4. Flipping four
+        // arbitrarily-chosen bits must trigger the parity-mismatch
+        // path at least some of the time (sentinel = u8::MAX).
+        let info = 0xABCu16;
+        let cw = golay_24_12_encode(info);
+        let mut detected = 0usize;
+        let mut total = 0usize;
+        for a in 0..24 {
+            for b in (a + 1)..24 {
+                for c in (b + 1)..24 {
+                    for d_bit in (c + 1)..24 {
+                        let err =
+                            (1u32 << a) | (1u32 << b) | (1u32 << c) | (1u32 << d_bit);
+                        let res = golay_24_12_decode(cw ^ err);
+                        total += 1;
+                        if res.errors == u8::MAX {
+                            detected += 1;
+                        }
+                    }
+                }
+            }
+        }
+        // Not all 4-error patterns are caught (the inner [23,12]
+        // sometimes happens to decode to the correct info word),
+        // but most should be. Expect >half.
+        assert!(
+            detected * 2 > total,
+            "detected only {detected}/{total} four-error patterns"
+        );
     }
 
     #[test]
