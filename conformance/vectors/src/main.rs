@@ -52,6 +52,7 @@ use blip25_mbe::imbe_frames::half_rate::decode_halfrate_frame;
 use blip25_mbe::imbe_frames::priority::{
     deprioritize_fullrate, prioritize_fullrate,
 };
+use blip25_mbe::mbe_params::MbeParams;
 
 const BYTES_PER_FEC_FRAME: usize = 18;
 const BYTES_PER_NOFEC_FRAME: usize = 11;
@@ -100,6 +101,12 @@ enum Cmd {
         /// Override γ_w (default: spec value 146.643269).
         #[arg(long)]
         gamma_w: Option<f64>,
+        /// Global scale factor applied to every M̃_l before
+        /// synthesis. Default 1.0. Candidate hypothesis for the §11
+        /// γ_w investigation: our dequant produces M̃_l ≈ 150× too
+        /// large, so a scale of 1/110 or similar should improve SNR.
+        #[arg(long, default_value_t = 1.0)]
+        m_scale: f64,
     },
     /// Half-rate bit-level roundtrip: decode each `r39/<name>.bit`
     /// frame to `MbeParams`, re-encode via `quantize_halfrate`, and
@@ -160,9 +167,13 @@ fn main() -> Result<()> {
         }
         Cmd::PnDiag { name, rc, frame } => cmd_pn_diag(&args.vectors, &name, rc, frame),
         Cmd::Roundtrip { name, rc } => cmd_roundtrip(&args.vectors, &name, rc),
-        Cmd::DecodePcm { name, rc, gamma_w } => {
-            cmd_decode_pcm(&args.vectors, &name, rc, gamma_w.unwrap_or(GAMMA_W))
-        }
+        Cmd::DecodePcm { name, rc, gamma_w, m_scale } => cmd_decode_pcm(
+            &args.vectors,
+            &name,
+            rc,
+            gamma_w.unwrap_or(GAMMA_W),
+            m_scale,
+        ),
         Cmd::DecodePcmHalfrate { name, gamma_w } => {
             cmd_decode_pcm_halfrate(&args.vectors, &name, gamma_w.unwrap_or(GAMMA_W))
         }
@@ -172,7 +183,25 @@ fn main() -> Result<()> {
 
 const FRAME_SAMPLES: usize = 160;
 
-fn cmd_decode_pcm(root: &Path, name: &str, rc: bool, gamma_w: f64) -> Result<()> {
+fn scale_params(params: &MbeParams, scale: f64) -> MbeParams {
+    let l = params.harmonic_count();
+    let voiced: Vec<bool> = params.voiced_slice().to_vec();
+    let amps: Vec<f32> = params
+        .amplitudes_slice()
+        .iter()
+        .map(|&a| ((f64::from(a) * scale) as f32).max(0.0))
+        .collect();
+    MbeParams::new(params.omega_0(), l, &voiced, &amps)
+        .expect("scaled params valid (non-negative, finite)")
+}
+
+fn cmd_decode_pcm(
+    root: &Path,
+    name: &str,
+    rc: bool,
+    gamma_w: f64,
+    m_scale: f64,
+) -> Result<()> {
     let dir = vector_dir(root, rc);
     let fec_path = dir.join("p25").join(format!("{name}.bit"));
     let pcm_path = dir.join("p25").join(format!("{name}.pcm"));
@@ -230,7 +259,12 @@ fn cmd_decode_pcm(root: &Path, name: &str, rc: bool, gamma_w: f64) -> Result<()>
             epsilon_t: imbe.error_total().min(255) as u8,
             bad_pitch: false,
         };
-        let pcm = synthesize_frame(&params, &err, gamma_w, &mut synth_state);
+        let params_scaled = if (m_scale - 1.0).abs() > 1e-12 {
+            scale_params(&params, m_scale)
+        } else {
+            params
+        };
+        let pcm = synthesize_frame(&params_scaled, &err, gamma_w, &mut synth_state);
         pcm_out.extend_from_slice(&pcm);
     }
 
