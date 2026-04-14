@@ -42,7 +42,8 @@ use blip25_mbe::imbe_frames::dequantize::{
 };
 use blip25_mbe::imbe_frames::fec::{deinterleave_fullrate, modulation_masks_fullrate};
 use blip25_mbe::imbe_frames::dequantize_halfrate::{
-    HalfrateDecoded, HalfrateDecoderState, decode_halfrate_to_params,
+    HalfrateDecoded, HalfrateDecoderState, decode_halfrate_to_params, dequantize_halfrate,
+    quantize_halfrate,
 };
 use blip25_mbe::imbe_frames::full_rate::{
     INFO_WIDTHS, ImbeFrame, decode_fullrate_frame,
@@ -100,6 +101,16 @@ enum Cmd {
         #[arg(long)]
         gamma_w: Option<f64>,
     },
+    /// Half-rate bit-level roundtrip: decode each `r39/<name>.bit`
+    /// frame to `MbeParams`, re-encode via `quantize_halfrate`, and
+    /// compare the recovered `û` vectors to the original. Pitch
+    /// (`b̂₀`) and V/UV row-0 endpoints should roundtrip bit-exact;
+    /// gain and spectral params may drift (see `dequantize_halfrate`
+    /// tests for the known stability boundaries).
+    HalfrateRoundtrip {
+        /// Vector name (e.g. `alert`).
+        name: String,
+    },
     /// Half-rate equivalent of `decode-pcm`. Reads
     /// `r39/<name>.bit` (rate index 39 = 3600 bps AMBE+2 per the
     /// USB-3000 manual §3.3.4), runs the full half-rate pipeline:
@@ -155,6 +166,7 @@ fn main() -> Result<()> {
         Cmd::DecodePcmHalfrate { name, gamma_w } => {
             cmd_decode_pcm_halfrate(&args.vectors, &name, gamma_w.unwrap_or(GAMMA_W))
         }
+        Cmd::HalfrateRoundtrip { name } => cmd_halfrate_roundtrip(&args.vectors, &name),
     }
 }
 
@@ -552,6 +564,72 @@ fn cmd_decode_pcm_halfrate(root: &Path, name: &str, gamma_w: f64) -> Result<()> 
     println!("  RMS error:          {rms_err:.2}");
     println!("  peak error:         {peak_err:.0}");
     println!("  SNR:                {snr_db:.2} dB");
+    Ok(())
+}
+
+fn cmd_halfrate_roundtrip(root: &Path, name: &str) -> Result<()> {
+    let dir = root.join("tv-std").join("tv").join("r39");
+    let bit_path = dir.join(format!("{name}.bit"));
+    let bit_bytes = fs::read(&bit_path)
+        .with_context(|| format!("read half-rate vector {}", bit_path.display()))?;
+    if bit_bytes.len() % BYTES_PER_HALFRATE_FRAME != 0 {
+        return Err(anyhow!("half-rate .bit file is not a whole number of frames"));
+    }
+    let n_frames = bit_bytes.len() / BYTES_PER_HALFRATE_FRAME;
+
+    println!("vector:        {name} (half-rate, r39)");
+    println!("frames:        {n_frames}");
+    println!();
+
+    let mut state_dec = HalfrateDecoderState::new();
+    let mut state_enc = HalfrateDecoderState::new();
+    let mut voice_frames = 0usize;
+    let mut non_voice_frames = 0usize;
+    let mut pitch_match = 0usize;
+    let mut vuv_match = 0usize;
+    let mut gain_match = 0usize;
+
+    use blip25_mbe::imbe_frames::priority::deprioritize_halfrate;
+
+    for f in 0..n_frames {
+        let frame = &bit_bytes[f * BYTES_PER_HALFRATE_FRAME..(f + 1) * BYTES_PER_HALFRATE_FRAME];
+        let dibits = unpack_dibits_halfrate(frame);
+        let ambe = decode_halfrate_frame(&dibits);
+        match decode_halfrate_to_params(&ambe.info, &mut state_dec) {
+            Ok(HalfrateDecoded::Voice(params)) => {
+                voice_frames += 1;
+                let u_back = match quantize_halfrate(&params, &mut state_enc) {
+                    Ok(u) => u,
+                    Err(_) => continue,
+                };
+                let b_orig = deprioritize_halfrate(&ambe.info);
+                let b_back = deprioritize_halfrate(&u_back);
+                if b_orig[0] == b_back[0] {
+                    pitch_match += 1;
+                }
+                if b_orig[1] == b_back[1] {
+                    vuv_match += 1;
+                }
+                if b_orig[2] == b_back[2] {
+                    gain_match += 1;
+                }
+            }
+            _ => non_voice_frames += 1,
+        }
+    }
+
+    println!("voice frames:     {voice_frames}");
+    println!("non-voice frames: {non_voice_frames} (tone/erasure, skipped)");
+    println!();
+    if voice_frames == 0 {
+        println!("No voice frames to compare.");
+        return Ok(());
+    }
+    let pct = |n: usize| 100.0 * n as f64 / voice_frames as f64;
+    println!("Parameter-level bit-exact roundtrip (voice frames only):");
+    println!("  pitch   b̂₀:  {pitch_match:>5} / {voice_frames}   {:5.1}%", pct(pitch_match));
+    println!("  V/UV    b̂₁:  {vuv_match:>5} / {voice_frames}   {:5.1}%", pct(vuv_match));
+    println!("  gain    b̂₂:  {gain_match:>5} / {voice_frames}   {:5.1}%", pct(gain_match));
     Ok(())
 }
 
