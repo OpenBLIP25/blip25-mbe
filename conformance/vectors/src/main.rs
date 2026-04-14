@@ -41,9 +41,13 @@ use blip25_mbe::imbe_frames::dequantize::{
     DecoderState, dequantize_fullrate, quantize_fullrate,
 };
 use blip25_mbe::imbe_frames::fec::{deinterleave_fullrate, modulation_masks_fullrate};
+use blip25_mbe::imbe_frames::dequantize_halfrate::{
+    HalfrateDecoderState, dequantize_halfrate,
+};
 use blip25_mbe::imbe_frames::full_rate::{
     INFO_WIDTHS, ImbeFrame, decode_fullrate_frame,
 };
+use blip25_mbe::imbe_frames::half_rate::decode_halfrate_frame;
 use blip25_mbe::imbe_frames::priority::{
     deprioritize_fullrate, prioritize_fullrate,
 };
@@ -96,6 +100,18 @@ enum Cmd {
         #[arg(long)]
         gamma_w: Option<f64>,
     },
+    /// Half-rate equivalent of `decode-pcm`. Reads
+    /// `r39/<name>.bit` (rate index 39 = 3600 bps AMBE+2 per the
+    /// USB-3000 manual §3.3.4), runs the full half-rate pipeline:
+    /// dibits → AmbeFrame → MbeParams → PCM via the shared §1.12
+    /// synthesizer, and compares to `r39/<name>.pcm`.
+    DecodePcmHalfrate {
+        /// Vector name (e.g. `alert`).
+        name: String,
+        /// Override γ_w (default: spec value 146.643269).
+        #[arg(long)]
+        gamma_w: Option<f64>,
+    },
     /// Round-trip test: decode each `p25_nofec/<name>.bit` frame to
     /// `MbeParams` then re-encode. Pitch (`b̂₀`) and V/UV (`b̂₁`) are
     /// expected to match bit-exact; gain DCT bits (`b̂₂..b̂₇`) and HOC
@@ -135,6 +151,9 @@ fn main() -> Result<()> {
         Cmd::Roundtrip { name, rc } => cmd_roundtrip(&args.vectors, &name, rc),
         Cmd::DecodePcm { name, rc, gamma_w } => {
             cmd_decode_pcm(&args.vectors, &name, rc, gamma_w.unwrap_or(GAMMA_W))
+        }
+        Cmd::DecodePcmHalfrate { name, gamma_w } => {
+            cmd_decode_pcm_halfrate(&args.vectors, &name, gamma_w.unwrap_or(GAMMA_W))
         }
     }
 }
@@ -401,6 +420,131 @@ fn cmd_pn_diag(root: &Path, name: &str, rc: bool, frame: usize) -> Result<()> {
             mark_rev,
         );
     }
+    Ok(())
+}
+
+const BYTES_PER_HALFRATE_FRAME: usize = 9;
+const DIBITS_PER_HALFRATE_FRAME: usize = 36;
+
+fn unpack_dibits_halfrate(bytes: &[u8]) -> [u8; DIBITS_PER_HALFRATE_FRAME] {
+    debug_assert_eq!(bytes.len(), BYTES_PER_HALFRATE_FRAME);
+    let mut r = BitReader::new(bytes);
+    let mut out = [0u8; DIBITS_PER_HALFRATE_FRAME];
+    for i in 0..DIBITS_PER_HALFRATE_FRAME {
+        let hi = r.read(1) as u8;
+        let lo = r.read(1) as u8;
+        out[i] = (hi << 1) | lo;
+    }
+    out
+}
+
+fn cmd_decode_pcm_halfrate(root: &Path, name: &str, gamma_w: f64) -> Result<()> {
+    // Half-rate DVSI vectors live under tv-std/tv/r39/ (rate index 39
+    // per USB-3000 manual §3.3.4 = 3600 bps AMBE+2).
+    let dir = root.join("tv-std").join("tv").join("r39");
+    let bit_path = dir.join(format!("{name}.bit"));
+    let pcm_path = dir.join(format!("{name}.pcm"));
+
+    let bit_bytes = fs::read(&bit_path)
+        .with_context(|| format!("read half-rate vector {}", bit_path.display()))?;
+    let pcm_ref_bytes = fs::read(&pcm_path)
+        .with_context(|| format!("read reference PCM {}", pcm_path.display()))?;
+
+    if bit_bytes.len() % BYTES_PER_HALFRATE_FRAME != 0 {
+        return Err(anyhow!(
+            "half-rate .bit file {} is {} bytes — not a multiple of {}",
+            bit_path.display(),
+            bit_bytes.len(),
+            BYTES_PER_HALFRATE_FRAME
+        ));
+    }
+    if pcm_ref_bytes.len() % 2 != 0 {
+        return Err(anyhow!("PCM file is not a whole number of i16 samples"));
+    }
+    let n_frames = bit_bytes.len() / BYTES_PER_HALFRATE_FRAME;
+    let n_ref_samples = pcm_ref_bytes.len() / 2;
+
+    println!("vector:        {name} (half-rate, r39)");
+    println!("frames:        {n_frames}");
+    println!(
+        "ref samples:   {n_ref_samples} (= {} frames)",
+        n_ref_samples / FRAME_SAMPLES
+    );
+    println!("γ_w:           {gamma_w}");
+    println!();
+
+    let pcm_ref: Vec<i16> = pcm_ref_bytes
+        .chunks_exact(2)
+        .map(|c| i16::from_le_bytes([c[0], c[1]]))
+        .collect();
+
+    let mut dec_state = HalfrateDecoderState::new();
+    let mut synth_state = SynthState::new();
+    let mut pcm_out: Vec<i16> = Vec::with_capacity(n_frames * FRAME_SAMPLES);
+    let mut tone_or_bad = 0usize;
+
+    for f in 0..n_frames {
+        let frame = &bit_bytes[f * BYTES_PER_HALFRATE_FRAME..(f + 1) * BYTES_PER_HALFRATE_FRAME];
+        let dibits = unpack_dibits_halfrate(frame);
+        let ambe = decode_halfrate_frame(&dibits);
+        let params = match dequantize_halfrate(&ambe.info, &mut dec_state) {
+            Ok(p) => p,
+            Err(_) => {
+                // Tone frame or bad pitch — emit silence for now.
+                // Full tone-frame synthesis (§2.10) is a separate commit.
+                tone_or_bad += 1;
+                pcm_out.extend(std::iter::repeat(0i16).take(FRAME_SAMPLES));
+                continue;
+            }
+        };
+        let err = FrameErrorContext {
+            epsilon_0: ambe.errors[0],
+            epsilon_4: 0, // half-rate doesn't have a c̃₄ vector
+            epsilon_t: ambe.error_total().min(255) as u8,
+            bad_pitch: false,
+        };
+        let pcm = synthesize_frame(&params, &err, gamma_w, &mut synth_state);
+        pcm_out.extend_from_slice(&pcm);
+    }
+
+    println!("decoded:       {} samples", pcm_out.len());
+    if tone_or_bad > 0 {
+        println!("tone / bad-pitch frames (silenced): {tone_or_bad}");
+    }
+    println!();
+
+    let n = pcm_out.len().min(pcm_ref.len());
+    if n == 0 {
+        return Err(anyhow!("no samples to compare"));
+    }
+    let mut sum_sq_err = 0f64;
+    let mut sum_sq_ref = 0f64;
+    let mut peak_err = 0f64;
+    let mut bit_exact = 0usize;
+    for i in 0..n {
+        let a = f64::from(pcm_out[i]);
+        let b = f64::from(pcm_ref[i]);
+        let e = a - b;
+        sum_sq_err += e * e;
+        sum_sq_ref += b * b;
+        peak_err = peak_err.max(e.abs());
+        if pcm_out[i] == pcm_ref[i] {
+            bit_exact += 1;
+        }
+    }
+    let rms_err = (sum_sq_err / n as f64).sqrt();
+    let snr_db = if sum_sq_err > 0.0 {
+        10.0 * (sum_sq_ref / sum_sq_err).log10()
+    } else {
+        f64::INFINITY
+    };
+    let pct_exact = 100.0 * bit_exact as f64 / n as f64;
+
+    println!("Comparison vs DVSI r39 reference PCM ({n} samples):");
+    println!("  bit-exact samples:  {bit_exact} / {n}   ({pct_exact:.2}%)");
+    println!("  RMS error:          {rms_err:.2}");
+    println!("  peak error:         {peak_err:.0}");
+    println!("  SNR:                {snr_db:.2} dB");
     Ok(())
 }
 
