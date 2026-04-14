@@ -145,6 +145,148 @@ pub fn enhance_spectral_amplitudes(
     (m_bar, s_e)
 }
 
+// ---------------------------------------------------------------------------
+// §1.11 — Adaptive smoothing, frame repeat / mute, V/UV smoothing
+// ---------------------------------------------------------------------------
+
+/// Initial value for the amplitude-smoothing state `τ_M` per BABA-A
+/// §10 Annex A.
+pub const INIT_TAU_M: f64 = 20480.0;
+
+/// Smoothed-error-rate threshold above which the frame is muted
+/// (Eq. mute condition in §1.11.2).
+pub const MUTE_EPSILON_R_THRESHOLD: f64 = 0.0875;
+
+/// Per-frame error context derived from FEC decoding (§1.5) plus the
+/// pitch-validity check (§1.3.1). Drives the §1.11 smoothing
+/// decisions.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FrameErrorContext {
+    /// Bit errors corrected in û₀ (Golay).
+    pub epsilon_0: u8,
+    /// Bit errors corrected in û₄ specifically (used in V_M branch 2).
+    pub epsilon_4: u8,
+    /// Total bit errors across all 7 FEC-protected vectors `û₀..û₆`.
+    pub epsilon_t: u8,
+    /// Set when the decoded pitch index `b̂₀` is in the reserved range
+    /// `[208, 255]` (or otherwise invalid) — forces a frame repeat
+    /// regardless of the error counts.
+    pub bad_pitch: bool,
+}
+
+/// Action the synthesizer should take for the current frame, per
+/// BABA-A §1.11.1 / §1.11.2.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameDisposition {
+    /// Synthesize from the current frame's parameters.
+    Use,
+    /// Substitute the previous frame's parameters (Eq. 99–104) and
+    /// then synthesize.
+    Repeat,
+    /// Bypass the synthesizer and emit silence / low-amplitude noise.
+    Mute,
+}
+
+/// Update the smoothed error rate `ε_R(0) = 0.95·ε_R(−1) + 0.05·(ε_T/144)`
+/// and decide the frame disposition.
+///
+/// Per §1.11.1 the repeat trigger is:
+/// `b̂₀ invalid` **OR** (`ε₀ ≥ 2` AND `ε_T ≥ 10 + 40·ε_R(0)`).
+///
+/// Per §1.11.2 mute supersedes repeat when `ε_R(0) > 0.0875`.
+pub fn frame_disposition(
+    err: &FrameErrorContext,
+    epsilon_r_prev: f64,
+) -> (FrameDisposition, f64) {
+    let epsilon_r =
+        0.95 * epsilon_r_prev + 0.05 * (f64::from(err.epsilon_t) / 144.0);
+    let disp = if epsilon_r > MUTE_EPSILON_R_THRESHOLD {
+        FrameDisposition::Mute
+    } else if err.bad_pitch
+        || (err.epsilon_0 >= 2
+            && f64::from(err.epsilon_t) >= 10.0 + 40.0 * epsilon_r)
+    {
+        FrameDisposition::Repeat
+    } else {
+        FrameDisposition::Use
+    };
+    (disp, epsilon_r)
+}
+
+/// Output of the §1.11.3 V/UV-and-amplitude smoothing step.
+#[derive(Clone, Debug)]
+pub struct SmoothedFrame {
+    /// Smoothed per-harmonic spectral amplitudes (`M̄_l` after γ_M scaling).
+    /// Entries `[0..L]` are populated.
+    pub m_bar: [f32; L_MAX as usize],
+    /// Smoothed per-harmonic V/UV decisions (`v̄_l`). Entries `[0..L]`
+    /// are populated; higher indices are `false`.
+    pub v_bar: [bool; L_MAX as usize],
+    /// Updated amplitude-smoothing state `τ_M(0)` for the next frame.
+    pub tau_m: f64,
+}
+
+/// Apply the §1.11.3 V/UV-and-amplitude smoothing pipeline.
+///
+/// Inputs:
+/// - `m_bar`: enhanced spectral amplitudes from §1.10 (`M̄_l`).
+/// - `v_tilde`: per-harmonic V/UV from the §1.3.2 expansion (`ṽ_l`).
+/// - `s_e`: current-frame `S_E(0)` from §1.10.
+/// - `epsilon_r`: smoothed error rate `ε_R(0)` from
+///   [`frame_disposition`].
+/// - `epsilon_t`, `epsilon_4`: per-frame error counts (raw, not smoothed).
+/// - `tau_m_prev`: previous frame's `τ_M(−1)`.
+///
+/// Returns the smoothed `M̄_l`, the smoothed per-harmonic V/UV `v̄_l`,
+/// and the updated `τ_M(0)`.
+pub fn apply_smoothing(
+    m_bar: &[f32],
+    v_tilde: &[bool],
+    s_e: f64,
+    epsilon_r: f64,
+    epsilon_t: u8,
+    epsilon_4: u8,
+    tau_m_prev: f64,
+) -> SmoothedFrame {
+    let l = m_bar.len();
+    debug_assert_eq!(v_tilde.len(), l);
+
+    // Eq. 112: V_M threshold (3-branch).
+    let v_m: f64 = if epsilon_r <= 0.005 && epsilon_t <= 4 {
+        f64::INFINITY
+    } else if epsilon_r <= 0.0125 && epsilon_4 == 0 {
+        45.255 * s_e.powf(0.375) * (-277.26 * epsilon_r).exp()
+    } else {
+        1.414 * s_e.powf(0.375)
+    };
+
+    // Eq. 113: per-harmonic V/UV override (force voiced if M̄_l > V_M).
+    let mut v_bar = [false; L_MAX as usize];
+    for (i, &m) in m_bar.iter().enumerate() {
+        v_bar[i] = if f64::from(m) > v_m { true } else { v_tilde[i] };
+    }
+
+    // Eq. 114: total amplitude.
+    let a_m: f64 = m_bar.iter().take(l).map(|&v| f64::from(v)).sum();
+
+    // Eq. 115: τ_M recurrence.
+    let tau_m = if epsilon_r <= 0.005 && epsilon_t <= 6 {
+        20480.0
+    } else {
+        6000.0 - 300.0 * f64::from(epsilon_t) + tau_m_prev
+    };
+
+    // Eq. 116: γ_M scaling.
+    let gamma_m: f64 = if tau_m > a_m { 1.0 } else if a_m > 0.0 { tau_m / a_m } else { 1.0 };
+
+    let mut m_bar_out = [0f32; L_MAX as usize];
+    for (i, &m) in m_bar.iter().enumerate() {
+        m_bar_out[i] = ((f64::from(m)) * gamma_m) as f32;
+    }
+
+    SmoothedFrame { m_bar: m_bar_out, v_bar, tau_m }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -271,6 +413,118 @@ mod tests {
             assert!(
                 (r - r0).abs() < 1e-4,
                 "bypassed harmonic l={}: ratio {r} vs {r0}",
+                i + 1
+            );
+        }
+    }
+
+    // ---- §1.11 smoothing / disposition -----------------------------------
+
+    fn err(epsilon_0: u8, epsilon_t: u8, epsilon_4: u8) -> FrameErrorContext {
+        FrameErrorContext { epsilon_0, epsilon_4, epsilon_t, bad_pitch: false }
+    }
+
+    #[test]
+    fn frame_disposition_clean_frame_uses() {
+        let (d, er) = frame_disposition(&err(0, 0, 0), 0.0);
+        assert_eq!(d, FrameDisposition::Use);
+        assert_eq!(er, 0.0);
+    }
+
+    #[test]
+    fn frame_disposition_bad_pitch_repeats() {
+        let mut e = err(0, 0, 0);
+        e.bad_pitch = true;
+        let (d, _) = frame_disposition(&e, 0.0);
+        assert_eq!(d, FrameDisposition::Repeat);
+    }
+
+    #[test]
+    fn frame_disposition_joint_error_threshold_repeats() {
+        // ε₀ ≥ 2 AND ε_T ≥ 10 + 40·ε_R(0). With ε_R(prev) = 0 and ε_T = 12,
+        // ε_R(0) = 0.05·12/144 ≈ 0.00417. Threshold = 10 + 40·0.00417 ≈ 10.17.
+        // ε_T = 12 ≥ 10.17 → repeat.
+        let (d, _) = frame_disposition(&err(2, 12, 0), 0.0);
+        assert_eq!(d, FrameDisposition::Repeat);
+        // ε₀ = 1 below threshold → use.
+        let (d, _) = frame_disposition(&err(1, 12, 0), 0.0);
+        assert_eq!(d, FrameDisposition::Use);
+    }
+
+    #[test]
+    fn frame_disposition_high_error_rate_mutes() {
+        // ε_R prev high enough that the smoothed value crosses 0.0875.
+        let (d, _) = frame_disposition(&err(0, 50, 0), 0.5);
+        assert_eq!(d, FrameDisposition::Mute);
+    }
+
+    #[test]
+    fn smoothing_low_error_uses_infinite_v_m() {
+        // Branch 1: ε_R ≤ 0.005 AND ε_T ≤ 4 → V_M = ∞. Even very tall
+        // M̄_l should not flip an unvoiced harmonic to voiced.
+        let m_bar = vec![1e6f32; 9];
+        let v_tilde = vec![false; 9];
+        let s = apply_smoothing(&m_bar, &v_tilde, 75000.0, 0.001, 2, 0, INIT_TAU_M);
+        for i in 0..9 {
+            assert!(!s.v_bar[i], "v̄_{i} flipped to voiced under V_M = ∞");
+        }
+    }
+
+    #[test]
+    fn smoothing_v_uv_override_when_amplitude_exceeds_threshold() {
+        // Force branch 3 (V_M = 1.414 · S_E^0.375). With S_E small, V_M
+        // is small; large M̄ should flip to voiced.
+        let s_e = 100.0; // V_M = 1.414 · 100^0.375 ≈ 1.414 · 5.84 ≈ 8.27
+        let m_bar = vec![1.0f32, 100.0, 1.0, 100.0, 1.0, 100.0, 1.0, 100.0, 1.0];
+        let v_tilde = vec![false; 9];
+        let s = apply_smoothing(&m_bar, &v_tilde, s_e, 0.05, 10, 1, INIT_TAU_M);
+        for i in 0..9 {
+            let expected = m_bar[i] > 8.27;
+            assert_eq!(s.v_bar[i], expected, "v̄_{i}");
+        }
+    }
+
+    #[test]
+    fn smoothing_amplitude_low_error_resets_tau_m() {
+        // Branch 1 of Eq. 115: ε_R ≤ 0.005 AND ε_T ≤ 6 → τ_M = 20480.
+        let m_bar = vec![10.0f32; 9];
+        let s = apply_smoothing(&m_bar, &vec![true; 9], 1000.0, 0.001, 3, 0, 5000.0);
+        assert_eq!(s.tau_m, 20480.0);
+    }
+
+    #[test]
+    fn smoothing_amplitude_recurrence_under_errors() {
+        // Branch 2: τ_M(0) = 6000 − 300·ε_T + τ_M(−1)
+        let m_bar = vec![10.0f32; 9];
+        let s = apply_smoothing(&m_bar, &vec![true; 9], 1000.0, 0.05, 8, 1, 10000.0);
+        // expected τ_M = 6000 − 300·8 + 10000 = 13600
+        assert!((s.tau_m - 13600.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn smoothing_gamma_m_is_one_when_tau_m_exceeds_amplitude_total() {
+        // A_M = Σ M̄_l. Tiny amplitudes → A_M < τ_M → γ_M = 1 (no scaling).
+        let m_bar = vec![0.01f32; 9];
+        let s = apply_smoothing(&m_bar, &vec![true; 9], 1000.0, 0.001, 0, 0, INIT_TAU_M);
+        for i in 0..9 {
+            assert!((s.m_bar[i] - 0.01).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn smoothing_gamma_m_clamps_loud_frames() {
+        // Loud amplitudes → A_M > τ_M → γ_M = τ_M / A_M < 1, all M̄_l scaled
+        // by the same γ_M.
+        let m_bar = vec![10000.0f32; 9];
+        let v_tilde = vec![true; 9];
+        let s = apply_smoothing(&m_bar, &v_tilde, 1000.0, 0.001, 0, 0, INIT_TAU_M);
+        // A_M = 90000, τ_M = 20480, γ_M ≈ 0.2276.
+        let expected_gamma = 20480.0 / 90000.0;
+        for i in 0..9 {
+            let ratio = s.m_bar[i] / 10000.0;
+            assert!(
+                (ratio - expected_gamma as f32).abs() < 1e-3,
+                "γ_M ratio at l={}: {ratio} vs {expected_gamma}",
                 i + 1
             );
         }
