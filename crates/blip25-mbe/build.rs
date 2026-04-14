@@ -23,6 +23,13 @@ fn main() {
     gen_annex_i(&out_dir);
     gen_annex_j(&out_dir);
     gen_annex_s(&out_dir);
+    gen_annex_l(&out_dir);
+    gen_annex_m(&out_dir);
+    gen_annex_n(&out_dir);
+    gen_annex_o(&out_dir);
+    gen_annex_p(&out_dir);
+    gen_annex_q(&out_dir);
+    gen_annex_r(&out_dir);
     gen_imbe_bit_prioritization(&out_dir);
     gen_ambe_bit_prioritization(&out_dir);
 }
@@ -532,6 +539,276 @@ fn gen_annex_s(out_dir: &PathBuf) {
     out.push_str("];\n");
 
     fs::write(out_dir.join("annex_s.rs"), out).expect("write annex_s.rs");
+}
+
+// ---------------------------------------------------------------------------
+// Half-rate codebooks (Annex L / M / N / O / P / Q / R)
+// ---------------------------------------------------------------------------
+
+/// Generic helper: read a CSV, skip comment and header lines, parse
+/// each remaining line into `cols` fields, and pass each row's parsed
+/// values to `row_fn`.
+fn parse_csv_rows(
+    csv_path: &str,
+    expected_cols: usize,
+    mut row_fn: impl FnMut(usize, &[&str]),
+) -> usize {
+    println!("cargo:rerun-if-changed={csv_path}");
+    let content = fs::read_to_string(csv_path)
+        .unwrap_or_else(|e| panic!("failed to read {csv_path}: {e}"));
+    let mut count = 0;
+    let mut saw_header = false;
+    for (lineno, raw) in content.lines().enumerate() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if !saw_header && line.chars().next().map_or(false, |c| c.is_ascii_alphabetic()) {
+            saw_header = true;
+            continue;
+        }
+        let cols: Vec<&str> = line.split(',').map(str::trim).collect();
+        assert_eq!(
+            cols.len(),
+            expected_cols,
+            "{csv_path} line {}: expected {expected_cols} cols, got {}",
+            lineno + 1,
+            cols.len()
+        );
+        row_fn(count, &cols);
+        count += 1;
+    }
+    count
+}
+
+/// Annex L — half-rate pitch quantization table (120 entries).
+/// Emits `AMBE_PITCH_TABLE: [PitchEntry; 120]` indexed by `b̂₀`.
+fn gen_annex_l(out_dir: &PathBuf) {
+    let mut entries: Vec<(u8, u8, f32)> = Vec::with_capacity(120);
+    parse_csv_rows(
+        "spec_tables/annex_l_pitch_table.csv",
+        3,
+        |row_idx, cols| {
+            let b0: u8 = cols[0].parse().expect("b0");
+            let l: u8 = cols[1].parse().expect("L");
+            let w: f32 = cols[2].parse().expect("omega_0");
+            assert_eq!(b0 as usize, row_idx, "Annex L must be sequential");
+            assert!((9..=56).contains(&l), "Annex L L={l} out of range");
+            assert!(w > 0.0, "Annex L omega_0 must be positive");
+            entries.push((b0, l, w));
+        },
+    );
+    assert_eq!(entries.len(), 120, "Annex L must have 120 entries");
+    // ω₀ strictly decreases with b̂₀.
+    for w in entries.windows(2) {
+        assert!(w[0].2 > w[1].2, "Annex L ω₀ not monotone decreasing");
+    }
+
+    let mut out = String::new();
+    out.push_str("// Auto-generated from spec_tables/annex_l_pitch_table.csv\n");
+    out.push_str("pub const AMBE_PITCH_TABLE: [PitchEntry; 120] = [\n");
+    for (_, l, w) in &entries {
+        out.push_str(&format!("    PitchEntry {{ l: {l}, omega_0: {w:.6} }},\n"));
+    }
+    out.push_str("];\n");
+    fs::write(out_dir.join("annex_l_pitch.rs"), out).expect("write annex_l_pitch.rs");
+}
+
+/// Annex M — half-rate V/UV codebook (32 entries, 8 bits each).
+fn gen_annex_m(out_dir: &PathBuf) {
+    let mut rows: Vec<[u8; 8]> = Vec::with_capacity(32);
+    parse_csv_rows(
+        "spec_tables/annex_m_vuv_codebook.csv",
+        9,
+        |row_idx, cols| {
+            let b1: u8 = cols[0].parse().expect("b1");
+            assert_eq!(b1 as usize, row_idx);
+            let mut v = [0u8; 8];
+            for i in 0..8 {
+                let bit: u8 = cols[i + 1].parse().expect("v_k");
+                assert!(bit <= 1, "V/UV bit must be 0 or 1");
+                v[i] = bit;
+            }
+            rows.push(v);
+        },
+    );
+    assert_eq!(rows.len(), 32);
+
+    let mut out = String::new();
+    out.push_str("// Auto-generated from spec_tables/annex_m_vuv_codebook.csv\n");
+    out.push_str("pub const AMBE_VUV_CODEBOOK: [[bool; 8]; 32] = [\n");
+    for row in &rows {
+        out.push_str(&format!(
+            "    [{}, {}, {}, {}, {}, {}, {}, {}],\n",
+            row[0] == 1, row[1] == 1, row[2] == 1, row[3] == 1,
+            row[4] == 1, row[5] == 1, row[6] == 1, row[7] == 1,
+        ));
+    }
+    out.push_str("];\n");
+    fs::write(out_dir.join("annex_m_vuv.rs"), out).expect("write annex_m_vuv.rs");
+}
+
+/// Annex N — half-rate block lengths (4 blocks, indexed by L − 9).
+fn gen_annex_n(out_dir: &PathBuf) {
+    let mut rows: Vec<[u8; 4]> = Vec::with_capacity(48);
+    parse_csv_rows(
+        "spec_tables/annex_n_block_lengths.csv",
+        5,
+        |row_idx, cols| {
+            let l: u8 = cols[0].parse().expect("L");
+            assert_eq!((l - 9) as usize, row_idx);
+            let mut r = [0u8; 4];
+            for i in 0..4 {
+                r[i] = cols[i + 1].parse().expect("J_i");
+            }
+            let sum: u32 = r.iter().map(|&x| x as u32).sum();
+            assert_eq!(sum, l as u32, "Annex N L={l}: Σ J̃_i = {sum}");
+            rows.push(r);
+        },
+    );
+    assert_eq!(rows.len(), 48);
+
+    let mut out = String::new();
+    out.push_str("// Auto-generated from spec_tables/annex_n_block_lengths.csv\n");
+    out.push_str("pub const AMBE_BLOCK_LENGTHS: [[u8; 4]; 48] = [\n");
+    for (l_idx, r) in rows.iter().enumerate() {
+        out.push_str(&format!(
+            "    [{}, {}, {}, {}], // L = {}\n",
+            r[0], r[1], r[2], r[3], l_idx + 9
+        ));
+    }
+    out.push_str("];\n");
+    fs::write(out_dir.join("annex_n_blocks.rs"), out).expect("write annex_n_blocks.rs");
+}
+
+/// Annex O — half-rate gain quantizer (32 levels).
+fn gen_annex_o(out_dir: &PathBuf) {
+    let mut levels: Vec<f32> = Vec::with_capacity(32);
+    parse_csv_rows(
+        "spec_tables/annex_o_gain_quantizer.csv",
+        2,
+        |row_idx, cols| {
+            let b2: u8 = cols[0].parse().expect("b2");
+            assert_eq!(b2 as usize, row_idx);
+            let lvl: f32 = cols[1].parse().expect("gain_level");
+            levels.push(lvl);
+        },
+    );
+    assert_eq!(levels.len(), 32);
+    for w in levels.windows(2) {
+        assert!(w[0] < w[1], "Annex O not monotone increasing");
+    }
+
+    let mut out = String::new();
+    out.push_str("// Auto-generated from spec_tables/annex_o_gain_quantizer.csv\n");
+    out.push_str("pub const AMBE_GAIN_LEVELS: [f32; 32] = [\n");
+    for (i, lvl) in levels.iter().enumerate() {
+        out.push_str(&format!("    {lvl:.6}, // b̂₂ = {i}\n"));
+    }
+    out.push_str("];\n");
+    fs::write(out_dir.join("annex_o_gain.rs"), out).expect("write annex_o_gain.rs");
+}
+
+/// Annex P — PRBA24 VQ (512 entries × 3 values).
+fn gen_annex_p(out_dir: &PathBuf) {
+    let mut rows: Vec<[f32; 3]> = Vec::with_capacity(512);
+    parse_csv_rows(
+        "spec_tables/annex_p_prba24_codebook.csv",
+        4,
+        |row_idx, cols| {
+            let b3: u16 = cols[0].parse().expect("b3");
+            assert_eq!(b3 as usize, row_idx);
+            rows.push([
+                cols[1].parse().expect("G2"),
+                cols[2].parse().expect("G3"),
+                cols[3].parse().expect("G4"),
+            ]);
+        },
+    );
+    assert_eq!(rows.len(), 512);
+
+    let mut out = String::new();
+    out.push_str("// Auto-generated from spec_tables/annex_p_prba24_codebook.csv\n");
+    out.push_str("pub const AMBE_PRBA24: [[f32; 3]; 512] = [\n");
+    for r in &rows {
+        out.push_str(&format!("    [{:.6}, {:.6}, {:.6}],\n", r[0], r[1], r[2]));
+    }
+    out.push_str("];\n");
+    fs::write(out_dir.join("annex_p_prba24.rs"), out).expect("write annex_p_prba24.rs");
+}
+
+/// Annex Q — PRBA58 VQ (128 entries × 4 values).
+fn gen_annex_q(out_dir: &PathBuf) {
+    let mut rows: Vec<[f32; 4]> = Vec::with_capacity(128);
+    parse_csv_rows(
+        "spec_tables/annex_q_prba58_codebook.csv",
+        5,
+        |row_idx, cols| {
+            let b4: u8 = cols[0].parse().expect("b4");
+            assert_eq!(b4 as usize, row_idx);
+            rows.push([
+                cols[1].parse().expect("G5"),
+                cols[2].parse().expect("G6"),
+                cols[3].parse().expect("G7"),
+                cols[4].parse().expect("G8"),
+            ]);
+        },
+    );
+    assert_eq!(rows.len(), 128);
+
+    let mut out = String::new();
+    out.push_str("// Auto-generated from spec_tables/annex_q_prba58_codebook.csv\n");
+    out.push_str("pub const AMBE_PRBA58: [[f32; 4]; 128] = [\n");
+    for r in &rows {
+        out.push_str(&format!(
+            "    [{:.6}, {:.6}, {:.6}, {:.6}],\n",
+            r[0], r[1], r[2], r[3]
+        ));
+    }
+    out.push_str("];\n");
+    fs::write(out_dir.join("annex_q_prba58.rs"), out).expect("write annex_q_prba58.rs");
+}
+
+/// Annex R — four HOC VQ tables (32/16/16/8 entries × 4 values).
+/// Emits four const arrays: `AMBE_HOC_B5` … `AMBE_HOC_B8`.
+fn gen_annex_r(out_dir: &PathBuf) {
+    let specs = [
+        ("spec_tables/annex_r_hoc_b5.csv", 32usize, "AMBE_HOC_B5", "b5"),
+        ("spec_tables/annex_r_hoc_b6.csv", 16, "AMBE_HOC_B6", "b6"),
+        ("spec_tables/annex_r_hoc_b7.csv", 16, "AMBE_HOC_B7", "b7"),
+        ("spec_tables/annex_r_hoc_b8.csv", 8,  "AMBE_HOC_B8", "b8"),
+    ];
+
+    let mut out = String::new();
+    out.push_str("// Auto-generated from spec_tables/annex_r_hoc_b{5..8}.csv\n");
+
+    for (path, expected_count, const_name, col_label) in specs {
+        let mut rows: Vec<[f32; 4]> = Vec::with_capacity(expected_count);
+        parse_csv_rows(path, 5, |row_idx, cols| {
+            let b: u16 = cols[0].parse().expect(col_label);
+            assert_eq!(b as usize, row_idx);
+            rows.push([
+                cols[1].parse().expect("H_i,1"),
+                cols[2].parse().expect("H_i,2"),
+                cols[3].parse().expect("H_i,3"),
+                cols[4].parse().expect("H_i,4"),
+            ]);
+        });
+        assert_eq!(rows.len(), expected_count, "{path}: row count");
+
+        out.push_str(&format!(
+            "pub const {const_name}: [[f32; 4]; {expected_count}] = [\n"
+        ));
+        for r in &rows {
+            out.push_str(&format!(
+                "    [{:.6}, {:.6}, {:.6}, {:.6}],\n",
+                r[0], r[1], r[2], r[3]
+            ));
+        }
+        out.push_str("];\n\n");
+    }
+
+    fs::write(out_dir.join("annex_r_hoc.rs"), out).expect("write annex_r_hoc.rs");
 }
 
 /// Parse `spec_tables/imbe_bit_prioritization.csv` into

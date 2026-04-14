@@ -30,6 +30,28 @@ use crate::fec::{
 };
 
 // ---------------------------------------------------------------------------
+// Half-rate codebook tables (Annex L / M / N / O / P / Q / R)
+// ---------------------------------------------------------------------------
+
+/// One row of the half-rate pitch quantization table (Annex L):
+/// a `(L̃, ω̃₀)` pair selected by the 7-bit `b̂₀` index.
+#[derive(Clone, Copy, Debug)]
+pub struct PitchEntry {
+    /// Number of harmonics for this pitch index.
+    pub l: u8,
+    /// Fundamental frequency in radians/sample.
+    pub omega_0: f32,
+}
+
+include!(concat!(env!("OUT_DIR"), "/annex_l_pitch.rs"));
+include!(concat!(env!("OUT_DIR"), "/annex_m_vuv.rs"));
+include!(concat!(env!("OUT_DIR"), "/annex_n_blocks.rs"));
+include!(concat!(env!("OUT_DIR"), "/annex_o_gain.rs"));
+include!(concat!(env!("OUT_DIR"), "/annex_p_prba24.rs"));
+include!(concat!(env!("OUT_DIR"), "/annex_q_prba58.rs"));
+include!(concat!(env!("OUT_DIR"), "/annex_r_hoc.rs"));
+
+// ---------------------------------------------------------------------------
 // Widths and constants
 // ---------------------------------------------------------------------------
 
@@ -393,6 +415,93 @@ mod tests {
         let out3 = decode_halfrate_frame(&interleave_halfrate(&c_flip3));
         assert_eq!(out3.info[3], u[3] ^ (1 << 11));
         assert_eq!(out3.errors[3], 0);
+    }
+
+    // ---- Annex L / M / N / O / P / Q / R spot checks ---------------------
+
+    #[test]
+    fn annex_l_spot_values_match_spec() {
+        // Spec-provided spot values from impl-spec §12.8 / full-text
+        // Annex L: b₀=0 → (L=9, ω₀=0.049971); b₀=119 → (L=56, ω₀=0.008125).
+        assert_eq!(AMBE_PITCH_TABLE.len(), 120);
+        let p0 = AMBE_PITCH_TABLE[0];
+        assert_eq!(p0.l, 9);
+        assert!((p0.omega_0 - 0.049971).abs() < 1e-6);
+        let p_last = AMBE_PITCH_TABLE[119];
+        assert_eq!(p_last.l, 56);
+        assert!((p_last.omega_0 - 0.008125).abs() < 1e-6);
+    }
+
+    #[test]
+    fn annex_l_omega_strictly_decreasing() {
+        for w in AMBE_PITCH_TABLE.windows(2) {
+            assert!(w[0].omega_0 > w[1].omega_0);
+        }
+    }
+
+    #[test]
+    fn annex_m_all_voiced_and_all_unvoiced_endpoints() {
+        assert_eq!(AMBE_VUV_CODEBOOK.len(), 32);
+        // b₁ = 0 → all 8 voiced (impl-spec §12.9 spot value).
+        for &v in &AMBE_VUV_CODEBOOK[0] { assert!(v); }
+        // b₁ = 16 → all 8 unvoiced.
+        for &v in &AMBE_VUV_CODEBOOK[16] { assert!(!v); }
+    }
+
+    #[test]
+    fn annex_n_block_lengths_sum_to_l() {
+        assert_eq!(AMBE_BLOCK_LENGTHS.len(), 48);
+        for (l_idx, row) in AMBE_BLOCK_LENGTHS.iter().enumerate() {
+            let l = (l_idx + 9) as u32;
+            let sum: u32 = row.iter().map(|&x| x as u32).sum();
+            assert_eq!(sum, l, "L={l}");
+        }
+    }
+
+    #[test]
+    fn annex_o_spot_values_and_monotone() {
+        assert_eq!(AMBE_GAIN_LEVELS.len(), 32);
+        assert!((AMBE_GAIN_LEVELS[0] - (-2.0)).abs() < 1e-6);
+        assert!((AMBE_GAIN_LEVELS[31] - 6.874496).abs() < 1e-6);
+        for w in AMBE_GAIN_LEVELS.windows(2) {
+            assert!(w[0] < w[1]);
+        }
+    }
+
+    #[test]
+    fn annex_p_first_entry_matches_spec() {
+        // Impl-spec §12.12: b₃=0 → G₂=0.526055, G₃=−0.328567, G₄=−0.304727.
+        assert_eq!(AMBE_PRBA24.len(), 512);
+        let e = AMBE_PRBA24[0];
+        assert!((e[0] - 0.526055).abs() < 1e-6);
+        assert!((e[1] - (-0.328567)).abs() < 1e-6);
+        assert!((e[2] - (-0.304727)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn annex_q_first_entry_matches_spec() {
+        // Impl-spec §12.13: b₄=0 → G₅=−0.103660, G₆=0.094597, G₇=−0.013149, G₈=0.081501.
+        assert_eq!(AMBE_PRBA58.len(), 128);
+        let e = AMBE_PRBA58[0];
+        assert!((e[0] - (-0.103660)).abs() < 1e-6);
+        assert!((e[1] - 0.094597).abs() < 1e-6);
+        assert!((e[2] - (-0.013149)).abs() < 1e-6);
+        assert!((e[3] - 0.081501).abs() < 1e-6);
+    }
+
+    #[test]
+    fn annex_r_hoc_shapes_and_spot_value() {
+        assert_eq!(AMBE_HOC_B5.len(), 32);
+        assert_eq!(AMBE_HOC_B6.len(), 16);
+        assert_eq!(AMBE_HOC_B7.len(), 16);
+        assert_eq!(AMBE_HOC_B8.len(), 8);
+        // Impl-spec §12.14: b₅=0 → H₁,₁=0.264108, H₁,₂=0.045976,
+        // H₁,₃=−0.200999, H₁,₄=−0.122344.
+        let e = AMBE_HOC_B5[0];
+        assert!((e[0] - 0.264108).abs() < 1e-6);
+        assert!((e[1] - 0.045976).abs() < 1e-6);
+        assert!((e[2] - (-0.200999)).abs() < 1e-6);
+        assert!((e[3] - (-0.122344)).abs() < 1e-6);
     }
 
     #[test]
