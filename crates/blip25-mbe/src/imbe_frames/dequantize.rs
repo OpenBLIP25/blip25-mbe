@@ -159,6 +159,184 @@ pub fn encode_gain(g1: f32) -> u8 {
 }
 
 // ---------------------------------------------------------------------------
+// Inverse uniform quantizer (§1.8.2, Eq. 68 / 71)
+// ---------------------------------------------------------------------------
+
+/// Midtread inverse uniform quantizer shared by Annex F (gain DCT) and
+/// Annex G (HOC) per BABA-A §1.8.2 Eq. 68 / 71:
+///
+/// ```text
+/// value = 0                                       if B̃_m = 0
+/// value = Δ̃_m · (b̃_m − 2^{B̃_m−1} + 0.5)         otherwise
+/// ```
+#[inline]
+pub fn decode_uniform(b_m: u16, b_m_bits: u8, delta_m: f32) -> f32 {
+    if b_m_bits == 0 {
+        return 0.0;
+    }
+    let half = 1u32 << (b_m_bits - 1);
+    delta_m * (f32::from(b_m) - half as f32 + 0.5)
+}
+
+/// HOC quantizer step-size table (`Table 3` from §1.8.2). Indexed by
+/// `B̃_m ∈ [0, 10]`; entry 0 is unused (returns 0 step size for absent
+/// coefficients).
+const HOC_STEP: [f32; 11] = [
+    0.0, 1.20, 0.85, 0.65, 0.40, 0.28, 0.15, 0.08, 0.04, 0.02, 0.01,
+];
+
+/// HOC variance scaling (`Table 4` from §1.8.2). Indexed by DCT
+/// position `k`. Entries 0 and 1 are unused (k starts at 2; k=1 is the
+/// block mean, sourced from the gain side via `R̃_i`). For `k ≥ 10` the
+/// scaling clamps to 0.170 per the Table 4 last row.
+const HOC_SIGMA: [f32; 11] = [
+    0.0, 0.0, 0.307, 0.241, 0.207, 0.190, 0.179, 0.173, 0.165, 0.170, 0.170,
+];
+
+/// HOC step size `Δ̃_m = HOC_STEP[B̃_m] · HOC_SIGMA[k]` per §1.8.2.
+/// `B̃_m` clamps to 10; `k` clamps to 10 (Table 4's last row).
+#[inline]
+pub fn hoc_step_size(b_m_bits: u8, k: u8) -> f32 {
+    let step_idx = (b_m_bits as usize).min(10);
+    let k_idx = (k as usize).min(10);
+    HOC_STEP[step_idx] * HOC_SIGMA[k_idx]
+}
+
+// ---------------------------------------------------------------------------
+// Gain vector recovery (§1.8.3, Eq. 68/69/70)
+// ---------------------------------------------------------------------------
+
+/// Decode the 6-element gain DCT vector `G̃_1..G̃_6` from the quantized
+/// parameter array `b̂` and the harmonic count `L̃`.
+///
+/// `b[2]` (`b̂₂`) is dequantized via Annex E; `b[3]..b[7]` (`b̂₃..b̂₇`)
+/// via Eq. 68 with step sizes from Annex F (`Δ̃_m`).
+///
+/// Output indexed 0..6 corresponds to spec `G̃_1..G̃_6` (1-based).
+pub fn decode_gain_dct(b: &[u16; 59], l: u8) -> [f32; 6] {
+    debug_assert!((9..=56).contains(&l));
+    let l_idx = (l - 9) as usize;
+    let mut g = [0f32; 6];
+    g[0] = decode_gain((b[2] & 0x3F) as u8); // Annex E
+    for m_idx in 0..5 {
+        // Spec m = 3..=7 → IMBE_GAIN_ALLOC column 0..=4; b̂_m at b[m].
+        let alloc = IMBE_GAIN_ALLOC[l_idx][m_idx];
+        g[m_idx + 1] = decode_uniform(b[m_idx + 3], alloc.b_m, alloc.delta_m);
+    }
+    g
+}
+
+/// Reconstruct the 6 per-block prediction-residual means `R̃_1..R̃_6`
+/// from the dequantized gain DCT vector via §1.8.3 Eq. 69:
+///
+/// ```text
+/// R̃_i = Σ_{m=1}^{6} α(m) · G̃_m · cos[π·(m−1)·(i − 0.5) / J̃_i]
+///         for 1 ≤ i ≤ 6
+/// α(1) = 1,  α(m) = 2 for m > 1
+/// ```
+///
+/// Per the spec note, this is a *per-block* inverse DCT — the cosine
+/// denominator is `J̃_i` (the i-th block's length), not 6. The basis
+/// frequency therefore changes block-by-block.
+pub fn gain_to_residuals(g: &[f32; 6], blocks: &[u8; 6]) -> [f32; 6] {
+    let mut r = [0f32; 6];
+    for i_0 in 0..6 {
+        let j_i = f32::from(blocks[i_0]);
+        debug_assert!(j_i > 0.0, "Annex J: J̃_i must be positive");
+        let i_half = i_0 as f32 + 0.5;
+        let mut acc = 0.0f32;
+        for m_0 in 0..6 {
+            let alpha = if m_0 == 0 { 1.0 } else { 2.0 };
+            let arg = PI * (m_0 as f32) * i_half / j_i;
+            acc += alpha * g[m_0] * arg.cos();
+        }
+        r[i_0] = acc;
+    }
+    r
+}
+
+// ---------------------------------------------------------------------------
+// HOC reconstruction (§1.8.4, Eq. 72/73/74)
+// ---------------------------------------------------------------------------
+
+/// Maximum block size: ⌈56 / 6⌉ = 10. Used to size HOC matrix rows.
+pub const MAX_BLOCK_SIZE: usize = 10;
+
+/// Assemble the per-block DCT coefficient matrix `C̃_{i,k}` for HOC
+/// reconstruction, per BABA-A §1.8 Eq. 67 + 72.
+///
+/// * `r_i` provides the block means: `C̃_{i,1} = R̃_i` (Eq. 67).
+/// * Entries `C̃_{i,k}` for `k ≥ 2` come from `b̂₈..b̂_{L+1}` via the
+///   inverse uniform quantizer with HOC step sizes.
+/// * The Annex G rows are pre-sorted by `(L, b_m)`, with `b_m` walking
+///   8↑; the `(C_i, C_k)` columns route each one to the correct block.
+///
+/// Output is a 6×`MAX_BLOCK_SIZE` matrix; only `[i][0..J̃_i]` is
+/// populated for each block.
+pub fn assemble_hoc_matrix(
+    b: &[u16; 59],
+    l: u8,
+    r_i: &[f32; 6],
+) -> [[f32; MAX_BLOCK_SIZE]; 6] {
+    debug_assert!((9..=56).contains(&l));
+    let l_idx = (l - 9) as usize;
+    let (off, len) = IMBE_HOC_OFFSETS[l_idx];
+
+    let mut c = [[0f32; MAX_BLOCK_SIZE]; 6];
+    // Block means from the gain side (k=1 → 0-based [0]).
+    for i in 0..6 {
+        c[i][0] = r_i[i];
+    }
+    // Higher-order coefficients from Annex G.
+    for j in 0..len as usize {
+        let entry = IMBE_HOC_ENTRIES[off as usize + j];
+        let val = decode_uniform(
+            b[entry.b_m as usize],
+            entry.b_m_bits,
+            hoc_step_size(entry.b_m_bits, entry.c_k),
+        );
+        c[(entry.c_i - 1) as usize][(entry.c_k - 1) as usize] = val;
+    }
+    c
+}
+
+/// Run the per-block inverse DCT over `C̃_{i,k}` and concatenate to
+/// produce `T̃_l` for `l = 1..=L̃` per BABA-A §1.8.4 Eq. 73 + 74:
+///
+/// ```text
+/// c̃_{i,j} = Σ_{k=1}^{J̃_i} α(k) · C̃_{i,k} · cos[π·(k−1)·(j − 0.5) / J̃_i]
+/// α(1) = 1,  α(k) = 2 for k > 1
+/// T̃_l = c̃_{i,j}   where l = j + Σ_{n=1}^{i-1} J̃_n
+/// ```
+///
+/// `T̃_l` is the log₂-domain spectral-amplitude prediction residual for
+/// the current frame; it feeds the inverse log-magnitude prediction
+/// step (§1.8.5) which is added in the next commit.
+///
+/// Returns an `[f32; L_MAX]` array; only entries `0..L̃` are populated.
+pub fn inverse_block_dct(
+    c: &[[f32; MAX_BLOCK_SIZE]; 6],
+    blocks: &[u8; 6],
+) -> [f32; L_MAX as usize] {
+    let mut t = [0f32; L_MAX as usize];
+    let mut l_offset = 0usize;
+    for i in 0..6 {
+        let j_i = blocks[i] as usize;
+        for j_0 in 0..j_i {
+            let mut acc = 0.0f32;
+            for k_0 in 0..j_i {
+                let alpha = if k_0 == 0 { 1.0 } else { 2.0 };
+                let arg = PI * (k_0 as f32) * (j_0 as f32 + 0.5) / j_i as f32;
+                acc += alpha * c[i][k_0] * arg.cos();
+            }
+            t[l_offset + j_0] = acc;
+        }
+        l_offset += j_i;
+    }
+    t
+}
+
+// ---------------------------------------------------------------------------
 // V/UV expansion (§1.3.2)
 // ---------------------------------------------------------------------------
 
@@ -372,6 +550,187 @@ mod tests {
             let just_above = mid + (hi - lo) * 0.01;
             assert_eq!(encode_gain(just_above), i + 1, "above midpoint at i={i}");
         }
+    }
+
+    // ---- Inverse uniform quantizer (§1.8.2) ------------------------------
+
+    #[test]
+    fn decode_uniform_zero_bits_is_zero() {
+        for delta in [0.001f32, 1.0, 100.0] {
+            assert_eq!(decode_uniform(0, 0, delta), 0.0);
+            assert_eq!(decode_uniform(7, 0, delta), 0.0);
+        }
+    }
+
+    #[test]
+    fn decode_uniform_midtread_centre_offset() {
+        // For B=4: half = 8. Codes 7 and 8 straddle zero by ±0.5·Δ.
+        let delta = 0.0964f32; // matches the spec example
+        assert!((decode_uniform(7, 4, delta) - (-0.5 * delta)).abs() < 1e-7);
+        assert!((decode_uniform(8, 4, delta) - 0.5 * delta).abs() < 1e-7);
+        // Ends of the range:
+        assert!((decode_uniform(0, 4, delta) - (-7.5 * delta)).abs() < 1e-7);
+        assert!((decode_uniform(15, 4, delta) - 7.5 * delta).abs() < 1e-7);
+    }
+
+    #[test]
+    fn hoc_step_size_matches_spec_example() {
+        // §1.8.2: 4 bits at k=3 → Δ̃ = 0.40 · 0.241 = 0.0964.
+        let s = hoc_step_size(4, 3);
+        assert!((s - 0.0964).abs() < 1e-6);
+    }
+
+    #[test]
+    fn hoc_step_size_clamps_high_k() {
+        // k ≥ 10 must use the same value as k=10 (Table 4 last row).
+        let s10 = hoc_step_size(5, 10);
+        for k in 10..=20u8 {
+            assert_eq!(hoc_step_size(5, k), s10);
+        }
+    }
+
+    // ---- Gain vector recovery (§1.8.3) -----------------------------------
+
+    #[test]
+    fn decode_gain_dct_only_g1_with_zero_quantizer_indices() {
+        // With b̂_3..b̂_7 all set to the midtread centre (2^{B-1}), the
+        // decoded G̃_2..G̃_6 should each be +0.5·Δ_m, NOT zero — that's
+        // the midtread bias. To get exactly zero across G̃_2..G̃_6 we
+        // can't with this quantizer, but we can verify the formula
+        // against direct computation.
+        let mut b = [0u16; 59];
+        b[2] = 31; // middle-ish gain index
+        for m_idx in 0..5 {
+            // Set b_m to the midtread centre.
+            let alloc = IMBE_GAIN_ALLOC[0][m_idx]; // L=9
+            b[m_idx + 3] = 1u16 << (alloc.b_m - 1);
+        }
+        let g = decode_gain_dct(&b, 9);
+        assert!((g[0] - decode_gain(31)).abs() < 1e-6);
+        for m_idx in 0..5 {
+            let alloc = IMBE_GAIN_ALLOC[0][m_idx];
+            let expected = alloc.delta_m * 0.5;
+            assert!(
+                (g[m_idx + 1] - expected).abs() < 1e-6,
+                "G̃_{}: expected {expected}, got {}",
+                m_idx + 2,
+                g[m_idx + 1]
+            );
+        }
+    }
+
+    #[test]
+    fn gain_to_residuals_constant_g1_propagates_to_all_blocks() {
+        // If only G̃_1 = c (DC term) and the rest are zero, the per-
+        // block inverse DCT must produce R̃_i = c for every block,
+        // independent of J̃_i.
+        let g = [3.5f32, 0.0, 0.0, 0.0, 0.0, 0.0];
+        // Try a non-trivial block layout.
+        let blocks: [u8; 6] = IMBE_BLOCK_LENGTHS[(56 - 9) as usize]; // L=56
+        let r = gain_to_residuals(&g, &blocks);
+        for i in 0..6 {
+            assert!((r[i] - 3.5).abs() < 1e-5, "R̃_{}: {}", i + 1, r[i]);
+        }
+    }
+
+    #[test]
+    fn gain_to_residuals_uses_per_block_denominator() {
+        // Two blocks with different J̃_i → DCT phase differs, so R̃_i
+        // should differ when only a higher-order G̃_m is non-zero.
+        let mut g = [0f32; 6];
+        g[2] = 1.0; // G̃_3 only (m_0 = 2)
+        // Contrived blocks: block 0 length 1, block 1 length 5.
+        // Eq. 69 with α(3)=2 and arg = π·(m-1)·(i-0.5)/J̃_i:
+        //   block 0 (i_0=0, J̃=1): arg = π·2·0.5/1 = π   → cos=-1   → 2·1·(-1)   = -2.0
+        //   block 1 (i_0=1, J̃=5): arg = π·2·1.5/5 = 3π/5 → cos≈-0.309 → 2·1·(-0.309) ≈ -0.618
+        let blocks = [1u8, 5, 1, 1, 1, 1];
+        let r = gain_to_residuals(&g, &blocks);
+        assert!((r[0] - (-2.0)).abs() < 1e-5, "block 0: {}", r[0]);
+        assert!((r[1] - (-0.618_034)).abs() < 1e-3, "block 1: {}", r[1]);
+    }
+
+    // ---- HOC reconstruction (§1.8.4) -------------------------------------
+
+    /// Forward DCT helper used only for tests. The spec's encode form
+    /// (Eq. 61 for the gain side) uses a *uniform* `1/N` factor across
+    /// all coefficients; the `α(k)` weighting that distinguishes DC
+    /// from the rest lives entirely on the inverse side (Eq. 73). So
+    /// this forward must apply the same `1/N` factor for `k=0` and
+    /// `k>0` to be a true inverse of `inverse_block_dct`.
+    fn forward_block_dct(samples: &[f32], n: usize) -> [f32; MAX_BLOCK_SIZE] {
+        let mut c = [0f32; MAX_BLOCK_SIZE];
+        for k_0 in 0..n {
+            let mut acc = 0.0f32;
+            for j_0 in 0..n {
+                let arg = PI * (k_0 as f32) * (j_0 as f32 + 0.5) / n as f32;
+                acc += samples[j_0] * arg.cos();
+            }
+            c[k_0] = acc / n as f32;
+        }
+        c
+    }
+
+    #[test]
+    fn block_dct_forward_then_inverse_is_identity() {
+        for &n in &[1usize, 2, 3, 5, 7, 10] {
+            let samples: [f32; MAX_BLOCK_SIZE] = std::array::from_fn(|i| {
+                if i < n { (i as f32 + 1.0).sin() * 2.0 } else { 0.0 }
+            });
+            let c = forward_block_dct(&samples, n);
+            // Place c into block 0 of a 6-block matrix; rest empty.
+            let mut matrix = [[0f32; MAX_BLOCK_SIZE]; 6];
+            matrix[0] = c;
+            // Block layout: block 0 takes n samples, blocks 1..5 are 0.
+            let mut blocks = [0u8; 6];
+            blocks[0] = n as u8;
+            let t = inverse_block_dct(&matrix, &blocks);
+            for i in 0..n {
+                assert!(
+                    (t[i] - samples[i]).abs() < 1e-4,
+                    "n={n}, i={i}: expected {}, got {}",
+                    samples[i],
+                    t[i]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn assemble_hoc_matrix_block_means_match_r_i() {
+        // C̃_{i,1} (k=1, 0-based [0]) must equal R̃_i for every block,
+        // regardless of the b array (Annex G entries only fill k ≥ 2).
+        let b = [0u16; 59];
+        let r = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let c = assemble_hoc_matrix(&b, 9, &r);
+        for i in 0..6 {
+            assert_eq!(c[i][0], r[i]);
+        }
+    }
+
+    #[test]
+    fn assemble_hoc_matrix_routes_via_eq_72() {
+        // For L=9 the first three Annex G entries are
+        // (C_i=4, C_k=2, b_m=8, B_m=9), (5,2,9,8), (6,2,10,7).
+        // Setting b[8]=midtread+1, b[9]=midtread+1, b[10]=midtread+1
+        // should produce non-zero C̃ at exactly (3,1), (4,1), (5,1)
+        // (0-based) and zero elsewhere.
+        let mut b = [0u16; 59];
+        b[8] = (1u16 << 8) + 1; // B_m=9 → midtread offset, then +1
+        b[9] = (1u16 << 7) + 1; // B_m=8
+        b[10] = (1u16 << 6) + 1; // B_m=7
+        let r = [0f32; 6];
+        let c = assemble_hoc_matrix(&b, 9, &r);
+
+        // All block means are zero (r = 0).
+        for i in 0..6 { assert_eq!(c[i][0], 0.0); }
+        // Non-zero entries at the routed positions only.
+        assert_ne!(c[3][1], 0.0, "(C_i=4, C_k=2)");
+        assert_ne!(c[4][1], 0.0, "(C_i=5, C_k=2)");
+        assert_ne!(c[5][1], 0.0, "(C_i=6, C_k=2)");
+        // Untouched cells stay zero.
+        assert_eq!(c[0][1], 0.0);
+        assert_eq!(c[1][1], 0.0);
+        assert_eq!(c[2][1], 0.0);
     }
 
     // ---- V/UV expansion --------------------------------------------------
