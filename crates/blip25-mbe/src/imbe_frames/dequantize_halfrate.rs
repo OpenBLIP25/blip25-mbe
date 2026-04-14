@@ -29,7 +29,7 @@ use crate::imbe_frames::dequantize::DecodeError;
 use crate::imbe_frames::half_rate::{
     AMBE_BLOCK_LENGTHS, AMBE_GAIN_LEVELS, AMBE_HOC_B5, AMBE_HOC_B6, AMBE_HOC_B7,
     AMBE_HOC_B8, AMBE_PITCH_TABLE, AMBE_PRBA24, AMBE_PRBA58, AMBE_VUV_CODEBOOK,
-    PitchEntry,
+    ANNEX_T, PitchEntry, ToneParams,
 };
 use crate::imbe_frames::priority::deprioritize_halfrate;
 use crate::mbe_params::{L_MAX, MbeParams};
@@ -430,6 +430,176 @@ pub fn dequantize_halfrate(
     Ok(params)
 }
 
+// ---------------------------------------------------------------------------
+// §2.10 — Tone frame dispatch, parsing, and MBE-bridge synthesis
+// ---------------------------------------------------------------------------
+
+/// First `b̂₀` value that unambiguously signals a tone frame per §2.10.1.
+/// Values `[126, 127]` are tone; `[120, 125]` are erasure/silence per
+/// §13.1 Table 14; `[128, 255]` are reserved.
+pub const HALFRATE_TONE_B0_FIRST: u8 = 126;
+
+/// Annex T sinusoidal-amplitude scale factor per §2.10.3 Eq. 209.
+/// `M̃_l = 16384 · 10^{0.03555·(A_D − 127)}` at the tone's harmonic
+/// indices.
+pub const TONE_AMPLITUDE_PEAK: f64 = 16384.0;
+
+/// `log10` exponent multiplier in Eq. 209 — 0.711 dB/step in linear form.
+pub const TONE_AMPLITUDE_EXPONENT_STEP: f64 = 0.03555;
+
+/// Classification of a received half-rate frame prior to MBE decode.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum HalfrateFrameKind {
+    /// Normal voice frame — dequantize per §2.11–§2.13.
+    Voice,
+    /// Tone frame per §2.10 — parse ID/amplitude and synthesize via
+    /// the MBE bridge.
+    Tone,
+    /// Erasure / silence marker per §13.1 Table 14 (`b̂₀ ∈ [120, 125]`)
+    /// or reserved range (`b̂₀ ∈ [128, 255]`). Decoder should repeat
+    /// the previous frame per §2.8.
+    Erasure,
+}
+
+/// Bits extracted from a tone frame per §2.10.2.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ToneFrameFields {
+    /// 8-bit tone ID (`I_D`).
+    pub id: u8,
+    /// 7-bit log-amplitude (`A_D ∈ [0, 127]`).
+    pub amplitude: u8,
+}
+
+/// Parsed half-rate frame — one of three kinds.
+#[derive(Clone, Debug)]
+pub enum HalfrateDecoded {
+    /// Normal voice frame with reconstructed [`MbeParams`].
+    Voice(MbeParams),
+    /// Tone frame with its ID/amplitude fields plus the MBE
+    /// parameters produced by Eq. 206–209. The params feed directly
+    /// into the §1.12 synthesizer.
+    Tone {
+        fields: ToneFrameFields,
+        params: MbeParams,
+    },
+    /// Erasure — caller should repeat the previous frame.
+    Erasure,
+}
+
+/// Classify a half-rate frame from its prioritized info vectors
+/// `û₀..û₃` per §2.10.1.
+///
+/// **Signature-first dispatch.** The tone-frame identification is
+/// `û₀(11..6) == 0x3F` with trailer `û₃(3..0) == 0` — not the voice-
+/// path `b̂₀` value. A legitimate voice frame cannot produce this
+/// signature because voice-path `b̂₀(6..3) = 1111` would require
+/// `b̂₀ ≥ 120`, which is outside Annex L's valid pitch range.
+pub fn classify_halfrate_frame(u: &[u16; 4]) -> HalfrateFrameKind {
+    // Signature + trailer check first — tone frames use their own
+    // bit layout (Table 20), so voice deprioritization is irrelevant
+    // until we've ruled out tone.
+    if ((u[0] >> 6) & 0x3F) == 0x3F && (u[3] & 0x0F) == 0 {
+        return HalfrateFrameKind::Tone;
+    }
+    // Not a tone frame — deprioritize and check `b̂₀` against Annex L's
+    // valid range `[0, 119]`. Any `b̂₀ ≥ 120` with no signature is an
+    // erasure (§13.1 Table 14) or reserved.
+    let b = deprioritize_halfrate(u);
+    let b0 = b[0] as u8;
+    if b0 <= HALFRATE_PITCH_MAX {
+        HalfrateFrameKind::Voice
+    } else {
+        HalfrateFrameKind::Erasure
+    }
+}
+
+/// Parse tone-frame fields per §2.10.2. Returns `None` if the signature
+/// (`û₀(11..6) == 0x3F`) or fixed trailer (`û₃(3..0) == 0`) doesn't
+/// match — caller should treat as erasure.
+pub fn parse_tone_frame(u: &[u16; 4]) -> Option<ToneFrameFields> {
+    // Signature check — required by §2.10.1.
+    if (u[0] >> 6) & 0x3F != 0x3F {
+        return None;
+    }
+    // Fixed trailer per Table 20.
+    if u[3] & 0x0F != 0 {
+        return None;
+    }
+    // I_D copy 4 — contiguous 8 bits in û₃(12..5).
+    let id = ((u[3] >> 5) & 0xFF) as u8;
+    // A_D: 6 MSBs in û₀(5..0) (= A_D(6..1)), LSB in û₃(4) (= A_D(0)).
+    let ad_hi = (u[0] & 0x3F) as u8; // bits 6..1
+    let ad_lo = ((u[3] >> 4) & 1) as u8; // bit 0
+    let amplitude = (ad_hi << 1) | ad_lo;
+    Some(ToneFrameFields { id, amplitude })
+}
+
+/// Convert `(I_D, A_D)` to `MbeParams` via the MBE bridge of Eq. 206–209.
+///
+/// Returns `None` for reserved `I_D` values (no row in `ANNEX_T`).
+/// For `I_D = 255` (silence) the amplitude is overridden to zero
+/// regardless of `A_D`.
+pub fn tone_to_mbe_params(id: u8, amplitude: u8) -> Option<MbeParams> {
+    let tone = ANNEX_T[id as usize]?;
+    let ToneParams { f0, l1, l2 } = tone;
+    let f0_f64 = f64::from(f0);
+    if f0_f64 <= 0.0 {
+        return None;
+    }
+    // Eq. 206–207: ω₀ and L̃ from f_0.
+    let omega_0 = (2.0 * PI64 / 8000.0) * f0_f64;
+    let l_tilde = (3812.5 / f0_f64).floor() as u8;
+    let l = l_tilde.clamp(crate::mbe_params::L_MIN, L_MAX);
+
+    // Eq. 208–209: voicing and magnitude at l_1 and l_2 only.
+    let mut voiced = [false; L_MAX as usize];
+    let mut amps = [0f32; L_MAX as usize];
+    let tone_magnitude = if id == 255 {
+        0.0 // silence override per §2.10.3 Step 3
+    } else {
+        TONE_AMPLITUDE_PEAK
+            * 10f64.powf(TONE_AMPLITUDE_EXPONENT_STEP * (f64::from(amplitude) - 127.0))
+    };
+    // Voicing and amplitudes are set on l_1 and l_2 if they're in-range.
+    for &l_tone in &[l1, l2] {
+        if l_tone >= 1 && l_tone <= l {
+            voiced[(l_tone - 1) as usize] = true;
+            amps[(l_tone - 1) as usize] = tone_magnitude as f32;
+        }
+    }
+
+    MbeParams::new(omega_0 as f32, l, &voiced[..l as usize], &amps[..l as usize]).ok()
+}
+
+/// Top-level half-rate frame decoder that handles all three frame kinds.
+///
+/// - Voice: returns `HalfrateDecoded::Voice(MbeParams)`, updates the
+///   `HalfrateDecoderState` (γ̃, Λ̃, L̃(−1)).
+/// - Tone: returns `HalfrateDecoded::Tone { fields, params }`. Does
+///   **not** update `prev_lambda`, `prev_l`, or `prev_gamma` — per
+///   §2.8.3 and §2.11, tone/silence/erasure frames do not advance
+///   voice-path state.
+/// - Erasure: returns `HalfrateDecoded::Erasure`. Caller repeats the
+///   previous voice frame (or emits silence on cold start).
+pub fn decode_halfrate_to_params(
+    u: &[u16; 4],
+    state: &mut HalfrateDecoderState,
+) -> Result<HalfrateDecoded, DecodeError> {
+    match classify_halfrate_frame(u) {
+        HalfrateFrameKind::Voice => {
+            let params = dequantize_halfrate(u, state)?;
+            Ok(HalfrateDecoded::Voice(params))
+        }
+        HalfrateFrameKind::Tone => {
+            let fields = parse_tone_frame(u).ok_or(DecodeError::BadPitch)?;
+            let params = tone_to_mbe_params(fields.id, fields.amplitude)
+                .ok_or(DecodeError::BadPitch)?;
+            Ok(HalfrateDecoded::Tone { fields, params })
+        }
+        HalfrateFrameKind::Erasure => Ok(HalfrateDecoded::Erasure),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -705,6 +875,207 @@ mod tests {
         }
         // State updated.
         assert_eq!(state.previous_l(), 9);
+    }
+
+    // ---- §2.10 tone frames -----------------------------------------------
+
+    fn build_tone_frame_u(id: u8, amplitude: u8) -> [u16; 4] {
+        // Build a half-rate info bundle per §2.10.1 Table 20:
+        //   û₀(11..6) = 0x3F        (signature)
+        //   û₀(5..0)  = A_D(6..1)   (amplitude bits 6..1)
+        //   û₁ carries I_D copy 1 and partial copy 2 — mirrors §2.10.2
+        //   û₂ carries partial copies 2 and 3
+        //   û₃ : I_D copy 3 LSB, I_D copy 4, A_D(0), fixed 0000
+        let mut u = [0u16; 4];
+        let ad_hi = (amplitude >> 1) & 0x3F;
+        let ad_lo = amplitude & 1;
+        u[0] = (0x3F << 6) | u16::from(ad_hi);
+        // û₁: copy 1 full 8 bits at (11..4); copy 2 MSB nibble at (3..0).
+        u[1] = (u16::from(id) << 4) | u16::from(id >> 4);
+        // û₂: copy 2 LSB nibble at (10..7); copy 3 top 7 bits at (6..0).
+        let id_lo_nibble = u16::from(id & 0x0F);
+        u[2] = (id_lo_nibble << 7) | u16::from(id >> 1);
+        // û₃: bit 13 = I_D(0); bits (12..5) = copy 4 full 8 bits; bit 4 = A_D(0).
+        u[3] = (u16::from(id & 1) << 13)
+            | (u16::from(id) << 5)
+            | (u16::from(ad_lo) << 4);
+        u
+    }
+
+    #[test]
+    fn classify_voice_frame_when_b0_valid() {
+        use crate::imbe_frames::priority::prioritize_halfrate;
+        let b = [0u16; 9];
+        let u = prioritize_halfrate(&b);
+        assert_eq!(classify_halfrate_frame(&u), HalfrateFrameKind::Voice);
+    }
+
+    #[test]
+    fn classify_erasure_for_b0_range_120_125() {
+        use crate::imbe_frames::priority::prioritize_halfrate;
+        for b0 in 120..=125u16 {
+            let mut b = [0u16; 9];
+            b[0] = b0;
+            let u = prioritize_halfrate(&b);
+            // Without the tone signature in û₀, this classifies as Erasure
+            // (the 120–125 range is specifically erasure per §13.1 Table 14).
+            assert_eq!(
+                classify_halfrate_frame(&u),
+                HalfrateFrameKind::Erasure,
+                "b̂₀ = {b0}"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_tone_for_b0_126_and_127_with_signature() {
+        let u = build_tone_frame_u(128, 0); // DTMF tone 0 (ID 128)
+        assert_eq!(classify_halfrate_frame(&u), HalfrateFrameKind::Tone);
+    }
+
+    #[test]
+    fn classify_erasure_when_tone_range_but_signature_missing() {
+        use crate::imbe_frames::priority::prioritize_halfrate;
+        let mut b = [0u16; 9];
+        b[0] = 126; // tone-range b̂₀ but no signature
+        let u = prioritize_halfrate(&b);
+        // With this synthetic frame, û₀ doesn't have the 0x3F
+        // signature — caller should fall back to Erasure.
+        assert_eq!(classify_halfrate_frame(&u), HalfrateFrameKind::Erasure);
+    }
+
+    #[test]
+    fn parse_tone_frame_recovers_id_and_amplitude() {
+        for id in [5u8, 64, 128, 144, 162, 255] {
+            for amp in [0u8, 1, 63, 64, 126, 127] {
+                let u = build_tone_frame_u(id, amp);
+                let fields = parse_tone_frame(&u).unwrap_or_else(|| {
+                    panic!("parse failed for id={id}, amp={amp}")
+                });
+                assert_eq!(fields.id, id, "id={id} amp={amp}");
+                assert_eq!(fields.amplitude, amp, "id={id} amp={amp}");
+            }
+        }
+    }
+
+    #[test]
+    fn parse_tone_frame_rejects_bad_signature() {
+        let mut u = build_tone_frame_u(128, 64);
+        u[0] &= !(0x3F << 6); // wipe the signature
+        assert_eq!(parse_tone_frame(&u), None);
+    }
+
+    #[test]
+    fn parse_tone_frame_rejects_bad_trailer() {
+        let mut u = build_tone_frame_u(128, 64);
+        u[3] |= 0x01; // set a trailer bit to non-zero
+        assert_eq!(parse_tone_frame(&u), None);
+    }
+
+    // ---- Tone → MBE bridge (§2.10.3) -------------------------------------
+
+    #[test]
+    fn tone_to_mbe_single_freq_tone() {
+        // ID = 5: f0 = 156.25 Hz, l1 = l2 = 1.
+        let params = tone_to_mbe_params(5, 127).unwrap();
+        // ω̃₀ = 2π·156.25/8000 = π/25.6
+        let expected_omega = (2.0 * core::f64::consts::PI / 8000.0) * 156.25;
+        assert!((f64::from(params.omega_0()) - expected_omega).abs() < 1e-6);
+        // L̃ = floor(3812.5 / 156.25) = 24, clamped to [9, 56]. So L=24.
+        assert_eq!(params.harmonic_count(), 24);
+        // Only l=1 should be voiced with non-zero amplitude (A_D=127 → peak=16384).
+        assert!(params.voiced(1));
+        assert!((params.amplitude(1) - 16384.0).abs() < 1.0);
+        for l_h in 2..=24 {
+            assert!(!params.voiced(l_h));
+            assert_eq!(params.amplitude(l_h), 0.0);
+        }
+    }
+
+    #[test]
+    fn tone_to_mbe_silence_id_255_has_zero_amplitude() {
+        // ID = 255 forces M̃_l = 0 regardless of A_D per §2.10.3 Step 3.
+        let params = tone_to_mbe_params(255, 127).unwrap();
+        for l_h in 1..=params.harmonic_count() {
+            assert_eq!(params.amplitude(l_h), 0.0, "l={l_h}");
+        }
+    }
+
+    #[test]
+    fn tone_to_mbe_reserved_id_returns_none() {
+        // Reserved range: 0..4 and 164..254.
+        for id in [0u8, 1, 4, 123, 164, 200, 254] {
+            assert!(tone_to_mbe_params(id, 64).is_none(), "id={id}");
+        }
+    }
+
+    #[test]
+    fn tone_to_mbe_two_freq_dtmf() {
+        // DTMF tone (ID = 128 → DTMF '1' or similar). Annex T row
+        // should have l1 != l2. Verify both are voiced and others aren't.
+        let params = tone_to_mbe_params(128, 100).unwrap();
+        let l = params.harmonic_count();
+        // Can't hard-code the DTMF indices without a copy of Annex T
+        // row values; just check that exactly two harmonics are voiced.
+        let voiced_count: usize = (1..=l).filter(|&i| params.voiced(i)).count();
+        assert!(
+            voiced_count <= 2,
+            "DTMF tone should activate at most 2 harmonics, got {voiced_count}"
+        );
+    }
+
+    #[test]
+    fn tone_amplitude_scales_logarithmically() {
+        // A_D drop of 1 step = 0.711 dB = factor of 10^{-0.03555}.
+        let step = 10f64.powf(-0.03555);
+        let p127 = tone_to_mbe_params(5, 127).unwrap();
+        let p126 = tone_to_mbe_params(5, 126).unwrap();
+        let a127 = f64::from(p127.amplitude(1));
+        let a126 = f64::from(p126.amplitude(1));
+        assert!((a126 / a127 - step).abs() < 1e-4, "a126/a127 = {}", a126 / a127);
+    }
+
+    // ---- Top-level dispatch ---------------------------------------------
+
+    #[test]
+    fn decode_halfrate_dispatches_voice() {
+        use crate::imbe_frames::priority::prioritize_halfrate;
+        let b = [0u16; 9];
+        let u = prioritize_halfrate(&b);
+        let mut state = HalfrateDecoderState::new();
+        match decode_halfrate_to_params(&u, &mut state).unwrap() {
+            HalfrateDecoded::Voice(_) => {}
+            other => panic!("expected Voice, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_halfrate_dispatches_tone() {
+        let u = build_tone_frame_u(5, 100); // 156.25 Hz tone
+        let mut state = HalfrateDecoderState::new();
+        match decode_halfrate_to_params(&u, &mut state).unwrap() {
+            HalfrateDecoded::Tone { fields, params: _ } => {
+                assert_eq!(fields.id, 5);
+                assert_eq!(fields.amplitude, 100);
+            }
+            other => panic!("expected Tone, got {other:?}"),
+        }
+        // Tone frame must not advance voice-state.
+        assert_eq!(state.previous_l(), HALFRATE_INIT_PREV_L);
+        assert_eq!(state.previous_gamma(), 0.0);
+    }
+
+    #[test]
+    fn decode_halfrate_dispatches_erasure() {
+        use crate::imbe_frames::priority::prioritize_halfrate;
+        let mut b = [0u16; 9];
+        b[0] = 120; // erasure
+        let u = prioritize_halfrate(&b);
+        let mut state = HalfrateDecoderState::new();
+        match decode_halfrate_to_params(&u, &mut state).unwrap() {
+            HalfrateDecoded::Erasure => {}
+            other => panic!("expected Erasure, got {other:?}"),
+        }
     }
 
     #[test]

@@ -51,6 +51,22 @@ include!(concat!(env!("OUT_DIR"), "/annex_p_prba24.rs"));
 include!(concat!(env!("OUT_DIR"), "/annex_q_prba58.rs"));
 include!(concat!(env!("OUT_DIR"), "/annex_r_hoc.rs"));
 
+/// One row of the Annex T tone-frame parameter table (§2.10.3).
+/// Carries the fundamental frequency and the two harmonic indices
+/// that make up a tone (`l1 == l2` for single-frequency tones).
+#[derive(Clone, Copy, Debug)]
+pub struct ToneParams {
+    /// Fundamental frequency in Hz.
+    pub f0: f32,
+    /// Harmonic index of the first tone component.
+    pub l1: u8,
+    /// Harmonic index of the second tone component (equal to `l1`
+    /// for single-frequency tones).
+    pub l2: u8,
+}
+
+include!(concat!(env!("OUT_DIR"), "/annex_t_tones.rs"));
+
 // ---------------------------------------------------------------------------
 // Widths and constants
 // ---------------------------------------------------------------------------

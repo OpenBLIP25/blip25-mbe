@@ -42,7 +42,7 @@ use blip25_mbe::imbe_frames::dequantize::{
 };
 use blip25_mbe::imbe_frames::fec::{deinterleave_fullrate, modulation_masks_fullrate};
 use blip25_mbe::imbe_frames::dequantize_halfrate::{
-    HalfrateDecoderState, dequantize_halfrate,
+    HalfrateDecoded, HalfrateDecoderState, decode_halfrate_to_params,
 };
 use blip25_mbe::imbe_frames::full_rate::{
     INFO_WIDTHS, ImbeFrame, decode_fullrate_frame,
@@ -481,36 +481,43 @@ fn cmd_decode_pcm_halfrate(root: &Path, name: &str, gamma_w: f64) -> Result<()> 
     let mut dec_state = HalfrateDecoderState::new();
     let mut synth_state = SynthState::new();
     let mut pcm_out: Vec<i16> = Vec::with_capacity(n_frames * FRAME_SAMPLES);
-    let mut tone_or_bad = 0usize;
+    let mut voice_frames = 0usize;
+    let mut tone_frames = 0usize;
+    let mut erasure_frames = 0usize;
 
     for f in 0..n_frames {
         let frame = &bit_bytes[f * BYTES_PER_HALFRATE_FRAME..(f + 1) * BYTES_PER_HALFRATE_FRAME];
         let dibits = unpack_dibits_halfrate(frame);
         let ambe = decode_halfrate_frame(&dibits);
-        let params = match dequantize_halfrate(&ambe.info, &mut dec_state) {
-            Ok(p) => p,
-            Err(_) => {
-                // Tone frame or bad pitch — emit silence for now.
-                // Full tone-frame synthesis (§2.10) is a separate commit.
-                tone_or_bad += 1;
-                pcm_out.extend(std::iter::repeat(0i16).take(FRAME_SAMPLES));
-                continue;
-            }
-        };
         let err = FrameErrorContext {
             epsilon_0: ambe.errors[0],
             epsilon_4: 0, // half-rate doesn't have a c̃₄ vector
             epsilon_t: ambe.error_total().min(255) as u8,
             bad_pitch: false,
         };
-        let pcm = synthesize_frame(&params, &err, gamma_w, &mut synth_state);
-        pcm_out.extend_from_slice(&pcm);
+        match decode_halfrate_to_params(&ambe.info, &mut dec_state) {
+            Ok(HalfrateDecoded::Voice(params)) => {
+                voice_frames += 1;
+                let pcm = synthesize_frame(&params, &err, gamma_w, &mut synth_state);
+                pcm_out.extend_from_slice(&pcm);
+            }
+            Ok(HalfrateDecoded::Tone { fields: _, params }) => {
+                tone_frames += 1;
+                // Tone frames feed the MBE synthesizer per §2.10.3.
+                let pcm = synthesize_frame(&params, &err, gamma_w, &mut synth_state);
+                pcm_out.extend_from_slice(&pcm);
+            }
+            Ok(HalfrateDecoded::Erasure) | Err(_) => {
+                erasure_frames += 1;
+                pcm_out.extend(std::iter::repeat(0i16).take(FRAME_SAMPLES));
+            }
+        }
     }
 
     println!("decoded:       {} samples", pcm_out.len());
-    if tone_or_bad > 0 {
-        println!("tone / bad-pitch frames (silenced): {tone_or_bad}");
-    }
+    println!(
+        "frame mix:     voice={voice_frames}, tone={tone_frames}, erasure={erasure_frames}"
+    );
     println!();
 
     let n = pcm_out.len().min(pcm_ref.len());

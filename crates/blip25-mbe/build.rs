@@ -30,6 +30,7 @@ fn main() {
     gen_annex_p(&out_dir);
     gen_annex_q(&out_dir);
     gen_annex_r(&out_dir);
+    gen_annex_t(&out_dir);
     gen_imbe_bit_prioritization(&out_dir);
     gen_ambe_bit_prioritization(&out_dir);
 }
@@ -809,6 +810,53 @@ fn gen_annex_r(out_dir: &PathBuf) {
     }
 
     fs::write(out_dir.join("annex_r_hoc.rs"), out).expect("write annex_r_hoc.rs");
+}
+
+/// Annex T — tone frame parameters, sparse table keyed by `I_D`.
+///
+/// The CSV skips reserved ID ranges (0–4, 123–127, 164–254). We emit
+/// a dense 256-entry `Option<ToneParams>` table so the decoder can
+/// index directly by `I_D`.
+fn gen_annex_t(out_dir: &PathBuf) {
+    let mut rows: Vec<(u8, f32, u8, u8)> = Vec::new();
+    parse_csv_rows(
+        "spec_tables/annex_t_tone_params.csv",
+        4,
+        |_row_idx, cols| {
+            let id: u8 = cols[0].parse().expect("tone_id");
+            let f0: f32 = cols[1].parse().expect("f0");
+            let l1: u8 = cols[2].parse().expect("l1");
+            let l2: u8 = cols[3].parse().expect("l2");
+            rows.push((id, f0, l1, l2));
+        },
+    );
+    assert!(!rows.is_empty(), "Annex T must have at least one row");
+
+    // Sanity: IDs should be strictly increasing.
+    for w in rows.windows(2) {
+        assert!(w[0].0 < w[1].0, "Annex T IDs not strictly increasing");
+    }
+
+    // Emit a dense 256-entry lookup — None for reserved slots, Some(...) for live rows.
+    let mut table: [Option<(f32, u8, u8)>; 256] = [None; 256];
+    for (id, f0, l1, l2) in &rows {
+        table[*id as usize] = Some((*f0, *l1, *l2));
+    }
+
+    let mut out = String::new();
+    out.push_str("// Auto-generated from spec_tables/annex_t_tone_params.csv\n");
+    out.push_str("pub const ANNEX_T: [Option<ToneParams>; 256] = [\n");
+    for entry in &table {
+        match entry {
+            None => out.push_str("    None,\n"),
+            Some((f0, l1, l2)) => out.push_str(&format!(
+                "    Some(ToneParams {{ f0: {f0:.4}, l1: {l1}, l2: {l2} }}),\n"
+            )),
+        }
+    }
+    out.push_str("];\n");
+
+    fs::write(out_dir.join("annex_t_tones.rs"), out).expect("write annex_t_tones.rs");
 }
 
 /// Parse `spec_tables/imbe_bit_prioritization.csv` into
