@@ -1,0 +1,17 @@
+[package]
+name = "blip25-dvsi-diff"
+description = "Iteration tool for diagnosing blip25-mbe divergence from DVSI reference output. Not published."
+publish = false
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "dvsi-diff"
+path = "src/main.rs"
+
+[dependencies]
+blip25-mbe.workspace = true
+anyhow.workspace = true
+clap.workspace = true

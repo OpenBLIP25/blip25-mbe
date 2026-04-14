@@ -1,0 +1,17 @@
+[package]
+name = "blip25-conformance-speech-quality"
+description = "BABG-style PESQ/POLQA perceptual scoring of blip25-mbe output. Not published."
+publish = false
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "conformance-speech-quality"
+path = "src/main.rs"
+
+[dependencies]
+blip25-mbe.workspace = true
+anyhow.workspace = true
+clap.workspace = true

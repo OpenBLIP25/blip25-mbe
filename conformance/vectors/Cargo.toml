@@ -1,0 +1,17 @@
+[package]
+name = "blip25-conformance-vectors"
+description = "DVSI test-vector conformance harness for blip25-mbe. Not published."
+publish = false
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "conformance-vectors"
+path = "src/main.rs"
+
+[dependencies]
+blip25-mbe.workspace = true
+anyhow.workspace = true
+clap.workspace = true

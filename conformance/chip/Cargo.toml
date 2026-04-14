@@ -1,0 +1,18 @@
+[package]
+name = "blip25-conformance-chip"
+description = "Live DVSI USB-3000 chip conformance harness for blip25-mbe. Not published."
+publish = false
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "conformance-chip"
+path = "src/main.rs"
+
+[dependencies]
+blip25-mbe.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+# USB driver dep (rusb / libusb1-sys) added when the chip protocol layer lands.

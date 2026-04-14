@@ -1,0 +1,24 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/blip25-mbe",
+    "conformance/vectors",
+    "conformance/chip",
+    "conformance/speech-quality",
+    "tools/dvsi-diff",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Chance Lindsey"]
+license = "MIT"
+
+[workspace.dependencies]
+blip25-mbe = { path = "crates/blip25-mbe", version = "0.1.0" }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

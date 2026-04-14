@@ -1,0 +1,14 @@
+[package]
+name = "blip25-mbe"
+description = "Clean-room MBE / IMBE / AMBE+2 vocoder family: P25 wire formats, multi-generation codecs, and parametric rate conversion"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+readme = "../../README.md"
+keywords = ["p25", "mbe", "imbe", "ambe", "vocoder"]
+categories = ["multimedia::audio", "encoding"]
+
+[dependencies]
+
+[dev-dependencies]
