@@ -21,6 +21,24 @@ test vectors, not any open-source implementation.
   is acceptable as a last-resort sanity check, but the design and code must
   come from the spec.
 
+### Full-text extracts and PDFs are copyrighted — source from derived works only
+- The TIA-102 PDFs and the `*_Full_Text.md` / `*_Summary.txt` extractions in
+  `~/blip25-specs/` are **copyrighted, internal-only source material**. They
+  are `.gitignored` in the blip25-specs repo for that reason.
+- **Do not base any committed code, constants, or comments on them.** All
+  code-level sourcing must come from the derived implementation specs
+  (`P25_*_Implementation_Spec.md`, `analysis/*.md`, `annex_tables/*.csv`),
+  which are the committable derived works.
+- **Reading the full text for gap detection is OK.** Scanning
+  `*_Full_Text.md` or the PDF to cross-check that a detail is truly missing
+  from the implementation spec, or to locate which section of the standard
+  holds the answer you need to request, is acceptable research. Citing the
+  full text in a gap report so the user can find the source material is
+  fine. But the implementation spec (not the full text) remains the only
+  acceptable code source.
+- Quoting non-trivial passages from the full text into code, comments, or
+  docs is a copyright issue. Keep such quotes out of the repo.
+
 ### What IS allowed
 - **General SDR open-source libraries** (DSP primitives, modulation, filter
   design, generic coding libraries) that are not P25-specific.
