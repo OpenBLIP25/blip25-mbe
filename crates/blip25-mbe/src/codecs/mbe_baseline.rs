@@ -21,6 +21,8 @@
 //!
 //! [`MbeParams`]: crate::mbe_params::MbeParams
 
+use core::f64::consts::PI as PI64;
+
 use crate::mbe_params::L_MAX;
 
 include!(concat!(env!("OUT_DIR"), "/annex_i_synth_window.rs"));
@@ -287,6 +289,274 @@ pub fn apply_smoothing(
     SmoothedFrame { m_bar: m_bar_out, v_bar, tau_m }
 }
 
+// ---------------------------------------------------------------------------
+// §1.12.1 — Unvoiced synthesis (Eq. 117–126)
+// ---------------------------------------------------------------------------
+
+/// Samples per 20 ms frame at 8 kHz (`N` in §1.12).
+pub const FRAME_SAMPLES: usize = 160;
+
+/// Initial state of the white-noise LCG: `u(−105) = 3147` per
+/// BABA-A §10 Annex A.
+pub const NOISE_INIT: u32 = 3147;
+
+/// Placeholder for the unvoiced-synthesis spectral scale `γ_w`
+/// (Eq. 121). The true value is a constant computed from the
+/// synthesis window `wS` (Annex I) and the pitch refinement window
+/// `wR` (Annex C). Annex C has not yet been extracted, so this
+/// placeholder is used until either Annex C lands or a DVSI
+/// fixture value is captured.
+pub const PLACEHOLDER_GAMMA_W: f64 = 1.0;
+
+/// Cross-frame state for the unvoiced synthesizer (§1.12.1).
+#[derive(Clone, Debug)]
+pub struct UnvoicedSynthState {
+    /// LCG state. Initial value: 3147 (= `u(−105)`).
+    lcg: u32,
+    /// Most recent 209 noise samples covering the synthesis window
+    /// `wS` over `n = −104..104`.
+    noise_window: [f64; 209],
+    /// Previous frame's IDFT output `ũ_w(n, −1)` for `n = −128..127`.
+    /// Indexed `[n + 128]`.
+    prev_idft: [f64; 256],
+    /// `false` until the first frame has populated `noise_window`.
+    initialized: bool,
+}
+
+impl UnvoicedSynthState {
+    /// Cold-start state per §1.13 / Annex A: empty noise window,
+    /// LCG seeded with `u(−105) = 3147`, prev IDFT all zero.
+    pub fn new() -> Self {
+        Self {
+            lcg: NOISE_INIT,
+            noise_window: [0.0; 209],
+            prev_idft: [0.0; 256],
+            initialized: false,
+        }
+    }
+
+    /// Advance the LCG one step: `u(n+1) = (171·u(n) + 11213) mod 53125`.
+    #[inline]
+    fn next_noise(&mut self) -> f64 {
+        self.lcg = (171u32
+            .wrapping_mul(self.lcg)
+            .wrapping_add(11213))
+            % 53125;
+        f64::from(self.lcg)
+    }
+
+    /// Per-frame: shift the noise window forward by N=160 samples.
+    /// First call generates 209 fresh samples; subsequent calls reuse
+    /// the trailing 49 samples and generate 160 new ones.
+    fn advance_window(&mut self) {
+        if !self.initialized {
+            for i in 0..209 {
+                self.noise_window[i] = self.next_noise();
+            }
+            self.initialized = true;
+        } else {
+            self.noise_window.copy_within(160..209, 0);
+            for i in 49..209 {
+                self.noise_window[i] = self.next_noise();
+            }
+        }
+    }
+}
+
+impl Default for UnvoicedSynthState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// 256-point complex DFT of a windowed real input over `n = −104..=104`.
+/// Returns `(re, im)` arrays of length 256 indexed `[m + 128]` for
+/// `m = −128..127`.
+fn dft_256_windowed(input: &[f64; 209]) -> ([f64; 256], [f64; 256]) {
+    let mut re = [0f64; 256];
+    let mut im = [0f64; 256];
+    for m_idx in 0..256 {
+        let m = m_idx as i32 - 128;
+        let mut acc_re = 0f64;
+        let mut acc_im = 0f64;
+        for n_idx in 0..209 {
+            let n = n_idx as i32 - 104;
+            let arg = -2.0 * PI64 * f64::from(m) * f64::from(n) / 256.0;
+            acc_re += input[n_idx] * arg.cos();
+            acc_im += input[n_idx] * arg.sin();
+        }
+        re[m_idx] = acc_re;
+        im[m_idx] = acc_im;
+    }
+    (re, im)
+}
+
+/// 256-point inverse DFT producing real-valued output (Eq. 125).
+/// The 1/256 normalization is included.
+fn idft_256(re: &[f64; 256], im: &[f64; 256]) -> [f64; 256] {
+    let mut out = [0f64; 256];
+    for n_idx in 0..256 {
+        let n = n_idx as i32 - 128;
+        let mut acc = 0f64;
+        for m_idx in 0..256 {
+            let m = m_idx as i32 - 128;
+            let arg = 2.0 * PI64 * f64::from(m) * f64::from(n) / 256.0;
+            acc += re[m_idx] * arg.cos() - im[m_idx] * arg.sin();
+        }
+        out[n_idx] = acc / 256.0;
+    }
+    out
+}
+
+/// Apply the per-band spectral shaping (Eq. 119–124) in-place on the
+/// DFT outputs.
+fn shape_spectrum(
+    re: &mut [f64; 256],
+    im: &mut [f64; 256],
+    omega_0: f64,
+    m_bar: &[f32],
+    v_bar: &[bool],
+    gamma_w: f64,
+) {
+    let l_count = m_bar.len();
+    let scale = 256.0 / (2.0 * PI64);
+
+    // First, zero everything outside band 1..L̃ (Eq. 124). Band edges:
+    //   ⌈ã_1⌉ at the low end, ⌈b̃_L̃⌉ at the high end.
+    let a1 = (scale * 0.5 * omega_0).ceil() as i32;
+    let b_last = (scale * (l_count as f64 + 0.5) * omega_0).ceil() as i32;
+    for m_idx in 0..256 {
+        let m = m_idx as i32 - 128;
+        if m.unsigned_abs() < a1 as u32 || (m.unsigned_abs() as i32) >= b_last {
+            re[m_idx] = 0.0;
+            im[m_idx] = 0.0;
+        }
+    }
+
+    // Pre-compute the unmodified spectrum power for each band's norm
+    // sum, since we'll be overwriting `re`/`im` during the sweep.
+    let mut band_norm: Vec<f64> = Vec::with_capacity(l_count);
+    let mut band_edges: Vec<(i32, i32)> = Vec::with_capacity(l_count);
+    for l in 1..=l_count as i32 {
+        let l_f = f64::from(l);
+        let a_l = (scale * (l_f - 0.5) * omega_0).ceil() as i32;
+        let b_l = (scale * (l_f + 0.5) * omega_0).ceil() as i32;
+        band_edges.push((a_l, b_l));
+        // Norm sum: η in [⌈ã_l⌉, ⌈b̃_l⌉) (half-open, count = b - a).
+        let mut norm_sum = 0f64;
+        let count = (b_l - a_l).max(0) as usize;
+        for eta in a_l..b_l {
+            // Both +η and −η contribute (the spec's "|m|" means both signs).
+            for &sign in &[1i32, -1] {
+                let m_idx = (sign * eta + 128) as usize;
+                if m_idx < 256 {
+                    norm_sum += re[m_idx] * re[m_idx] + im[m_idx] * im[m_idx];
+                }
+            }
+        }
+        // Average over (count) magnitudes counted twice (positive + negative).
+        let norm = if count > 0 && norm_sum > 0.0 {
+            (norm_sum / (2.0 * count as f64)).sqrt()
+        } else {
+            1.0
+        };
+        band_norm.push(norm);
+    }
+
+    // Per-band assignment.
+    for (l_idx, &(a_l, b_l)) in band_edges.iter().enumerate() {
+        let voiced = v_bar[l_idx];
+        if voiced {
+            // Eq. 119: zero voiced bands.
+            for m_abs in a_l..=b_l {
+                for &sign in &[1i32, -1] {
+                    let m = sign * m_abs;
+                    let m_idx = (m + 128) as usize;
+                    if m_idx < 256 {
+                        re[m_idx] = 0.0;
+                        im[m_idx] = 0.0;
+                    }
+                }
+            }
+        } else {
+            // Eq. 120: scale by γ_w · M̄_l / norm.
+            let m_bar_l = f64::from(m_bar[l_idx]);
+            let norm = band_norm[l_idx];
+            let factor = if norm > 0.0 {
+                gamma_w * m_bar_l / norm
+            } else {
+                0.0
+            };
+            for m_abs in a_l..=b_l {
+                for &sign in &[1i32, -1] {
+                    let m = sign * m_abs;
+                    let m_idx = (m + 128) as usize;
+                    if m_idx < 256 {
+                        re[m_idx] *= factor;
+                        im[m_idx] *= factor;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Synthesize the unvoiced component for one 20 ms frame per BABA-A
+/// §1.12.1 Eq. 117–126.
+///
+/// Returns 160 PCM-domain samples (in `f64`; the final cast to `i16`
+/// happens after voiced + unvoiced sum at the synthesis top level).
+///
+/// `gamma_w` is the spectral scale from Eq. 121. Pass
+/// [`PLACEHOLDER_GAMMA_W`] until Annex C lands or a DVSI fixture
+/// value is available.
+pub fn synthesize_unvoiced(
+    omega_0: f32,
+    m_bar: &[f32],
+    v_bar: &[bool],
+    gamma_w: f64,
+    state: &mut UnvoicedSynthState,
+) -> [f64; FRAME_SAMPLES] {
+    state.advance_window();
+
+    // Window the noise: u(n) · wS(n) for n = −104..104.
+    let mut windowed = [0f64; 209];
+    for i in 0..209 {
+        let n = i as i32 - 104;
+        windowed[i] = state.noise_window[i] * f64::from(synth_window(n));
+    }
+
+    let (mut re, mut im) = dft_256_windowed(&windowed);
+    shape_spectrum(&mut re, &mut im, f64::from(omega_0), m_bar, v_bar, gamma_w);
+    let u_w = idft_256(&re, &im);
+
+    // Eq. 126: weighted overlap-add with previous frame.
+    let mut out = [0f64; FRAME_SAMPLES];
+    for n in 0..FRAME_SAMPLES as i32 {
+        let ws_n = f64::from(synth_window(n));
+        let ws_n_minus_n = f64::from(synth_window(n - FRAME_SAMPLES as i32));
+        let prev_term = if (0..=127).contains(&n) {
+            ws_n * state.prev_idft[(n + 128) as usize]
+        } else {
+            0.0
+        };
+        let curr_term = if (32..=159).contains(&n) {
+            ws_n_minus_n * u_w[(n - 32) as usize]
+        } else {
+            0.0
+        };
+        let denom = ws_n * ws_n + ws_n_minus_n * ws_n_minus_n;
+        out[n as usize] = if denom > 1e-30 {
+            (prev_term + curr_term) / denom
+        } else {
+            0.0
+        };
+    }
+
+    state.prev_idft = u_w;
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -509,6 +779,111 @@ mod tests {
         for i in 0..9 {
             assert!((s.m_bar[i] - 0.01).abs() < 1e-6);
         }
+    }
+
+    // ---- §1.12.1 unvoiced synthesis --------------------------------------
+
+    #[test]
+    fn lcg_first_few_values_match_recurrence() {
+        // u(n+1) = (171·u(n) + 11213) mod 53125, u(−105) = 3147.
+        let mut state = UnvoicedSynthState::new();
+        // First call: u(−104) = (171·3147 + 11213) mod 53125
+        //           = (538137 + 11213) mod 53125
+        //           = 549350 mod 53125
+        //           = 549350 - 10·53125 = 549350 - 531250 = 18100
+        let v1 = state.next_noise();
+        assert_eq!(v1 as u32, 18100);
+        // Second: u(−103) = (171·18100 + 11213) mod 53125
+        //                 = (3095100 + 11213) mod 53125
+        //                 = 3106313 mod 53125
+        //                 = 3106313 - 58·53125 = 3106313 - 3081250 = 25063
+        let v2 = state.next_noise();
+        assert_eq!(v2 as u32, 25063);
+    }
+
+    #[test]
+    fn dft_idft_roundtrip_recovers_input() {
+        // A real input that fits in n=−104..=104, surrounded by zero.
+        let mut input = [0f64; 209];
+        for i in 0..209 {
+            let n = i as i32 - 104;
+            input[i] = (f64::from(n) * 0.05).sin() * 100.0;
+        }
+        let (re, im) = dft_256_windowed(&input);
+        let recovered = idft_256(&re, &im);
+        // The IDFT spans n=−128..127 (256 values), our input spans n=-104..=104.
+        // Recovered values for n in [-104, 104] should match the input
+        // at the same n-position. recovered[(n+128)] = input[(n+104)].
+        for n in -104..=104i32 {
+            let in_val = input[(n + 104) as usize];
+            let out_val = recovered[(n + 128) as usize];
+            assert!(
+                (out_val - in_val).abs() < 1e-6,
+                "n={n}: in={in_val}, out={out_val}"
+            );
+        }
+    }
+
+    #[test]
+    fn unvoiced_silence_input_produces_silence_output() {
+        let m_bar = vec![0.0f32; 12];
+        let v_bar = vec![false; 12];
+        let mut state = UnvoicedSynthState::new();
+        let pcm = synthesize_unvoiced(0.2, &m_bar, &v_bar, PLACEHOLDER_GAMMA_W, &mut state);
+        for (i, &s) in pcm.iter().enumerate() {
+            assert!(s.abs() < 1e-6, "n={i}: {s}");
+        }
+    }
+
+    #[test]
+    fn unvoiced_all_voiced_first_frame_produces_silence_output() {
+        // Voiced bands → Ũ_w = 0 in those bands; with no unvoiced bands
+        // there's no signal. Previous IDFT is also zero (init), so OLA
+        // output is silence.
+        let m_bar = vec![10.0f32; 12];
+        let v_bar = vec![true; 12];
+        let mut state = UnvoicedSynthState::new();
+        let pcm = synthesize_unvoiced(0.2, &m_bar, &v_bar, PLACEHOLDER_GAMMA_W, &mut state);
+        for (i, &s) in pcm.iter().enumerate() {
+            assert!(s.abs() < 1e-6, "n={i}: {s}");
+        }
+    }
+
+    #[test]
+    fn unvoiced_nonzero_input_produces_nonzero_output() {
+        let m_bar = vec![10.0f32; 12];
+        let v_bar = vec![false; 12];
+        let mut state = UnvoicedSynthState::new();
+        // First frame's OLA blends prev IDFT (zero) with current IDFT.
+        // So we run two frames and check the second has non-trivial energy.
+        let _ = synthesize_unvoiced(0.2, &m_bar, &v_bar, PLACEHOLDER_GAMMA_W, &mut state);
+        let pcm = synthesize_unvoiced(0.2, &m_bar, &v_bar, PLACEHOLDER_GAMMA_W, &mut state);
+        let energy: f64 = pcm.iter().map(|&s| s * s).sum();
+        assert!(energy > 1e-3, "energy too low: {energy}");
+    }
+
+    #[test]
+    fn unvoiced_state_advances_between_frames() {
+        let m_bar = vec![1.0f32; 9];
+        let v_bar = vec![false; 9];
+        let mut state = UnvoicedSynthState::new();
+        let lcg_init = state.lcg;
+        let _ = synthesize_unvoiced(0.2, &m_bar, &v_bar, PLACEHOLDER_GAMMA_W, &mut state);
+        let lcg_after_1 = state.lcg;
+        assert_ne!(lcg_after_1, lcg_init);
+        let _ = synthesize_unvoiced(0.2, &m_bar, &v_bar, PLACEHOLDER_GAMMA_W, &mut state);
+        let lcg_after_2 = state.lcg;
+        assert_ne!(lcg_after_2, lcg_after_1);
+    }
+
+    #[test]
+    fn unvoiced_output_length_is_one_frame() {
+        let m_bar = vec![1.0f32; 9];
+        let v_bar = vec![false; 9];
+        let mut state = UnvoicedSynthState::new();
+        let pcm = synthesize_unvoiced(0.2, &m_bar, &v_bar, PLACEHOLDER_GAMMA_W, &mut state);
+        assert_eq!(pcm.len(), FRAME_SAMPLES);
+        assert_eq!(FRAME_SAMPLES, 160);
     }
 
     #[test]
