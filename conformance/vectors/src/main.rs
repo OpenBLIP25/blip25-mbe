@@ -34,9 +34,15 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use blip25_mbe::fec::{golay_23_12_encode, hamming_15_11_encode};
+use blip25_mbe::imbe_frames::dequantize::{
+    DecoderState, dequantize_fullrate, quantize_fullrate,
+};
 use blip25_mbe::imbe_frames::fec::{deinterleave_fullrate, modulation_masks_fullrate};
 use blip25_mbe::imbe_frames::full_rate::{
     INFO_WIDTHS, ImbeFrame, decode_fullrate_frame,
+};
+use blip25_mbe::imbe_frames::priority::{
+    deprioritize_fullrate, prioritize_fullrate,
 };
 
 const BYTES_PER_FEC_FRAME: usize = 18;
@@ -70,6 +76,19 @@ enum Cmd {
         #[arg(long)]
         stop_on_first: bool,
     },
+    /// Round-trip test: decode each `p25_nofec/<name>.bit` frame to
+    /// `MbeParams` then re-encode. Pitch (`b̂₀`) and V/UV (`b̂₁`) are
+    /// expected to match bit-exact; gain DCT bits (`b̂₂..b̂₇`) and HOC
+    /// bits (`b̂₈..b̂_{L+1}`) may drift because the encoder/decoder
+    /// gain-DCT pair is intentionally lossy by design (Eq. 61 vs
+    /// Eq. 69 — see analysis disambiguations §9).
+    Roundtrip {
+        /// Vector name (e.g. `alert`).
+        name: String,
+        /// Use `tv-rc/` instead of `tv-std/tv/`.
+        #[arg(long)]
+        rc: bool,
+    },
     /// Diagnose PN modulation by re-encoding the no-FEC reference and
     /// XORing against the deinterleaved FEC frame to recover DVSI's
     /// actual mask. Compare to our computed mask to see exactly how
@@ -93,6 +112,103 @@ fn main() -> Result<()> {
             cmd_compare(&args.vectors, &name, rc, stop_on_first)
         }
         Cmd::PnDiag { name, rc, frame } => cmd_pn_diag(&args.vectors, &name, rc, frame),
+        Cmd::Roundtrip { name, rc } => cmd_roundtrip(&args.vectors, &name, rc),
+    }
+}
+
+fn cmd_roundtrip(root: &Path, name: &str, rc: bool) -> Result<()> {
+    let dir = vector_dir(root, rc);
+    let nofec_path = dir.join("p25_nofec").join(format!("{name}.bit"));
+    let nofec_bytes = fs::read(&nofec_path)
+        .with_context(|| format!("read no-FEC vector {}", nofec_path.display()))?;
+    if nofec_bytes.len() % BYTES_PER_NOFEC_FRAME != 0 {
+        return Err(anyhow!(
+            "no-FEC file {} is {} bytes — not a multiple of {}",
+            nofec_path.display(),
+            nofec_bytes.len(),
+            BYTES_PER_NOFEC_FRAME
+        ));
+    }
+    let n_frames = nofec_bytes.len() / BYTES_PER_NOFEC_FRAME;
+
+    println!("vector:        {name}{}", if rc { " (rc)" } else { "" });
+    println!("frames:        {n_frames}");
+    println!();
+
+    let mut state_dec = DecoderState::new();
+    let mut state_enc = DecoderState::new();
+    let mut bad_pitch = 0usize;
+    let mut pitch_match = 0usize;
+    let mut vuv_match = 0usize;
+    let mut vec_matches = [0usize; 8];
+
+    for f in 0..n_frames {
+        let frame_bytes =
+            &nofec_bytes[f * BYTES_PER_NOFEC_FRAME..(f + 1) * BYTES_PER_NOFEC_FRAME];
+        let u_orig = unpack_nofec_info(frame_bytes);
+
+        // Decode → params.
+        let params = match dequantize_fullrate(&u_orig, &mut state_dec) {
+            Ok(p) => p,
+            Err(_) => {
+                bad_pitch += 1;
+                continue;
+            }
+        };
+
+        // Re-encode using the encoder state (which evolves in lockstep).
+        let b_back = match quantize_fullrate(&params, &mut state_enc) {
+            Ok(b) => b,
+            Err(_) => {
+                bad_pitch += 1;
+                continue;
+            }
+        };
+        let u_back = prioritize_fullrate(&b_back, params.harmonic_count());
+
+        // Per-vector match accounting.
+        for i in 0..8 {
+            if u_orig[i] == u_back[i] {
+                vec_matches[i] += 1;
+            }
+        }
+
+        // Pitch (b̂₀) and V/UV (b̂₁): pull from the original u via
+        // deprioritize so we can compare at the parameter level too.
+        let b_orig = deprioritize_fullrate(&u_orig, params.harmonic_count());
+        if b_orig[0] == b_back[0] {
+            pitch_match += 1;
+        }
+        if b_orig[1] == b_back[1] {
+            vuv_match += 1;
+        }
+    }
+
+    let usable = n_frames - bad_pitch;
+    println!("bad-pitch frames: {bad_pitch} (skipped)");
+    println!("usable frames:    {usable}");
+    println!();
+    println!("Per-vector û match counts (out of {usable}):");
+    for i in 0..8 {
+        let pct = 100.0 * vec_matches[i] as f64 / usable as f64;
+        println!(
+            "  û_{i}  width {:>3}   {:>5} / {usable}   {:5.1}%",
+            INFO_WIDTHS[i], vec_matches[i], pct
+        );
+    }
+    println!();
+    println!(
+        "Parameter-level matches: pitch (b̂₀) {pitch_match}/{usable}, V/UV (b̂₁) {vuv_match}/{usable}"
+    );
+
+    if pitch_match == usable && vuv_match == usable {
+        println!();
+        println!("PASS — pitch and V/UV bit-exact across all usable frames.");
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "expected bit-exact pitch + V/UV roundtrip; pitch={pitch_match}/{usable}, V/UV={vuv_match}/{usable}"
+        ))
     }
 }
 

@@ -552,6 +552,297 @@ pub fn dequantize_fullrate(
     Ok(params)
 }
 
+// ===========================================================================
+// ENCODE (forward direction) — paired with the decode functions above.
+// All references to spec §1.8 use the same equations rearranged.
+// ===========================================================================
+
+/// Encode a fundamental frequency `ω̃₀` to the 8-bit pitch index `b̂₀`
+/// per BABA-A §6.1 Eq. 45: `b̂₀ = floor(4π/ω̃₀ − 39)`.
+///
+/// Returns `None` if the result is outside `[0, 207]` — i.e. `ω̃₀` is
+/// outside the pitch estimator's valid range
+/// `(2π/123.125, 2π/19.875)`.
+pub fn encode_pitch(omega_0: f32) -> Option<u8> {
+    if !(omega_0 > 0.0 && omega_0 < PI) {
+        return None;
+    }
+    let raw = (4.0 * PI / omega_0 - 39.0).floor() as i32;
+    if (0..=PITCH_INDEX_MAX as i32).contains(&raw) {
+        Some(raw as u8)
+    } else {
+        None
+    }
+}
+
+/// Inverse of [`expand_vuv`]: collapse per-harmonic voicing into the
+/// K-bit `b̂₁` band-level word.
+///
+/// Per §1.3.2, all harmonics in a band share one V/UV decision. The
+/// per-harmonic input is expected to be already band-uniform — every
+/// harmonic in the same band must agree. We use the first harmonic
+/// of each band as the band's V/UV (any harmonic in the band would
+/// give the same answer for round-trippable inputs).
+pub fn collapse_vuv(voiced: &[bool], k: u8) -> u16 {
+    debug_assert!(k > 0 && k <= 12);
+    let l = voiced.len() as u8;
+    let mut b1 = 0u16;
+    for band in 1..=k {
+        // First harmonic in the band: smallest `l` with band_for_harmonic(l, k) == band.
+        let first = (1..=l).find(|&l_h| band_for_harmonic(l_h, k) == band);
+        let v = first.map_or(false, |l_h| voiced[(l_h - 1) as usize]);
+        // Band 1 → MSB at bit (k-1); band K → LSB at bit 0.
+        if v {
+            b1 |= 1u16 << (k - band);
+        }
+    }
+    b1
+}
+
+/// Inverse of [`decode_uniform`]: midtread uniform encoder per Eq. 68/71.
+///
+/// `value = Δ̃_m · (b̃_m − 2^{B̃_m−1} + 0.5)` solved for `b̃_m`:
+///
+/// ```text
+/// b̃_m = round(value / Δ̃_m + 2^{B̃_m−1} − 0.5),  clamped to [0, 2^B̃_m − 1]
+/// ```
+///
+/// For `B̃_m = 0` the coefficient is not transmitted; this returns 0.
+#[inline]
+pub fn encode_uniform(value: f32, b_m_bits: u8, delta_m: f32) -> u16 {
+    if b_m_bits == 0 {
+        return 0;
+    }
+    let half = 1u32 << (b_m_bits - 1);
+    let max = (1u32 << b_m_bits) - 1;
+    let raw = (value / delta_m + half as f32 - 0.5).round() as i32;
+    raw.clamp(0, max as i32) as u16
+}
+
+/// Encode a 6-element gain DCT vector `G̃_1..G̃_6` to quantizer indices
+/// `b̂₂..b̂₇`. `b̂₂` uses Annex E (argmin via [`encode_gain`]); `b̂₃..b̂₇`
+/// use [`encode_uniform`] with Annex F step sizes.
+pub fn encode_gain_dct(g: &[f32; 6], l: u8) -> [u16; 6] {
+    debug_assert!((9..=56).contains(&l));
+    let l_idx = (l - 9) as usize;
+    let mut b = [0u16; 6];
+    b[0] = u16::from(encode_gain(g[0]));
+    for m_idx in 0..5 {
+        let alloc = IMBE_GAIN_ALLOC[l_idx][m_idx];
+        b[m_idx + 1] = encode_uniform(g[m_idx + 1], alloc.b_m, alloc.delta_m);
+    }
+    b
+}
+
+/// Forward gain DCT — given the 6 per-block prediction-residual means
+/// `R̂_1..R̂_6`, compute the gain DCT vector `Ĝ_1..Ĝ_6` per BABA-A §6
+/// Eq. 61:
+///
+/// ```text
+/// Ĝ_m = (1/6) · Σ_{i=1}^{6} R̂_i · cos[π·(m−1)·(i−0.5) / 6]
+///         for 1 ≤ m ≤ 6
+/// ```
+///
+/// **Important — this is *not* the inverse of [`gain_to_residuals`].**
+/// The encoder uses uniform `1/6` (matching a 6-point DCT) while the
+/// decoder uses `/J̃_i` per output block (Eq. 69). The gain DCT step
+/// is therefore intentionally lossy by design: the decoder reshapes
+/// the 6 transmitted coefficients into per-block-size residuals.
+///
+/// See `analysis/vocoder_decode_disambiguations.md` §9 for the full
+/// asymmetric pairing.
+pub fn residuals_to_gain(r: &[f32; 6]) -> [f32; 6] {
+    let mut g = [0f32; 6];
+    for m_0 in 0..6 {
+        let mut acc = 0f32;
+        for i_0 in 0..6 {
+            let i_half = i_0 as f32 + 0.5;
+            let arg = PI * (m_0 as f32) * i_half / 6.0;
+            acc += r[i_0] * arg.cos();
+        }
+        g[m_0] = acc / 6.0;
+    }
+    g
+}
+
+/// Forward block DCT — pairs with [`inverse_block_dct`] per BABA-A §6
+/// Eq. 73 inverse. Uses uniform `1/N` factor across all coefficients
+/// (Eq. 61 convention); the `α(k)` weighting that distinguishes DC
+/// from the rest lives entirely on the inverse side.
+///
+/// Run on each block independently to obtain `C̃_{i,k}`.
+pub fn forward_block_dct(samples: &[f32], n: usize) -> [f32; MAX_BLOCK_SIZE] {
+    let mut c = [0f32; MAX_BLOCK_SIZE];
+    for k_0 in 0..n {
+        let mut acc = 0f32;
+        for j_0 in 0..n {
+            let arg = PI * (k_0 as f32) * (j_0 as f32 + 0.5) / n as f32;
+            acc += samples[j_0] * arg.cos();
+        }
+        c[k_0] = acc / n as f32;
+    }
+    c
+}
+
+/// Disassemble the 6-block HOC matrix into the parameter array
+/// `b̂₈..b̂_{L+1}` by re-quantizing `C̃_{i,k}` for `k ≥ 2` per Annex G's
+/// `(C_i, C_k, b_m, B_m)` schema. Mirror of [`assemble_hoc_matrix`].
+///
+/// Writes into `b[8..=L+1]`. The block means `C̃_{i,1}` are produced by
+/// the gain DCT path and are not encoded here.
+pub fn disassemble_hoc_matrix(
+    c: &[[f32; MAX_BLOCK_SIZE]; 6],
+    l: u8,
+    b: &mut [u16; 59],
+) {
+    debug_assert!((9..=56).contains(&l));
+    let l_idx = (l - 9) as usize;
+    let (off, len) = IMBE_HOC_OFFSETS[l_idx];
+    for j in 0..len as usize {
+        let entry = IMBE_HOC_ENTRIES[off as usize + j];
+        let val = c[(entry.c_i - 1) as usize][(entry.c_k - 1) as usize];
+        b[entry.b_m as usize] = encode_uniform(
+            val,
+            entry.b_m_bits,
+            hoc_step_size(entry.b_m_bits, entry.c_k),
+        );
+    }
+}
+
+/// Forward of [`apply_log_prediction`]: given `log₂ M̃_l(0)` and the
+/// previous frame's state, recover the prediction residual `T̃_l` per
+/// BABA-A §1.8.5 Eq. 77 rearranged:
+///
+/// ```text
+/// T̃_l = log₂ M̃_l(0)
+///       − ρ·(1−δ̃_l)·log₂ M̃_{⌊k̃_l⌋}(−1)
+///       − ρ·δ̃_l    ·log₂ M̃_{⌊k̃_l⌋+1}(−1)
+///       + (ρ / L̃(0)) · Σ_{λ} […]
+/// ```
+pub fn forward_log_prediction(
+    log_m: &[f32; L_MAX as usize + 2],
+    l: u8,
+    state: &DecoderState,
+) -> [f32; L_MAX as usize] {
+    let mut t = [0f32; L_MAX as usize];
+    let l_curr = f32::from(l);
+    let l_prev = f32::from(state.prev_l);
+
+    let mut mean_sum = 0f32;
+    for lambda in 1..=l {
+        let k_lambda = l_prev * f32::from(lambda) / l_curr;
+        let k_floor = k_lambda.floor();
+        let delta = k_lambda - k_floor;
+        let log_lo = state.prev_m_at(k_floor as u8).log2();
+        let log_hi = state.prev_m_at(k_floor as u8 + 1).log2();
+        mean_sum += (1.0 - delta) * log_lo + delta * log_hi;
+    }
+    let mean = mean_sum / l_curr;
+
+    for l_h in 1..=l {
+        let k_l = l_prev * f32::from(l_h) / l_curr;
+        let k_floor = k_l.floor();
+        let delta = k_l - k_floor;
+        let log_lo = state.prev_m_at(k_floor as u8).log2();
+        let log_hi = state.prev_m_at(k_floor as u8 + 1).log2();
+        t[(l_h - 1) as usize] = log_m[l_h as usize]
+            - RHO * (1.0 - delta) * log_lo
+            - RHO * delta * log_hi
+            + RHO * mean;
+    }
+
+    t
+}
+
+/// Errors returned by [`quantize_fullrate`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EncodeError {
+    /// `ω₀` is outside the encodable range (`b̂₀` would fall outside
+    /// `[0, 207]`).
+    PitchOutOfRange,
+}
+
+/// Run the full-rate quantization pipeline end-to-end:
+/// `(MbeParams, &mut state) → b̂₀..b̂_{L+2}`.
+///
+/// Pipeline (mirror of [`dequantize_fullrate`]):
+/// 1. Encode pitch → `b̂₀`; derive `K`.
+/// 2. Collapse per-harmonic voicing → `b̂₁`.
+/// 3. Forward log-magnitude prediction → `T̃_l` (uses `state.prev_l`,
+///    `state.prev_m_linear` — must be the previous frame's, not the
+///    current).
+/// 4. Per-block forward DCT over `T̃` slices → `C̃_{i,k}`.
+/// 5. Pull out block means → `R̃_i`; forward DCT to `G̃_1..G̃_6`.
+/// 6. Quantize `G̃` → `b̂₂..b̂₇` (Annex E + F).
+/// 7. Quantize HOC `C̃_{i,k≥2}` → `b̂₈..b̂_{L+1}` (Annex G).
+/// 8. `b̂_{L+2}` is a single sync bit — toggled from `state.prev_sync`.
+/// 9. Update `state.prev_m_linear`, `state.prev_l`, `state.prev_sync`.
+pub fn quantize_fullrate(
+    params: &MbeParams,
+    state: &mut DecoderState,
+) -> Result<[u16; 59], EncodeError> {
+    let l = params.harmonic_count();
+    let omega_0 = params.omega_0();
+    let b0 = encode_pitch(omega_0).ok_or(EncodeError::PitchOutOfRange)?;
+    let k = vuv_band_count(l);
+
+    let mut b = [0u16; 59];
+    b[0] = u16::from(b0);
+    b[1] = collapse_vuv(params.voiced_slice(), k);
+
+    // T̃_l = forward log-magnitude prediction of log₂ M̃_l(0).
+    let mut log_m = [0f32; L_MAX as usize + 2];
+    log_m[0] = 0.0; // log₂(1) virtual M̃_0
+    for i in 0..l as usize {
+        let m = params.amplitudes_slice()[i];
+        // Guard against log2(0): pin to a small value matching MbeParams' invariant.
+        log_m[i + 1] = if m > 0.0 { m.log2() } else { f32::NEG_INFINITY };
+    }
+    let t = forward_log_prediction(&log_m, l, state);
+
+    // Forward block DCT per block → C̃_{i,k}.
+    let blocks = IMBE_BLOCK_LENGTHS[(l - 9) as usize];
+    let mut c_matrix = [[0f32; MAX_BLOCK_SIZE]; 6];
+    let mut l_offset = 0usize;
+    for i in 0..6 {
+        let j_i = blocks[i] as usize;
+        let mut block = [0f32; MAX_BLOCK_SIZE];
+        for j in 0..j_i {
+            block[j] = t[l_offset + j];
+        }
+        c_matrix[i] = forward_block_dct(&block, j_i);
+        l_offset += j_i;
+    }
+
+    // Block means R̃_i = C̃_{i,1} → gain DCT → b̂₂..b̂₇.
+    let r_i: [f32; 6] = std::array::from_fn(|i| c_matrix[i][0]);
+    let g = residuals_to_gain(&r_i);
+    let g_indices = encode_gain_dct(&g, l);
+    for m_idx in 0..6 {
+        b[m_idx + 2] = g_indices[m_idx];
+    }
+
+    // HOC C̃_{i,k≥2} → b̂₈..b̂_{L+1}.
+    disassemble_hoc_matrix(&c_matrix, l, &mut b);
+
+    // Sync bit b̂_{L+2}: toggle.
+    let sync = !state.prev_sync;
+    b[(l + 2) as usize] = u16::from(sync);
+
+    // Update state for the next frame: prev_m = the *quantized*
+    // amplitudes of this frame as the decoder would reconstruct them
+    // (so encoder and decoder evolve in lockstep). For an exact
+    // round-trip-able pipeline we use the input M̃ directly.
+    state.prev_m_linear[0] = 1.0;
+    for i in 1..=l as usize {
+        state.prev_m_linear[i] = params.amplitudes_slice()[i - 1];
+    }
+    state.prev_l = l;
+    state.prev_sync = sync;
+
+    Ok(b)
+}
+
 // ---------------------------------------------------------------------------
 // V/UV expansion (§1.3.2)
 // ---------------------------------------------------------------------------
@@ -867,25 +1158,6 @@ mod tests {
 
     // ---- HOC reconstruction (§1.8.4) -------------------------------------
 
-    /// Forward DCT helper used only for tests. The spec's encode form
-    /// (Eq. 61 for the gain side) uses a *uniform* `1/N` factor across
-    /// all coefficients; the `α(k)` weighting that distinguishes DC
-    /// from the rest lives entirely on the inverse side (Eq. 73). So
-    /// this forward must apply the same `1/N` factor for `k=0` and
-    /// `k>0` to be a true inverse of `inverse_block_dct`.
-    fn forward_block_dct(samples: &[f32], n: usize) -> [f32; MAX_BLOCK_SIZE] {
-        let mut c = [0f32; MAX_BLOCK_SIZE];
-        for k_0 in 0..n {
-            let mut acc = 0.0f32;
-            for j_0 in 0..n {
-                let arg = PI * (k_0 as f32) * (j_0 as f32 + 0.5) / n as f32;
-                acc += samples[j_0] * arg.cos();
-            }
-            c[k_0] = acc / n as f32;
-        }
-        c
-    }
-
     #[test]
     fn block_dct_forward_then_inverse_is_identity() {
         for &n in &[1usize, 2, 3, 5, 7, 10] {
@@ -1118,6 +1390,171 @@ mod tests {
         let p2 = dequantize_fullrate(&u, &mut state).unwrap();
         assert_eq!(p2.harmonic_count(), p1.harmonic_count());
         assert_eq!(state.previous_l(), p2.harmonic_count());
+    }
+
+    // ---- Encoder side ----------------------------------------------------
+
+    #[test]
+    fn encode_pitch_roundtrip_across_full_range() {
+        for b0 in 0..=PITCH_INDEX_MAX {
+            let p = pitch_decode(b0).unwrap();
+            assert_eq!(encode_pitch(p.omega_0), Some(b0), "b̂₀ = {b0}");
+        }
+    }
+
+    #[test]
+    fn encode_pitch_rejects_out_of_range_omega() {
+        assert_eq!(encode_pitch(0.0), None);
+        assert_eq!(encode_pitch(-0.1), None);
+        assert_eq!(encode_pitch(PI), None);
+        assert_eq!(encode_pitch(PI + 0.1), None);
+        // Just above the highest pitch (b̂₀ = 0 → ω₀ = 4π/39.5 ≈ 0.318).
+        assert_eq!(encode_pitch(0.5), None);
+    }
+
+    #[test]
+    fn collapse_vuv_roundtrips_against_expand() {
+        // For every L, K and every possible b̂₁ value, expand then
+        // collapse should recover the original b̂₁.
+        for l in [9u8, 16, 36, 37, 56] {
+            let k = vuv_band_count(l);
+            let max = 1u32 << k;
+            for b1 in 0..max as u16 {
+                let v = expand_vuv(b1, l, k);
+                let b1_back = collapse_vuv(&v[..l as usize], k);
+                assert_eq!(b1_back, b1, "L={l}, K={k}, b̂₁={b1:#x}");
+            }
+        }
+    }
+
+    #[test]
+    fn encode_uniform_roundtrips_at_quantizer_grid() {
+        // For every B in 1..=10, every code 0..2^B-1 must roundtrip.
+        for b_bits in 1..=10u8 {
+            let max = 1u32 << b_bits;
+            let delta = 0.5f32; // arbitrary positive
+            for code in 0..max as u16 {
+                let v = decode_uniform(code, b_bits, delta);
+                let back = encode_uniform(v, b_bits, delta);
+                assert_eq!(back, code, "B={b_bits}, code={code}");
+            }
+        }
+    }
+
+    #[test]
+    fn encode_uniform_zero_bits_returns_zero() {
+        assert_eq!(encode_uniform(0.0, 0, 1.0), 0);
+        assert_eq!(encode_uniform(123.0, 0, 1.0), 0);
+    }
+
+    #[test]
+    fn encode_uniform_clamps_outside_range() {
+        // B=4, half=8, range = (-7.5..=7.5)*Δ.
+        assert_eq!(encode_uniform(-1000.0, 4, 1.0), 0);
+        assert_eq!(encode_uniform(1000.0, 4, 1.0), 15);
+    }
+
+    #[test]
+    fn forward_block_dct_inverts_inverse_block_dct() {
+        // Check that the public forward_block_dct is the proper inverse
+        // of inverse_block_dct (paired exact inversion).
+        for &n in &[1usize, 2, 3, 5, 7, 10] {
+            let samples: [f32; MAX_BLOCK_SIZE] =
+                std::array::from_fn(|i| if i < n { (i as f32 + 1.0).sin() * 2.0 } else { 0.0 });
+            let c = forward_block_dct(&samples, n);
+            let mut matrix = [[0f32; MAX_BLOCK_SIZE]; 6];
+            matrix[0] = c;
+            let mut blocks = [0u8; 6];
+            blocks[0] = n as u8;
+            let t = inverse_block_dct(&matrix, &blocks);
+            for i in 0..n {
+                assert!((t[i] - samples[i]).abs() < 1e-4, "n={n}, i={i}");
+            }
+        }
+    }
+
+    #[test]
+    fn gain_dct_is_lossy_by_design_but_invertible_when_blocks_uniform_six() {
+        // The encoder/decoder pair (Eq. 61 / Eq. 69) is intentionally
+        // asymmetric — forward uses /6 uniformly, inverse uses /J̃_i.
+        // They are exact inverses *only* when J̃_i = 6 for all i (i.e.
+        // never, since L_MAX = 56 and 6·6 = 36).
+        // Synthesize that hypothetical case explicitly to verify the
+        // forward function behaves like a 6-point DCT-II.
+        let r: [f32; 6] = [1.0, -2.5, 0.3, 0.0, -0.7, 1.8];
+        let blocks_uniform_six = [6u8; 6];
+        let g = residuals_to_gain(&r);
+        let r2 = gain_to_residuals(&g, &blocks_uniform_six);
+        for i in 0..6 {
+            assert!(
+                (r2[i] - r[i]).abs() < 1e-4,
+                "uniform J̃=6: i={i}: {} vs {}",
+                r2[i],
+                r[i]
+            );
+        }
+    }
+
+    #[test]
+    fn gain_dct_dc_only_input_propagates_uniformly() {
+        // R̂ = [c, c, c, c, c, c] → Ĝ_1 = c, Ĝ_2..6 ≈ 0 (DCT of constant).
+        let c = 3.5;
+        let r = [c; 6];
+        let g = residuals_to_gain(&r);
+        assert!((g[0] - c).abs() < 1e-5);
+        for m in 1..6 {
+            assert!(g[m].abs() < 1e-5, "Ĝ_{m} = {}", g[m]);
+        }
+    }
+
+    #[test]
+    fn forward_log_prediction_inverts_apply_log_prediction() {
+        // Pick a state and a current frame, feed log_m through forward
+        // then inverse — should recover log_m exactly (modulo float).
+        let state = DecoderState::new();
+        let l = 30u8;
+        let mut log_m = [0f32; L_MAX as usize + 2];
+        log_m[0] = 0.0; // virtual M̃_0 = 1 → log = 0
+        for i in 1..=l as usize {
+            log_m[i] = (i as f32 * 0.1) - 1.5; // varied
+        }
+        let t = forward_log_prediction(&log_m, l, &state);
+        let log_m_back = apply_log_prediction(&t, l, &state);
+        for i in 1..=l as usize {
+            assert!(
+                (log_m_back[i] - log_m[i]).abs() < 1e-4,
+                "i={i}: {} vs {}",
+                log_m_back[i],
+                log_m[i]
+            );
+        }
+    }
+
+    #[test]
+    fn quantize_pitch_and_vuv_roundtrip_against_dequantize() {
+        // Pitch (Eq. 45 ↔ Eq. 46) and V/UV (collapse ↔ expand) are
+        // both exact inverses; the gain DCT step is intentionally
+        // lossy (see `analysis/vocoder_decode_disambiguations.md` §9)
+        // so we don't expect b̂₂..b̂_{L+1} to roundtrip exactly. This
+        // test pins down the bit-exact pieces.
+        use crate::imbe_frames::priority::prioritize_fullrate;
+        // Pick a pitch index whose decoded L lets us reuse the same L
+        // in prioritize. b̂₀ = 0 → L = 9.
+        let l = 9u8;
+        let k = vuv_band_count(l);
+        let mut b = [0u16; 59];
+        b[0] = 0;
+        b[1] = 0b101 & ((1u16 << k) - 1);
+        let u = prioritize_fullrate(&b, l);
+
+        let mut state_dec = DecoderState::new();
+        let params = dequantize_fullrate(&u, &mut state_dec).unwrap();
+
+        let mut state_enc = DecoderState::new();
+        let b_back = quantize_fullrate(&params, &mut state_enc).unwrap();
+
+        assert_eq!(b_back[0], b[0], "b̂₀ pitch");
+        assert_eq!(b_back[1], b[1], "b̂₁ V/UV");
     }
 
     // ---- V/UV expansion --------------------------------------------------
