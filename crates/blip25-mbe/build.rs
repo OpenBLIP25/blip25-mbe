@@ -15,7 +15,10 @@ use std::path::PathBuf;
 
 fn main() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR set by cargo"));
+    println!("cargo:rerun-if-changed=build.rs");
     gen_annex_h(&out_dir);
+    gen_imbe_bit_prioritization(&out_dir);
+    gen_ambe_bit_prioritization(&out_dir);
 }
 
 /// Parse `spec_tables/annex_h_interleave.csv` into
@@ -23,7 +26,6 @@ fn main() {
 fn gen_annex_h(out_dir: &PathBuf) {
     let csv_path = "spec_tables/annex_h_interleave.csv";
     println!("cargo:rerun-if-changed={csv_path}");
-    println!("cargo:rerun-if-changed=build.rs");
 
     let content = fs::read_to_string(csv_path)
         .unwrap_or_else(|e| panic!("failed to read {csv_path}: {e}"));
@@ -102,4 +104,143 @@ fn gen_annex_h(out_dir: &PathBuf) {
     out.push_str("];\n");
 
     fs::write(out_dir.join("annex_h.rs"), out).expect("write annex_h.rs");
+}
+
+/// Parse `spec_tables/imbe_bit_prioritization.csv` into
+/// `$OUT_DIR/imbe_bit_priority.rs`, emitting a `[[BitMap; 88]; 48]`
+/// table indexed by `L - 9`.
+fn gen_imbe_bit_prioritization(out_dir: &PathBuf) {
+    let csv_path = "spec_tables/imbe_bit_prioritization.csv";
+    println!("cargo:rerun-if-changed={csv_path}");
+
+    let content = fs::read_to_string(csv_path)
+        .unwrap_or_else(|e| panic!("failed to read {csv_path}: {e}"));
+
+    // Group rows by L. Each L in [9, 56] must contain exactly 88 rows.
+    let mut per_l: Vec<Vec<(u8, u8, u8, u8)>> = (0..48).map(|_| Vec::with_capacity(88)).collect();
+
+    for (lineno, raw) in content.lines().enumerate() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with('L') {
+            continue;
+        }
+        let cols: Vec<&str> = line.split(',').map(str::trim).collect();
+        assert_eq!(
+            cols.len(),
+            5,
+            "imbe prioritization line {}: expected 5 columns, got {}: {raw:?}",
+            lineno + 1,
+            cols.len()
+        );
+        let l: u8 = cols[0].parse().expect("L");
+        let src_param: u8 = cols[1].parse().expect("src_param");
+        let src_bit: u8 = cols[2].parse().expect("src_bit");
+        let dst_vec: u8 = cols[3].parse().expect("dst_vec");
+        let dst_bit: u8 = cols[4].parse().expect("dst_bit");
+        assert!((9..=56).contains(&l), "L={l} out of range");
+        assert!(dst_vec < 8, "dst_vec out of range");
+        let dst_width = [12u8, 12, 12, 12, 11, 11, 11, 7][dst_vec as usize];
+        assert!(dst_bit < dst_width, "dst_bit {dst_bit} exceeds vec {dst_vec} width");
+        per_l[(l - 9) as usize].push((src_param, src_bit, dst_vec, dst_bit));
+    }
+
+    for (i, rows) in per_l.iter().enumerate() {
+        assert_eq!(rows.len(), 88, "L={}: expected 88 rows, got {}", i + 9, rows.len());
+        // Destination coverage: every (dst_vec, dst_bit) appears exactly once.
+        let mut seen = [[false; 12]; 8];
+        for (_, _, v, b) in rows {
+            assert!(!seen[*v as usize][*b as usize],
+                "L={}: (dst_vec={v}, dst_bit={b}) appears twice", i + 9);
+            seen[*v as usize][*b as usize] = true;
+        }
+        let widths = [12u8, 12, 12, 12, 11, 11, 11, 7];
+        for (v, w) in widths.iter().enumerate() {
+            for b in 0..*w {
+                assert!(seen[v][b as usize],
+                    "L={}: (dst_vec={v}, dst_bit={b}) never appears", i + 9);
+            }
+        }
+    }
+
+    let mut out = String::new();
+    out.push_str("// Auto-generated from spec_tables/imbe_bit_prioritization.csv\n");
+    out.push_str("// Do not edit — regenerated each build.\n");
+    out.push_str("pub(crate) const IMBE_BIT_MAP: [[BitMap; 88]; 48] = [\n");
+    for (l_idx, rows) in per_l.iter().enumerate() {
+        out.push_str(&format!("    // L = {}\n    [\n", l_idx + 9));
+        for (sp, sb, dv, db) in rows {
+            out.push_str(&format!(
+                "        BitMap {{ src_param: {sp}, src_bit: {sb}, dst_vec: {dv}, dst_bit: {db} }},\n"
+            ));
+        }
+        out.push_str("    ],\n");
+    }
+    out.push_str("];\n");
+
+    fs::write(out_dir.join("imbe_bit_priority.rs"), out).expect("write imbe_bit_priority.rs");
+}
+
+/// Parse `spec_tables/ambe_bit_prioritization.csv` into
+/// `$OUT_DIR/ambe_bit_priority.rs`, emitting a flat `[BitMap; 49]`
+/// (half-rate prioritization is L-independent).
+fn gen_ambe_bit_prioritization(out_dir: &PathBuf) {
+    let csv_path = "spec_tables/ambe_bit_prioritization.csv";
+    println!("cargo:rerun-if-changed={csv_path}");
+
+    let content = fs::read_to_string(csv_path)
+        .unwrap_or_else(|e| panic!("failed to read {csv_path}: {e}"));
+
+    let mut rows: Vec<(u8, u8, u8, u8)> = Vec::with_capacity(49);
+    for (lineno, raw) in content.lines().enumerate() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with("src_param") {
+            continue;
+        }
+        let cols: Vec<&str> = line.split(',').map(str::trim).collect();
+        assert_eq!(
+            cols.len(),
+            4,
+            "ambe prioritization line {}: expected 4 columns, got {}: {raw:?}",
+            lineno + 1,
+            cols.len()
+        );
+        let src_param: u8 = cols[0].parse().expect("src_param");
+        let src_bit: u8 = cols[1].parse().expect("src_bit");
+        let dst_vec: u8 = cols[2].parse().expect("dst_vec");
+        let dst_bit: u8 = cols[3].parse().expect("dst_bit");
+        assert!(dst_vec < 4, "half-rate dst_vec out of range");
+        // Half-rate vector widths per the CSV's header: û₀=12, û₁=12, û₂=11, û₃=14.
+        let dst_width = [12u8, 12, 11, 14][dst_vec as usize];
+        assert!(dst_bit < dst_width, "dst_bit {dst_bit} exceeds vec {dst_vec} width");
+        rows.push((src_param, src_bit, dst_vec, dst_bit));
+    }
+    assert_eq!(rows.len(), 49, "ambe prioritization must have 49 entries");
+
+    // Destination coverage.
+    let widths = [12u8, 12, 11, 14];
+    let mut seen = [[false; 14]; 4];
+    for (_, _, v, b) in &rows {
+        assert!(!seen[*v as usize][*b as usize],
+            "ambe: (dst_vec={v}, dst_bit={b}) appears twice");
+        seen[*v as usize][*b as usize] = true;
+    }
+    for (v, w) in widths.iter().enumerate() {
+        for b in 0..*w {
+            assert!(seen[v][b as usize],
+                "ambe: (dst_vec={v}, dst_bit={b}) never appears");
+        }
+    }
+
+    let mut out = String::new();
+    out.push_str("// Auto-generated from spec_tables/ambe_bit_prioritization.csv\n");
+    out.push_str("// Do not edit — regenerated each build.\n");
+    out.push_str("pub(crate) const AMBE_BIT_MAP: [BitMap; 49] = [\n");
+    for (sp, sb, dv, db) in &rows {
+        out.push_str(&format!(
+            "    BitMap {{ src_param: {sp}, src_bit: {sb}, dst_vec: {dv}, dst_bit: {db} }},\n"
+        ));
+    }
+    out.push_str("];\n");
+
+    fs::write(out_dir.join("ambe_bit_priority.rs"), out).expect("write ambe_bit_priority.rs");
 }

@@ -17,3 +17,4 @@
 pub mod full_rate;
 pub mod half_rate;
 pub mod fec;
+pub mod priority;

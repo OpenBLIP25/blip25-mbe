@@ -1,0 +1,56 @@
+# TIA-102.BABA-A ambe_bit_prioritization.csv — Half-Rate Bit Prioritization Map (Tables 15–18)
+# Source: BABA-A PDF, pages 66–67 (Section 14.1, Tables 15, 16, 17, 18)
+# Invariant: every (src_param, src_bit) in b̂₀..b̂₈ appears exactly once (coverage check PASS)
+# Parameter widths: b̂₀=7 (pitch), b̂₁=5 (V/UV), b̂₂=5 (gain), b̂₃=9 (PRBA24), b̂₄=7 (PRBA58),
+#                    b̂₅=5 (HOC1), b̂₆=4 (HOC2), b̂₇=4 (HOC3), b̂₈=3 (HOC4); sum = 49
+# Vector widths: û₀=12, û₁=12, û₂=11, û₃=14; sum = 49
+src_param,src_bit,dst_vec,dst_bit
+2,1,0,0
+2,2,0,1
+2,3,0,2
+2,4,0,3
+1,1,0,4
+1,2,0,5
+1,3,0,6
+1,4,0,7
+0,3,0,8
+0,4,0,9
+0,5,0,10
+0,6,0,11
+4,3,1,0
+4,4,1,1
+4,5,1,2
+4,6,1,3
+3,1,1,4
+3,2,1,5
+3,3,1,6
+3,4,1,7
+3,5,1,8
+3,6,1,9
+3,7,1,10
+3,8,1,11
+8,2,2,0
+7,1,2,1
+7,2,2,2
+7,3,2,3
+6,1,2,4
+6,2,2,5
+6,3,2,6
+5,1,2,7
+5,2,2,8
+5,3,2,9
+5,4,2,10
+8,0,3,0
+8,1,3,1
+7,0,3,2
+6,0,3,3
+5,0,3,4
+4,0,3,5
+4,1,3,6
+4,2,3,7
+3,0,3,8
+0,0,3,9
+0,1,3,10
+0,2,3,11
+2,0,3,12
+1,0,3,13
