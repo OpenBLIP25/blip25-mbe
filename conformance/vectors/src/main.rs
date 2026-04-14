@@ -108,6 +108,28 @@ enum Cmd {
         #[arg(long, default_value_t = 1.0)]
         m_scale: f64,
     },
+    /// Single-frame cross-correlation diagnostic for the §11 voiced-
+    /// synthesis investigation. Decodes one frame from the full-rate
+    /// FEC vector, runs the §1.12 synthesizer (voiced-only unless
+    /// `--both` is set), and compares to the DVSI reference PCM for
+    /// the same 160-sample window. Reports peak correlation, zero-lag
+    /// correlation, and suggests which equation subset is implicated.
+    XcorrFrame {
+        /// Vector name (e.g. `clean`).
+        name: String,
+        /// Frame index to inspect (0-based).
+        #[arg(long, default_value_t = 0)]
+        frame: usize,
+        /// Include the unvoiced component (default: voiced-only).
+        #[arg(long)]
+        both: bool,
+        /// Override γ_w (only meaningful with `--both`).
+        #[arg(long)]
+        gamma_w: Option<f64>,
+        /// M̃_l scale factor. Default 1.0.
+        #[arg(long, default_value_t = 1.0)]
+        m_scale: f64,
+    },
     /// Half-rate bit-level roundtrip: decode each `r39/<name>.bit`
     /// frame to `MbeParams`, re-encode via `quantize_halfrate`, and
     /// compare the recovered `û` vectors to the original. Pitch
@@ -178,6 +200,14 @@ fn main() -> Result<()> {
             cmd_decode_pcm_halfrate(&args.vectors, &name, gamma_w.unwrap_or(GAMMA_W))
         }
         Cmd::HalfrateRoundtrip { name } => cmd_halfrate_roundtrip(&args.vectors, &name),
+        Cmd::XcorrFrame { name, frame, both, gamma_w, m_scale } => cmd_xcorr_frame(
+            &args.vectors,
+            &name,
+            frame,
+            both,
+            gamma_w.unwrap_or(GAMMA_W),
+            m_scale,
+        ),
     }
 }
 
@@ -599,6 +629,208 @@ fn cmd_decode_pcm_halfrate(root: &Path, name: &str, gamma_w: f64) -> Result<()> 
     println!("  peak error:         {peak_err:.0}");
     println!("  SNR:                {snr_db:.2} dB");
     Ok(())
+}
+
+fn cmd_xcorr_frame(
+    root: &Path,
+    name: &str,
+    frame_idx: usize,
+    both: bool,
+    gamma_w: f64,
+    m_scale: f64,
+) -> Result<()> {
+    let dir = root.join("tv-std").join("tv").join("p25");
+    let fec_path = dir.join(format!("{name}.bit"));
+    let pcm_path = dir.join(format!("{name}.pcm"));
+
+    let fec_bytes = fs::read(&fec_path)
+        .with_context(|| format!("read FEC vector {}", fec_path.display()))?;
+    let pcm_ref_bytes = fs::read(&pcm_path)
+        .with_context(|| format!("read reference PCM {}", pcm_path.display()))?;
+
+    let n_frames = fec_bytes.len() / BYTES_PER_FEC_FRAME;
+    if frame_idx >= n_frames {
+        return Err(anyhow!("frame {frame_idx} out of range (0..{n_frames})"));
+    }
+    let pcm_ref: Vec<i16> = pcm_ref_bytes
+        .chunks_exact(2)
+        .map(|c| i16::from_le_bytes([c[0], c[1]]))
+        .collect();
+
+    // Run the decoder up to and including `frame_idx`, accumulating
+    // state but only emitting the final frame's PCM.
+    let mut decoder_state = DecoderState::new();
+    let mut synth_state = SynthState::new();
+    let mut our_frame = [0i16; FRAME_SAMPLES];
+    let mut frame_info: Option<(f32, u8, u8, usize, Vec<bool>, Vec<f32>)> = None;
+
+    for f in 0..=frame_idx {
+        let fec = &fec_bytes[f * BYTES_PER_FEC_FRAME..(f + 1) * BYTES_PER_FEC_FRAME];
+        let dibits = unpack_dibits(fec);
+        let imbe = decode_fullrate_frame(&dibits);
+        let params = dequantize_fullrate(&imbe.info, &mut decoder_state)
+            .map_err(|e| anyhow!("dequant failed at frame {f}: {e:?}"))?;
+        let err = FrameErrorContext {
+            epsilon_0: imbe.errors[0],
+            epsilon_4: imbe.errors[4],
+            epsilon_t: imbe.error_total().min(255) as u8,
+            bad_pitch: false,
+        };
+        let effective_gamma_w = if both { gamma_w } else { 0.0 };
+        let params_scaled = if (m_scale - 1.0).abs() > 1e-12 {
+            scale_params(&params, m_scale)
+        } else {
+            params.clone()
+        };
+        let pcm = synthesize_frame(&params_scaled, &err, effective_gamma_w, &mut synth_state);
+        if f == frame_idx {
+            our_frame = pcm;
+            let voiced_count = params.voiced_slice().iter().filter(|&&v| v).count();
+            let peak_m = params
+                .amplitudes_slice()
+                .iter()
+                .map(|m| m.abs())
+                .fold(0f32, f32::max);
+            frame_info = Some((
+                params.omega_0(),
+                params.harmonic_count(),
+                voiced_count as u8,
+                peak_m as usize,
+                params.voiced_slice().to_vec(),
+                params.amplitudes_slice().to_vec(),
+            ));
+        }
+    }
+
+    // DVSI reference window for this frame.
+    let start = frame_idx * FRAME_SAMPLES;
+    let end = start + FRAME_SAMPLES;
+    if end > pcm_ref.len() {
+        return Err(anyhow!(
+            "DVSI PCM too short for frame {frame_idx}: need {end}, have {}",
+            pcm_ref.len()
+        ));
+    }
+    let dvsi = &pcm_ref[start..end];
+
+    // Header
+    let (omega_0, l, voiced_count, peak_m_int, voiced, amps) = frame_info.unwrap();
+    let peak_m = f32::max(peak_m_int as f32, amps.iter().fold(0f32, |a, &b| a.max(b)));
+    let voiced_idx: Vec<usize> = voiced
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &v)| if v { Some(i + 1) } else { None })
+        .collect();
+    println!("vector:         {name}");
+    println!("frame:          {frame_idx} of {n_frames}");
+    println!("decode path:    {}", if both { "voiced + unvoiced (γ_w applied)" } else { "voiced only (γ_w = 0)" });
+    println!("m_scale:        {m_scale}");
+    println!(
+        "ω̃₀ = {:.4} (= {:.1} Hz),  L = {l},  voiced = {voiced_count} / {l}",
+        omega_0,
+        omega_0 * 8000.0 / (2.0 * core::f32::consts::PI)
+    );
+    println!(
+        "voiced harmonics: {}",
+        voiced_idx.iter().take(12).map(|x| x.to_string()).collect::<Vec<_>>().join(", ")
+    );
+    println!("peak M̃_l:       {peak_m:.0}");
+    println!();
+
+    // Stats per side.
+    let our_rms = rms(&our_frame);
+    let dvsi_rms = rms(dvsi);
+    println!("our  RMS:        {our_rms:.0}");
+    println!("DVSI RMS:        {dvsi_rms:.0}");
+    println!();
+
+    // Cross-correlation over a ±20 sample lag window. Normalize by
+    // the product of RMS values × N so values live in [-1, +1].
+    const LAG_HALF: i32 = 20;
+    let mut peak_corr = 0f64;
+    let mut peak_lag = 0i32;
+    println!("Normalized cross-correlation (lag: our[n] · dvsi[n + lag]):");
+    for lag in (-LAG_HALF..=LAG_HALF).step_by(1) {
+        let c = xcorr_normalized(&our_frame, dvsi, lag);
+        if c.abs() > peak_corr.abs() {
+            peak_corr = c;
+            peak_lag = lag;
+        }
+        if lag.rem_euclid(5) == 0 || lag == peak_lag {
+            let mark = if lag == peak_lag { " ← peak" } else { "" };
+            println!("  lag = {lag:>3}:  {c:>+.4}{mark}");
+        }
+    }
+    let zero_lag = xcorr_normalized(&our_frame, dvsi, 0);
+    println!();
+    println!("peak corr:  {peak_corr:+.4} at lag = {peak_lag}");
+    println!("zero-lag:   {zero_lag:+.4}");
+
+    // Interpretation heuristic.
+    println!();
+    let peak_abs = peak_corr.abs();
+    let zero_abs = zero_lag.abs();
+    println!("Diagnostic interpretation:");
+    if peak_abs > 0.5 && peak_lag.abs() > 0 {
+        let phase_rad = f64::from(omega_0) * f64::from(peak_lag);
+        let phase_deg = phase_rad * 180.0 / core::f64::consts::PI;
+        println!(
+            "  ✓ HIGH peak ({peak_abs:.2}) at NON-ZERO lag ({peak_lag}) — likely PHASE-TRACKING issue."
+        );
+        println!(
+            "    At ω̃₀ = {omega_0:.4}, lag {peak_lag} ≈ {phase_rad:.3} rad = {phase_deg:.1}° shift"
+        );
+        println!("    at the fundamental. Inspect §1.12.2 Eq. 134–141 (voiced phase evolution,");
+        println!("    φ_l / ψ_l / Δω_l); also §1.13 Annex A φ_l(−1), ψ_l(−1) init values.");
+    } else if peak_abs > 0.5 && peak_lag.abs() == 0 {
+        println!("  ✓ HIGH zero-lag correlation ({peak_abs:.2}) — phase tracking is aligned.");
+        println!("    Residual error is likely amplitude or harmonic structure, not phase.");
+        println!("    Inspect §1.10 enhancement or §1.11 smoothing for amplitude shaping.");
+    } else {
+        println!("  ✗ LOW peak correlation ({peak_abs:.2}) — waveform structurally different.");
+        println!("    Candidates (in priority order): OLA branch selection across the 5");
+        println!("    V/UV transition cases in §1.12.2 (Eq. 130–134); per-frame φ/ψ state");
+        println!("    init (§1.13 Annex A); window application (wS vs wS(n−N) alignment in");
+        println!("    Eq. 131/132); or §1.12.2 Eq. 127 sum bounds / factor-of-2.");
+    }
+    println!();
+    println!(
+        "If you want to see the waveforms directly, first 16 samples side by side:"
+    );
+    println!("  n   our     DVSI    diff");
+    for n in 0..16 {
+        let o = our_frame[n];
+        let d = dvsi[n];
+        let diff = i32::from(o) - i32::from(d);
+        println!("  {n:>2}  {o:>6}  {d:>6}  {diff:>+6}");
+    }
+    Ok(())
+}
+
+fn rms(samples: &[i16]) -> f64 {
+    let n = samples.len() as f64;
+    let ss: f64 = samples.iter().map(|&s| f64::from(s) * f64::from(s)).sum();
+    (ss / n).sqrt()
+}
+
+/// Normalized cross-correlation at a given integer lag. Returns
+/// Σ a[n]·b[n+lag] / (N · RMS(a) · RMS(b)) so magnitudes live in
+/// [-1, +1]. Out-of-range indices contribute zero.
+fn xcorr_normalized(a: &[i16], b: &[i16], lag: i32) -> f64 {
+    let n = a.len() as f64;
+    let rms_a = rms(a);
+    let rms_b = rms(b);
+    if rms_a < 1e-6 || rms_b < 1e-6 {
+        return 0.0;
+    }
+    let mut acc = 0f64;
+    for i in 0..a.len() {
+        let j = i as i32 + lag;
+        if j >= 0 && (j as usize) < b.len() {
+            acc += f64::from(a[i]) * f64::from(b[j as usize]);
+        }
+    }
+    acc / (n * rms_a * rms_b)
 }
 
 fn cmd_halfrate_roundtrip(root: &Path, name: &str) -> Result<()> {
