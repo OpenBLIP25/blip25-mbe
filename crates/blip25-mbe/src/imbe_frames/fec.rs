@@ -75,8 +75,23 @@ pub fn pn_mask_bit(pr_n: u16) -> u32 {
 /// Compute the 8 PN modulation masks `m̂₀..m̂₇` for full-rate IMBE.
 ///
 /// Returns one `u32` per vector with mask bits packed at positions
-/// `0..VECTOR_LENGTHS[i]` (element `k` at bit `k`, matching the codeword
-/// convention above).
+/// `0..VECTOR_LENGTHS[i]`. The first PN value `p_r(start)` lands at
+/// the highest used bit (`len-1`); the last PN value `p_r(start+len-1)`
+/// lands at bit 0.
+///
+/// **PN-to-codeword alignment.** In our codeword storage convention,
+/// `u32` bit `(len-1)` is the first-transmitted (MSB) bit of the
+/// codeword (per the Annex H deinterleaver: row 0 routes
+/// `c0[22]` — the first dibit's high bit — to `u32` bit 22). Aligning
+/// the first PN value with the first-transmitted bit means the PN
+/// advances *with* transmission order, which is what DVSI's encoder
+/// produces. Validated empirically against the DVSI `tv-std/tv/p25/`
+/// reference vectors: every recovered DVSI mask matches this packing.
+///
+/// Note: the spec's §1.6 C code documents `MASK_RANGE` with element-k-
+/// at-bit-k packing, which is self-consistent but differs from the
+/// codeword bit ordering at the wire boundary. The disagreement is
+/// invisible in encode→decode roundtrips that share both ends.
 ///
 /// * `m̂₀` and `m̂₇` are always zero (Eqs. 86, 93).
 /// * `m̂₁..m̂₃` each consume 23 PN indices at offsets 1, 24, 47.
@@ -101,7 +116,8 @@ pub fn modulation_masks_fullrate(u0: u16) -> [u32; 8] {
     for (vec_idx, start, len) in LAYOUT {
         let mut m = 0u32;
         for k in 0..len {
-            m |= pn_mask_bit(pr[start + k]) << k;
+            // First PN value at highest bit (= first-transmitted bit).
+            m |= pn_mask_bit(pr[start + k]) << (len - 1 - k);
         }
         masks[vec_idx] = m;
     }
