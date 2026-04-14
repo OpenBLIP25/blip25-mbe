@@ -82,11 +82,12 @@ impl MbeParams {
     /// slices of length `L`.
     ///
     /// Validates the invariants stated on the field docs. The caller is
-    /// responsible for ensuring `L` is consistent with `ω₀` via the
-    /// codec's `L = floor(π/ω₀)` rule (see [`Self::harmonic_count_for`]);
-    /// this constructor does not re-derive `L`, because wire formats
-    /// transmit a quantized pitch index that fixes both `ω₀` and `L`
-    /// together by table lookup and the two are kept as-supplied.
+    /// responsible for ensuring `L` is consistent with `ω₀` (see
+    /// [`Self::harmonic_count_for`] for the decoder rule); this
+    /// constructor does not re-derive `L`. Full-rate IMBE derives the
+    /// pair analytically from `b₀` (BABA-A §6.1 Eqs. 46–47); half-rate
+    /// AMBE+2 derives them by lookup (Annex L). Either way the wire side
+    /// owns the pairing, and the two are kept as supplied.
     pub fn new(
         omega_0: f32,
         l: u8,
@@ -119,12 +120,14 @@ impl MbeParams {
     /// A silent frame: all unvoiced, all amplitudes zero.
     ///
     /// BABA-A §6 treats silence as an MBE frame with near-zero amplitudes
-    /// and all bands unvoiced. `L` and `ω₀` are set to the minimum
-    /// harmonic configuration; they are unobservable in the synthesized
-    /// output when all amplitudes are zero.
+    /// and all bands unvoiced. `ω₀` is set to the highest full-rate
+    /// decoder value (`b̃₀ = 0`, i.e. `4π/39.5`, per §6.1 Eq. 46), which
+    /// pairs with `L = L_MIN` under Eq. 47. The exact value is
+    /// unobservable in the synthesized output when all amplitudes are
+    /// zero.
     pub fn silence() -> Self {
         Self {
-            omega_0: PI / (L_MIN as f32),
+            omega_0: 4.0 * PI / 39.5,
             l: L_MIN,
             voiced: [false; L_CAP],
             amplitudes: [0.0; L_CAP],
@@ -174,17 +177,22 @@ impl MbeParams {
         &self.amplitudes[..self.l as usize]
     }
 
-    /// Compute the harmonic count `L` implied by `ω₀` per BABA-A §5:
-    /// `L = floor(π / ω₀)`, clamped to `[L_MIN, L_MAX]`.
+    /// Compute the harmonic count `L` implied by `ω₀` per BABA-A §6.1
+    /// Eq. 47 (= §5.1.5 Eq. 31 for the estimator):
     ///
-    /// Wire formats use a quantized pitch index that pairs `ω₀` with an
-    /// `L` value via table lookup; this helper exposes the underlying
-    /// rule for callers that need it directly.
+    /// ```text
+    /// L = floor(0.9254 · floor(π / ω₀ + 0.25))
+    /// ```
+    ///
+    /// Clamped to `[L_MIN, L_MAX]`. The inner floor rounds `π/ω₀` to
+    /// the nearest integer with a 0.25 offset before the 0.9254 scale,
+    /// so this is **not** the same as `floor(π/ω₀)` — do not simplify.
     pub fn harmonic_count_for(omega_0: f32) -> u8 {
         if !(omega_0 > 0.0) {
             return L_MIN;
         }
-        let raw = (PI / omega_0).floor() as i32;
+        let inner = (PI / omega_0 + 0.25).floor();
+        let raw = (0.9254 * inner).floor() as i32;
         raw.clamp(L_MIN as i32, L_MAX as i32) as u8
     }
 }
@@ -240,12 +248,23 @@ mod tests {
 
     #[test]
     fn harmonic_count_for_matches_spec_rule() {
-        // ω₀ = π/20 → floor(20) = 20
-        assert_eq!(MbeParams::harmonic_count_for(PI / 20.0), 20);
+        // ω₀ = π/20: π/ω₀=20, +0.25→20.25, floor=20, ·0.9254=18.508, floor=18
+        assert_eq!(MbeParams::harmonic_count_for(PI / 20.0), 18);
         // ω₀ tiny → clamps to L_MAX
         assert_eq!(MbeParams::harmonic_count_for(0.001), L_MAX);
         // ω₀ large → clamps to L_MIN
         assert_eq!(MbeParams::harmonic_count_for(PI / 2.0), L_MIN);
+    }
+
+    #[test]
+    fn harmonic_count_matches_full_rate_b0_endpoints() {
+        // §6.1 Eq. 46: ω̃₀ = 4π/(b̃₀ + 39.5).
+        // b̃₀ = 0 → ω̃₀ = 4π/39.5, and Eq. 47 pairs this with L = 9.
+        let omega_at_b0_zero = 4.0 * PI / 39.5;
+        assert_eq!(MbeParams::harmonic_count_for(omega_at_b0_zero), 9);
+        // b̃₀ = 207 (highest valid) → ω̃₀ = 4π/246.5, pairs with L = 56.
+        let omega_at_b0_max = 4.0 * PI / 246.5;
+        assert_eq!(MbeParams::harmonic_count_for(omega_at_b0_max), 56);
     }
 
     #[test]
