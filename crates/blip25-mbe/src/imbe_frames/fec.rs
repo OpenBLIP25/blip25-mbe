@@ -3,9 +3,9 @@
 //! into a 144-bit frame.
 //!
 //! Per TIA-102.BABA-A. This module composes the generic Golay/Hamming
-//! primitives in [`crate::fec`] into the full-rate wire layout. The
-//! Annex H deinterleaving lives alongside this module, in
-//! [`crate::imbe_frames::full_rate`] once added.
+//! primitives in [`crate::fec`] into the full-rate wire layout and
+//! carries the Annex H interleaving table (generated at build time
+//! from `spec_tables/annex_h_interleave.csv` by `build.rs`).
 //!
 //! ## Bit-ordering convention (frame-wide)
 //!
@@ -125,6 +125,59 @@ pub fn demodulate_fullrate(codewords: [u32; 8], u0: u16) -> [u32; 8] {
     v
 }
 
+// ---------------------------------------------------------------------------
+// Annex H — full-rate interleaving
+// ---------------------------------------------------------------------------
+
+/// One row of the Annex H interleaving table. Each of the 72 dibit
+/// symbols in an IMBE frame carries two bits; this struct records which
+/// codeword vector (0–7) and which bit index within that vector each
+/// of the two bits belongs to. `bit1_*` is the dibit's high bit (sent
+/// first), `bit0_*` is the low bit.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AnnexHEntry {
+    pub bit1_vec: u8,
+    pub bit1_idx: u8,
+    pub bit0_vec: u8,
+    pub bit0_idx: u8,
+}
+
+include!(concat!(env!("OUT_DIR"), "/annex_h.rs"));
+
+/// Deinterleave a 144-bit IMBE frame (72 dibit symbols) into the 8
+/// code vectors `c₀..c₇` per BABA-A Annex H.
+///
+/// Each input byte is a dibit in `0..=3`: bit 1 is the high (first-sent)
+/// bit, bit 0 is the low bit. Output vector lengths are 23, 23, 23, 23,
+/// 15, 15, 15, 7 bits respectively, packed LSB-first per the module-level
+/// convention (element `k` at bit `k`).
+pub fn deinterleave_fullrate(dibits: &[u8; 72]) -> [u32; 8] {
+    let mut c = [0u32; 8];
+    for (sym, d) in dibits.iter().enumerate() {
+        let entry = ANNEX_H[sym];
+        let hi = u32::from((d >> 1) & 1);
+        let lo = u32::from(d & 1);
+        c[entry.bit1_vec as usize] |= hi << entry.bit1_idx;
+        c[entry.bit0_vec as usize] |= lo << entry.bit0_idx;
+    }
+    c
+}
+
+/// Interleave 8 code vectors `c₀..c₇` into a 144-bit IMBE frame
+/// (72 dibit symbols) per BABA-A Annex H.
+///
+/// Inverse of [`deinterleave_fullrate`]. Useful for encode paths and
+/// roundtrip tests.
+pub fn interleave_fullrate(codewords: &[u32; 8]) -> [u8; 72] {
+    let mut dibits = [0u8; 72];
+    for (sym, entry) in ANNEX_H.iter().enumerate() {
+        let hi = ((codewords[entry.bit1_vec as usize] >> entry.bit1_idx) & 1) as u8;
+        let lo = ((codewords[entry.bit0_vec as usize] >> entry.bit0_idx) & 1) as u8;
+        dibits[sym] = (hi << 1) | lo;
+    }
+    dibits
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -219,5 +272,88 @@ mod tests {
         let total: u8 = [1u8, 2, 3, 4, 5, 6].iter().map(|&i| VECTOR_LENGTHS[i as usize]).sum();
         assert_eq!(total, 114);
         assert_eq!(PN_SEQ_LEN_FULLRATE - 1, 114);
+    }
+
+    // ---- Annex H interleaving ---------------------------------------------
+
+    /// Mask that keeps only the valid bits of codeword `i`.
+    fn valid_mask(i: usize) -> u32 {
+        let len = VECTOR_LENGTHS[i] as u32;
+        if len == 32 { u32::MAX } else { (1u32 << len) - 1 }
+    }
+
+    #[test]
+    fn interleave_table_covers_every_codeword_bit_exactly_once() {
+        // 144 dibit bits should map 1:1 onto (vector, bit_index) across
+        // the 8 vectors' 23+23+23+23+15+15+15+7 = 144 positions.
+        let mut seen = [[false; 23]; 8];
+        for entry in ANNEX_H.iter() {
+            for (v, i) in [(entry.bit1_vec, entry.bit1_idx), (entry.bit0_vec, entry.bit0_idx)] {
+                assert!((i as u8) < VECTOR_LENGTHS[v as usize]);
+                assert!(!seen[v as usize][i as usize], "double coverage at ({v}, {i})");
+                seen[v as usize][i as usize] = true;
+            }
+        }
+        for (v, row) in seen.iter().enumerate() {
+            for (i, &b) in row.iter().enumerate().take(VECTOR_LENGTHS[v] as usize) {
+                assert!(b, "({v}, {i}) never covered");
+            }
+        }
+    }
+
+    #[test]
+    fn interleave_deinterleave_roundtrip() {
+        // Deterministic pseudo-random codewords within valid widths.
+        let mut cw = [0u32; 8];
+        let mut state = 0xCAFEBABEu32;
+        for i in 0..8 {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            cw[i] = state & valid_mask(i);
+        }
+        let dibits = interleave_fullrate(&cw);
+        // All dibits must be in 0..=3.
+        for (s, d) in dibits.iter().enumerate() {
+            assert!(*d < 4, "symbol {s} produced {d} (not a dibit)");
+        }
+        let recovered = deinterleave_fullrate(&dibits);
+        assert_eq!(recovered, cw);
+    }
+
+    #[test]
+    fn deinterleave_interleave_roundtrip() {
+        // Other direction: arbitrary 72-dibit stream → 8 codewords →
+        // re-interleave → same stream.
+        let mut dibits = [0u8; 72];
+        let mut state = 0xDEADBEEFu32;
+        for d in dibits.iter_mut() {
+            state = state.wrapping_mul(1103515245).wrapping_add(12345);
+            *d = (state >> 30) as u8; // top 2 bits, avoids LSB bias
+        }
+        let cw = deinterleave_fullrate(&dibits);
+        // Sanity: every decoded codeword fits within its declared width.
+        for (i, c) in cw.iter().enumerate() {
+            assert_eq!(c & !valid_mask(i), 0, "c[{i}] has bits beyond its width");
+        }
+        let re = interleave_fullrate(&cw);
+        assert_eq!(re, dibits);
+    }
+
+    #[test]
+    fn single_bit_propagates_to_one_dibit_position() {
+        // Setting exactly one bit in one codeword should produce a
+        // frame with exactly one '1' dibit-bit set.
+        for v in 0..8 {
+            for idx in 0..VECTOR_LENGTHS[v] {
+                let mut cw = [0u32; 8];
+                cw[v] = 1u32 << idx;
+                let dibits = interleave_fullrate(&cw);
+                let ones: u32 = dibits.iter().map(|d| u32::from(*d).count_ones()).sum();
+                assert_eq!(
+                    ones, 1,
+                    "single bit at (v={v}, idx={idx}) produced {ones} dibit-bits"
+                );
+                assert_eq!(deinterleave_fullrate(&dibits), cw);
+            }
+        }
     }
 }
