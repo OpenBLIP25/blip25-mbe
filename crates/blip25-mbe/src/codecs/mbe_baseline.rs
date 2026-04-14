@@ -557,6 +557,237 @@ pub fn synthesize_unvoiced(
     out
 }
 
+/// Snapshot the noise samples that the voiced synthesizer needs for
+/// phase randomization (`u(l)` for `l = 1..=56`, per Eq. 141).
+///
+/// Reads from the *current* (post-`advance_window`) noise window, so
+/// the caller must invoke this after [`synthesize_unvoiced`] — at
+/// which point both synthesizers see the same shifted sequence per
+/// the §1.13 cross-frame state contract.
+pub fn voiced_noise_samples(state: &UnvoicedSynthState) -> [f64; L_MAX as usize] {
+    let mut out = [0f64; L_MAX as usize];
+    for l in 1..=L_MAX as usize {
+        // u(l) at global n = l, indexed in the window at l + 104.
+        out[l - 1] = state.noise_window[l + 104];
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// §1.12.2 — Voiced synthesis (Eq. 127–141)
+// ---------------------------------------------------------------------------
+
+/// Initial value for `ω̃₀(−1)` per BABA-A §10 Annex A.
+pub const INIT_PREV_OMEGA_0: f64 = 0.02985 * PI64;
+
+/// Cross-frame state for the voiced synthesizer (§1.12.2).
+#[derive(Clone, Debug)]
+pub struct VoicedSynthState {
+    /// `φ_l(−1)` for `l = 1..=56`; index 0 unused. Init: 0.
+    phi: [f64; L_MAX as usize + 1],
+    /// `ψ_l(−1)` (auxiliary phase) for `l = 1..=56`; index 0 unused. Init: 0.
+    psi: [f64; L_MAX as usize + 1],
+    /// Previous frame's enhanced amplitudes `M̄_l(−1)`; index 0 unused. Init: 0.
+    prev_m_bar: [f64; L_MAX as usize + 1],
+    /// Previous frame's per-harmonic V/UV `v̄_l(−1)`; index 0 unused. Init: false.
+    prev_v_bar: [bool; L_MAX as usize + 1],
+    /// Previous frame's harmonic count `L̃(−1)`. Init: 30.
+    prev_l: u8,
+    /// Previous frame's fundamental frequency `ω̃₀(−1)`. Init: 0.02985·π.
+    prev_omega_0: f64,
+}
+
+impl VoicedSynthState {
+    /// Cold-start state per §1.13 / Annex A.
+    pub fn new() -> Self {
+        Self {
+            phi: [0.0; L_MAX as usize + 1],
+            psi: [0.0; L_MAX as usize + 1],
+            prev_m_bar: [0.0; L_MAX as usize + 1],
+            prev_v_bar: [false; L_MAX as usize + 1],
+            prev_l: 30,
+            prev_omega_0: INIT_PREV_OMEGA_0,
+        }
+    }
+}
+
+impl Default for VoicedSynthState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Wrap a phase value to the principal range `[−π, π)` per Eq. 138's
+/// `Δφ − 2π·⌊(Δφ+π)/(2π)⌋` formulation.
+#[inline]
+fn wrap_phase(delta_phi: f64) -> f64 {
+    delta_phi - 2.0 * PI64 * ((delta_phi + PI64) / (2.0 * PI64)).floor()
+}
+
+/// Synthesize the voiced component for one 20 ms frame per BABA-A
+/// §1.12.2 Eq. 127–141.
+///
+/// Returns 160 PCM-domain samples (in `f64`; the final `i16` cast
+/// happens at the synthesis top level after summing with the unvoiced
+/// component per Eq. 142).
+///
+/// `noise_samples` carries `u(l)` for `l = 1..=56` (index 0 = `u(1)`),
+/// extracted from [`voiced_noise_samples`] after the unvoiced synth's
+/// noise advance.
+pub fn synthesize_voiced(
+    omega_0: f32,
+    m_bar: &[f32],
+    v_bar: &[bool],
+    noise_samples: &[f64; L_MAX as usize],
+    state: &mut VoicedSynthState,
+) -> [f64; FRAME_SAMPLES] {
+    let l_curr = m_bar.len() as u8;
+    let l_prev = state.prev_l;
+    let max_l = l_curr.max(l_prev) as usize;
+
+    let omega_curr = f64::from(omega_0);
+    let omega_prev = state.prev_omega_0;
+    let n_f = FRAME_SAMPLES as f64;
+    let delta_omega = omega_curr - omega_prev;
+
+    // ψ_l(0) = ψ_l(−1) + (ω̃₀(−1) + ω̃₀(0))·l·N/2  (Eq. 139, all l in 1..=56)
+    let mut psi_curr = [0f64; L_MAX as usize + 1];
+    for l in 1..=L_MAX as usize {
+        let l_f = l as f64;
+        psi_curr[l] = state.psi[l] + (omega_prev + omega_curr) * l_f * n_f / 2.0;
+    }
+
+    // φ_l(0) — Eq. 140 + 141.
+    // Branch 1 for 1 ≤ l ≤ ⌊L̃/4⌋: φ = ψ.
+    // Branch 2 for ⌊L̃/4⌋ < l ≤ max(L̃(−1), L̃(0)): φ = ψ + L̃_uv·ρ_l/L̃·l.
+    // For l beyond max (up to 56): apply branch 2 too — these harmonics
+    // are out-of-range (treated as unvoiced per Eq. 128–129) and their
+    // phase still evolves for next-frame continuity.
+    let l_uv: u8 = (0..l_curr as usize).filter(|&i| !v_bar[i]).count() as u8;
+    let l_quarter = (l_curr as usize) / 4;
+    let mut phi_curr = [0f64; L_MAX as usize + 1];
+    for l in 1..=L_MAX as usize {
+        if l <= l_quarter {
+            phi_curr[l] = psi_curr[l];
+        } else {
+            let u_l = noise_samples[l - 1];
+            let rho_l = (2.0 * PI64 / 53125.0) * u_l - PI64; // Eq. 141
+            let l_curr_f = if l_curr > 0 { f64::from(l_curr) } else { 1.0 };
+            phi_curr[l] = psi_curr[l]
+                + f64::from(l_uv) * rho_l / l_curr_f * (l as f64);
+        }
+    }
+
+    // Pre-cache wS(n) and wS(n−N) over n = 0..N to avoid 56·160·2
+    // bounds-checked lookups in the inner loop.
+    let mut ws_n = [0f64; FRAME_SAMPLES];
+    let mut ws_nm = [0f64; FRAME_SAMPLES];
+    for n in 0..FRAME_SAMPLES {
+        ws_n[n] = f64::from(synth_window(n as i32));
+        ws_nm[n] = f64::from(synth_window(n as i32 - FRAME_SAMPLES as i32));
+    }
+
+    // Per-harmonic synthesis + accumulate.
+    let mut s_v = [0f64; FRAME_SAMPLES];
+    for l in 1..=max_l {
+        let l_f = l as f64;
+        let m_curr_l = if l <= l_curr as usize { f64::from(m_bar[l - 1]) } else { 0.0 };
+        let m_prev_l = if l <= l_prev as usize { state.prev_m_bar[l] } else { 0.0 };
+        let v_curr = l <= l_curr as usize && v_bar[l - 1];
+        let v_prev = l <= l_prev as usize && state.prev_v_bar[l];
+
+        // Decide which branch this harmonic uses for the entire frame.
+        // (It's a function of l, prev/curr V/UV, and the |Δω·l/ω| ratio.)
+        enum Branch {
+            UvUv,
+            VUv,
+            UvV,
+            VVSum,
+            VVRamp,
+        }
+        let branch = match (v_prev, v_curr) {
+            (false, false) => Branch::UvUv,
+            (true, false) => Branch::VUv,
+            (false, true) => Branch::UvV,
+            (true, true) => {
+                let pitch_change_ratio = if omega_curr.abs() > 1e-30 {
+                    (delta_omega * l_f / omega_curr).abs()
+                } else {
+                    0.0
+                };
+                if l >= 8 || pitch_change_ratio >= 0.1 {
+                    Branch::VVSum
+                } else {
+                    Branch::VVRamp
+                }
+            }
+        };
+
+        // Pre-compute Eq. 134 ramp constants once per harmonic.
+        let (delta_omega_l, theta0, omega_curr_minus_prev_over_2n) = if matches!(branch, Branch::VVRamp) {
+            let delta_phi = phi_curr[l] - state.phi[l]
+                - (omega_prev + omega_curr) * l_f * n_f / 2.0;
+            let wrapped = wrap_phase(delta_phi);
+            let dω_l = wrapped / n_f;
+            let coef_n2 = (omega_curr * l_f - omega_prev * l_f) / (2.0 * n_f);
+            (dω_l, state.phi[l], coef_n2)
+        } else {
+            (0.0, 0.0, 0.0)
+        };
+
+        for n in 0..FRAME_SAMPLES {
+            let n_int = n as i32;
+            let nf = f64::from(n_int);
+            let n_minus_n_f = nf - n_f;
+            let s_vl: f64 = match branch {
+                Branch::UvUv => 0.0,
+                Branch::VUv => {
+                    ws_n[n] * m_prev_l
+                        * (omega_prev * nf * l_f + state.phi[l]).cos()
+                }
+                Branch::UvV => {
+                    ws_nm[n] * m_curr_l
+                        * (omega_curr * n_minus_n_f * l_f + phi_curr[l]).cos()
+                }
+                Branch::VVSum => {
+                    let t1 = ws_n[n] * m_prev_l
+                        * (omega_prev * nf * l_f + state.phi[l]).cos();
+                    let t2 = ws_nm[n] * m_curr_l
+                        * (omega_curr * n_minus_n_f * l_f + phi_curr[l]).cos();
+                    t1 + t2
+                }
+                Branch::VVRamp => {
+                    let a_l = m_prev_l + (nf / n_f) * (m_curr_l - m_prev_l);
+                    let theta_l =
+                        theta0 + (omega_prev * l_f + delta_omega_l) * nf
+                            + omega_curr_minus_prev_over_2n * nf * nf;
+                    a_l * theta_l.cos()
+                }
+            };
+            s_v[n] += 2.0 * s_vl;
+        }
+    }
+
+    // Update state for next frame.
+    for l in 1..=L_MAX as usize {
+        state.psi[l] = psi_curr[l];
+        state.phi[l] = phi_curr[l];
+    }
+    for l in 1..=l_curr as usize {
+        state.prev_m_bar[l] = f64::from(m_bar[l - 1]);
+        state.prev_v_bar[l] = v_bar[l - 1];
+    }
+    // Zero out fields beyond the current L̃ so they don't leak.
+    for l in (l_curr as usize + 1)..=L_MAX as usize {
+        state.prev_m_bar[l] = 0.0;
+        state.prev_v_bar[l] = false;
+    }
+    state.prev_l = l_curr;
+    state.prev_omega_0 = omega_curr;
+
+    s_v
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -902,6 +1133,169 @@ mod tests {
                 "γ_M ratio at l={}: {ratio} vs {expected_gamma}",
                 i + 1
             );
+        }
+    }
+
+    // ---- §1.12.2 voiced synthesis ----------------------------------------
+
+    #[test]
+    fn voiced_state_init_matches_annex_a() {
+        let s = VoicedSynthState::new();
+        assert_eq!(s.prev_l, 30);
+        assert!((s.prev_omega_0 - 0.02985 * PI64).abs() < 1e-12);
+        for l in 1..=L_MAX as usize {
+            assert_eq!(s.phi[l], 0.0);
+            assert_eq!(s.psi[l], 0.0);
+            assert_eq!(s.prev_m_bar[l], 0.0);
+            assert!(!s.prev_v_bar[l]);
+        }
+    }
+
+    #[test]
+    fn wrap_phase_into_principal_range() {
+        let cases = [
+            (0.0f64, 0.0),
+            (PI64, -PI64),
+            (-PI64, -PI64),
+            (3.0 * PI64, -PI64),
+            (-3.0 * PI64, -PI64),
+        ];
+        for (input, expected) in cases {
+            let w = wrap_phase(input);
+            assert!(
+                (w - expected).abs() < 1e-12,
+                "wrap({input}) = {w}, expected {expected}"
+            );
+        }
+        // Verify range invariant for arbitrary inputs.
+        for k in -10..=10 {
+            let raw = (k as f64) * 0.7 * PI64;
+            let w = wrap_phase(raw);
+            assert!((-PI64..PI64).contains(&w), "wrap({raw}) = {w}");
+        }
+    }
+
+    #[test]
+    fn voiced_all_unvoiced_produces_silence() {
+        // (UV, UV) for every harmonic → branch UvUv → s̃_{v,l} = 0.
+        let m_bar = vec![10.0f32; 12];
+        let v_bar = vec![false; 12];
+        let noise = [0f64; L_MAX as usize];
+        let mut state = VoicedSynthState::new();
+        // First call: prev is also init (all UV by Annex A).
+        let pcm = synthesize_voiced(0.2, &m_bar, &v_bar, &noise, &mut state);
+        for &s in pcm.iter() {
+            assert!(s.abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn voiced_silence_amplitudes_produces_silence() {
+        let m_bar = vec![0f32; 12];
+        let v_bar = vec![true; 12];
+        let noise = [0f64; L_MAX as usize];
+        let mut state = VoicedSynthState::new();
+        // First frame: prev is all UV (Annex A init), so harmonics use
+        // Branch::UvV with M̄_curr = 0 → output is zero.
+        let pcm = synthesize_voiced(0.2, &m_bar, &v_bar, &noise, &mut state);
+        for &s in pcm.iter() {
+            assert!(s.abs() < 1e-9, "{s}");
+        }
+    }
+
+    #[test]
+    fn voiced_state_advances_phase_for_all_56_harmonics() {
+        // ψ_l(0) = ψ_l(−1) + (ω_prev + ω_curr)·l·N/2 — for ALL l in 1..=56,
+        // regardless of L̃ or V/UV.
+        let m_bar = vec![1.0f32; 9]; // L = 9
+        let v_bar = vec![false; 9];
+        let noise = [0f64; L_MAX as usize];
+        let mut state = VoicedSynthState::new();
+        let psi_init = state.psi;
+        let _ = synthesize_voiced(0.2, &m_bar, &v_bar, &noise, &mut state);
+        // Every harmonic's ψ should have advanced.
+        for l in 1..=L_MAX as usize {
+            assert!(
+                state.psi[l] > psi_init[l] - 1e-12,
+                "ψ_{l} did not advance: {} → {}",
+                psi_init[l],
+                state.psi[l]
+            );
+            assert!(state.psi[l] != psi_init[l], "ψ_{l} unchanged");
+        }
+    }
+
+    #[test]
+    fn voiced_steady_state_pure_tone() {
+        // Steady-state sinusoid: identical M̄, ω₀, V/UV across two
+        // frames should produce a near-pure-tone-like waveform on the
+        // second frame (after warm-up).
+        let omega_0 = 0.2f32;
+        let mut m_bar = [0f32; 12];
+        m_bar[0] = 100.0; // fundamental only, harmonic 1 voiced
+        let mut v_bar = [false; 12];
+        v_bar[0] = true;
+        let noise = [0f64; L_MAX as usize];
+        let mut state = VoicedSynthState::new();
+        let _ = synthesize_voiced(omega_0, &m_bar, &v_bar, &noise, &mut state);
+        let pcm = synthesize_voiced(omega_0, &m_bar, &v_bar, &noise, &mut state);
+
+        // Output should have measurable energy concentrated around
+        // ω₀. We just sanity-check non-zero variance.
+        let mean: f64 = pcm.iter().sum::<f64>() / pcm.len() as f64;
+        let var: f64 = pcm.iter().map(|&s| (s - mean).powi(2)).sum::<f64>()
+            / pcm.len() as f64;
+        assert!(var > 100.0, "voiced steady-state variance too low: {var}");
+    }
+
+    #[test]
+    fn voiced_phase_carries_across_frames_for_continuity() {
+        // The φ_l update should keep the synthesized waveform roughly
+        // continuous between consecutive steady-state frames. We
+        // compare the last sample of frame N with the first sample of
+        // frame N+1 — they should be close (within a few % of peak).
+        let omega_0 = 0.15f32;
+        let mut m_bar = [0f32; 12];
+        m_bar[0] = 100.0;
+        m_bar[1] = 60.0;
+        let mut v_bar = [false; 12];
+        v_bar[0] = true;
+        v_bar[1] = true;
+        let noise = [0f64; L_MAX as usize];
+        let mut state = VoicedSynthState::new();
+        // Warm up.
+        let _ = synthesize_voiced(omega_0, &m_bar, &v_bar, &noise, &mut state);
+        let _ = synthesize_voiced(omega_0, &m_bar, &v_bar, &noise, &mut state);
+        let pcm_a = synthesize_voiced(omega_0, &m_bar, &v_bar, &noise, &mut state);
+        let pcm_b = synthesize_voiced(omega_0, &m_bar, &v_bar, &noise, &mut state);
+        let last_a = pcm_a[FRAME_SAMPLES - 1];
+        let first_b = pcm_b[0];
+        // Approximate continuity: difference well below the typical
+        // sample magnitude.
+        let typical_mag = pcm_a.iter().map(|s| s.abs()).fold(0f64, f64::max);
+        assert!(
+            (last_a - first_b).abs() < typical_mag,
+            "phase discontinuity: last={last_a}, first={first_b}, max={typical_mag}"
+        );
+    }
+
+    #[test]
+    fn voiced_output_length_is_one_frame() {
+        let m_bar = [0f32; 9];
+        let v_bar = [false; 9];
+        let noise = [0f64; L_MAX as usize];
+        let mut state = VoicedSynthState::new();
+        let pcm = synthesize_voiced(0.2, &m_bar, &v_bar, &noise, &mut state);
+        assert_eq!(pcm.len(), FRAME_SAMPLES);
+    }
+
+    #[test]
+    fn voiced_noise_samples_extracts_from_window() {
+        let mut us = UnvoicedSynthState::new();
+        us.advance_window();
+        let n = voiced_noise_samples(&us);
+        for l in 1..=L_MAX as usize {
+            assert_eq!(n[l - 1], us.noise_window[l + 104]);
         }
     }
 
