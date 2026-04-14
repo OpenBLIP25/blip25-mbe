@@ -23,7 +23,7 @@
 
 use core::f64::consts::PI as PI64;
 
-use crate::mbe_params::L_MAX;
+use crate::mbe_params::{L_MAX, MbeParams};
 
 include!(concat!(env!("OUT_DIR"), "/annex_i_synth_window.rs"));
 
@@ -788,6 +788,183 @@ pub fn synthesize_voiced(
     s_v
 }
 
+// ---------------------------------------------------------------------------
+// Top-level synthesis (Eq. 142)
+// ---------------------------------------------------------------------------
+
+/// Bundled cross-frame state for the full §1.10–§1.12 synthesis
+/// pipeline. Owns the unvoiced and voiced sub-states plus the scalar
+/// state from §1.10 / §1.11 (S_E, τ_M, ε_R).
+#[derive(Clone, Debug)]
+pub struct SynthState {
+    /// §1.10 local-energy state.
+    pub s_e: f64,
+    /// §1.11 amplitude-smoothing state.
+    pub tau_m: f64,
+    /// §1.11 smoothed error rate.
+    pub epsilon_r: f64,
+    /// §1.12.1 unvoiced sub-state.
+    pub unvoiced: UnvoicedSynthState,
+    /// §1.12.2 voiced sub-state.
+    pub voiced: VoicedSynthState,
+    /// Snapshot of the last successfully-synthesized frame's parameters
+    /// (for Eq. 99–104 substitution on Repeat/Mute). `None` until the
+    /// first valid frame.
+    last_good: Option<LastGoodFrame>,
+}
+
+#[derive(Clone, Debug)]
+struct LastGoodFrame {
+    omega_0: f32,
+    l: u8,
+    voiced: [bool; L_MAX as usize],
+    m_tilde: [f32; L_MAX as usize],
+}
+
+impl SynthState {
+    /// Cold-start synthesis state per §1.13 / Annex A.
+    pub fn new() -> Self {
+        Self {
+            s_e: INIT_S_E,
+            tau_m: INIT_TAU_M,
+            epsilon_r: 0.0,
+            unvoiced: UnvoicedSynthState::new(),
+            voiced: VoicedSynthState::new(),
+            last_good: None,
+        }
+    }
+}
+
+impl Default for SynthState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Convert one frame of `f64` synthesizer output into 16-bit signed
+/// PCM with rounding and clamp at the i16 limits.
+#[inline]
+pub fn pcm_from_f64(samples: &[f64; FRAME_SAMPLES]) -> [i16; FRAME_SAMPLES] {
+    let mut out = [0i16; FRAME_SAMPLES];
+    for (i, &s) in samples.iter().enumerate() {
+        let clamped = s.clamp(f64::from(i16::MIN), f64::from(i16::MAX));
+        out[i] = clamped.round() as i16;
+    }
+    out
+}
+
+/// Synthesize one 20 ms frame (160 PCM samples) from `MbeParams` per
+/// the §1.10–§1.12 pipeline, with the §1.11 disposition deciding
+/// whether to use, repeat, or mute the current frame.
+///
+/// `gamma_w` is the §1.12.1 spectral scale; pass [`PLACEHOLDER_GAMMA_W`]
+/// until a calibrated value is available.
+pub fn synthesize_frame(
+    params: &MbeParams,
+    err: &FrameErrorContext,
+    gamma_w: f64,
+    state: &mut SynthState,
+) -> [i16; FRAME_SAMPLES] {
+    let (disp, epsilon_r) = frame_disposition(err, state.epsilon_r);
+    state.epsilon_r = epsilon_r;
+
+    // Choose which set of parameters drives this frame's synthesis.
+    // On Mute we still want to advance every cross-frame piece of
+    // state (so re-acquisition works after the mute clears) but we
+    // emit silence — Eq. 99–104 still apply to substitute the last
+    // good frame's values into the synth pipeline so its state
+    // evolves smoothly.
+    let (omega_0, l, voiced_arr, m_tilde_arr) = match (disp, &state.last_good) {
+        (FrameDisposition::Use, _) => {
+            let l = params.harmonic_count();
+            let mut voiced = [false; L_MAX as usize];
+            let mut m_tilde = [0f32; L_MAX as usize];
+            voiced[..l as usize].copy_from_slice(params.voiced_slice());
+            m_tilde[..l as usize].copy_from_slice(params.amplitudes_slice());
+            (params.omega_0(), l, voiced, m_tilde)
+        }
+        (FrameDisposition::Repeat | FrameDisposition::Mute, Some(prev)) => {
+            (prev.omega_0, prev.l, prev.voiced, prev.m_tilde)
+        }
+        (FrameDisposition::Repeat | FrameDisposition::Mute, None) => {
+            // First-frame edge case: nothing to repeat. Fall back to
+            // current frame's params (treats the disposition as Use).
+            let l = params.harmonic_count();
+            let mut voiced = [false; L_MAX as usize];
+            let mut m_tilde = [0f32; L_MAX as usize];
+            voiced[..l as usize].copy_from_slice(params.voiced_slice());
+            m_tilde[..l as usize].copy_from_slice(params.amplitudes_slice());
+            (params.omega_0(), l, voiced, m_tilde)
+        }
+    };
+
+    // §1.10 enhancement: M̃_l → M̄_l, update S_E.
+    let (m_bar_full, s_e_new) = enhance_spectral_amplitudes(
+        &m_tilde_arr[..l as usize],
+        omega_0,
+        state.s_e,
+    );
+    state.s_e = s_e_new;
+
+    // §1.11.3 V/UV-and-amplitude smoothing.
+    let smoothed = apply_smoothing(
+        &m_bar_full[..l as usize],
+        &voiced_arr[..l as usize],
+        state.s_e,
+        state.epsilon_r,
+        err.epsilon_t,
+        err.epsilon_4,
+        state.tau_m,
+    );
+    state.tau_m = smoothed.tau_m;
+
+    // §1.12.1 unvoiced + §1.12.2 voiced + Eq. 142 sum.
+    let s_uv = synthesize_unvoiced(
+        omega_0,
+        &smoothed.m_bar[..l as usize],
+        &smoothed.v_bar[..l as usize],
+        gamma_w,
+        &mut state.unvoiced,
+    );
+    let noise_samples = voiced_noise_samples(&state.unvoiced);
+    let s_v = synthesize_voiced(
+        omega_0,
+        &smoothed.m_bar[..l as usize],
+        &smoothed.v_bar[..l as usize],
+        &noise_samples,
+        &mut state.voiced,
+    );
+
+    let mut s = [0f64; FRAME_SAMPLES];
+    if disp == FrameDisposition::Mute {
+        // §1.11.2: bypass synthesis output, emit silence (the simpler
+        // of the spec's two suggested options). State above already
+        // advanced normally.
+        // s stays zero.
+    } else {
+        for i in 0..FRAME_SAMPLES {
+            s[i] = s_uv[i] + s_v[i];
+        }
+    }
+
+    // Snapshot for next-frame substitution. Storing (ω₀, L, voiced,
+    // M̃) is enough — rerunning §1.10 enhancement on M̃ with the
+    // current S_E reproduces M̄ exactly, so no separate M̄ snapshot
+    // is needed.
+    let mut snap_voiced = [false; L_MAX as usize];
+    let mut snap_m_tilde = [0f32; L_MAX as usize];
+    snap_voiced[..l as usize].copy_from_slice(&voiced_arr[..l as usize]);
+    snap_m_tilde[..l as usize].copy_from_slice(&m_tilde_arr[..l as usize]);
+    state.last_good = Some(LastGoodFrame {
+        omega_0,
+        l,
+        voiced: snap_voiced,
+        m_tilde: snap_m_tilde,
+    });
+
+    pcm_from_f64(&s)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1296,6 +1473,114 @@ mod tests {
         let n = voiced_noise_samples(&us);
         for l in 1..=L_MAX as usize {
             assert_eq!(n[l - 1], us.noise_window[l + 104]);
+        }
+    }
+
+    // ---- Top-level synthesize_frame --------------------------------------
+
+    fn build_params(omega_0: f32, voiced: &[bool], amplitudes: &[f32]) -> MbeParams {
+        let l = voiced.len() as u8;
+        MbeParams::new(omega_0, l, voiced, amplitudes).expect("valid params")
+    }
+
+    #[test]
+    fn synthesize_frame_silence_input_produces_silence_output() {
+        let p = build_params(0.2, &[false; 9], &[0f32; 9]);
+        let err = FrameErrorContext::default();
+        let mut state = SynthState::new();
+        let pcm = synthesize_frame(&p, &err, PLACEHOLDER_GAMMA_W, &mut state);
+        for s in pcm.iter() {
+            assert_eq!(*s, 0);
+        }
+    }
+
+    #[test]
+    fn synthesize_frame_advances_all_substates() {
+        let voiced = vec![true; 9];
+        let amps = vec![100f32; 9];
+        let p = build_params(0.2, &voiced, &amps);
+        let err = FrameErrorContext::default();
+        let mut state = SynthState::new();
+        let s_e_init = state.s_e;
+        let lcg_init = state.unvoiced.lcg;
+        let psi_init = state.voiced.psi;
+        let _ = synthesize_frame(&p, &err, PLACEHOLDER_GAMMA_W, &mut state);
+        assert_ne!(state.s_e, s_e_init, "S_E unchanged");
+        assert_ne!(state.unvoiced.lcg, lcg_init, "LCG unchanged");
+        // ψ for at least one harmonic should have advanced.
+        let any_changed = (1..=L_MAX as usize).any(|l| state.voiced.psi[l] != psi_init[l]);
+        assert!(any_changed, "no ψ advanced");
+        assert!(state.last_good.is_some(), "no snapshot stored");
+    }
+
+    #[test]
+    fn synthesize_frame_mute_emits_silence_but_advances_state() {
+        // Force a Mute by pre-loading a high ε_R into state.
+        let voiced = vec![true; 9];
+        let amps = vec![100f32; 9];
+        let p = build_params(0.2, &voiced, &amps);
+        let err = FrameErrorContext { epsilon_t: 100, ..Default::default() };
+        let mut state = SynthState::new();
+        state.epsilon_r = 0.5; // > MUTE_EPSILON_R_THRESHOLD
+        let s_e_init = state.s_e;
+        let pcm = synthesize_frame(&p, &err, PLACEHOLDER_GAMMA_W, &mut state);
+        for s in pcm.iter() {
+            assert_eq!(*s, 0, "Mute should output silence");
+        }
+        // State should still have advanced (so re-acquisition works).
+        assert_ne!(state.s_e, s_e_init);
+    }
+
+    #[test]
+    fn pcm_from_f64_clamps_and_rounds() {
+        let mut input = [0f64; FRAME_SAMPLES];
+        input[0] = 0.0;
+        input[1] = 100.4; // → 100
+        input[2] = 100.6; // → 101
+        input[3] = -100.6; // → -101
+        input[4] = 50000.0; // → clamp to 32767
+        input[5] = -50000.0; // → clamp to -32768
+        let out = pcm_from_f64(&input);
+        assert_eq!(out[0], 0);
+        assert_eq!(out[1], 100);
+        assert_eq!(out[2], 101);
+        assert_eq!(out[3], -101);
+        assert_eq!(out[4], 32767);
+        assert_eq!(out[5], -32768);
+    }
+
+    #[test]
+    fn synthesize_frame_repeat_reuses_last_good() {
+        // Run a clean frame to populate last_good, then a Repeat frame
+        // using completely different params — output should match what
+        // the clean frame would have produced for the SAME index in
+        // its OWN second call (since substitution + state evolution is
+        // deterministic).
+        let voiced = vec![true; 9];
+        let amps = vec![50f32; 9];
+        let p_good = build_params(0.2, &voiced, &amps);
+        let p_repeat = build_params(0.1, &vec![false; 12], &vec![1.0; 12]);
+        let err_use = FrameErrorContext::default();
+        let err_repeat = FrameErrorContext { bad_pitch: true, ..Default::default() };
+
+        let mut state_a = SynthState::new();
+        let _ = synthesize_frame(&p_good, &err_use, PLACEHOLDER_GAMMA_W, &mut state_a);
+        let pcm_repeat = synthesize_frame(&p_repeat, &err_repeat, PLACEHOLDER_GAMMA_W, &mut state_a);
+
+        let mut state_b = SynthState::new();
+        let _ = synthesize_frame(&p_good, &err_use, PLACEHOLDER_GAMMA_W, &mut state_b);
+        let pcm_use_again = synthesize_frame(&p_good, &err_use, PLACEHOLDER_GAMMA_W, &mut state_b);
+
+        // The Repeat path used last_good (= p_good), so its output
+        // should equal the second p_good frame, modulo the change in
+        // ε_R (Repeat carries non-zero ε_T = 0 by default so ε_R is
+        // unchanged in this test).
+        for i in 0..FRAME_SAMPLES {
+            assert_eq!(
+                pcm_repeat[i], pcm_use_again[i],
+                "n={i}: repeat={} use={}",
+                pcm_repeat[i], pcm_use_again[i]
+            );
         }
     }
 

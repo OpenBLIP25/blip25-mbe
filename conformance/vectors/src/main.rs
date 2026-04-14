@@ -33,6 +33,9 @@ use clap::{Parser, Subcommand};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use blip25_mbe::codecs::mbe_baseline::{
+    FrameErrorContext, PLACEHOLDER_GAMMA_W, SynthState, synthesize_frame,
+};
 use blip25_mbe::fec::{golay_23_12_encode, hamming_15_11_encode};
 use blip25_mbe::imbe_frames::dequantize::{
     DecoderState, dequantize_fullrate, quantize_fullrate,
@@ -76,6 +79,20 @@ enum Cmd {
         #[arg(long)]
         stop_on_first: bool,
     },
+    /// Decode `p25/<name>.bit` (FEC frames) all the way to PCM via
+    /// the §1.10–§1.12 synthesizer, and compare the output to
+    /// `p25/<name>.pcm` (the DVSI reference). Reports sample-count
+    /// match, RMS error, peak error, and signal-to-noise ratio.
+    /// Bit-exact agreement is **not** expected — γ_w is a placeholder
+    /// and the synthesizer's float precision differs from DVSI's
+    /// internal arithmetic.
+    DecodePcm {
+        /// Vector name (e.g. `alert`).
+        name: String,
+        /// Use `tv-rc/` instead of `tv-std/tv/`.
+        #[arg(long)]
+        rc: bool,
+    },
     /// Round-trip test: decode each `p25_nofec/<name>.bit` frame to
     /// `MbeParams` then re-encode. Pitch (`b̂₀`) and V/UV (`b̂₁`) are
     /// expected to match bit-exact; gain DCT bits (`b̂₂..b̂₇`) and HOC
@@ -113,7 +130,114 @@ fn main() -> Result<()> {
         }
         Cmd::PnDiag { name, rc, frame } => cmd_pn_diag(&args.vectors, &name, rc, frame),
         Cmd::Roundtrip { name, rc } => cmd_roundtrip(&args.vectors, &name, rc),
+        Cmd::DecodePcm { name, rc } => cmd_decode_pcm(&args.vectors, &name, rc),
     }
+}
+
+const FRAME_SAMPLES: usize = 160;
+
+fn cmd_decode_pcm(root: &Path, name: &str, rc: bool) -> Result<()> {
+    let dir = vector_dir(root, rc);
+    let fec_path = dir.join("p25").join(format!("{name}.bit"));
+    let pcm_path = dir.join("p25").join(format!("{name}.pcm"));
+
+    let fec_bytes = fs::read(&fec_path)
+        .with_context(|| format!("read FEC vector {}", fec_path.display()))?;
+    let pcm_ref_bytes = fs::read(&pcm_path)
+        .with_context(|| format!("read reference PCM {}", pcm_path.display()))?;
+
+    if fec_bytes.len() % BYTES_PER_FEC_FRAME != 0 {
+        return Err(anyhow!(
+            "FEC file {} is {} bytes — not a multiple of {}",
+            fec_path.display(),
+            fec_bytes.len(),
+            BYTES_PER_FEC_FRAME
+        ));
+    }
+    if pcm_ref_bytes.len() % 2 != 0 {
+        return Err(anyhow!("PCM file is not a whole number of i16 samples"));
+    }
+    let n_frames = fec_bytes.len() / BYTES_PER_FEC_FRAME;
+    let n_ref_samples = pcm_ref_bytes.len() / 2;
+
+    println!("vector:        {name}{}", if rc { " (rc)" } else { "" });
+    println!("frames:        {n_frames}");
+    println!("ref samples:   {n_ref_samples} (= {} frames)", n_ref_samples / FRAME_SAMPLES);
+
+    // Decode the reference PCM as i16 little-endian.
+    let pcm_ref: Vec<i16> = pcm_ref_bytes
+        .chunks_exact(2)
+        .map(|c| i16::from_le_bytes([c[0], c[1]]))
+        .collect();
+
+    // Run the full pipeline.
+    let mut decoder_state = DecoderState::new();
+    let mut synth_state = SynthState::new();
+    let mut pcm_out: Vec<i16> = Vec::with_capacity(n_frames * FRAME_SAMPLES);
+    let mut bad_pitch_frames = 0usize;
+
+    for f in 0..n_frames {
+        let fec = &fec_bytes[f * BYTES_PER_FEC_FRAME..(f + 1) * BYTES_PER_FEC_FRAME];
+        let dibits = unpack_dibits(fec);
+        let imbe = decode_fullrate_frame(&dibits);
+        let params = match dequantize_fullrate(&imbe.info, &mut decoder_state) {
+            Ok(p) => p,
+            Err(_) => {
+                bad_pitch_frames += 1;
+                pcm_out.extend(std::iter::repeat(0i16).take(FRAME_SAMPLES));
+                continue;
+            }
+        };
+        let err = FrameErrorContext {
+            epsilon_0: imbe.errors[0],
+            epsilon_4: imbe.errors[4],
+            epsilon_t: imbe.error_total().min(255) as u8,
+            bad_pitch: false,
+        };
+        let pcm = synthesize_frame(&params, &err, PLACEHOLDER_GAMMA_W, &mut synth_state);
+        pcm_out.extend_from_slice(&pcm);
+    }
+
+    println!("decoded:       {} samples", pcm_out.len());
+    if bad_pitch_frames > 0 {
+        println!("bad-pitch frames (silenced): {bad_pitch_frames}");
+    }
+    println!();
+
+    // Compare. Use the shorter of the two so we don't index OOB.
+    let n = pcm_out.len().min(pcm_ref.len());
+    if n == 0 {
+        return Err(anyhow!("no samples to compare"));
+    }
+    let mut sum_sq_err = 0f64;
+    let mut sum_sq_ref = 0f64;
+    let mut peak_err = 0f64;
+    let mut bit_exact = 0usize;
+    for i in 0..n {
+        let a = f64::from(pcm_out[i]);
+        let b = f64::from(pcm_ref[i]);
+        let e = a - b;
+        sum_sq_err += e * e;
+        sum_sq_ref += b * b;
+        peak_err = peak_err.max(e.abs());
+        if pcm_out[i] == pcm_ref[i] {
+            bit_exact += 1;
+        }
+    }
+    let rms_err = (sum_sq_err / n as f64).sqrt();
+    let snr_db = if sum_sq_err > 0.0 {
+        10.0 * (sum_sq_ref / sum_sq_err).log10()
+    } else {
+        f64::INFINITY
+    };
+    let pct_exact = 100.0 * bit_exact as f64 / n as f64;
+
+    println!("Comparison vs DVSI reference PCM ({n} samples):");
+    println!("  bit-exact samples:  {bit_exact} / {n}   ({pct_exact:.2}%)");
+    println!("  RMS error:          {rms_err:.2}");
+    println!("  peak error:         {peak_err:.0}");
+    println!("  SNR:                {snr_db:.2} dB");
+    Ok(())
 }
 
 fn cmd_roundtrip(root: &Path, name: &str, rc: bool) -> Result<()> {
