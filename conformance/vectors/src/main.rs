@@ -108,6 +108,22 @@ enum Cmd {
         #[arg(long, default_value_t = 1.0)]
         m_scale: f64,
     },
+    /// Scan a full-rate vector for V/UV transition frames that
+    /// isolate §1.12.2 Eq. 131 vs Eq. 132 candidates, then run xcorr
+    /// on each and report which candidate's branch shows the
+    /// phase-inversion signature. The §11 investigation's candidate
+    /// discriminator.
+    ScanTransitions {
+        /// Vector name (e.g. `clean`).
+        name: String,
+        /// Minimum voiced harmonic change required to call it a
+        /// transition (out of L). Default 0.6.
+        #[arg(long, default_value_t = 0.6)]
+        min_transition_ratio: f32,
+        /// Maximum number of each transition type to print.
+        #[arg(long, default_value_t = 5)]
+        limit: usize,
+    },
     /// Single-frame cross-correlation diagnostic for the §11 voiced-
     /// synthesis investigation. Decodes one frame from the full-rate
     /// FEC vector, runs the §1.12 synthesizer (voiced-only unless
@@ -200,6 +216,9 @@ fn main() -> Result<()> {
             cmd_decode_pcm_halfrate(&args.vectors, &name, gamma_w.unwrap_or(GAMMA_W))
         }
         Cmd::HalfrateRoundtrip { name } => cmd_halfrate_roundtrip(&args.vectors, &name),
+        Cmd::ScanTransitions { name, min_transition_ratio, limit } => {
+            cmd_scan_transitions(&args.vectors, &name, min_transition_ratio, limit)
+        }
         Cmd::XcorrFrame { name, frame, both, gamma_w, m_scale } => cmd_xcorr_frame(
             &args.vectors,
             &name,
@@ -628,6 +647,278 @@ fn cmd_decode_pcm_halfrate(root: &Path, name: &str, gamma_w: f64) -> Result<()> 
     println!("  RMS error:          {rms_err:.2}");
     println!("  peak error:         {peak_err:.0}");
     println!("  SNR:                {snr_db:.2} dB");
+    Ok(())
+}
+
+fn cmd_scan_transitions(
+    root: &Path,
+    name: &str,
+    min_ratio: f32,
+    limit: usize,
+) -> Result<()> {
+    let dir = root.join("tv-std").join("tv").join("p25");
+    let fec_path = dir.join(format!("{name}.bit"));
+    let pcm_path = dir.join(format!("{name}.pcm"));
+    let fec_bytes = fs::read(&fec_path)?;
+    let pcm_ref_bytes = fs::read(&pcm_path)?;
+    let n_frames = fec_bytes.len() / BYTES_PER_FEC_FRAME;
+    let pcm_ref: Vec<i16> = pcm_ref_bytes
+        .chunks_exact(2)
+        .map(|c| i16::from_le_bytes([c[0], c[1]]))
+        .collect();
+
+    // Walk the full vector. For each frame, record (prev voiced count,
+    // curr voiced count, L). Classify transitions when the curr frame
+    // has ≥ min_ratio · L voiced harmonics and prev had ≤ (1 −
+    // min_ratio) · prev_L, or vice versa.
+    let mut decoder_state = DecoderState::new();
+    let mut synth_state = SynthState::new();
+
+    #[derive(Clone)]
+    struct FrameSnapshot {
+        idx: usize,
+        l: u8,
+        voiced_count: u8,
+        our_pcm: [i16; FRAME_SAMPLES],
+        omega_0: f32,
+    }
+    let mut prev: Option<FrameSnapshot> = None;
+    let mut uv_to_v: Vec<(FrameSnapshot, FrameSnapshot)> = Vec::new();
+    let mut v_to_uv: Vec<(FrameSnapshot, FrameSnapshot)> = Vec::new();
+
+    for f in 0..n_frames {
+        let fec = &fec_bytes[f * BYTES_PER_FEC_FRAME..(f + 1) * BYTES_PER_FEC_FRAME];
+        let dibits = unpack_dibits(fec);
+        let imbe = decode_fullrate_frame(&dibits);
+        let params = match dequantize_fullrate(&imbe.info, &mut decoder_state) {
+            Ok(p) => p,
+            Err(_) => {
+                prev = None;
+                continue;
+            }
+        };
+        let err = FrameErrorContext {
+            epsilon_0: imbe.errors[0],
+            epsilon_4: imbe.errors[4],
+            epsilon_t: imbe.error_total().min(255) as u8,
+            bad_pitch: false,
+        };
+        // Voiced-only synthesis for the xcorr — matches what
+        // cmd_xcorr_frame does.
+        let pcm = synthesize_frame(&params, &err, 0.0, &mut synth_state);
+        let voiced_count = params
+            .voiced_slice()
+            .iter()
+            .filter(|&&v| v)
+            .count() as u8;
+        let curr = FrameSnapshot {
+            idx: f,
+            l: params.harmonic_count(),
+            voiced_count,
+            our_pcm: pcm,
+            omega_0: params.omega_0(),
+        };
+
+        if let Some(p) = prev.as_ref() {
+            let prev_ratio = f32::from(p.voiced_count) / f32::from(p.l);
+            let curr_ratio = f32::from(curr.voiced_count) / f32::from(curr.l);
+            // UV → V: prev mostly unvoiced, curr mostly voiced. Isolates
+            // Eq. 132 (candidate #2).
+            if prev_ratio <= (1.0 - min_ratio) && curr_ratio >= min_ratio {
+                uv_to_v.push((p.clone(), curr.clone()));
+            }
+            // V → UV: prev mostly voiced, curr mostly unvoiced. Isolates
+            // Eq. 131 (candidate #1).
+            else if prev_ratio >= min_ratio && curr_ratio <= (1.0 - min_ratio) {
+                v_to_uv.push((p.clone(), curr.clone()));
+            }
+        }
+        prev = Some(curr);
+    }
+
+    println!("vector:   {name}");
+    println!("frames:   {n_frames}");
+    println!(
+        "criteria: prev/curr voiced ratio ≥ {:.0}% or ≤ {:.0}%",
+        min_ratio * 100.0,
+        (1.0 - min_ratio) * 100.0
+    );
+    println!();
+
+    fn xcorr_and_print(
+        label: &str,
+        candidate: &str,
+        fires_on: &str,
+        frames: &[(FrameSnapshot, FrameSnapshot)],
+        pcm_ref: &[i16],
+        limit: usize,
+    ) {
+        println!("=== {label} — isolates {candidate} ({fires_on}) ===");
+        if frames.is_empty() {
+            println!("  (no matching frames found — try lowering --min-transition-ratio)");
+            println!();
+            return;
+        }
+        println!("  frames found: {}", frames.len());
+        println!(
+            "  {:>5}  {:>4}  {:>4}/{:>2}  {:>4}/{:>2}  {:>7}  {:>6}  {:>4}",
+            "frame", "ω̃₀", "prev", "L₋", "curr", "L₀", "peak", "zero", "lag"
+        );
+        for (p, c) in frames.iter().take(limit) {
+            let dvsi_start = c.idx * FRAME_SAMPLES;
+            let dvsi_end = dvsi_start + FRAME_SAMPLES;
+            if dvsi_end > pcm_ref.len() {
+                continue;
+            }
+            let dvsi = &pcm_ref[dvsi_start..dvsi_end];
+            // Find peak lag in ±20.
+            let mut peak_corr = 0f64;
+            let mut peak_lag = 0i32;
+            for lag in -20..=20i32 {
+                let corr = xcorr_normalized(&c.our_pcm, dvsi, lag);
+                if corr.abs() > peak_corr.abs() {
+                    peak_corr = corr;
+                    peak_lag = lag;
+                }
+            }
+            let zero_lag = xcorr_normalized(&c.our_pcm, dvsi, 0);
+            println!(
+                "  {:>5}  {:.3}  {:>4}/{:>2}  {:>4}/{:>2}  {:>+7.3}  {:>+6.3}  {:>+4}",
+                c.idx,
+                c.omega_0,
+                p.voiced_count,
+                p.l,
+                c.voiced_count,
+                c.l,
+                peak_corr,
+                zero_lag,
+                peak_lag
+            );
+        }
+        // Aggregate signature.
+        let mut sum_peak = 0f64;
+        let mut sum_peak_abs = 0f64;
+        let mut lag_hist = [0usize; 41]; // lags −20..+20
+        let mut neg_peak_count = 0usize;
+        let mut pos_peak_count = 0usize;
+        let mut scored = 0usize;
+        for (_, c) in frames {
+            let dvsi_start = c.idx * FRAME_SAMPLES;
+            let dvsi_end = dvsi_start + FRAME_SAMPLES;
+            if dvsi_end > pcm_ref.len() {
+                continue;
+            }
+            let dvsi = &pcm_ref[dvsi_start..dvsi_end];
+            let mut peak_corr = 0f64;
+            let mut peak_lag = 0i32;
+            for lag in -20..=20i32 {
+                let corr = xcorr_normalized(&c.our_pcm, dvsi, lag);
+                if corr.abs() > peak_corr.abs() {
+                    peak_corr = corr;
+                    peak_lag = lag;
+                }
+            }
+            sum_peak += peak_corr;
+            sum_peak_abs += peak_corr.abs();
+            lag_hist[(peak_lag + 20) as usize] += 1;
+            if peak_corr < 0.0 { neg_peak_count += 1; }
+            if peak_corr > 0.0 { pos_peak_count += 1; }
+            scored += 1;
+        }
+        if scored > 0 {
+            let mean_peak = sum_peak / scored as f64;
+            let mean_peak_abs = sum_peak_abs / scored as f64;
+            println!();
+            println!(
+                "  aggregate over {scored}: mean peak corr = {mean_peak:+.3}, mean |peak| = {mean_peak_abs:.3}"
+            );
+            println!(
+                "  sign split: {neg_peak_count} negative, {pos_peak_count} positive"
+            );
+            let neg_pct = 100.0 * neg_peak_count as f64 / scored as f64;
+            if neg_pct > 70.0 && mean_peak_abs > 0.3 {
+                println!(
+                    "  → SIGNATURE MATCH: {neg_pct:.0}% negative peaks w/ |peak| > 0.3 → 180° sign-flip on {candidate}"
+                );
+            } else if mean_peak_abs < 0.2 {
+                println!(
+                    "  → No clear structural match — error may be elsewhere (window, state init, or {candidate} is innocent)"
+                );
+            } else {
+                println!(
+                    "  → Mixed signal — {candidate} is partially implicated but not the sole cause"
+                );
+            }
+        }
+        println!();
+    }
+
+    // Also classify V → V frames (both fully voiced) to isolate
+    // Eq. 133/134 (the V→V branches), which are different from #1/#2.
+    let mut decoder_state = DecoderState::new();
+    let mut synth_state = SynthState::new();
+    let mut prev: Option<FrameSnapshot> = None;
+    let mut v_to_v: Vec<(FrameSnapshot, FrameSnapshot)> = Vec::new();
+    for f in 0..n_frames {
+        let fec = &fec_bytes[f * BYTES_PER_FEC_FRAME..(f + 1) * BYTES_PER_FEC_FRAME];
+        let dibits = unpack_dibits(fec);
+        let imbe = decode_fullrate_frame(&dibits);
+        let params = match dequantize_fullrate(&imbe.info, &mut decoder_state) {
+            Ok(p) => p,
+            Err(_) => {
+                prev = None;
+                continue;
+            }
+        };
+        let err = FrameErrorContext {
+            epsilon_0: imbe.errors[0],
+            epsilon_4: imbe.errors[4],
+            epsilon_t: imbe.error_total().min(255) as u8,
+            bad_pitch: false,
+        };
+        let pcm = synthesize_frame(&params, &err, 0.0, &mut synth_state);
+        let voiced_count = params.voiced_slice().iter().filter(|&&v| v).count() as u8;
+        let curr = FrameSnapshot {
+            idx: f,
+            l: params.harmonic_count(),
+            voiced_count,
+            our_pcm: pcm,
+            omega_0: params.omega_0(),
+        };
+        if let Some(p) = prev.as_ref() {
+            let prev_ratio = f32::from(p.voiced_count) / f32::from(p.l);
+            let curr_ratio = f32::from(curr.voiced_count) / f32::from(curr.l);
+            if prev_ratio >= min_ratio && curr_ratio >= min_ratio {
+                v_to_v.push((p.clone(), curr.clone()));
+            }
+        }
+        prev = Some(curr);
+    }
+
+    xcorr_and_print(
+        "V → UV transitions",
+        "Eq. 131 (candidate #1)",
+        "cos(ω̃₀(−1)·n·l + φ_l(−1)) on prev-voiced harmonics",
+        &v_to_uv,
+        &pcm_ref,
+        limit,
+    );
+    xcorr_and_print(
+        "UV → V transitions",
+        "Eq. 132 (candidate #2)",
+        "cos(ω̃₀(0)·(n−N)·l + φ_l(0)) on curr-voiced harmonics",
+        &uv_to_v,
+        &pcm_ref,
+        limit,
+    );
+    xcorr_and_print(
+        "V → V stable voicing",
+        "Eq. 133/134 (candidate #3/#4)",
+        "sum-of-both (l≥8 or |Δω·l/ω|≥0.1) OR amplitude-ramp (l<8 and small Δω)",
+        &v_to_v,
+        &pcm_ref,
+        limit,
+    );
     Ok(())
 }
 
