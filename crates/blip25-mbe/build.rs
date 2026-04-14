@@ -18,6 +18,9 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     gen_annex_h(&out_dir);
     gen_annex_e(&out_dir);
+    gen_annex_f(&out_dir);
+    gen_annex_g(&out_dir);
+    gen_annex_j(&out_dir);
     gen_imbe_bit_prioritization(&out_dir);
     gen_ambe_bit_prioritization(&out_dir);
 }
@@ -153,6 +156,231 @@ fn gen_annex_e(out_dir: &PathBuf) {
     out.push_str("];\n");
 
     fs::write(out_dir.join("annex_e_gain.rs"), out).expect("write annex_e_gain.rs");
+}
+
+/// Parse `spec_tables/annex_f_gain_allocation.csv` into
+/// `$OUT_DIR/annex_f_gain_alloc.rs`, emitting `IMBE_GAIN_ALLOC: [[GainAlloc; 5]; 48]`.
+///
+/// Indexed by `[L - 9][m - 3]` for `m ∈ {3, 4, 5, 6, 7}`. Each entry
+/// carries `B_m` (bit count, 1–10) and `delta_m` (uniform-quantizer
+/// step size, float).
+fn gen_annex_f(out_dir: &PathBuf) {
+    let csv_path = "spec_tables/annex_f_gain_allocation.csv";
+    println!("cargo:rerun-if-changed={csv_path}");
+
+    let content = fs::read_to_string(csv_path)
+        .unwrap_or_else(|e| panic!("failed to read {csv_path}: {e}"));
+
+    // [L_idx][m_idx] = (B_m, Delta_m)
+    let mut table: Vec<Vec<(u8, f32)>> = (0..48).map(|_| Vec::with_capacity(5)).collect();
+
+    for (lineno, raw) in content.lines().enumerate() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with('L') {
+            continue;
+        }
+        let cols: Vec<&str> = line.split(',').map(str::trim).collect();
+        assert_eq!(
+            cols.len(),
+            4,
+            "annex F line {}: expected 4 columns, got {}: {raw:?}",
+            lineno + 1,
+            cols.len()
+        );
+        let l: u8 = cols[0].parse().expect("L");
+        let m: u8 = cols[1].parse().expect("m");
+        let b_m: u8 = cols[2].parse().expect("B_m");
+        let delta_m: f32 = cols[3].parse().expect("Delta_m");
+        assert!((9..=56).contains(&l), "annex F: L={l} out of range");
+        assert!((3..=7).contains(&m), "annex F: m={m} out of range");
+        assert!(b_m >= 1 && b_m <= 10, "annex F: B_m={b_m} out of range");
+        assert!(delta_m > 0.0, "annex F: delta_m must be positive");
+        let l_idx = (l - 9) as usize;
+        let m_idx = (m - 3) as usize;
+        assert_eq!(
+            table[l_idx].len(),
+            m_idx,
+            "annex F rows must be sorted by (L, m)"
+        );
+        table[l_idx].push((b_m, delta_m));
+    }
+    for (i, row) in table.iter().enumerate() {
+        assert_eq!(row.len(), 5, "annex F: L={} expected 5 entries", i + 9);
+    }
+
+    let mut out = String::new();
+    out.push_str("// Auto-generated from spec_tables/annex_f_gain_allocation.csv\n");
+    out.push_str("// Do not edit — regenerated each build.\n");
+    out.push_str("pub(crate) const IMBE_GAIN_ALLOC: [[GainAlloc; 5]; 48] = [\n");
+    for (l_idx, row) in table.iter().enumerate() {
+        out.push_str(&format!("    // L = {}\n    [\n", l_idx + 9));
+        for (b_m, delta_m) in row {
+            out.push_str(&format!(
+                "        GainAlloc {{ b_m: {b_m}, delta_m: {delta_m:.6} }},\n"
+            ));
+        }
+        out.push_str("    ],\n");
+    }
+    out.push_str("];\n");
+
+    fs::write(out_dir.join("annex_f_gain_alloc.rs"), out).expect("write annex_f_gain_alloc.rs");
+}
+
+/// Parse `spec_tables/annex_g_hoc_allocation.csv` into
+/// `$OUT_DIR/annex_g_hoc_alloc.rs`. Variable-length per L̂; emits both
+/// a flat entries array and a per-L̂ offset/length index.
+///
+/// Each entry holds `(C_i, C_k, b_m, B_m)`. Total rows: 1272 (sum of
+/// `L̂ − 6` across L̂ ∈ [9, 56]).
+fn gen_annex_g(out_dir: &PathBuf) {
+    let csv_path = "spec_tables/annex_g_hoc_allocation.csv";
+    println!("cargo:rerun-if-changed={csv_path}");
+
+    let content = fs::read_to_string(csv_path)
+        .unwrap_or_else(|e| panic!("failed to read {csv_path}: {e}"));
+
+    let mut per_l: Vec<Vec<(u8, u8, u8, u8)>> = (0..48).map(|_| Vec::new()).collect();
+
+    for (lineno, raw) in content.lines().enumerate() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with('L') {
+            continue;
+        }
+        let cols: Vec<&str> = line.split(',').map(str::trim).collect();
+        assert_eq!(
+            cols.len(),
+            5,
+            "annex G line {}: expected 5 columns, got {}: {raw:?}",
+            lineno + 1,
+            cols.len()
+        );
+        let l: u8 = cols[0].parse().expect("L");
+        let c_i: u8 = cols[1].parse().expect("C_i");
+        let c_k: u8 = cols[2].parse().expect("C_k");
+        let b_m: u8 = cols[3].parse().expect("b_m");
+        let b_m_bits: u8 = cols[4].parse().expect("B_m");
+        assert!((9..=56).contains(&l), "annex G: L={l} out of range");
+        assert!((1..=6).contains(&c_i), "annex G: C_i={c_i} out of range");
+        assert!(c_k >= 2, "annex G: C_k={c_k} below 2");
+        assert!(b_m_bits <= 10, "annex G: B_m={b_m_bits} exceeds 10");
+        per_l[(l - 9) as usize].push((c_i, c_k, b_m, b_m_bits));
+    }
+
+    // Validate entry counts: L̂ − 6 per L̂.
+    let mut total = 0usize;
+    for (i, rows) in per_l.iter().enumerate() {
+        let l = (i + 9) as u8;
+        let expected = (l - 6) as usize;
+        assert_eq!(
+            rows.len(),
+            expected,
+            "annex G: L={l} expected {expected} rows, got {}",
+            rows.len()
+        );
+        // b_m must increment by 1 starting at 8.
+        for (j, row) in rows.iter().enumerate() {
+            let expected_bm = 8 + j as u8;
+            assert_eq!(row.2, expected_bm, "annex G: L={l} row {j} b_m mismatch");
+        }
+        total += rows.len();
+    }
+    assert_eq!(total, 1272, "annex G: total row count mismatch");
+
+    // Flatten + emit offset table.
+    let mut flat: Vec<(u8, u8, u8, u8)> = Vec::with_capacity(total);
+    let mut offsets: [(u32, u32); 48] = [(0, 0); 48];
+    for (i, rows) in per_l.iter().enumerate() {
+        let off = flat.len() as u32;
+        let len = rows.len() as u32;
+        offsets[i] = (off, len);
+        flat.extend_from_slice(rows);
+    }
+
+    let mut out = String::new();
+    out.push_str("// Auto-generated from spec_tables/annex_g_hoc_allocation.csv\n");
+    out.push_str("// Do not edit — regenerated each build.\n");
+    out.push_str(&format!(
+        "pub(crate) const IMBE_HOC_ENTRIES: [HocAlloc; {}] = [\n",
+        flat.len()
+    ));
+    for (c_i, c_k, b_m, b_m_bits) in &flat {
+        out.push_str(&format!(
+            "    HocAlloc {{ c_i: {c_i}, c_k: {c_k}, b_m: {b_m}, b_m_bits: {b_m_bits} }},\n"
+        ));
+    }
+    out.push_str("];\n\n");
+    out.push_str("/// `(offset, len)` pairs into IMBE_HOC_ENTRIES, indexed by `L − 9`.\n");
+    out.push_str("pub(crate) const IMBE_HOC_OFFSETS: [(u32, u32); 48] = [\n");
+    for (off, len) in &offsets {
+        out.push_str(&format!("    ({off}, {len}),\n"));
+    }
+    out.push_str("];\n");
+
+    fs::write(out_dir.join("annex_g_hoc_alloc.rs"), out).expect("write annex_g_hoc_alloc.rs");
+}
+
+/// Parse `spec_tables/annex_j_block_lengths.csv` into
+/// `$OUT_DIR/annex_j_blocks.rs`, emitting `IMBE_BLOCK_LENGTHS: [[u8; 6]; 48]`.
+///
+/// Validates Eq. 65 (`Σ J̃_i = L̃`) and Eq. 66 (`⌊L/6⌋ ≤ J̃_i ≤ J̃_{i+1} ≤ ⌈L/6⌉`).
+fn gen_annex_j(out_dir: &PathBuf) {
+    let csv_path = "spec_tables/annex_j_block_lengths.csv";
+    println!("cargo:rerun-if-changed={csv_path}");
+
+    let content = fs::read_to_string(csv_path)
+        .unwrap_or_else(|e| panic!("failed to read {csv_path}: {e}"));
+
+    let mut blocks: Vec<[u8; 6]> = Vec::with_capacity(48);
+
+    for (lineno, raw) in content.lines().enumerate() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with('L') {
+            continue;
+        }
+        let cols: Vec<&str> = line.split(',').map(str::trim).collect();
+        assert_eq!(
+            cols.len(),
+            7,
+            "annex J line {}: expected 7 columns, got {}: {raw:?}",
+            lineno + 1,
+            cols.len()
+        );
+        let l: u8 = cols[0].parse().expect("L");
+        assert!((9..=56).contains(&l));
+        assert_eq!((l - 9) as usize, blocks.len(), "annex J rows must be sequential");
+        let mut row = [0u8; 6];
+        for i in 0..6 {
+            row[i] = cols[i + 1].parse().expect("J_i");
+        }
+        // Eq. 65: sum equals L.
+        let sum: u32 = row.iter().map(|&x| x as u32).sum();
+        assert_eq!(sum, l as u32, "annex J: L={l}, sum(J)={sum}");
+        // Eq. 66: ⌊L/6⌋ ≤ J̃_i ≤ J̃_{i+1} ≤ ⌈L/6⌉.
+        let lo = l / 6;
+        let hi = (l + 5) / 6;
+        for &j in &row {
+            assert!(j >= lo && j <= hi, "annex J: L={l}, J̃ out of range");
+        }
+        for i in 0..5 {
+            assert!(row[i] <= row[i + 1], "annex J: L={l} blocks not non-decreasing");
+        }
+        blocks.push(row);
+    }
+    assert_eq!(blocks.len(), 48, "annex J: expected 48 rows");
+
+    let mut out = String::new();
+    out.push_str("// Auto-generated from spec_tables/annex_j_block_lengths.csv\n");
+    out.push_str("// Do not edit — regenerated each build.\n");
+    out.push_str("pub(crate) const IMBE_BLOCK_LENGTHS: [[u8; 6]; 48] = [\n");
+    for (l_idx, row) in blocks.iter().enumerate() {
+        out.push_str(&format!(
+            "    [{}, {}, {}, {}, {}, {}], // L = {}\n",
+            row[0], row[1], row[2], row[3], row[4], row[5], l_idx + 9
+        ));
+    }
+    out.push_str("];\n");
+
+    fs::write(out_dir.join("annex_j_blocks.rs"), out).expect("write annex_j_blocks.rs");
 }
 
 /// Parse `spec_tables/imbe_bit_prioritization.csv` into

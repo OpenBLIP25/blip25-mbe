@@ -25,6 +25,31 @@ use crate::mbe_params::{L_MAX, MbeParams};
 
 include!(concat!(env!("OUT_DIR"), "/annex_e_gain.rs"));
 
+/// One row of Annex F: bit count and uniform-quantizer step size for
+/// gain DCT coefficient `b̂_m` (`m ∈ {3..7}`).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct GainAlloc {
+    pub b_m: u8,
+    pub delta_m: f32,
+}
+
+/// One row of Annex G: bit allocation for one HOC coefficient.
+/// `c_i` is the 1-based block index (1..6); `c_k` is the 1-based DCT
+/// position inside that block (k ≥ 2 — k=1 is reserved for the block
+/// mean, which comes from the gain side via `R̃_i`); `b_m` is the
+/// voice-parameter index (8 + offset); `b_m_bits` is `B_m` (0..10).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct HocAlloc {
+    pub c_i: u8,
+    pub c_k: u8,
+    pub b_m: u8,
+    pub b_m_bits: u8,
+}
+
+include!(concat!(env!("OUT_DIR"), "/annex_f_gain_alloc.rs"));
+include!(concat!(env!("OUT_DIR"), "/annex_g_hoc_alloc.rs"));
+include!(concat!(env!("OUT_DIR"), "/annex_j_blocks.rs"));
+
 /// Highest valid full-rate pitch index per BABA-A §1.3.1: values
 /// `b̂₀ ∈ [0, 207]` are transmittable; `[208, 255]` are reserved and
 /// indicate either uncorrectable FEC errors or a non-conformant encoder.
@@ -219,6 +244,81 @@ mod tests {
         }
         // L=9 → K=3
         assert_eq!(vuv_band_count(9), 3);
+    }
+
+    // ---- Annex F / G / J generated tables --------------------------------
+
+    #[test]
+    fn annex_f_table_shape_and_spot_values() {
+        // 48 L values × 5 m values (m=3..=7).
+        assert_eq!(IMBE_GAIN_ALLOC.len(), 48);
+        for row in IMBE_GAIN_ALLOC.iter() {
+            assert_eq!(row.len(), 5);
+            for entry in row {
+                assert!(entry.b_m >= 1 && entry.b_m <= 10);
+                assert!(entry.delta_m > 0.0);
+            }
+        }
+        // L=9, m=3 first row from CSV: B_m=10, Delta_m=0.003100.
+        let r = IMBE_GAIN_ALLOC[0][0];
+        assert_eq!(r.b_m, 10);
+        assert!((r.delta_m - 0.003100).abs() < 1e-6);
+        // L=9, m=4: B_m=9, Delta_m=0.004020.
+        let r = IMBE_GAIN_ALLOC[0][1];
+        assert_eq!(r.b_m, 9);
+        assert!((r.delta_m - 0.004020).abs() < 1e-6);
+    }
+
+    #[test]
+    fn annex_g_table_shape_and_offsets() {
+        // 1272 entries total; 48 (offset, len) pairs.
+        assert_eq!(IMBE_HOC_ENTRIES.len(), 1272);
+        assert_eq!(IMBE_HOC_OFFSETS.len(), 48);
+
+        // Per-L̂ length = L̂ − 6.
+        for (i, &(_off, len)) in IMBE_HOC_OFFSETS.iter().enumerate() {
+            let l = (i + 9) as u32;
+            assert_eq!(len as u32, l - 6, "L={l}");
+        }
+        // Offsets must be contiguous and cover all entries.
+        let (last_off, last_len) = IMBE_HOC_OFFSETS[47];
+        assert_eq!(last_off + last_len, IMBE_HOC_ENTRIES.len() as u32);
+
+        // Spot: L=9 first row → C_i=4, C_k=2, b_m=8, B_m=9.
+        let r = IMBE_HOC_ENTRIES[0];
+        assert_eq!((r.c_i, r.c_k, r.b_m, r.b_m_bits), (4, 2, 8, 9));
+    }
+
+    #[test]
+    fn annex_g_b_m_walks_8_upward_per_l() {
+        // Per spec §1.8.2 Eq. 72: the b_m index walks contiguously
+        // from 8 upward within each L̂.
+        for (l_idx, &(off, len)) in IMBE_HOC_OFFSETS.iter().enumerate() {
+            let entries = &IMBE_HOC_ENTRIES[off as usize..(off + len) as usize];
+            for (j, e) in entries.iter().enumerate() {
+                assert_eq!(
+                    e.b_m,
+                    8 + j as u8,
+                    "L={}: row {j} expected b_m={}, got {}",
+                    l_idx + 9,
+                    8 + j as u8,
+                    e.b_m
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn annex_j_block_lengths_sum_to_l() {
+        for (l_idx, row) in IMBE_BLOCK_LENGTHS.iter().enumerate() {
+            let l = (l_idx + 9) as u32;
+            let sum: u32 = row.iter().map(|&x| x as u32).sum();
+            assert_eq!(sum, l, "L={l}");
+            // Eq. 66: non-decreasing.
+            for i in 0..5 {
+                assert!(row[i] <= row[i + 1], "L={l}: blocks not non-decreasing");
+            }
+        }
     }
 
     // ---- Gain dequantization (Annex E) -----------------------------------
