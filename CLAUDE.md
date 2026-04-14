@@ -9,13 +9,31 @@ test vectors, not any open-source implementation.
 
 ### Spec-first, not source-first
 - **Always work from the TIA-102 implementation specs in `~/blip25-specs/`**, not
-  from open-source P25 / MBE implementations (OP25, SDRTrunk, dsdcc, JMBE, etc.).
+  from open-source P25 / MBE implementations (OP25, SDRTrunk, dsdcc, JMBE,
+  imbe_vocoder, or any other P25/IMBE/AMBE project).
 - If a spec is ambiguous, incomplete, or missing required detail, **stop and
   report the gap** — the user will have it added to the spec rather than have
-  you guess or reference third-party code.
-- Do not copy algorithms, constants, or structure from open-source implementations.
-  Cross-checking a single numeric constant against a reference is acceptable as a
-  last-resort sanity check, but the design and code must come from the spec.
+  you guess or reference P25 third-party code. Strengthening the spec as we go
+  is an explicit project goal: every gap you flag makes the spec more ready
+  for the next implementer.
+- Do not copy algorithms, constants, or structure from P25 open-source
+  implementations. Cross-checking a single numeric constant against a reference
+  is acceptable as a last-resort sanity check, but the design and code must
+  come from the spec.
+
+### What IS allowed
+- **General SDR open-source libraries** (DSP primitives, modulation, filter
+  design, generic coding libraries) that are not P25-specific.
+- **LLM knowledge of widely-established, textbook methods** — Golay codes,
+  Hamming codes, Reed-Solomon, CRC polynomials, standard DSP transforms,
+  linear congruential generators, etc. These are mathematical constructs,
+  not project IP. Implementing them from first principles (generator
+  polynomials, parity-check matrices, standard decoding algorithms) is
+  expected and is not considered "guessing."
+
+The restriction is on the **P25 domain specifically**. General signal
+processing and coding theory are fair game. The stop-on-gap rule applies to
+**any** spec ambiguity — don't scope it narrowly.
 
 ### DVSI emulation target
 - The goal is bit-exact (or as close as the spec allows) equivalence with the
