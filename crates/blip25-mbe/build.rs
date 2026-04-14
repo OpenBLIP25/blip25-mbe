@@ -17,6 +17,7 @@ fn main() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR set by cargo"));
     println!("cargo:rerun-if-changed=build.rs");
     gen_annex_h(&out_dir);
+    gen_annex_e(&out_dir);
     gen_imbe_bit_prioritization(&out_dir);
     gen_ambe_bit_prioritization(&out_dir);
 }
@@ -104,6 +105,54 @@ fn gen_annex_h(out_dir: &PathBuf) {
     out.push_str("];\n");
 
     fs::write(out_dir.join("annex_h.rs"), out).expect("write annex_h.rs");
+}
+
+/// Parse `spec_tables/annex_e_gain_quantizer.csv` into
+/// `$OUT_DIR/annex_e_gain.rs`, emitting the 64-entry `IMBE_GAIN_LEVELS`
+/// `[f32; 64]` table.
+fn gen_annex_e(out_dir: &PathBuf) {
+    let csv_path = "spec_tables/annex_e_gain_quantizer.csv";
+    println!("cargo:rerun-if-changed={csv_path}");
+
+    let content = fs::read_to_string(csv_path)
+        .unwrap_or_else(|e| panic!("failed to read {csv_path}: {e}"));
+
+    let mut levels: Vec<f32> = Vec::with_capacity(64);
+    for (lineno, raw) in content.lines().enumerate() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with("b2_index") {
+            continue;
+        }
+        let cols: Vec<&str> = line.split(',').map(str::trim).collect();
+        assert_eq!(
+            cols.len(),
+            2,
+            "annex E line {}: expected 2 columns, got {}: {raw:?}",
+            lineno + 1,
+            cols.len()
+        );
+        let idx: usize = cols[0].parse().expect("b2_index");
+        let level: f32 = cols[1].parse().expect("level");
+        assert_eq!(idx, levels.len(), "Annex E rows must be sequential 0..64");
+        levels.push(level);
+    }
+    assert_eq!(levels.len(), 64, "Annex E must have exactly 64 entries");
+
+    // Monotonicity invariant — Annex E is non-uniform but strictly increasing.
+    for w in levels.windows(2) {
+        assert!(w[0] < w[1], "Annex E levels must be strictly increasing");
+    }
+
+    let mut out = String::new();
+    out.push_str("// Auto-generated from spec_tables/annex_e_gain_quantizer.csv\n");
+    out.push_str("// Do not edit — regenerated each build.\n");
+    out.push_str("pub const IMBE_GAIN_LEVELS: [f32; 64] = [\n");
+    for (i, level) in levels.iter().enumerate() {
+        out.push_str(&format!("    {level:.6}, // b̂₂ = {i}\n"));
+    }
+    out.push_str("];\n");
+
+    fs::write(out_dir.join("annex_e_gain.rs"), out).expect("write annex_e_gain.rs");
 }
 
 /// Parse `spec_tables/imbe_bit_prioritization.csv` into

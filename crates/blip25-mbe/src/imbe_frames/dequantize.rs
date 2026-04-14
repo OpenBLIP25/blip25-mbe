@@ -23,6 +23,8 @@ use core::f32::consts::PI;
 
 use crate::mbe_params::{L_MAX, MbeParams};
 
+include!(concat!(env!("OUT_DIR"), "/annex_e_gain.rs"));
+
 /// Highest valid full-rate pitch index per BABA-A §1.3.1: values
 /// `b̂₀ ∈ [0, 207]` are transmittable; `[208, 255]` are reserved and
 /// indicate either uncorrectable FEC errors or a non-conformant encoder.
@@ -82,6 +84,58 @@ pub const fn band_for_harmonic(l: u8, k: u8) -> u8 {
     let raw = if l <= 36 { (l + 2) / 3 } else { 12 };
     if raw > k { k } else { raw }
 }
+
+// ---------------------------------------------------------------------------
+// Gain dequantization (Annex E)
+// ---------------------------------------------------------------------------
+
+/// Number of entries in the Annex E gain quantizer (6-bit index → 64 levels).
+pub const GAIN_LEVELS: usize = 64;
+
+/// Decode the 6-bit gain index `b̂₂` to the overall log-gain `G̃₁`
+/// per BABA-A §6 / impl-spec §12.1.
+///
+/// `G̃₁` is the first element of the 6-element gain DCT vector and
+/// represents the overall block-average log-gain. Subsequent gain DCT
+/// coefficients `G̃₂..G̃₆` are reconstructed from `b̂₃..b̂₇` via Annex F
+/// step sizes (next pipeline step).
+///
+/// Panics in debug builds if `b2 >= 64`.
+#[inline]
+pub fn decode_gain(b2: u8) -> f32 {
+    debug_assert!(b2 < 64, "b̂₂ is a 6-bit value");
+    IMBE_GAIN_LEVELS[b2 as usize]
+}
+
+/// Encode an overall log-gain value `G_1` to the 6-bit Annex E index
+/// `b̂₂` (argmin over the table).
+///
+/// The Annex E table is strictly monotone increasing, so this is a
+/// binary search that reports whichever of the two bracketing entries
+/// is closest. Ties go to the lower index.
+pub fn encode_gain(g1: f32) -> u8 {
+    // Saturate at the boundaries.
+    if g1 <= IMBE_GAIN_LEVELS[0] {
+        return 0;
+    }
+    if g1 >= IMBE_GAIN_LEVELS[GAIN_LEVELS - 1] {
+        return (GAIN_LEVELS - 1) as u8;
+    }
+    // Find the largest index with level ≤ g1, then compare with the next.
+    let mut lo = 0usize;
+    let mut hi = GAIN_LEVELS - 1;
+    while lo + 1 < hi {
+        let mid = (lo + hi) / 2;
+        if IMBE_GAIN_LEVELS[mid] <= g1 { lo = mid; } else { hi = mid; }
+    }
+    let lo_dist = (g1 - IMBE_GAIN_LEVELS[lo]).abs();
+    let hi_dist = (IMBE_GAIN_LEVELS[hi] - g1).abs();
+    if hi_dist < lo_dist { hi as u8 } else { lo as u8 }
+}
+
+// ---------------------------------------------------------------------------
+// V/UV expansion (§1.3.2)
+// ---------------------------------------------------------------------------
 
 /// Expand the K-bit voicing word `b̂₁` into per-harmonic V/UV decisions.
 ///
@@ -165,6 +219,59 @@ mod tests {
         }
         // L=9 → K=3
         assert_eq!(vuv_band_count(9), 3);
+    }
+
+    // ---- Gain dequantization (Annex E) -----------------------------------
+
+    #[test]
+    fn gain_table_endpoints_match_spec() {
+        // Spec spot values from impl-spec §7.1 / §12.1.
+        assert!((decode_gain(0) - (-2.842205)).abs() < 1e-6);
+        assert!((decode_gain(63) - 8.695827).abs() < 1e-6);
+    }
+
+    #[test]
+    fn gain_table_is_strictly_monotone() {
+        for i in 0..63 {
+            assert!(
+                decode_gain(i) < decode_gain(i + 1),
+                "gain table not strictly increasing at b̂₂={i}"
+            );
+        }
+    }
+
+    #[test]
+    fn gain_encode_decode_roundtrip_on_table_values() {
+        // Encoding a table value must return its index (within ties).
+        for i in 0..64u8 {
+            let g = decode_gain(i);
+            assert_eq!(encode_gain(g), i, "roundtrip failed at b̂₂={i}");
+        }
+    }
+
+    #[test]
+    fn gain_encode_saturates_outside_range() {
+        assert_eq!(encode_gain(-100.0), 0);
+        assert_eq!(encode_gain(100.0), 63);
+        assert_eq!(encode_gain(f32::NEG_INFINITY), 0);
+        assert_eq!(encode_gain(f32::INFINITY), 63);
+    }
+
+    #[test]
+    fn gain_encode_picks_nearest_neighbour() {
+        // For every adjacent pair, the midpoint should round to one
+        // side and a value just past it to the other.
+        for i in 0..63u8 {
+            let lo = decode_gain(i);
+            let hi = decode_gain(i + 1);
+            let mid = (lo + hi) / 2.0;
+            // Just below the midpoint → the lower bin.
+            let just_below = mid - (hi - lo) * 0.01;
+            assert_eq!(encode_gain(just_below), i, "below midpoint at i={i}");
+            // Just above the midpoint → the upper bin.
+            let just_above = mid + (hi - lo) * 0.01;
+            assert_eq!(encode_gain(just_above), i + 1, "above midpoint at i={i}");
+        }
     }
 
     // ---- V/UV expansion --------------------------------------------------
