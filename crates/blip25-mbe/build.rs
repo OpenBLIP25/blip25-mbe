@@ -20,6 +20,7 @@ fn main() {
     gen_annex_e(&out_dir);
     gen_annex_f(&out_dir);
     gen_annex_g(&out_dir);
+    gen_annex_i(&out_dir);
     gen_annex_j(&out_dir);
     gen_imbe_bit_prioritization(&out_dir);
     gen_ambe_bit_prioritization(&out_dir);
@@ -317,6 +318,76 @@ fn gen_annex_g(out_dir: &PathBuf) {
     out.push_str("];\n");
 
     fs::write(out_dir.join("annex_g_hoc_alloc.rs"), out).expect("write annex_g_hoc_alloc.rs");
+}
+
+/// Parse `spec_tables/annex_i_synthesis_window.csv` into
+/// `$OUT_DIR/annex_i_synth_window.rs`, emitting `IMBE_SYNTH_WINDOW`
+/// (`[f32; 211]`) and the `SYNTH_WINDOW_LEN` constant.
+///
+/// The window covers `n = −105..=105`. Index 0 of the array corresponds
+/// to `n = −105`. Validates length 211 and even symmetry around `n = 0`.
+fn gen_annex_i(out_dir: &PathBuf) {
+    let csv_path = "spec_tables/annex_i_synthesis_window.csv";
+    println!("cargo:rerun-if-changed={csv_path}");
+
+    let content = fs::read_to_string(csv_path)
+        .unwrap_or_else(|e| panic!("failed to read {csv_path}: {e}"));
+
+    let mut samples: Vec<(i32, f32)> = Vec::with_capacity(211);
+    for (lineno, raw) in content.lines().enumerate() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with('n') {
+            continue;
+        }
+        let cols: Vec<&str> = line.split(',').map(str::trim).collect();
+        assert_eq!(
+            cols.len(),
+            2,
+            "annex I line {}: expected 2 columns, got {}: {raw:?}",
+            lineno + 1,
+            cols.len()
+        );
+        let n: i32 = cols[0].parse().expect("n");
+        let w: f32 = cols[1].parse().expect("wS_n");
+        assert!((-105..=105).contains(&n), "annex I: n={n} out of range");
+        let expected_idx = (n + 105) as usize;
+        assert_eq!(
+            samples.len(),
+            expected_idx,
+            "annex I rows must be sequential n = −105..=105"
+        );
+        assert!(w >= 0.0, "annex I: wS({n}) = {w} negative");
+        samples.push((n, w));
+    }
+    assert_eq!(samples.len(), 211, "Annex I must have 211 entries");
+
+    // Check even symmetry: wS(-n) == wS(n).
+    for k in 1..=105 {
+        let a = samples[(105 - k) as usize].1;
+        let b = samples[(105 + k) as usize].1;
+        assert!(
+            (a - b).abs() < 1e-6,
+            "annex I: wS({}) = {a} != wS({}) = {b}",
+            -k,
+            k
+        );
+    }
+
+    let mut out = String::new();
+    out.push_str("// Auto-generated from spec_tables/annex_i_synthesis_window.csv\n");
+    out.push_str("// Do not edit — regenerated each build.\n");
+    out.push_str("/// Length of the speech synthesis window (n = −105..=105).\n");
+    out.push_str("pub const SYNTH_WINDOW_LEN: usize = 211;\n\n");
+    out.push_str("/// Speech synthesis window wS(n) per BABA-A Annex I.\n");
+    out.push_str("/// Indexed `[n + 105]` so `IMBE_SYNTH_WINDOW[0] = wS(−105)`.\n");
+    out.push_str("pub const IMBE_SYNTH_WINDOW: [f32; SYNTH_WINDOW_LEN] = [\n");
+    for (n, w) in &samples {
+        out.push_str(&format!("    {w:.6}, // n = {n}\n"));
+    }
+    out.push_str("];\n");
+
+    fs::write(out_dir.join("annex_i_synth_window.rs"), out)
+        .expect("write annex_i_synth_window.rs");
 }
 
 /// Parse `spec_tables/annex_j_block_lengths.csv` into
