@@ -21,7 +21,9 @@
 
 use core::f32::consts::PI;
 
-use crate::mbe_params::{L_MAX, MbeParams};
+use crate::mbe_params::{L_MAX, MbeParams, MbeParamsError};
+
+use super::priority::deprioritize_fullrate;
 
 include!(concat!(env!("OUT_DIR"), "/annex_e_gain.rs"));
 
@@ -334,6 +336,220 @@ pub fn inverse_block_dct(
         l_offset += j_i;
     }
     t
+}
+
+// ---------------------------------------------------------------------------
+// Inverse log-magnitude prediction (§1.8.5, Eq. 75–79)
+// ---------------------------------------------------------------------------
+
+/// Prediction gain `ρ` per BABA-A §6.3 / §1.8.5.
+pub const RHO: f32 = 0.65;
+
+/// Initial harmonic count for the very first frame after reset
+/// (`L̃(−1) = 30`), per §1.8.5 / §10 Annex A.
+pub const INIT_PREV_L: u8 = 30;
+
+/// Cross-frame state required by the inverse log-magnitude predictor.
+///
+/// Per §1.9: this state must be **preserved through frame mute** and
+/// **updated on every successful or repeated frame**. After a cold
+/// start, all `prev_m_linear` entries are 1.0 (so `log₂ = 0` and the
+/// predictor contributes a constant bias that decays over a few
+/// frames at `ρ = 0.65`).
+#[derive(Clone, Debug)]
+pub struct DecoderState {
+    /// Previous frame's spectral amplitudes `M̃_l(−1)` in **linear**
+    /// units. Index 0 holds the virtual `M̃_0(−1) = 1.0` from Eq. 78;
+    /// indices `1..=prev_l` hold the reconstructed amplitudes.
+    /// Indices beyond `prev_l` are unused and clamp on read per Eq. 79.
+    prev_m_linear: [f32; L_MAX as usize + 2],
+    /// Previous frame's harmonic count `L̃(−1)`.
+    prev_l: u8,
+    /// Previous frame's sync bit (Eq. 80).
+    prev_sync: bool,
+}
+
+impl DecoderState {
+    /// New decoder state with the §1.8.5 / §10 Annex A initialization:
+    /// `M̃_l(−1) = 1` for all l, `L̃(−1) = 30`, sync bit = 0.
+    pub fn new() -> Self {
+        Self {
+            prev_m_linear: [1.0; L_MAX as usize + 2],
+            prev_l: INIT_PREV_L,
+            prev_sync: false,
+        }
+    }
+
+    /// Read `M̃_l(−1)` per Eqs. 78–79: index 0 returns 1.0 (virtual),
+    /// indices > `prev_l` clamp to `M̃_{prev_l}(−1)`.
+    fn prev_m_at(&self, l: u8) -> f32 {
+        if l == 0 {
+            return 1.0; // Eq. 78
+        }
+        let idx = (l as usize).min(self.prev_l as usize);
+        self.prev_m_linear[idx]
+    }
+
+    /// Previous harmonic count `L̃(−1)`.
+    pub fn previous_l(&self) -> u8 {
+        self.prev_l
+    }
+
+    /// Previous frame's sync bit.
+    pub fn previous_sync(&self) -> bool {
+        self.prev_sync
+    }
+}
+
+impl Default for DecoderState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Apply the inverse log-magnitude predictor (Eq. 75–79) to obtain the
+/// log₂-domain spectral amplitudes for the current frame.
+///
+/// Returns an array sized to `L_MAX + 2`; index 0 is unused, indices
+/// `1..=l` hold `log₂ M̃_l(0)`. The exponentiation step is left to the
+/// caller so this stage is testable in isolation.
+pub fn apply_log_prediction(
+    t: &[f32; L_MAX as usize],
+    l: u8,
+    state: &DecoderState,
+) -> [f32; L_MAX as usize + 2] {
+    let mut log_m = [0f32; L_MAX as usize + 2];
+    let l_curr = f32::from(l);
+    let l_prev = f32::from(state.prev_l);
+
+    // Pre-compute the global mean (the "− (ρ/L̃(0)) Σ" term in Eq. 77).
+    // Doing it once lets us reuse it across all l_h iterations.
+    let mut mean_sum = 0f32;
+    for lambda in 1..=l {
+        let k_lambda = l_prev * f32::from(lambda) / l_curr;
+        let k_floor = k_lambda.floor();
+        let delta = k_lambda - k_floor;
+        let log_lo = state.prev_m_at(k_floor as u8).log2();
+        let log_hi = state.prev_m_at(k_floor as u8 + 1).log2();
+        mean_sum += (1.0 - delta) * log_lo + delta * log_hi;
+    }
+    let mean = mean_sum / l_curr;
+
+    // Per-harmonic reconstruction.
+    for l_h in 1..=l {
+        let k_l = l_prev * f32::from(l_h) / l_curr;
+        let k_floor = k_l.floor();
+        let delta = k_l - k_floor;
+        let log_lo = state.prev_m_at(k_floor as u8).log2();
+        let log_hi = state.prev_m_at(k_floor as u8 + 1).log2();
+        log_m[l_h as usize] = t[(l_h - 1) as usize]
+            + RHO * (1.0 - delta) * log_lo
+            + RHO * delta * log_hi
+            - RHO * mean;
+    }
+
+    log_m
+}
+
+// ---------------------------------------------------------------------------
+// Frame sync bit (§1.8.6, Eq. 80)
+// ---------------------------------------------------------------------------
+
+/// Compute the expected current-frame sync bit per Eq. 80: it toggles
+/// each frame. The decoder can compare this to the received bit at
+/// `b̂_{L+2}[0]` to detect frame-boundary anomalies.
+#[inline]
+pub fn expected_sync_bit(prev_sync: bool) -> bool {
+    !prev_sync
+}
+
+// ---------------------------------------------------------------------------
+// Pitch index extraction (§1.4.2 fixed slots)
+// ---------------------------------------------------------------------------
+
+/// Extract the 8-bit pitch index `b̂₀` directly from the info vectors,
+/// before knowing `L`. Per §1.3.1 robustness note + §1.4.2 fixed
+/// placement: `û₀[11..6] = b̂₀[7..2]`, `û₇[2..1] = b̂₀[1..0]`.
+///
+/// The 6 MSBs of `b̂₀` are protected by `û₀`'s [23,12] Golay; the 2
+/// LSBs are uncoded (in `û₇`). This split lets the decoder derive `L`
+/// even when `û₇` errors are present.
+#[inline]
+pub fn extract_pitch_index(u: &[u16; 8]) -> u8 {
+    let msbs = ((u[0] >> 6) & 0x3F) as u8; // û₀[11..6] → b̂₀[7..2]
+    let lsbs = ((u[7] >> 1) & 0x03) as u8; // û₇[2..1]  → b̂₀[1..0]
+    (msbs << 2) | lsbs
+}
+
+// ---------------------------------------------------------------------------
+// Top-level full-rate dequantization
+// ---------------------------------------------------------------------------
+
+/// Errors returned by [`dequantize_fullrate`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DecodeError {
+    /// `b̂₀` lies in the reserved range `[208, 255]` — frame should be
+    /// muted or repeated per BABA-A §4.1 error logic.
+    BadPitch,
+    /// Reconstruction produced a non-finite or otherwise invalid
+    /// spectral amplitude (typically a sign of FEC corruption).
+    InvalidParams(MbeParamsError),
+}
+
+/// Run the full-rate dequantization pipeline end-to-end:
+/// `(û₀..û₇, state) → MbeParams`.
+///
+/// Pipeline (BABA-A §1.3, §1.8):
+/// 1. Extract `b̂₀` directly from `û₀`/`û₇` fixed slots.
+/// 2. Pitch decode → `(ω̃₀, L̃, K̃)`.
+/// 3. Deprioritize `û₀..û₇` → `b̂₀..b̂_{L+2}` using the L-indexed map.
+/// 4. V/UV expand `b̂₁` → per-harmonic voicing.
+/// 5. Gain DCT recover `b̂₂..b̂₇` → `G̃_1..G̃_6` → `R̃_1..R̃_6`.
+/// 6. HOC + per-block inverse DCT → `T̃_l`.
+/// 7. Inverse log-magnitude prediction → `log₂ M̃_l(0)` → `M̃_l`.
+/// 8. Update `state.prev_m_linear`, `state.prev_l`, `state.prev_sync`
+///    for the next frame.
+pub fn dequantize_fullrate(
+    u: &[u16; 8],
+    state: &mut DecoderState,
+) -> Result<MbeParams, DecodeError> {
+    let b0 = extract_pitch_index(u);
+    let pitch = pitch_decode(b0).ok_or(DecodeError::BadPitch)?;
+    let l = pitch.l;
+    let k = pitch.k;
+
+    let b = deprioritize_fullrate(u, l);
+    let voiced = expand_vuv(b[1], l, k);
+    let g = decode_gain_dct(&b, l);
+    let blocks = IMBE_BLOCK_LENGTHS[(l - 9) as usize];
+    let r_i = gain_to_residuals(&g, &blocks);
+    let c = assemble_hoc_matrix(&b, l, &r_i);
+    let t = inverse_block_dct(&c, &blocks);
+    let log_m = apply_log_prediction(&t, l, state);
+
+    let mut amplitudes = [0f32; L_MAX as usize];
+    for i in 0..l as usize {
+        amplitudes[i] = log_m[i + 1].exp2();
+    }
+
+    let params = MbeParams::new(
+        pitch.omega_0,
+        l,
+        &voiced[..l as usize],
+        &amplitudes[..l as usize],
+    )
+    .map_err(DecodeError::InvalidParams)?;
+
+    // Update decoder state for the next frame.
+    state.prev_m_linear[0] = 1.0;
+    for i in 1..=l as usize {
+        state.prev_m_linear[i] = amplitudes[i - 1];
+    }
+    state.prev_l = l;
+    // Eq. 80 sync bit lives at b̂_{L+2}[0].
+    state.prev_sync = (b[(l + 2) as usize] & 1) != 0;
+
+    Ok(params)
 }
 
 // ---------------------------------------------------------------------------
@@ -731,6 +947,177 @@ mod tests {
         assert_eq!(c[0][1], 0.0);
         assert_eq!(c[1][1], 0.0);
         assert_eq!(c[2][1], 0.0);
+    }
+
+    // ---- Inverse log-magnitude prediction (§1.8.5) -----------------------
+
+    #[test]
+    fn decoder_state_init_matches_spec() {
+        let s = DecoderState::new();
+        assert_eq!(s.previous_l(), 30);
+        assert!(!s.previous_sync());
+        // All entries 1.0 (including index 0 which is the virtual M̃_0).
+        for i in 0..=L_MAX as usize + 1 {
+            assert_eq!(s.prev_m_linear[i], 1.0);
+        }
+    }
+
+    #[test]
+    fn prev_m_at_clamps_for_indices_above_prev_l() {
+        // Configure prev_l = 9 with distinct amplitudes; reads beyond
+        // index 9 must return prev_m_linear[9].
+        let mut s = DecoderState::new();
+        s.prev_l = 9;
+        for i in 0..=L_MAX as usize + 1 {
+            s.prev_m_linear[i] = 0.5; // placeholder
+        }
+        s.prev_m_linear[0] = 1.0;
+        for i in 1..=9 {
+            s.prev_m_linear[i] = i as f32; // 1.0, 2.0, …, 9.0
+        }
+        assert_eq!(s.prev_m_at(0), 1.0);
+        assert_eq!(s.prev_m_at(1), 1.0);
+        assert_eq!(s.prev_m_at(9), 9.0);
+        // Eq. 79: clamp.
+        assert_eq!(s.prev_m_at(10), 9.0);
+        assert_eq!(s.prev_m_at(56), 9.0);
+        assert_eq!(s.prev_m_at(57), 9.0);
+    }
+
+    #[test]
+    fn log_prediction_with_unit_prev_m_subtracts_to_zero() {
+        // prev_m all 1.0 → log₂ = 0 everywhere → predictor terms all 0
+        // → log_m[l] = T̃_l directly. Tests that the global mean term
+        // and the per-harmonic terms cancel correctly.
+        let mut t = [0f32; L_MAX as usize];
+        for i in 0..30 {
+            t[i] = (i as f32) * 0.1 - 1.5; // varied non-trivial T values
+        }
+        let state = DecoderState::new();
+        let log_m = apply_log_prediction(&t, 30, &state);
+        for l in 1..=30usize {
+            assert!(
+                (log_m[l] - t[l - 1]).abs() < 1e-5,
+                "l={l}: expected {}, got {}",
+                t[l - 1],
+                log_m[l]
+            );
+        }
+    }
+
+    #[test]
+    fn log_prediction_constant_prev_amplitude_subtracts_constant() {
+        // If all prev M̃ are the same constant C ≠ 1 (so log₂C ≠ 0):
+        //   per-harmonic prediction term = ρ · log₂C
+        //   global mean term = ρ · log₂C
+        //   net contribution = 0
+        // Result: log_m[l] = T̃_l (same as unit case).
+        let mut state = DecoderState::new();
+        state.prev_l = 20;
+        for i in 0..=L_MAX as usize + 1 {
+            state.prev_m_linear[i] = 4.0;
+        }
+        state.prev_m_linear[0] = 1.0; // M̃_0 is always 1
+        let mut t = [0f32; L_MAX as usize];
+        for i in 0..15 { t[i] = 0.5; }
+        let log_m = apply_log_prediction(&t, 15, &state);
+        // Per-harmonic prediction term uses M̃_l(−1) for l>=1 (= 4.0).
+        // Mean term averages the same 4.0 values.
+        // The virtual M̃_0 = 1 introduces a small skew at l with
+        // ⌊k_l⌋ = 0, but for l_curr=15 and l_prev=20 the smallest
+        // k_l = 20·1/15 ≈ 1.33, so floor is 1 (not 0). No skew.
+        for l in 1..=15 {
+            assert!(
+                (log_m[l] - t[l - 1]).abs() < 1e-5,
+                "l={l}: expected {}, got {}",
+                t[l - 1],
+                log_m[l]
+            );
+        }
+    }
+
+    // ---- Frame sync (§1.8.6) ---------------------------------------------
+
+    #[test]
+    fn expected_sync_bit_toggles() {
+        assert!(expected_sync_bit(false));
+        assert!(!expected_sync_bit(true));
+    }
+
+    // ---- Pitch index extraction (§1.4.2 fixed slots) ---------------------
+
+    #[test]
+    fn extract_pitch_index_round_trip_via_priority_table() {
+        use crate::imbe_frames::priority::prioritize_fullrate;
+        // Build a known b array, prioritize at any L (any L works for
+        // pitch since positions are L-invariant per §1.3.1 robustness),
+        // and verify extraction recovers the exact b̂₀.
+        for b0 in 0..=255u8 {
+            let mut b = [0u16; 59];
+            b[0] = u16::from(b0);
+            // Other params kept zero.
+            let u = prioritize_fullrate(&b, 9);
+            assert_eq!(extract_pitch_index(&u), b0, "b̂₀ = {b0}");
+        }
+    }
+
+    // ---- Top-level dequantize_fullrate -----------------------------------
+
+    #[test]
+    fn dequantize_fullrate_rejects_reserved_pitch() {
+        use crate::imbe_frames::priority::prioritize_fullrate;
+        let mut b = [0u16; 59];
+        b[0] = 220; // reserved
+        let u = prioritize_fullrate(&b, 9);
+        let mut state = DecoderState::new();
+        assert_eq!(
+            dequantize_fullrate(&u, &mut state),
+            Err(DecodeError::BadPitch)
+        );
+    }
+
+    #[test]
+    fn dequantize_fullrate_produces_sane_silence_for_zero_b() {
+        use crate::imbe_frames::priority::prioritize_fullrate;
+        // b̂₀ = 0 → ω₀ = 4π/39.5, L = 9, K = 3
+        // All other bits zero → quantizer indices at midtread base
+        //   (which represents −2^{B−1} + 0.5 step → small negative
+        //    log-amplitudes, NOT silence per se). But this is a valid
+        //    decode path — the caller should not crash.
+        let b = [0u16; 59];
+        let u = prioritize_fullrate(&b, 9);
+        let mut state = DecoderState::new();
+        let p = dequantize_fullrate(&u, &mut state).expect("decode");
+        assert_eq!(p.harmonic_count(), 9);
+        assert!((p.omega_0() - 4.0 * PI / 39.5).abs() < 1e-6);
+        // All voicing bits in b̂₁ are zero → all unvoiced.
+        for l in 1..=9 {
+            assert!(!p.voiced(l));
+        }
+        // All amplitudes finite and non-negative.
+        for l in 1..=9 {
+            let a = p.amplitude(l);
+            assert!(a.is_finite() && a >= 0.0, "l={l}: M̃ = {a}");
+        }
+        // State updated.
+        assert_eq!(state.previous_l(), 9);
+    }
+
+    #[test]
+    fn dequantize_fullrate_advances_decoder_state() {
+        use crate::imbe_frames::priority::prioritize_fullrate;
+        let b = [0u16; 59];
+        let u = prioritize_fullrate(&b, 9);
+        let mut state = DecoderState::new();
+        let p1 = dequantize_fullrate(&u, &mut state).unwrap();
+        let prev_l_after_first = state.previous_l();
+        assert_eq!(prev_l_after_first, p1.harmonic_count());
+
+        // Run a second frame; result will differ because prev_m is no
+        // longer the uniform init state.
+        let p2 = dequantize_fullrate(&u, &mut state).unwrap();
+        assert_eq!(p2.harmonic_count(), p1.harmonic_count());
+        assert_eq!(state.previous_l(), p2.harmonic_count());
     }
 
     // ---- V/UV expansion --------------------------------------------------
