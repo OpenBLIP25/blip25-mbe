@@ -34,7 +34,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use blip25_mbe::codecs::mbe_baseline::{
-    FrameErrorContext, PLACEHOLDER_GAMMA_W, SynthState, synthesize_frame,
+    FrameErrorContext, GAMMA_W, SynthState, synthesize_frame,
 };
 use blip25_mbe::fec::{golay_23_12_encode, hamming_15_11_encode};
 use blip25_mbe::imbe_frames::dequantize::{
@@ -92,6 +92,9 @@ enum Cmd {
         /// Use `tv-rc/` instead of `tv-std/tv/`.
         #[arg(long)]
         rc: bool,
+        /// Override γ_w (default: spec value 146.643269).
+        #[arg(long)]
+        gamma_w: Option<f64>,
     },
     /// Round-trip test: decode each `p25_nofec/<name>.bit` frame to
     /// `MbeParams` then re-encode. Pitch (`b̂₀`) and V/UV (`b̂₁`) are
@@ -130,13 +133,15 @@ fn main() -> Result<()> {
         }
         Cmd::PnDiag { name, rc, frame } => cmd_pn_diag(&args.vectors, &name, rc, frame),
         Cmd::Roundtrip { name, rc } => cmd_roundtrip(&args.vectors, &name, rc),
-        Cmd::DecodePcm { name, rc } => cmd_decode_pcm(&args.vectors, &name, rc),
+        Cmd::DecodePcm { name, rc, gamma_w } => {
+            cmd_decode_pcm(&args.vectors, &name, rc, gamma_w.unwrap_or(GAMMA_W))
+        }
     }
 }
 
 const FRAME_SAMPLES: usize = 160;
 
-fn cmd_decode_pcm(root: &Path, name: &str, rc: bool) -> Result<()> {
+fn cmd_decode_pcm(root: &Path, name: &str, rc: bool, gamma_w: f64) -> Result<()> {
     let dir = vector_dir(root, rc);
     let fec_path = dir.join("p25").join(format!("{name}.bit"));
     let pcm_path = dir.join("p25").join(format!("{name}.pcm"));
@@ -194,7 +199,7 @@ fn cmd_decode_pcm(root: &Path, name: &str, rc: bool) -> Result<()> {
             epsilon_t: imbe.error_total().min(255) as u8,
             bad_pitch: false,
         };
-        let pcm = synthesize_frame(&params, &err, PLACEHOLDER_GAMMA_W, &mut synth_state);
+        let pcm = synthesize_frame(&params, &err, gamma_w, &mut synth_state);
         pcm_out.extend_from_slice(&pcm);
     }
 

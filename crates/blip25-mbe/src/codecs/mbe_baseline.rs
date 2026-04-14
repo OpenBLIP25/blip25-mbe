@@ -300,13 +300,17 @@ pub const FRAME_SAMPLES: usize = 160;
 /// BABA-A §10 Annex A.
 pub const NOISE_INIT: u32 = 3147;
 
-/// Placeholder for the unvoiced-synthesis spectral scale `γ_w`
-/// (Eq. 121). The true value is a constant computed from the
-/// synthesis window `wS` (Annex I) and the pitch refinement window
-/// `wR` (Annex C). Annex C has not yet been extracted, so this
-/// placeholder is used until either Annex C lands or a DVSI
-/// fixture value is captured.
-pub const PLACEHOLDER_GAMMA_W: f64 = 1.0;
+/// Unvoiced-synthesis spectral scale `γ_w` per BABA-A §1.12.1 Eq. 121:
+///
+/// ```text
+/// γ_w = [Σ_{n=−110}^{110} wR(n)]
+///       · sqrt( Σ_{n=−104}^{104} wS²(n) / Σ_{n=−110}^{110} wR²(n) )
+/// ```
+///
+/// Pre-evaluated from the committed Annex I (synthesis window) and
+/// Annex C (pitch refinement window) CSVs. Decoder-init constant.
+pub const GAMMA_W: f64 = 146.643269;
+
 
 /// Cross-frame state for the unvoiced synthesizer (§1.12.1).
 #[derive(Clone, Debug)]
@@ -508,7 +512,7 @@ fn shape_spectrum(
 /// happens after voiced + unvoiced sum at the synthesis top level).
 ///
 /// `gamma_w` is the spectral scale from Eq. 121. Pass
-/// [`PLACEHOLDER_GAMMA_W`] until Annex C lands or a DVSI fixture
+/// [`GAMMA_W`] until Annex C lands or a DVSI fixture
 /// value is available.
 pub fn synthesize_unvoiced(
     omega_0: f32,
@@ -857,7 +861,7 @@ pub fn pcm_from_f64(samples: &[f64; FRAME_SAMPLES]) -> [i16; FRAME_SAMPLES] {
 /// the §1.10–§1.12 pipeline, with the §1.11 disposition deciding
 /// whether to use, repeat, or mute the current frame.
 ///
-/// `gamma_w` is the §1.12.1 spectral scale; pass [`PLACEHOLDER_GAMMA_W`]
+/// `gamma_w` is the §1.12.1 spectral scale; pass [`GAMMA_W`]
 /// until a calibrated value is available.
 pub fn synthesize_frame(
     params: &MbeParams,
@@ -1237,7 +1241,7 @@ mod tests {
         let m_bar = vec![0.0f32; 12];
         let v_bar = vec![false; 12];
         let mut state = UnvoicedSynthState::new();
-        let pcm = synthesize_unvoiced(0.2, &m_bar, &v_bar, PLACEHOLDER_GAMMA_W, &mut state);
+        let pcm = synthesize_unvoiced(0.2, &m_bar, &v_bar, GAMMA_W, &mut state);
         for (i, &s) in pcm.iter().enumerate() {
             assert!(s.abs() < 1e-6, "n={i}: {s}");
         }
@@ -1251,7 +1255,7 @@ mod tests {
         let m_bar = vec![10.0f32; 12];
         let v_bar = vec![true; 12];
         let mut state = UnvoicedSynthState::new();
-        let pcm = synthesize_unvoiced(0.2, &m_bar, &v_bar, PLACEHOLDER_GAMMA_W, &mut state);
+        let pcm = synthesize_unvoiced(0.2, &m_bar, &v_bar, GAMMA_W, &mut state);
         for (i, &s) in pcm.iter().enumerate() {
             assert!(s.abs() < 1e-6, "n={i}: {s}");
         }
@@ -1264,8 +1268,8 @@ mod tests {
         let mut state = UnvoicedSynthState::new();
         // First frame's OLA blends prev IDFT (zero) with current IDFT.
         // So we run two frames and check the second has non-trivial energy.
-        let _ = synthesize_unvoiced(0.2, &m_bar, &v_bar, PLACEHOLDER_GAMMA_W, &mut state);
-        let pcm = synthesize_unvoiced(0.2, &m_bar, &v_bar, PLACEHOLDER_GAMMA_W, &mut state);
+        let _ = synthesize_unvoiced(0.2, &m_bar, &v_bar, GAMMA_W, &mut state);
+        let pcm = synthesize_unvoiced(0.2, &m_bar, &v_bar, GAMMA_W, &mut state);
         let energy: f64 = pcm.iter().map(|&s| s * s).sum();
         assert!(energy > 1e-3, "energy too low: {energy}");
     }
@@ -1276,10 +1280,10 @@ mod tests {
         let v_bar = vec![false; 9];
         let mut state = UnvoicedSynthState::new();
         let lcg_init = state.lcg;
-        let _ = synthesize_unvoiced(0.2, &m_bar, &v_bar, PLACEHOLDER_GAMMA_W, &mut state);
+        let _ = synthesize_unvoiced(0.2, &m_bar, &v_bar, GAMMA_W, &mut state);
         let lcg_after_1 = state.lcg;
         assert_ne!(lcg_after_1, lcg_init);
-        let _ = synthesize_unvoiced(0.2, &m_bar, &v_bar, PLACEHOLDER_GAMMA_W, &mut state);
+        let _ = synthesize_unvoiced(0.2, &m_bar, &v_bar, GAMMA_W, &mut state);
         let lcg_after_2 = state.lcg;
         assert_ne!(lcg_after_2, lcg_after_1);
     }
@@ -1289,7 +1293,7 @@ mod tests {
         let m_bar = vec![1.0f32; 9];
         let v_bar = vec![false; 9];
         let mut state = UnvoicedSynthState::new();
-        let pcm = synthesize_unvoiced(0.2, &m_bar, &v_bar, PLACEHOLDER_GAMMA_W, &mut state);
+        let pcm = synthesize_unvoiced(0.2, &m_bar, &v_bar, GAMMA_W, &mut state);
         assert_eq!(pcm.len(), FRAME_SAMPLES);
         assert_eq!(FRAME_SAMPLES, 160);
     }
@@ -1488,7 +1492,7 @@ mod tests {
         let p = build_params(0.2, &[false; 9], &[0f32; 9]);
         let err = FrameErrorContext::default();
         let mut state = SynthState::new();
-        let pcm = synthesize_frame(&p, &err, PLACEHOLDER_GAMMA_W, &mut state);
+        let pcm = synthesize_frame(&p, &err, GAMMA_W, &mut state);
         for s in pcm.iter() {
             assert_eq!(*s, 0);
         }
@@ -1504,7 +1508,7 @@ mod tests {
         let s_e_init = state.s_e;
         let lcg_init = state.unvoiced.lcg;
         let psi_init = state.voiced.psi;
-        let _ = synthesize_frame(&p, &err, PLACEHOLDER_GAMMA_W, &mut state);
+        let _ = synthesize_frame(&p, &err, GAMMA_W, &mut state);
         assert_ne!(state.s_e, s_e_init, "S_E unchanged");
         assert_ne!(state.unvoiced.lcg, lcg_init, "LCG unchanged");
         // ψ for at least one harmonic should have advanced.
@@ -1523,7 +1527,7 @@ mod tests {
         let mut state = SynthState::new();
         state.epsilon_r = 0.5; // > MUTE_EPSILON_R_THRESHOLD
         let s_e_init = state.s_e;
-        let pcm = synthesize_frame(&p, &err, PLACEHOLDER_GAMMA_W, &mut state);
+        let pcm = synthesize_frame(&p, &err, GAMMA_W, &mut state);
         for s in pcm.iter() {
             assert_eq!(*s, 0, "Mute should output silence");
         }
@@ -1564,12 +1568,12 @@ mod tests {
         let err_repeat = FrameErrorContext { bad_pitch: true, ..Default::default() };
 
         let mut state_a = SynthState::new();
-        let _ = synthesize_frame(&p_good, &err_use, PLACEHOLDER_GAMMA_W, &mut state_a);
-        let pcm_repeat = synthesize_frame(&p_repeat, &err_repeat, PLACEHOLDER_GAMMA_W, &mut state_a);
+        let _ = synthesize_frame(&p_good, &err_use, GAMMA_W, &mut state_a);
+        let pcm_repeat = synthesize_frame(&p_repeat, &err_repeat, GAMMA_W, &mut state_a);
 
         let mut state_b = SynthState::new();
-        let _ = synthesize_frame(&p_good, &err_use, PLACEHOLDER_GAMMA_W, &mut state_b);
-        let pcm_use_again = synthesize_frame(&p_good, &err_use, PLACEHOLDER_GAMMA_W, &mut state_b);
+        let _ = synthesize_frame(&p_good, &err_use, GAMMA_W, &mut state_b);
+        let pcm_use_again = synthesize_frame(&p_good, &err_use, GAMMA_W, &mut state_b);
 
         // The Repeat path used last_good (= p_good), so its output
         // should equal the second p_good frame, modulo the change in
