@@ -1,6 +1,6 @@
 //! MBE baseline codec — TIA-102.BABA-A §1.10–§1.13 (synthesis pipeline)
 //! and §1.8 (analysis is shared with the upstream pipeline in
-//! [`crate::imbe_frames::dequantize`]).
+//! [`crate::p25_fullrate::dequantize`]).
 //!
 //! This module hosts the synthesizer that turns [`MbeParams`] into
 //! 8 kHz 16-bit PCM. The synthesis algorithm follows the 1993 P25

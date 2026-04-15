@@ -20,3 +20,6 @@
 
 pub mod converter;
 pub mod repeater;
+
+pub use converter::{ConvertError, FullToHalfConverter, HalfToFullConverter};
+pub use repeater::{FullRateRepeater, HalfRateRepeater};

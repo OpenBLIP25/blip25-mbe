@@ -23,7 +23,7 @@ use core::f32::consts::PI;
 
 use crate::mbe_params::{L_MAX, MbeParams, MbeParamsError};
 
-use super::priority::deprioritize_fullrate;
+use super::priority::deprioritize;
 
 include!(concat!(env!("OUT_DIR"), "/annex_e_gain.rs"));
 
@@ -485,7 +485,7 @@ pub fn extract_pitch_index(u: &[u16; 8]) -> u8 {
 // Top-level full-rate dequantization
 // ---------------------------------------------------------------------------
 
-/// Errors returned by [`dequantize_fullrate`].
+/// Errors returned by [`dequantize`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DecodeError {
     /// `b̂₀` lies in the reserved range `[208, 255]` — frame should be
@@ -509,7 +509,7 @@ pub enum DecodeError {
 /// 7. Inverse log-magnitude prediction → `log₂ M̃_l(0)` → `M̃_l`.
 /// 8. Update `state.prev_m_linear`, `state.prev_l`, `state.prev_sync`
 ///    for the next frame.
-pub fn dequantize_fullrate(
+pub fn dequantize(
     u: &[u16; 8],
     state: &mut DecoderState,
 ) -> Result<MbeParams, DecodeError> {
@@ -518,7 +518,7 @@ pub fn dequantize_fullrate(
     let l = pitch.l;
     let k = pitch.k;
 
-    let b = deprioritize_fullrate(u, l);
+    let b = deprioritize(u, l);
     let voiced = expand_vuv(b[1], l, k);
     let g = decode_gain_dct(&b, l);
     let blocks = IMBE_BLOCK_LENGTHS[(l - 9) as usize];
@@ -754,7 +754,7 @@ pub fn forward_log_prediction(
     t
 }
 
-/// Errors returned by [`quantize_fullrate`].
+/// Errors returned by [`quantize`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EncodeError {
     /// `ω₀` is outside the encodable range (`b̂₀` would fall outside
@@ -765,7 +765,7 @@ pub enum EncodeError {
 /// Run the full-rate quantization pipeline end-to-end:
 /// `(MbeParams, &mut state) → b̂₀..b̂_{L+2}`.
 ///
-/// Pipeline (mirror of [`dequantize_fullrate`]):
+/// Pipeline (mirror of [`dequantize`]):
 /// 1. Encode pitch → `b̂₀`; derive `K`.
 /// 2. Collapse per-harmonic voicing → `b̂₁`.
 /// 3. Forward log-magnitude prediction → `T̃_l` (uses `state.prev_l`,
@@ -777,7 +777,7 @@ pub enum EncodeError {
 /// 7. Quantize HOC `C̃_{i,k≥2}` → `b̂₈..b̂_{L+1}` (Annex G).
 /// 8. `b̂_{L+2}` is a single sync bit — toggled from `state.prev_sync`.
 /// 9. Update `state.prev_m_linear`, `state.prev_l`, `state.prev_sync`.
-pub fn quantize_fullrate(
+pub fn quantize(
     params: &MbeParams,
     state: &mut DecoderState,
 ) -> Result<[u16; 59], EncodeError> {
@@ -1320,7 +1320,7 @@ mod tests {
 
     #[test]
     fn extract_pitch_index_round_trip_via_priority_table() {
-        use crate::imbe_frames::priority::prioritize_fullrate;
+        use crate::p25_fullrate::priority::prioritize;
         // Build a known b array, prioritize at any L (any L works for
         // pitch since positions are L-invariant per §1.3.1 robustness),
         // and verify extraction recovers the exact b̂₀.
@@ -1328,38 +1328,38 @@ mod tests {
             let mut b = [0u16; 59];
             b[0] = u16::from(b0);
             // Other params kept zero.
-            let u = prioritize_fullrate(&b, 9);
+            let u = crate::p25_fullrate::priority::prioritize(&b, 9);
             assert_eq!(extract_pitch_index(&u), b0, "b̂₀ = {b0}");
         }
     }
 
-    // ---- Top-level dequantize_fullrate -----------------------------------
+    // ---- Top-level dequantize -----------------------------------
 
     #[test]
-    fn dequantize_fullrate_rejects_reserved_pitch() {
-        use crate::imbe_frames::priority::prioritize_fullrate;
+    fn dequantize_rejects_reserved_pitch() {
+        use crate::p25_fullrate::priority::prioritize;
         let mut b = [0u16; 59];
         b[0] = 220; // reserved
-        let u = prioritize_fullrate(&b, 9);
+        let u = crate::p25_fullrate::priority::prioritize(&b, 9);
         let mut state = DecoderState::new();
         assert_eq!(
-            dequantize_fullrate(&u, &mut state),
+            dequantize(&u, &mut state),
             Err(DecodeError::BadPitch)
         );
     }
 
     #[test]
-    fn dequantize_fullrate_produces_sane_silence_for_zero_b() {
-        use crate::imbe_frames::priority::prioritize_fullrate;
+    fn dequantize_produces_sane_silence_for_zero_b() {
+        use crate::p25_fullrate::priority::prioritize;
         // b̂₀ = 0 → ω₀ = 4π/39.5, L = 9, K = 3
         // All other bits zero → quantizer indices at midtread base
         //   (which represents −2^{B−1} + 0.5 step → small negative
         //    log-amplitudes, NOT silence per se). But this is a valid
         //    decode path — the caller should not crash.
         let b = [0u16; 59];
-        let u = prioritize_fullrate(&b, 9);
+        let u = crate::p25_fullrate::priority::prioritize(&b, 9);
         let mut state = DecoderState::new();
-        let p = dequantize_fullrate(&u, &mut state).expect("decode");
+        let p = dequantize(&u, &mut state).expect("decode");
         assert_eq!(p.harmonic_count(), 9);
         assert!((p.omega_0() - 4.0 * PI / 39.5).abs() < 1e-6);
         // All voicing bits in b̂₁ are zero → all unvoiced.
@@ -1376,18 +1376,18 @@ mod tests {
     }
 
     #[test]
-    fn dequantize_fullrate_advances_decoder_state() {
-        use crate::imbe_frames::priority::prioritize_fullrate;
+    fn dequantize_advances_decoder_state() {
+        use crate::p25_fullrate::priority::prioritize;
         let b = [0u16; 59];
-        let u = prioritize_fullrate(&b, 9);
+        let u = crate::p25_fullrate::priority::prioritize(&b, 9);
         let mut state = DecoderState::new();
-        let p1 = dequantize_fullrate(&u, &mut state).unwrap();
+        let p1 = dequantize(&u, &mut state).unwrap();
         let prev_l_after_first = state.previous_l();
         assert_eq!(prev_l_after_first, p1.harmonic_count());
 
         // Run a second frame; result will differ because prev_m is no
         // longer the uniform init state.
-        let p2 = dequantize_fullrate(&u, &mut state).unwrap();
+        let p2 = dequantize(&u, &mut state).unwrap();
         assert_eq!(p2.harmonic_count(), p1.harmonic_count());
         assert_eq!(state.previous_l(), p2.harmonic_count());
     }
@@ -1537,7 +1537,7 @@ mod tests {
         // lossy (see `analysis/vocoder_decode_disambiguations.md` §9)
         // so we don't expect b̂₂..b̂_{L+1} to roundtrip exactly. This
         // test pins down the bit-exact pieces.
-        use crate::imbe_frames::priority::prioritize_fullrate;
+        use crate::p25_fullrate::priority::prioritize;
         // Pick a pitch index whose decoded L lets us reuse the same L
         // in prioritize. b̂₀ = 0 → L = 9.
         let l = 9u8;
@@ -1545,13 +1545,13 @@ mod tests {
         let mut b = [0u16; 59];
         b[0] = 0;
         b[1] = 0b101 & ((1u16 << k) - 1);
-        let u = prioritize_fullrate(&b, l);
+        let u = crate::p25_fullrate::priority::prioritize(&b, l);
 
         let mut state_dec = DecoderState::new();
-        let params = dequantize_fullrate(&u, &mut state_dec).unwrap();
+        let params = dequantize(&u, &mut state_dec).unwrap();
 
         let mut state_enc = DecoderState::new();
-        let b_back = quantize_fullrate(&params, &mut state_enc).unwrap();
+        let b_back = quantize(&params, &mut state_enc).unwrap();
 
         assert_eq!(b_back[0], b[0], "b̂₀ pitch");
         assert_eq!(b_back[1], b[1], "b̂₁ V/UV");

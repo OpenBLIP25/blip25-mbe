@@ -14,7 +14,7 @@
 //! * **`p25/<name>.bit`** (full-FEC) — 18 bytes per 20 ms frame = 144
 //!   bits packed MSB-first. The 144 bits are 72 dibits in transmission
 //!   order, each dibit's high bit transmitted first. Feeds directly
-//!   into [`blip25_mbe::imbe_frames::full_rate::decode_fullrate_frame`].
+//!   into [`blip25_mbe::p25_fullrate::frame::decode_frame`].
 //!
 //! * **`p25_nofec/<name>.bit`** (info-only) — 11 bytes per 20 ms frame
 //!   = 88 bits packed MSB-first. The 88 bits are the eight info
@@ -37,20 +37,25 @@ use blip25_mbe::codecs::mbe_baseline::{
     FrameErrorContext, GAMMA_W, SynthState, synthesize_frame,
 };
 use blip25_mbe::fec::{golay_23_12_encode, hamming_15_11_encode};
-use blip25_mbe::imbe_frames::dequantize::{
-    DecoderState, dequantize_fullrate, quantize_fullrate,
+use blip25_mbe::p25_fullrate::dequantize::{
+    DecoderState, dequantize as dequantize_full, quantize as quantize_full,
 };
-use blip25_mbe::imbe_frames::fec::{deinterleave_fullrate, modulation_masks_fullrate};
-use blip25_mbe::imbe_frames::dequantize_halfrate::{
-    HalfrateDecoded, HalfrateDecoderState, decode_halfrate_to_params, dequantize_halfrate,
-    quantize_halfrate,
+use blip25_mbe::p25_fullrate::fec::{deinterleave as deinterleave_full, modulation_masks};
+use blip25_mbe::p25_fullrate::frame::{
+    Frame as FullFrame, INFO_WIDTHS, decode_frame as decode_full_frame,
 };
-use blip25_mbe::imbe_frames::full_rate::{
-    INFO_WIDTHS, ImbeFrame, decode_fullrate_frame,
+use blip25_mbe::p25_fullrate::priority::{
+    deprioritize as deprioritize_full, prioritize as prioritize_full,
 };
-use blip25_mbe::imbe_frames::half_rate::decode_halfrate_frame;
-use blip25_mbe::imbe_frames::priority::{
-    deprioritize_fullrate, prioritize_fullrate,
+use blip25_mbe::p25_halfrate::dequantize::{
+    Decoded, DecoderState as HalfDecoderState, decode_to_params,
+    quantize as quantize_half,
+};
+use blip25_mbe::p25_halfrate::frame::{
+    decode_frame as decode_half_frame, deinterleave as deinterleave_half,
+};
+use blip25_mbe::p25_halfrate::priority::{
+    deprioritize as deprioritize_half,
 };
 use blip25_mbe::mbe_params::MbeParams;
 
@@ -146,27 +151,32 @@ enum Cmd {
         #[arg(long, default_value_t = 1.0)]
         m_scale: f64,
     },
-    /// Half-rate bit-level roundtrip: decode each `r39/<name>.bit`
-    /// frame to `MbeParams`, re-encode via `quantize_halfrate`, and
+    /// Half-rate bit-level roundtrip: decode each `r33/<name>.bit`
+    /// frame to `MbeParams`, re-encode via `quantize`, and
     /// compare the recovered `û` vectors to the original. Pitch
     /// (`b̂₀`) and V/UV row-0 endpoints should roundtrip bit-exact;
-    /// gain and spectral params may drift (see `dequantize_halfrate`
+    /// gain and spectral params may drift (see `dequantize`
     /// tests for the known stability boundaries).
     HalfrateRoundtrip {
         /// Vector name (e.g. `alert`).
         name: String,
     },
     /// Half-rate equivalent of `decode-pcm`. Reads
-    /// `r39/<name>.bit` (rate index 39 = 3600 bps AMBE+2 per the
+    /// `r33/<name>.bit` (rate index 39 = 2450 voice + 1150 FEC = 3600 bps total per the
     /// USB-3000 manual §3.3.4), runs the full half-rate pipeline:
-    /// dibits → AmbeFrame → MbeParams → PCM via the shared §1.12
-    /// synthesizer, and compares to `r39/<name>.pcm`.
+    /// dibits → Frame → MbeParams → PCM via the shared §1.12
+    /// synthesizer, and compares to `r33/<name>.pcm`.
     DecodePcmHalfrate {
         /// Vector name (e.g. `alert`).
         name: String,
         /// Override γ_w (default: spec value 146.643269).
         #[arg(long)]
         gamma_w: Option<f64>,
+        /// Optional path to write the synthesized PCM (raw 16-bit
+        /// little-endian, mono, 8 kHz). Useful for audible A/B
+        /// comparison against the DVSI reference.
+        #[arg(long)]
+        write_pcm: Option<std::path::PathBuf>,
     },
     /// Round-trip test: decode each `p25_nofec/<name>.bit` frame to
     /// `MbeParams` then re-encode. Pitch (`b̂₀`) and V/UV (`b̂₁`) are
@@ -180,6 +190,34 @@ enum Cmd {
         /// Use `tv-rc/` instead of `tv-std/tv/`.
         #[arg(long)]
         rc: bool,
+    },
+    /// Dump per-frame half-rate decode state for the first N voice
+    /// frames of `r33/<name>.bit`. Logs ω₀, L, voicing pattern,
+    /// amplitude summary, and PCM peak/RMS after synthesis — lets us
+    /// see where in the dequantize → synth chain the output is going
+    /// to silence.
+    HalfrateInspect {
+        /// Vector name (e.g. `clean`).
+        name: String,
+        /// How many voice frames to dump.
+        #[arg(long, default_value_t = 3)]
+        frames: usize,
+    },
+    /// Synthetic encoder diagnostic: build speech-scale MbeParams,
+    /// run quantize, and log the b̂ vector it produces. If
+    /// our quantizer + Γ̃ derivation are correct, b̂₂ should land in
+    /// the high-20s to 31 for typical speech (§13.2).
+    HalfrateEncoderSanity,
+    /// Dump Annex S → Golay seam for one frame: 24-bit ĉ₀ after
+    /// deinterleave, 12-bit û₀ after Golay decode, and the pairwise
+    /// bit-identity check between ĉ₀[0..11] (systematic info positions
+    /// per G's [I | P] form) and û₀[0..11].
+    HalfrateSeamDump {
+        /// Vector name (e.g. `clean`).
+        name: String,
+        /// Frame index to inspect (0-based).
+        #[arg(long, default_value_t = 1)]
+        frame: usize,
     },
     /// Diagnose PN modulation by re-encoding the no-FEC reference and
     /// XORing against the deinterleaved FEC frame to recover DVSI's
@@ -212,8 +250,15 @@ fn main() -> Result<()> {
             gamma_w.unwrap_or(GAMMA_W),
             m_scale,
         ),
-        Cmd::DecodePcmHalfrate { name, gamma_w } => {
-            cmd_decode_pcm_halfrate(&args.vectors, &name, gamma_w.unwrap_or(GAMMA_W))
+        Cmd::DecodePcmHalfrate { name, gamma_w, write_pcm } => {
+            cmd_decode_pcm_halfrate(&args.vectors, &name, gamma_w.unwrap_or(GAMMA_W), write_pcm.as_deref())
+        }
+        Cmd::HalfrateInspect { name, frames } => {
+            cmd_halfrate_inspect(&args.vectors, &name, frames)
+        }
+        Cmd::HalfrateEncoderSanity => cmd_halfrate_encoder_sanity(),
+        Cmd::HalfrateSeamDump { name, frame } => {
+            cmd_halfrate_seam_dump(&args.vectors, &name, frame)
         }
         Cmd::HalfrateRoundtrip { name } => cmd_halfrate_roundtrip(&args.vectors, &name),
         Cmd::ScanTransitions { name, min_transition_ratio, limit } => {
@@ -293,8 +338,8 @@ fn cmd_decode_pcm(
     for f in 0..n_frames {
         let fec = &fec_bytes[f * BYTES_PER_FEC_FRAME..(f + 1) * BYTES_PER_FEC_FRAME];
         let dibits = unpack_dibits(fec);
-        let imbe = decode_fullrate_frame(&dibits);
-        let params = match dequantize_fullrate(&imbe.info, &mut decoder_state) {
+        let imbe = decode_full_frame(&dibits);
+        let params = match dequantize_full(&imbe.info, &mut decoder_state) {
             Ok(p) => p,
             Err(_) => {
                 bad_pitch_frames += 1;
@@ -391,7 +436,7 @@ fn cmd_roundtrip(root: &Path, name: &str, rc: bool) -> Result<()> {
         let u_orig = unpack_nofec_info(frame_bytes);
 
         // Decode → params.
-        let params = match dequantize_fullrate(&u_orig, &mut state_dec) {
+        let params = match dequantize_full(&u_orig, &mut state_dec) {
             Ok(p) => p,
             Err(_) => {
                 bad_pitch += 1;
@@ -400,14 +445,14 @@ fn cmd_roundtrip(root: &Path, name: &str, rc: bool) -> Result<()> {
         };
 
         // Re-encode using the encoder state (which evolves in lockstep).
-        let b_back = match quantize_fullrate(&params, &mut state_enc) {
+        let b_back = match quantize_full(&params, &mut state_enc) {
             Ok(b) => b,
             Err(_) => {
                 bad_pitch += 1;
                 continue;
             }
         };
-        let u_back = prioritize_fullrate(&b_back, params.harmonic_count());
+        let u_back = prioritize_full(&b_back, params.harmonic_count());
 
         // Per-vector match accounting.
         for i in 0..8 {
@@ -418,7 +463,7 @@ fn cmd_roundtrip(root: &Path, name: &str, rc: bool) -> Result<()> {
 
         // Pitch (b̂₀) and V/UV (b̂₁): pull from the original u via
         // deprioritize so we can compare at the parameter level too.
-        let b_orig = deprioritize_fullrate(&u_orig, params.harmonic_count());
+        let b_orig = deprioritize_full(&u_orig, params.harmonic_count());
         if b_orig[0] == b_back[0] {
             pitch_match += 1;
         }
@@ -465,7 +510,7 @@ fn cmd_pn_diag(root: &Path, name: &str, rc: bool, frame: usize) -> Result<()> {
         &nofec_bytes[frame * BYTES_PER_NOFEC_FRAME..(frame + 1) * BYTES_PER_NOFEC_FRAME];
 
     let dibits = unpack_dibits(fec_frame);
-    let c_tilde = deinterleave_fullrate(&dibits);
+    let c_tilde = deinterleave_full(&dibits);
     let u_expected = unpack_nofec_info(nofec_frame);
 
     // Re-encode the no-FEC û_i to get the v̂_i the encoder produced
@@ -483,7 +528,7 @@ fn cmd_pn_diag(root: &Path, name: &str, rc: bool, frame: usize) -> Result<()> {
 
     // Recovered DVSI mask = c̃ ⊕ v̂. Our computed mask uses û₀ as seed.
     let dvsi_mask: [u32; 8] = std::array::from_fn(|i| c_tilde[i] ^ v_expected[i]);
-    let our_mask = modulation_masks_fullrate(u_expected[0]);
+    let our_mask = modulation_masks(u_expected[0]);
 
     let widths = [23u8, 23, 23, 23, 15, 15, 15, 7];
     println!("frame {frame}, û₀ = 0x{:03x}", u_expected[0]);
@@ -533,10 +578,10 @@ fn unpack_dibits_halfrate(bytes: &[u8]) -> [u8; DIBITS_PER_HALFRATE_FRAME] {
     out
 }
 
-fn cmd_decode_pcm_halfrate(root: &Path, name: &str, gamma_w: f64) -> Result<()> {
-    // Half-rate DVSI vectors live under tv-std/tv/r39/ (rate index 39
+fn cmd_decode_pcm_halfrate(root: &Path, name: &str, gamma_w: f64, write_pcm: Option<&Path>) -> Result<()> {
+    // Half-rate DVSI vectors live under tv-std/tv/r33/ (rate index 33 — P25 half-rate with FEC
     // per USB-3000 manual §3.3.4 = 3600 bps AMBE+2).
-    let dir = root.join("tv-std").join("tv").join("r39");
+    let dir = root.join("tv-std").join("tv").join("r33");
     let bit_path = dir.join(format!("{name}.bit"));
     let pcm_path = dir.join(format!("{name}.pcm"));
 
@@ -559,7 +604,7 @@ fn cmd_decode_pcm_halfrate(root: &Path, name: &str, gamma_w: f64) -> Result<()> 
     let n_frames = bit_bytes.len() / BYTES_PER_HALFRATE_FRAME;
     let n_ref_samples = pcm_ref_bytes.len() / 2;
 
-    println!("vector:        {name} (half-rate, r39)");
+    println!("vector:        {name} (half-rate, r33 — P25 with FEC)");
     println!("frames:        {n_frames}");
     println!(
         "ref samples:   {n_ref_samples} (= {} frames)",
@@ -573,7 +618,7 @@ fn cmd_decode_pcm_halfrate(root: &Path, name: &str, gamma_w: f64) -> Result<()> 
         .map(|c| i16::from_le_bytes([c[0], c[1]]))
         .collect();
 
-    let mut dec_state = HalfrateDecoderState::new();
+    let mut dec_state = HalfDecoderState::new();
     let mut synth_state = SynthState::new();
     let mut pcm_out: Vec<i16> = Vec::with_capacity(n_frames * FRAME_SAMPLES);
     let mut voice_frames = 0usize;
@@ -583,26 +628,26 @@ fn cmd_decode_pcm_halfrate(root: &Path, name: &str, gamma_w: f64) -> Result<()> 
     for f in 0..n_frames {
         let frame = &bit_bytes[f * BYTES_PER_HALFRATE_FRAME..(f + 1) * BYTES_PER_HALFRATE_FRAME];
         let dibits = unpack_dibits_halfrate(frame);
-        let ambe = decode_halfrate_frame(&dibits);
+        let ambe = decode_half_frame(&dibits);
         let err = FrameErrorContext {
             epsilon_0: ambe.errors[0],
             epsilon_4: 0, // half-rate doesn't have a c̃₄ vector
             epsilon_t: ambe.error_total().min(255) as u8,
             bad_pitch: false,
         };
-        match decode_halfrate_to_params(&ambe.info, &mut dec_state) {
-            Ok(HalfrateDecoded::Voice(params)) => {
+        match decode_to_params(&ambe.info, &mut dec_state) {
+            Ok(Decoded::Voice(params)) => {
                 voice_frames += 1;
                 let pcm = synthesize_frame(&params, &err, gamma_w, &mut synth_state);
                 pcm_out.extend_from_slice(&pcm);
             }
-            Ok(HalfrateDecoded::Tone { fields: _, params }) => {
+            Ok(Decoded::Tone { fields: _, params }) => {
                 tone_frames += 1;
                 // Tone frames feed the MBE synthesizer per §2.10.3.
                 let pcm = synthesize_frame(&params, &err, gamma_w, &mut synth_state);
                 pcm_out.extend_from_slice(&pcm);
             }
-            Ok(HalfrateDecoded::Erasure) | Err(_) => {
+            Ok(Decoded::Erasure) | Err(_) => {
                 erasure_frames += 1;
                 pcm_out.extend(std::iter::repeat(0i16).take(FRAME_SAMPLES));
             }
@@ -642,11 +687,235 @@ fn cmd_decode_pcm_halfrate(root: &Path, name: &str, gamma_w: f64) -> Result<()> 
     };
     let pct_exact = 100.0 * bit_exact as f64 / n as f64;
 
-    println!("Comparison vs DVSI r39 reference PCM ({n} samples):");
+    println!("Comparison vs DVSI r33 reference PCM ({n} samples):");
     println!("  bit-exact samples:  {bit_exact} / {n}   ({pct_exact:.2}%)");
     println!("  RMS error:          {rms_err:.2}");
     println!("  peak error:         {peak_err:.0}");
     println!("  SNR:                {snr_db:.2} dB");
+
+    if let Some(out_path) = write_pcm {
+        let mut bytes = Vec::with_capacity(pcm_out.len() * 2);
+        for s in &pcm_out {
+            bytes.extend_from_slice(&s.to_le_bytes());
+        }
+        fs::write(out_path, &bytes)
+            .with_context(|| format!("write PCM to {}", out_path.display()))?;
+        println!("\nwrote synthesized PCM: {} ({} samples)", out_path.display(), pcm_out.len());
+    }
+
+    Ok(())
+}
+
+fn cmd_halfrate_seam_dump(root: &Path, name: &str, frame_idx: usize) -> Result<()> {
+    use blip25_mbe::fec::golay_24_12_decode;
+
+    let dir = root.join("tv-std").join("tv").join("r33");
+    let bit_bytes = fs::read(dir.join(format!("{name}.bit")))?;
+    let n_frames = bit_bytes.len() / BYTES_PER_HALFRATE_FRAME;
+    if frame_idx >= n_frames {
+        return Err(anyhow!("frame {frame_idx} out of range (have {n_frames})"));
+    }
+
+    let frame = &bit_bytes[frame_idx * BYTES_PER_HALFRATE_FRAME..(frame_idx + 1) * BYTES_PER_HALFRATE_FRAME];
+    let dibits = unpack_dibits_halfrate(frame);
+
+    println!("=== Frame {frame_idx} of r33/{name}.bit ===\n");
+
+    // Step 1: ĉ vectors after Annex S deinterleave.
+    let c = deinterleave_half(&dibits);
+    println!("After Annex S deinterleave:");
+    println!("  ĉ₀ (24 bits): 0x{:06x} = {:024b}", c[0] & 0xFF_FFFF, c[0] & 0xFF_FFFF);
+    println!("  ĉ₁ (23 bits): 0x{:06x}", c[1] & 0x7F_FFFF);
+    println!("  ĉ₂ (11 bits): 0x{:03x}", c[2] & 0x7FF);
+    println!("  ĉ₃ (14 bits): 0x{:04x}", c[3] & 0x3FFF);
+    println!();
+
+    // Step 2: Golay-decode ĉ₀ → û₀ (both straight and with 24-bit
+    // reversal, to test the [I|P] vs [P|I] hypothesis).
+    let d0 = golay_24_12_decode(c[0]);
+    let u0 = d0.info;
+    println!("After Golay-24-12 decode of ĉ₀ (current convention):");
+    println!("  û₀ (12 bits): 0x{:03x} = {:012b}  (errors={})", u0, u0, d0.errors);
+    let c0_rev = {
+        let mut r = 0u32;
+        for i in 0..24 {
+            if (c[0] >> i) & 1 == 1 { r |= 1 << (23 - i); }
+        }
+        r
+    };
+    let d0r = golay_24_12_decode(c0_rev);
+    let u0r = d0r.info;
+    println!("After Golay-24-12 decode of bit-reversed ĉ₀:");
+    println!("  ĉ₀_rev     : 0x{c0_rev:06x}");
+    println!("  û₀ (12 bits): 0x{:03x} = {:012b}  (errors={})", u0r, u0r, d0r.errors);
+    println!();
+
+    // Step 3: bit-identity check ĉ₀[0..11] vs û₀[0..11]. In a [I|P]
+    // systematic code, these should be bit-identical.
+    println!("Systematic bit correspondence check (should be identical if [I|P]-form Golay):");
+    println!("  idx  ĉ₀[k]  û₀[k]  match");
+    let mut match_low = 0usize;
+    let mut match_rev = 0usize;
+    for k in 0..12 {
+        let cb = ((c[0] >> k) & 1) as u8;
+        let ub = ((u0 >> k) & 1) as u8;
+        let urev = ((u0 >> (11 - k)) & 1) as u8;
+        let m_lo = if cb == ub { "✓" } else { " " };
+        if cb == ub { match_low += 1; }
+        if cb == urev { match_rev += 1; }
+        println!("  {k:>3}    {cb}      {ub}      {m_lo}");
+    }
+    println!();
+    println!("  ĉ₀[0..11] matches û₀[0..11]: {match_low}/12");
+    println!("  ĉ₀[0..11] matches û₀[11..0] reversed: {match_rev}/12");
+    if match_rev == 12 && match_low < 12 {
+        println!("\n  *** û₀ is bit-reversed vs the systematic positions of ĉ₀. ***");
+    }
+    println!();
+
+    // Step 4: Also check the high half of ĉ₀ (positions 12..23) — in
+    // an [I|P] code these are parity bits, so they shouldn't be
+    // identical to anything in û₀. Just report their pattern.
+    print!("  ĉ₀[12..23] (parity in [I|P] form): ");
+    for k in 12..24 {
+        print!("{}", (c[0] >> k) & 1);
+    }
+    println!();
+
+    // Step 5: Annex S bit-lane check — symbols 0 and 2 put ĉ₀[23]
+    // and ĉ₀[22] in the bit1 (MSB-of-dibit) lane. Verify our lane
+    // assignment matches.
+    println!();
+    println!("Annex S bit-lane sanity (per user-provided PDF description):");
+    println!("  symbol 0 raw dibit: {}  (bit1={}, bit0={})",
+        dibits[0], (dibits[0] >> 1) & 1, dibits[0] & 1);
+    println!("  symbol 2 raw dibit: {}  (bit1={}, bit0={})",
+        dibits[2], (dibits[2] >> 1) & 1, dibits[2] & 1);
+    println!("  Per spec: bit1 of symbol 0 → ĉ₀[23], bit1 of symbol 2 → ĉ₀[22].");
+    println!("  Our deinterleaver result: ĉ₀[23] = {}, ĉ₀[22] = {}",
+        (c[0] >> 23) & 1, (c[0] >> 22) & 1);
+
+    Ok(())
+}
+
+fn cmd_halfrate_encoder_sanity() -> Result<()> {
+    // Speech-scale voiced frame: pitch ≈ 150 Hz, L = 27, all voiced,
+    // M_l following a -6 dB/octave-ish roll-off typical for voiced
+    // speech. Peak M_l = 2000 (ln₂ ≈ 11), mean ≈ 500 (ln₂ ≈ 9).
+    use std::f32::consts::PI;
+    let omega_0 = 2.0 * PI * 150.0 / 8000.0;
+    let l = MbeParams::harmonic_count_for(omega_0);
+    let voiced: Vec<bool> = (1..=l).map(|_| true).collect();
+    let amps: Vec<f32> = (1..=l)
+        .map(|h| 2000.0 / (h as f32).powf(0.6))
+        .collect();
+    let params = MbeParams::new(omega_0, l, &voiced, &amps).unwrap();
+
+    println!("Synthetic speech-scale MbeParams:");
+    println!("  ω₀ = {omega_0:.4} rad/s ({:.1} Hz)", params.fundamental_hz());
+    println!("  L  = {l}");
+    println!("  M_l range = {:.1} .. {:.1}", amps.iter().cloned().fold(f32::INFINITY, f32::min),
+        amps.iter().cloned().fold(f32::NEG_INFINITY, f32::max));
+    println!("  log₂(M_l) range ≈ {:.2} .. {:.2}",
+        amps.iter().cloned().fold(f32::INFINITY, f32::min).log2(),
+        amps.iter().cloned().fold(f32::NEG_INFINITY, f32::max).log2());
+    println!();
+
+    let mut state = HalfDecoderState::new();
+
+    // Run the encoder a few times so cross-frame state settles.
+    for iter in 0..5 {
+        let u = quantize_half(&params, &mut state).unwrap();
+        let b = deprioritize_half(&u);
+        println!("iter {iter}: b̂ = [b0={}, b1={}, b2={}, b3={}, b4={}, b5={}, b6={}, b7={}, b8={}]",
+            b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8]);
+        println!("         u = [0x{:03x}, 0x{:03x}, 0x{:03x}, 0x{:04x}]",
+            u[0], u[1], u[2], u[3]);
+        println!("         prev_γ = {:.4}", state.previous_gamma());
+    }
+
+    println!();
+    println!("Spec prediction (§13.2 + Eq. 151): b̂₂ should settle in high 20s to 31.");
+    Ok(())
+}
+
+fn cmd_halfrate_inspect(root: &Path, name: &str, frames_to_dump: usize) -> Result<()> {
+    let dir = root.join("tv-std").join("tv").join("r33");
+    let bit_path = dir.join(format!("{name}.bit"));
+    let bit_bytes = fs::read(&bit_path)
+        .with_context(|| format!("read {}", bit_path.display()))?;
+    let n_frames = bit_bytes.len() / BYTES_PER_HALFRATE_FRAME;
+
+    let mut dec_state = HalfDecoderState::new();
+    let mut synth_state = SynthState::new();
+    let mut dumped = 0usize;
+
+    println!("vector: {name} — {n_frames} frames total\n");
+
+    for f in 0..n_frames {
+        if dumped >= frames_to_dump {
+            break;
+        }
+        let frame = &bit_bytes[f * BYTES_PER_HALFRATE_FRAME..(f + 1) * BYTES_PER_HALFRATE_FRAME];
+        let dibits = unpack_dibits_halfrate(frame);
+        let ambe = decode_half_frame(&dibits);
+        let err = FrameErrorContext {
+            epsilon_0: ambe.errors[0],
+            epsilon_4: 0,
+            epsilon_t: ambe.error_total().min(255) as u8,
+            bad_pitch: false,
+        };
+        let decoded = decode_to_params(&ambe.info, &mut dec_state);
+
+        match decoded {
+            Ok(Decoded::Voice(params)) => {
+                dumped += 1;
+                let l = params.harmonic_count();
+                let amps = params.amplitudes_slice();
+                let voiced = params.voiced_slice();
+                let amp_min = amps.iter().cloned().fold(f32::INFINITY, f32::min);
+                let amp_max = amps.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let amp_mean = amps.iter().sum::<f32>() / amps.len() as f32;
+                let vcount = voiced.iter().filter(|&&v| v).count();
+                let nonfin = amps.iter().filter(|a| !a.is_finite()).count();
+
+                // Raw bit layout: show u[] and the deprioritized b[].
+                let b = deprioritize_half(&ambe.info);
+                println!("  raw u[]  = [0x{:03x}, 0x{:03x}, 0x{:03x}, 0x{:04x}]",
+                    ambe.info[0], ambe.info[1], ambe.info[2], ambe.info[3]);
+                println!("  b̂ vals   = [b0={}, b1={}, b2={}, b3={}, b4={}, b5={}, b6={}, b7={}, b8={}]",
+                    b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8]);
+
+                let pcm = synthesize_frame(&params, &err, GAMMA_W, &mut synth_state);
+                let pcm_peak = pcm.iter().map(|s| s.abs()).max().unwrap_or(0);
+                let pcm_rms = (pcm.iter().map(|&s| (s as f64).powi(2)).sum::<f64>()
+                    / pcm.len() as f64).sqrt();
+
+                println!("frame {f} (voice):");
+                println!("  ω₀            = {:.6} rad/s  ({:.1} Hz)",
+                    params.omega_0(), params.fundamental_hz());
+                println!("  L             = {l}");
+                println!("  voiced count  = {vcount}/{l}");
+                println!("  amp min/mean/max = {amp_min:.4} / {amp_mean:.4} / {amp_max:.4}");
+                println!("  amp non-finite  = {nonfin}");
+                println!("  first 8 amps  = {:?}",
+                    amps.iter().take(8).map(|a| format!("{a:.3}")).collect::<Vec<_>>());
+                println!("  first 8 vuv   = {:?}", &voiced[..voiced.len().min(8)]);
+                println!("  prev_gamma    = {:.6}", dec_state.previous_gamma());
+                println!("  prev_L        = {}", dec_state.previous_l());
+                println!("  PCM peak/rms  = {pcm_peak} / {pcm_rms:.2}");
+                println!();
+            }
+            Ok(Decoded::Tone { .. }) => {
+                let _ = synthesize_frame(&MbeParams::silence(), &err, GAMMA_W, &mut synth_state);
+                println!("frame {f} (tone) — skipped");
+            }
+            Ok(Decoded::Erasure) | Err(_) => {
+                let _ = synthesize_frame(&MbeParams::silence(), &err, GAMMA_W, &mut synth_state);
+                println!("frame {f} (erasure) — skipped");
+            }
+        }
+    }
     Ok(())
 }
 
@@ -689,8 +958,8 @@ fn cmd_scan_transitions(
     for f in 0..n_frames {
         let fec = &fec_bytes[f * BYTES_PER_FEC_FRAME..(f + 1) * BYTES_PER_FEC_FRAME];
         let dibits = unpack_dibits(fec);
-        let imbe = decode_fullrate_frame(&dibits);
-        let params = match dequantize_fullrate(&imbe.info, &mut decoder_state) {
+        let imbe = decode_full_frame(&dibits);
+        let params = match dequantize_full(&imbe.info, &mut decoder_state) {
             Ok(p) => p,
             Err(_) => {
                 prev = None;
@@ -862,8 +1131,8 @@ fn cmd_scan_transitions(
     for f in 0..n_frames {
         let fec = &fec_bytes[f * BYTES_PER_FEC_FRAME..(f + 1) * BYTES_PER_FEC_FRAME];
         let dibits = unpack_dibits(fec);
-        let imbe = decode_fullrate_frame(&dibits);
-        let params = match dequantize_fullrate(&imbe.info, &mut decoder_state) {
+        let imbe = decode_full_frame(&dibits);
+        let params = match dequantize_full(&imbe.info, &mut decoder_state) {
             Ok(p) => p,
             Err(_) => {
                 prev = None;
@@ -958,8 +1227,8 @@ fn cmd_xcorr_frame(
     for f in 0..=frame_idx {
         let fec = &fec_bytes[f * BYTES_PER_FEC_FRAME..(f + 1) * BYTES_PER_FEC_FRAME];
         let dibits = unpack_dibits(fec);
-        let imbe = decode_fullrate_frame(&dibits);
-        let params = dequantize_fullrate(&imbe.info, &mut decoder_state)
+        let imbe = decode_full_frame(&dibits);
+        let params = dequantize_full(&imbe.info, &mut decoder_state)
             .map_err(|e| anyhow!("dequant failed at frame {f}: {e:?}"))?;
         let err = FrameErrorContext {
             epsilon_0: imbe.errors[0],
@@ -1125,7 +1394,7 @@ fn xcorr_normalized(a: &[i16], b: &[i16], lag: i32) -> f64 {
 }
 
 fn cmd_halfrate_roundtrip(root: &Path, name: &str) -> Result<()> {
-    let dir = root.join("tv-std").join("tv").join("r39");
+    let dir = root.join("tv-std").join("tv").join("r33");
     let bit_path = dir.join(format!("{name}.bit"));
     let bit_bytes = fs::read(&bit_path)
         .with_context(|| format!("read half-rate vector {}", bit_path.display()))?;
@@ -1134,33 +1403,31 @@ fn cmd_halfrate_roundtrip(root: &Path, name: &str) -> Result<()> {
     }
     let n_frames = bit_bytes.len() / BYTES_PER_HALFRATE_FRAME;
 
-    println!("vector:        {name} (half-rate, r39)");
+    println!("vector:        {name} (half-rate, r33 — P25 with FEC)");
     println!("frames:        {n_frames}");
     println!();
 
-    let mut state_dec = HalfrateDecoderState::new();
-    let mut state_enc = HalfrateDecoderState::new();
+    let mut state_dec = HalfDecoderState::new();
+    let mut state_enc = HalfDecoderState::new();
     let mut voice_frames = 0usize;
     let mut non_voice_frames = 0usize;
     let mut pitch_match = 0usize;
     let mut vuv_match = 0usize;
     let mut gain_match = 0usize;
 
-    use blip25_mbe::imbe_frames::priority::deprioritize_halfrate;
-
     for f in 0..n_frames {
         let frame = &bit_bytes[f * BYTES_PER_HALFRATE_FRAME..(f + 1) * BYTES_PER_HALFRATE_FRAME];
         let dibits = unpack_dibits_halfrate(frame);
-        let ambe = decode_halfrate_frame(&dibits);
-        match decode_halfrate_to_params(&ambe.info, &mut state_dec) {
-            Ok(HalfrateDecoded::Voice(params)) => {
+        let ambe = decode_half_frame(&dibits);
+        match decode_to_params(&ambe.info, &mut state_dec) {
+            Ok(Decoded::Voice(params)) => {
                 voice_frames += 1;
-                let u_back = match quantize_halfrate(&params, &mut state_enc) {
+                let u_back = match quantize_half(&params, &mut state_enc) {
                     Ok(u) => u,
                     Err(_) => continue,
                 };
-                let b_orig = deprioritize_halfrate(&ambe.info);
-                let b_back = deprioritize_halfrate(&u_back);
+                let b_orig = deprioritize_half(&ambe.info);
+                let b_back = deprioritize_half(&u_back);
                 if b_orig[0] == b_back[0] {
                     pitch_match += 1;
                 }
@@ -1261,7 +1528,7 @@ fn cmd_compare(root: &Path, name: &str, rc: bool, stop_on_first: bool) -> Result
             &nofec_bytes[f * BYTES_PER_NOFEC_FRAME..(f + 1) * BYTES_PER_NOFEC_FRAME];
 
         let dibits = unpack_dibits(fec_frame);
-        let decoded: ImbeFrame = decode_fullrate_frame(&dibits);
+        let decoded: FullFrame = decode_full_frame(&dibits);
         let expected = unpack_nofec_info(nofec_frame);
         total_fec_errors += u32::from(decoded.error_total());
 
@@ -1293,7 +1560,7 @@ fn cmd_compare(root: &Path, name: &str, rc: bool, stop_on_first: bool) -> Result
     }
 }
 
-fn report_mismatch(frame_idx: usize, decoded: &ImbeFrame, expected: &[u16; 8]) {
+fn report_mismatch(frame_idx: usize, decoded: &FullFrame, expected: &[u16; 8]) {
     println!("FIRST DIVERGENCE at frame {frame_idx}");
     println!("  vector  width  decoded   expected  errors");
     for i in 0..8 {

@@ -15,7 +15,7 @@ use crate::fec::{
 };
 
 use super::fec::{
-    deinterleave_fullrate, interleave_fullrate, modulation_masks_fullrate,
+    deinterleave, interleave, modulation_masks,
 };
 
 /// Width in bits of each info vector `û₀..û₇`. BABA-A §1.2.
@@ -40,14 +40,14 @@ pub const INFO_BITS_TOTAL: u16 = 88;
 /// nothing about pitch, L, or gain yet — that interpretation happens
 /// downstream in bit deprioritization + dequantization.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ImbeFrame {
+pub struct Frame {
     /// Decoded info vectors û₀..û₇.
     pub info: [u16; 8],
     /// Per-vector FEC error count from decode.
     pub errors: [u8; 8],
 }
 
-impl ImbeFrame {
+impl Frame {
     /// Total error count across all vectors, used by BABA-A §4.1 error
     /// assessment (frame repeat / mute triggers).
     pub fn error_total(&self) -> u16 {
@@ -67,17 +67,17 @@ impl ImbeFrame {
 /// 5. **FEC-decode** `v̂₁..v̂₃` with Golay, `v̂₄..v̂₆` with Hamming.
 /// 6. **Uncoded passthrough**: `û₇ = c̃₇` (`m̂₇ = 0` and no FEC).
 ///
-/// The returned `ImbeFrame` can be fed into a bit-deprioritizer +
+/// The returned `Frame` can be fed into a bit-deprioritizer +
 /// dequantizer to obtain `MbeParams`.
-pub fn decode_fullrate_frame(dibits: &[u8; 72]) -> ImbeFrame {
-    let c = deinterleave_fullrate(dibits);
+pub fn decode_frame(dibits: &[u8; 72]) -> Frame {
+    let c = deinterleave(dibits);
 
     // Step 2: Golay-decode c̃₀ directly (m̂₀ = 0).
     let d0 = golay_23_12_decode(c[0]);
     let u0 = d0.info;
 
     // Step 3: generate masks from the full 12-bit û₀.
-    let masks = modulation_masks_fullrate(u0);
+    let masks = modulation_masks(u0);
 
     // Step 4+5: demodulate c̃₁..c̃₆ and FEC-decode.
     let d1 = golay_23_12_decode(c[1] ^ masks[1]);
@@ -90,7 +90,7 @@ pub fn decode_fullrate_frame(dibits: &[u8; 72]) -> ImbeFrame {
     // Step 6: û₇ is uncoded (7 bits, also unmodulated).
     let u7 = (c[7] & 0x7F) as u16;
 
-    ImbeFrame {
+    Frame {
         info: [d0.info, d1.info, d2.info, d3.info, d4.info, d5.info, d6.info, u7],
         errors: [d0.errors, d1.errors, d2.errors, d3.errors, d4.errors, d5.errors, d6.errors, 0],
     }
@@ -99,7 +99,7 @@ pub fn decode_fullrate_frame(dibits: &[u8; 72]) -> ImbeFrame {
 /// Encode an 88-bit information layer into a full-rate IMBE frame
 /// (72 dibit symbols).
 ///
-/// Inverse of [`decode_fullrate_frame`]:
+/// Inverse of [`decode_frame`]:
 /// 1. **FEC-encode** û₀..û₃ with Golay, û₄..û₆ with Hamming.
 /// 2. **Generate PN masks** from û₀.
 /// 3. **Modulate** v̂₁..v̂₆ with m̂₁..m̂₆ (c̃₀ and c̃₇ pass through).
@@ -107,7 +107,7 @@ pub fn decode_fullrate_frame(dibits: &[u8; 72]) -> ImbeFrame {
 ///
 /// `info` widths must match [`INFO_WIDTHS`]; bits above each vector's
 /// declared width are masked off before encoding.
-pub fn encode_fullrate_frame(info: &[u16; 8]) -> [u8; 72] {
+pub fn encode_frame(info: &[u16; 8]) -> [u8; 72] {
     // Mask each input to its declared width so a caller that stuffs
     // stray high bits can't silently corrupt the frame.
     let u: [u16; 8] = core::array::from_fn(|i| {
@@ -125,7 +125,7 @@ pub fn encode_fullrate_frame(info: &[u16; 8]) -> [u8; 72] {
     let v6 = u32::from(hamming_15_11_encode(u[6]));
     let v7 = u32::from(u[7]);
 
-    let masks = modulation_masks_fullrate(u[0]);
+    let masks = modulation_masks(u[0]);
     let c = [
         v0, // m̂₀ = 0
         v1 ^ masks[1],
@@ -137,7 +137,7 @@ pub fn encode_fullrate_frame(info: &[u16; 8]) -> [u8; 72] {
         v7, // m̂₇ = 0
     ];
 
-    interleave_fullrate(&c)
+    interleave(&c)
 }
 
 #[cfg(test)]
@@ -161,11 +161,11 @@ mod tests {
     #[test]
     fn encode_decode_roundtrip_zero() {
         let u = [0u16; 8];
-        let f = encode_fullrate_frame(&u);
+        let f = encode_frame(&u);
         for (s, d) in f.iter().enumerate() {
             assert!(*d < 4, "symbol {s} is not a dibit");
         }
-        let back = decode_fullrate_frame(&f);
+        let back = decode_frame(&f);
         assert_eq!(back.info, u);
         assert_eq!(back.errors, [0u8; 8]);
     }
@@ -174,8 +174,8 @@ mod tests {
     fn encode_decode_roundtrip_sampled() {
         for seed in [1u32, 0xDEADBEEF, 0xCAFEBABE, 0x12345678, 42] {
             let u = sample_info(seed);
-            let f = encode_fullrate_frame(&u);
-            let back = decode_fullrate_frame(&f);
+            let f = encode_frame(&u);
+            let back = decode_frame(&f);
             assert_eq!(back.info, u, "seed 0x{seed:08x}");
             assert_eq!(back.errors, [0u8; 8], "seed 0x{seed:08x}");
         }
@@ -189,8 +189,8 @@ mod tests {
         for i in 0..8 {
             u[i] = 0xFFFF; // all ones; high bits must be ignored
         }
-        let f = encode_fullrate_frame(&u);
-        let back = decode_fullrate_frame(&f);
+        let f = encode_frame(&u);
+        let back = decode_frame(&f);
         for i in 0..8 {
             let w = INFO_WIDTHS[i] as u32;
             let m = ((1u32 << w) - 1) as u16;
@@ -203,16 +203,16 @@ mod tests {
         // Flipping one bit inside any of c̃₀..c̃₃'s 23-bit range should
         // be corrected (Golay handles up to 3 errors).
         let u = sample_info(0xA5A5A5A5);
-        let clean = encode_fullrate_frame(&u);
+        let clean = encode_frame(&u);
         for bit in 0..23 {
             // We can't flip a single codeword bit directly on the dibit
             // stream without knowing Annex H — instead, deinterleave,
             // flip a bit, re-interleave, then decode and verify.
-            let c = deinterleave_fullrate(&clean);
+            let c = deinterleave(&clean);
             let mut c_flipped = c;
             c_flipped[0] ^= 1u32 << bit;
-            let dibits = interleave_fullrate(&c_flipped);
-            let out = decode_fullrate_frame(&dibits);
+            let dibits = interleave(&c_flipped);
+            let out = decode_frame(&dibits);
             assert_eq!(out.info, u, "bit {bit} flip in c̃₀");
             assert_eq!(out.errors[0], 1, "bit {bit} flip in c̃₀");
         }
@@ -221,14 +221,14 @@ mod tests {
     #[test]
     fn single_bit_flip_in_hamming_vector_is_corrected() {
         let u = sample_info(0x5A5A5A5A);
-        let clean = encode_fullrate_frame(&u);
+        let clean = encode_frame(&u);
         // Flip any single bit inside c̃₄ (15 bits).
         for bit in 0..15 {
-            let c = deinterleave_fullrate(&clean);
+            let c = deinterleave(&clean);
             let mut c_flipped = c;
             c_flipped[4] ^= 1u32 << bit;
-            let dibits = interleave_fullrate(&c_flipped);
-            let out = decode_fullrate_frame(&dibits);
+            let dibits = interleave(&c_flipped);
+            let out = decode_frame(&dibits);
             assert_eq!(out.info, u, "bit {bit} flip in c̃₄");
             assert_eq!(out.errors[4], 1, "bit {bit} flip in c̃₄");
         }
@@ -240,12 +240,12 @@ mod tests {
         // decoded info (and errors[7] stays zero because there is no
         // FEC to report errors against).
         let u = sample_info(0xFACEFEED);
-        let clean = encode_fullrate_frame(&u);
-        let c = deinterleave_fullrate(&clean);
+        let clean = encode_frame(&u);
+        let c = deinterleave(&clean);
         let mut c_flipped = c;
         c_flipped[7] ^= 1u32 << 3;
-        let dibits = interleave_fullrate(&c_flipped);
-        let out = decode_fullrate_frame(&dibits);
+        let dibits = interleave(&c_flipped);
+        let out = decode_frame(&dibits);
         assert_eq!(out.info[7], u[7] ^ 0b1000);
         assert_eq!(out.errors[7], 0);
     }
@@ -256,12 +256,12 @@ mod tests {
         // three-bit pattern in c̃₁ is handled correctly (and that PN
         // demodulation does not interfere).
         let u = sample_info(0x01020304);
-        let clean = encode_fullrate_frame(&u);
-        let c = deinterleave_fullrate(&clean);
+        let clean = encode_frame(&u);
+        let c = deinterleave(&clean);
         let mut c_flipped = c;
         c_flipped[1] ^= (1u32 << 0) | (1u32 << 7) | (1u32 << 19);
-        let dibits = interleave_fullrate(&c_flipped);
-        let out = decode_fullrate_frame(&dibits);
+        let dibits = interleave(&c_flipped);
+        let out = decode_frame(&dibits);
         assert_eq!(out.info, u);
         assert_eq!(out.errors[1], 3);
         assert_eq!(out.error_total(), 3);

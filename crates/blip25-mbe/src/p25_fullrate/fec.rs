@@ -31,7 +31,7 @@
 
 /// Length of the full-rate PN sequence: `p_r(0)` seed plus `p_r(1..=114)`
 /// for the six non-zero masks (23 + 23 + 23 + 15 + 15 + 15 = 114 bits).
-pub const PN_SEQ_LEN_FULLRATE: usize = 115;
+pub const PN_SEQ_LEN: usize = 115;
 
 /// Lengths of the 8 modulation vectors in bits.
 /// Matches the full-rate FEC layout: c0..c3 = 23-bit Golay,
@@ -51,11 +51,11 @@ pub const VECTOR_LENGTHS: [u8; 8] = [23, 23, 23, 23, 15, 15, 15, 7];
 /// `n` is the MSB of `p_r(n)` (bit 15); see [`pn_mask_bit`].
 ///
 /// Panics in debug builds if `u0 >= 4096`.
-pub fn pn_sequence_fullrate(u0: u16) -> [u16; PN_SEQ_LEN_FULLRATE] {
+pub fn pn_sequence(u0: u16) -> [u16; PN_SEQ_LEN] {
     debug_assert!(u0 < 4096, "û₀ is a 12-bit Golay info word");
-    let mut pr = [0u16; PN_SEQ_LEN_FULLRATE];
+    let mut pr = [0u16; PN_SEQ_LEN];
     pr[0] = u0.wrapping_mul(16);
-    for n in 1..PN_SEQ_LEN_FULLRATE {
+    for n in 1..PN_SEQ_LEN {
         pr[n] = (173u32
             .wrapping_mul(pr[n - 1] as u32)
             .wrapping_add(13849)
@@ -99,8 +99,8 @@ pub fn pn_mask_bit(pr_n: u16) -> u32 {
 ///
 /// Total PN indices consumed: 114, matching the sum of the six modulated
 /// vector lengths.
-pub fn modulation_masks_fullrate(u0: u16) -> [u32; 8] {
-    let pr = pn_sequence_fullrate(u0);
+pub fn modulation_masks(u0: u16) -> [u32; 8] {
+    let pr = pn_sequence(u0);
     let mut masks = [0u32; 8];
 
     // (vector index, PN start offset, length)
@@ -132,8 +132,8 @@ pub fn modulation_masks_fullrate(u0: u16) -> [u32; 8] {
 /// [`crate::fec::golay_23_12_decode`]). This function then XORs `c̃₁..c̃₆`
 /// with their masks and returns `v̂₀..v̂₇` (with `v̂₀ = c̃₀` and
 /// `v̂₇ = c̃₇` passed through).
-pub fn demodulate_fullrate(codewords: [u32; 8], u0: u16) -> [u32; 8] {
-    let masks = modulation_masks_fullrate(u0);
+pub fn demodulate(codewords: [u32; 8], u0: u16) -> [u32; 8] {
+    let masks = modulation_masks(u0);
     let mut v = [0u32; 8];
     for i in 0..8 {
         v[i] = codewords[i] ^ masks[i];
@@ -167,7 +167,7 @@ include!(concat!(env!("OUT_DIR"), "/annex_h.rs"));
 /// bit, bit 0 is the low bit. Output vector lengths are 23, 23, 23, 23,
 /// 15, 15, 15, 7 bits respectively, packed LSB-first per the module-level
 /// convention (element `k` at bit `k`).
-pub fn deinterleave_fullrate(dibits: &[u8; 72]) -> [u32; 8] {
+pub fn deinterleave(dibits: &[u8; 72]) -> [u32; 8] {
     let mut c = [0u32; 8];
     for (sym, d) in dibits.iter().enumerate() {
         let entry = ANNEX_H[sym];
@@ -182,9 +182,9 @@ pub fn deinterleave_fullrate(dibits: &[u8; 72]) -> [u32; 8] {
 /// Interleave 8 code vectors `c₀..c₇` into a 144-bit IMBE frame
 /// (72 dibit symbols) per BABA-A Annex H.
 ///
-/// Inverse of [`deinterleave_fullrate`]. Useful for encode paths and
+/// Inverse of [`deinterleave`]. Useful for encode paths and
 /// roundtrip tests.
-pub fn interleave_fullrate(codewords: &[u32; 8]) -> [u8; 72] {
+pub fn interleave(codewords: &[u32; 8]) -> [u8; 72] {
     let mut dibits = [0u8; 72];
     for (sym, entry) in ANNEX_H.iter().enumerate() {
         let hi = ((codewords[entry.bit1_vec as usize] >> entry.bit1_idx) & 1) as u8;
@@ -201,7 +201,7 @@ mod tests {
     #[test]
     fn pn_seed_zero_is_all_zero_run_of_lcg() {
         // u0 = 0 → pr[0] = 0, pr[1] = (0 + 13849) & 0xFFFF = 13849
-        let pr = pn_sequence_fullrate(0);
+        let pr = pn_sequence(0);
         assert_eq!(pr[0], 0);
         assert_eq!(pr[1], 13849);
         assert_eq!(pr[2], ((173u32 * 13849 + 13849) & 0xFFFF) as u16);
@@ -210,14 +210,14 @@ mod tests {
     #[test]
     fn pn_seed_is_16_times_u0() {
         for u0 in [0u16, 1, 7, 255, 4095] {
-            assert_eq!(pn_sequence_fullrate(u0)[0], u0 * 16);
+            assert_eq!(pn_sequence(u0)[0], u0 * 16);
         }
     }
 
     #[test]
     fn pn_sequence_matches_recurrence_by_hand() {
         // u0 = 1 → pr[0] = 16, pr[1] = (173*16 + 13849) & 0xFFFF = 16617
-        let pr = pn_sequence_fullrate(1);
+        let pr = pn_sequence(1);
         assert_eq!(pr[0], 16);
         assert_eq!(pr[1], 16617);
         // pr[2] = (173*16617 + 13849) mod 65536
@@ -236,7 +236,7 @@ mod tests {
     #[test]
     fn masks_zero_and_seven_are_zero() {
         for u0 in [0u16, 1, 42, 4095] {
-            let m = modulation_masks_fullrate(u0);
+            let m = modulation_masks(u0);
             assert_eq!(m[0], 0, "m̂₀ must be zero (Eq. 86), u0={u0}");
             assert_eq!(m[7], 0, "m̂₇ must be zero (Eq. 93), u0={u0}");
         }
@@ -245,7 +245,7 @@ mod tests {
     #[test]
     fn masks_fit_within_vector_lengths() {
         for u0 in [0u16, 1, 42, 4095] {
-            let m = modulation_masks_fullrate(u0);
+            let m = modulation_masks(u0);
             for i in 0..8 {
                 let len = VECTOR_LENGTHS[i] as u32;
                 let max_mask = if len == 32 { u32::MAX } else { (1u32 << len) - 1 };
@@ -264,18 +264,18 @@ mod tests {
         // original vectors when applied twice (or equivalently, when
         // applied to `v ⊕ m` given the same u0).
         let u0 = 0xABC;
-        let masks = modulation_masks_fullrate(u0);
+        let masks = modulation_masks(u0);
         let v: [u32; 8] = [0x123, 0x456, 0x789, 0xABC, 0x111, 0x222, 0x333, 0x44];
         let c: [u32; 8] = std::array::from_fn(|i| v[i] ^ masks[i]);
-        let v2 = demodulate_fullrate(c, u0);
+        let v2 = demodulate(c, u0);
         assert_eq!(v2, v);
     }
 
     #[test]
     fn different_u0_produce_different_masks() {
         // Sanity: changing u0 changes the non-zero masks.
-        let m1 = modulation_masks_fullrate(1);
-        let m2 = modulation_masks_fullrate(2);
+        let m1 = modulation_masks(1);
+        let m2 = modulation_masks(2);
         // At least one of m1..m6 differs.
         let any_diff = (1..=6).any(|i| m1[i] != m2[i]);
         assert!(any_diff, "masks should depend on u0");
@@ -287,7 +287,7 @@ mod tests {
         // number of non-seed PN indices.
         let total: u8 = [1u8, 2, 3, 4, 5, 6].iter().map(|&i| VECTOR_LENGTHS[i as usize]).sum();
         assert_eq!(total, 114);
-        assert_eq!(PN_SEQ_LEN_FULLRATE - 1, 114);
+        assert_eq!(PN_SEQ_LEN - 1, 114);
     }
 
     // ---- Annex H interleaving ---------------------------------------------
@@ -326,12 +326,12 @@ mod tests {
             state = state.wrapping_mul(1664525).wrapping_add(1013904223);
             cw[i] = state & valid_mask(i);
         }
-        let dibits = interleave_fullrate(&cw);
+        let dibits = interleave(&cw);
         // All dibits must be in 0..=3.
         for (s, d) in dibits.iter().enumerate() {
             assert!(*d < 4, "symbol {s} produced {d} (not a dibit)");
         }
-        let recovered = deinterleave_fullrate(&dibits);
+        let recovered = deinterleave(&dibits);
         assert_eq!(recovered, cw);
     }
 
@@ -345,12 +345,12 @@ mod tests {
             state = state.wrapping_mul(1103515245).wrapping_add(12345);
             *d = (state >> 30) as u8; // top 2 bits, avoids LSB bias
         }
-        let cw = deinterleave_fullrate(&dibits);
+        let cw = deinterleave(&dibits);
         // Sanity: every decoded codeword fits within its declared width.
         for (i, c) in cw.iter().enumerate() {
             assert_eq!(c & !valid_mask(i), 0, "c[{i}] has bits beyond its width");
         }
-        let re = interleave_fullrate(&cw);
+        let re = interleave(&cw);
         assert_eq!(re, dibits);
     }
 
@@ -362,13 +362,13 @@ mod tests {
             for idx in 0..VECTOR_LENGTHS[v] {
                 let mut cw = [0u32; 8];
                 cw[v] = 1u32 << idx;
-                let dibits = interleave_fullrate(&cw);
+                let dibits = interleave(&cw);
                 let ones: u32 = dibits.iter().map(|d| u32::from(*d).count_ones()).sum();
                 assert_eq!(
                     ones, 1,
                     "single bit at (v={v}, idx={idx}) produced {ones} dibit-bits"
                 );
-                assert_eq!(deinterleave_fullrate(&dibits), cw);
+                assert_eq!(deinterleave(&dibits), cw);
             }
         }
     }

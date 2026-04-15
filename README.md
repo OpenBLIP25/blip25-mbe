@@ -63,8 +63,9 @@ That is not what happened. What happened was iterative correction:
   sharing one parameter model, and that DVSI's own P25 / P25A / P25X
   modes run different codec algorithms behind identical wire bits.
 - When the model drifted toward IMBE-centric naming, the author
-  redirected it to `imbe_frames` and `ambe_frames` as peers, reflecting
-  that both are wires over the same parameter model.
+  redirected it to `p25_fullrate` and `p25_halfrate` as peers (with
+  `dvsi_3000` alongside for the chip-protocol wire), reflecting that
+  each is a wire over the same shared parameter model.
 - The three-tier test architecture — self-contained unit tests, vector
   blackbox, live-chip blackbox — came from the author requiring that
   contributors never be blocked by lack of proprietary material.

@@ -1,7 +1,15 @@
 //! Half-rate AMBE+2 dequantization — `b̂₀..b̂₈ → MbeParams` per
 //! TIA-102.BABA-A §2.11–§2.13.
 //!
-//! Pipeline (mirrors full-rate's `dequantize_fullrate` but with
+//! These quantizer tables (Annexes L, M, N, O, P, Q, R) and the
+//! reconstruction equations are the AMBE+2 codec's normative bit
+//! interpretation as published in BABA-A's half-rate sections (the
+//! BABA-1 addendum, originally). The spec calls this "Half-Rate
+//! Vocoder" rather than "AMBE+2" to dodge DVSI's trademark, but
+//! the bit rate, frame structure, and quantizer behaviour are AMBE+2
+//! in everything but name.
+//!
+//! Pipeline (mirrors full-rate's `dequantize` but with
 //! different quantizer structure):
 //!
 //! 1. Pitch: `b̂₀` (7 bits) → Annex L lookup → `(L̃, ω̃₀)`.
@@ -25,41 +33,41 @@
 
 use core::f64::consts::{LN_2, PI as PI64, SQRT_2};
 
-use crate::imbe_frames::dequantize::DecodeError;
-use crate::imbe_frames::half_rate::{
+use crate::p25_fullrate::dequantize::DecodeError;
+use crate::p25_halfrate::frame::{
     AMBE_BLOCK_LENGTHS, AMBE_GAIN_LEVELS, AMBE_HOC_B5, AMBE_HOC_B6, AMBE_HOC_B7,
     AMBE_HOC_B8, AMBE_PITCH_TABLE, AMBE_PRBA24, AMBE_PRBA58, AMBE_VUV_CODEBOOK,
     ANNEX_T, PitchEntry, ToneParams,
 };
-use crate::imbe_frames::priority::deprioritize_halfrate;
+use crate::p25_halfrate::priority::{deprioritize, prioritize};
 use crate::mbe_params::{L_MAX, MbeParams};
 
 /// Maximum per-block length observed in Annex N (`L̃ = 56` row has
 /// `J̃₄ = 17`). Sized generously to cover the full table.
-pub const MAX_BLOCK_SIZE_HALFRATE: usize = 17;
+pub const MAX_BLOCK_SIZE: usize = 17;
 
 /// Initial value of `L̃(−1)` for the half-rate decoder (§2.13 Annex A).
 /// Differs from full-rate's 30 (§1.8.5).
-pub const HALFRATE_INIT_PREV_L: u8 = 15;
+pub const INIT_PREV_L: u8 = 15;
 
 /// Highest valid half-rate pitch index per Annex L (120 entries,
 /// `b̂₀ ∈ [0, 119]`). Values `[120, 127]` indicate tone frames;
 /// `[128, 255]` are reserved / error conditions.
-pub const HALFRATE_PITCH_MAX: u8 = 119;
+pub const PITCH_INDEX_MAX: u8 = 119;
 
 /// First tone-frame `b̂₀` value. Tone-frame decoding lives in a
-/// separate path (§2.10) and is not handled by [`dequantize_halfrate`].
+/// separate path (§2.10) and is not handled by [`dequantize`].
 pub const HALFRATE_TONE_FIRST: u8 = 120;
 
 /// Cross-frame state for the half-rate decoder.
 ///
-/// Two key differences from [`crate::imbe_frames::dequantize::DecoderState`]:
+/// Two key differences from [`crate::p25_fullrate::dequantize::DecoderState`]:
 /// - `prev_lambda` is stored in **log₂** domain (Λ̃_l(−1)), not linear.
 /// - `prev_l` initializes to 15, not 30.
 /// - `prev_gamma` carries the Eq. 168 differential-gain state, updated
 ///   only on voice frames.
 #[derive(Clone, Debug)]
-pub struct HalfrateDecoderState {
+pub struct DecoderState {
     /// Previous frame's `Λ̃_l(−1)` in log₂ domain. Index 0 unused —
     /// Eq. 186 says `Λ̃_0(−1) = Λ̃_1(−1)`, so the virtual index 0
     /// reads mirror `Λ̃_1`. Indices `1..=prev_l` populated; reads
@@ -72,13 +80,13 @@ pub struct HalfrateDecoderState {
     prev_gamma: f64,
 }
 
-impl HalfrateDecoderState {
+impl DecoderState {
     /// Cold-start state per §2.13 Annex A: `Λ̃_l(−1) = 1` for all l,
     /// `L̃(−1) = 15`, `γ̃(−1) = 0`.
     pub fn new() -> Self {
         Self {
             prev_lambda: [1.0; L_MAX as usize + 2],
-            prev_l: HALFRATE_INIT_PREV_L,
+            prev_l: INIT_PREV_L,
             prev_gamma: 0.0,
         }
     }
@@ -105,7 +113,7 @@ impl HalfrateDecoderState {
     }
 }
 
-impl Default for HalfrateDecoderState {
+impl Default for DecoderState {
     fn default() -> Self {
         Self::new()
     }
@@ -119,7 +127,7 @@ impl Default for HalfrateDecoderState {
 /// because half-rate doesn't have the per-band V/UV structure of full
 /// rate — V/UV is codebook-indexed per §2.3.6.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct HalfratePitchInfo {
+pub struct PitchInfo {
     /// Fundamental frequency in radians/sample.
     pub omega_0: f32,
     /// Number of harmonics.
@@ -132,12 +140,12 @@ pub struct HalfratePitchInfo {
 ///   [`AMBE_PITCH_TABLE`] to obtain `(L̃, ω̃₀)`.
 /// * `b̂₀ ∈ [120, 127]` → tone frame; returns `None` and the caller
 ///   should switch to the §2.10 tone path.
-pub fn pitch_decode_halfrate(b0: u8) -> Option<HalfratePitchInfo> {
-    if b0 > HALFRATE_PITCH_MAX {
+pub fn decode_pitch(b0: u8) -> Option<PitchInfo> {
+    if b0 > PITCH_INDEX_MAX {
         return None;
     }
     let PitchEntry { l, omega_0 } = AMBE_PITCH_TABLE[b0 as usize];
-    Some(HalfratePitchInfo { omega_0, l })
+    Some(PitchInfo { omega_0, l })
 }
 
 // ---------------------------------------------------------------------------
@@ -149,7 +157,7 @@ pub fn pitch_decode_halfrate(b0: u8) -> Option<HalfratePitchInfo> {
 /// to `[0, 7]`; `v̄_l = v_{j_l}(b̂₁)`.
 ///
 /// Returns an `[bool; L_MAX]` with entries `0..(l as usize)` populated.
-pub fn expand_vuv_halfrate(b1: u8, omega_0: f32, l: u8) -> [bool; L_MAX as usize] {
+pub fn expand_vuv(b1: u8, omega_0: f32, l: u8) -> [bool; L_MAX as usize] {
     debug_assert!(b1 < 32, "b̂₁ is a 5-bit index");
     debug_assert!(l <= L_MAX);
     let codebook = &AMBE_VUV_CODEBOOK[b1 as usize];
@@ -169,7 +177,7 @@ pub fn expand_vuv_halfrate(b1: u8, omega_0: f32, l: u8) -> [bool; L_MAX as usize
 
 /// Decode the 5-bit gain index per Eq. 168:
 /// `γ̃(0) = Δ̃_γ + 0.5 · γ̃(−1)` with `Δ̃_γ = AMBE_GAIN_QUANTIZER[b̂₂]`.
-pub fn decode_gain_halfrate(b2: u8, prev_gamma: f64) -> f64 {
+pub fn decode_gain(b2: u8, prev_gamma: f64) -> f64 {
     debug_assert!(b2 < 32);
     f64::from(AMBE_GAIN_LEVELS[b2 as usize]) + 0.5 * prev_gamma
 }
@@ -232,16 +240,16 @@ pub fn pair_split(r: &[f64; 8]) -> [(f64, f64); 4] {
 /// pair-split; `k=3..min(J̃_i, 6)` come from Annex R (Reading #1 of
 /// Eq. 179); everything else is zero.
 ///
-/// Returns a 4×`MAX_BLOCK_SIZE_HALFRATE` matrix; only `[i][0..J̃_i]`
+/// Returns a 4×`MAX_BLOCK_SIZE` matrix; only `[i][0..J̃_i]`
 /// is meaningful.
-pub fn assemble_hoc_matrix_halfrate(
+pub fn assemble_hoc_matrix(
     pair: &[(f64, f64); 4],
     b5: u8,
     b6: u8,
     b7: u8,
     b8: u8,
     blocks: &[u8; 4],
-) -> [[f64; MAX_BLOCK_SIZE_HALFRATE]; 4] {
+) -> [[f64; MAX_BLOCK_SIZE]; 4] {
     debug_assert!(b5 < 32 && b6 < 16 && b7 < 16 && b8 < 8);
     let hoc: [[f32; 4]; 4] = [
         AMBE_HOC_B5[b5 as usize],
@@ -249,7 +257,7 @@ pub fn assemble_hoc_matrix_halfrate(
         AMBE_HOC_B7[b7 as usize],
         AMBE_HOC_B8[b8 as usize],
     ];
-    let mut c = [[0f64; MAX_BLOCK_SIZE_HALFRATE]; 4];
+    let mut c = [[0f64; MAX_BLOCK_SIZE]; 4];
     for i in 0..4 {
         c[i][0] = pair[i].0; // C̃_{i,1} — block mean
         c[i][1] = pair[i].1; // C̃_{i,2} — first non-mean
@@ -273,8 +281,8 @@ pub fn assemble_hoc_matrix_halfrate(
 /// for `l = 1..=L̃`. This is the §1.8.4 form but over four half-rate
 /// blocks from Annex N rather than the six full-rate blocks from
 /// Annex J.
-pub fn inverse_block_dct_halfrate(
-    c: &[[f64; MAX_BLOCK_SIZE_HALFRATE]; 4],
+pub fn inverse_block_dct(
+    c: &[[f64; MAX_BLOCK_SIZE]; 4],
     blocks: &[u8; 4],
 ) -> [f64; L_MAX as usize] {
     let mut t = [0f64; L_MAX as usize];
@@ -299,11 +307,11 @@ pub fn inverse_block_dct_halfrate(
 /// produce `Λ̃_l(0)` for `l = 1..=L̃`. Returns an array sized to
 /// `L_MAX + 2`; index 0 unused, indices `1..=l` hold the log₂-domain
 /// magnitudes.
-pub fn apply_log_prediction_halfrate(
+pub fn apply_log_prediction(
     t: &[f64; L_MAX as usize],
     l: u8,
     gamma: f64,
-    state: &HalfrateDecoderState,
+    state: &DecoderState,
 ) -> [f64; L_MAX as usize + 2] {
     let mut lambda = [0f64; L_MAX as usize + 2];
     let l_curr = f64::from(l);
@@ -346,7 +354,7 @@ pub fn apply_log_prediction_halfrate(
 ///
 /// The unvoiced rescale is half-rate-specific (no analog in full-rate
 /// Eq. 79).
-pub fn compute_m_tilde_halfrate(
+pub fn compute_m_tilde(
     lambda: &[f64; L_MAX as usize + 2],
     voiced: &[bool],
     omega_0: f32,
@@ -376,27 +384,27 @@ pub fn compute_m_tilde_halfrate(
 /// Returns `DecodeError::BadPitch` for `b̂₀ ∈ [120, 255]` — the caller
 /// should switch to the tone path (§2.10) for `b̂₀ ∈ [120, 127]` and
 /// treat `[128, 255]` as an erasure condition.
-pub fn dequantize_halfrate(
+pub fn dequantize(
     u: &[u16; 4],
-    state: &mut HalfrateDecoderState,
+    state: &mut DecoderState,
 ) -> Result<MbeParams, DecodeError> {
-    let b = deprioritize_halfrate(u);
+    let b = deprioritize(u);
     let b0 = b[0] as u8;
-    let pitch = pitch_decode_halfrate(b0).ok_or(DecodeError::BadPitch)?;
+    let pitch = decode_pitch(b0).ok_or(DecodeError::BadPitch)?;
     let l = pitch.l;
 
     let b1 = b[1] as u8;
-    let voiced = expand_vuv_halfrate(b1, pitch.omega_0, l);
+    let voiced = expand_vuv(b1, pitch.omega_0, l);
 
     let b2 = b[2] as u8;
-    let gamma = decode_gain_halfrate(b2, state.prev_gamma);
+    let gamma = decode_gain(b2, state.prev_gamma);
 
     let g = decode_prba_vector(b[3], b[4] as u8);
     let r = prba_to_residuals(&g);
     let pair = pair_split(&r);
 
     let blocks = AMBE_BLOCK_LENGTHS[(l - 9) as usize];
-    let c = assemble_hoc_matrix_halfrate(
+    let c = assemble_hoc_matrix(
         &pair,
         b[5] as u8,
         b[6] as u8,
@@ -405,9 +413,9 @@ pub fn dequantize_halfrate(
         &blocks,
     );
 
-    let t = inverse_block_dct_halfrate(&c, &blocks);
-    let lambda = apply_log_prediction_halfrate(&t, l, gamma, state);
-    let m_tilde = compute_m_tilde_halfrate(&lambda, &voiced[..l as usize], pitch.omega_0);
+    let t = inverse_block_dct(&c, &blocks);
+    let lambda = apply_log_prediction(&t, l, gamma, state);
+    let m_tilde = compute_m_tilde(&lambda, &voiced[..l as usize], pitch.omega_0);
 
     let params = MbeParams::new(
         pitch.omega_0,
@@ -441,7 +449,7 @@ pub fn dequantize_halfrate(
 /// in ω̃₀, so we binary-search.
 ///
 /// Returns `None` if `omega_0` is not in the table's range.
-pub fn pitch_encode_halfrate(omega_0: f32) -> Option<u8> {
+pub fn encode_pitch(omega_0: f32) -> Option<u8> {
     if !(omega_0.is_finite()) || omega_0 <= 0.0 {
         return None;
     }
@@ -490,7 +498,7 @@ pub fn pitch_encode_halfrate(omega_0: f32) -> Option<u8> {
 /// (or that are the lowest-indexed row with that pattern) round-trip
 /// bit-exact. Row 0 (all voiced) is always the lowest such row; other
 /// rows may not.
-pub fn vuv_encode_halfrate(voiced: &[bool], omega_0: f32) -> u8 {
+pub fn encode_vuv(voiced: &[bool], omega_0: f32) -> u8 {
     let omega_0 = f64::from(omega_0);
     let mut voted = [0i32; 8]; // +1 voiced, −1 unvoiced, summed per slot
     let mut active = [false; 8];
@@ -526,7 +534,7 @@ pub fn vuv_encode_halfrate(voiced: &[bool], omega_0: f32) -> u8 {
 /// Encode a raw Δ̃_γ (differential gain) to a 5-bit Annex O index by
 /// nearest-neighbour argmin. Annex O is strictly monotone increasing
 /// so binary search works. Ties go low.
-pub fn gain_encode_halfrate(delta_gamma: f64) -> u8 {
+pub fn encode_gain(delta_gamma: f64) -> u8 {
     if delta_gamma <= f64::from(AMBE_GAIN_LEVELS[0]) {
         return 0;
     }
@@ -612,7 +620,7 @@ pub fn quantize_prba(g: &[f64; 8]) -> (u16, u8) {
 /// Quantize the per-block HOC coefficients `C̃_{i, 3..=6}` for one
 /// block to its Annex R codebook index. For blocks with `J̃_i < 3`
 /// there are no HOCs to encode — returns 0.
-fn quantize_hoc_block(c_block: &[f64; MAX_BLOCK_SIZE_HALFRATE], j_i: u8, book: &[[f32; 4]]) -> u8 {
+fn quantize_hoc_block(c_block: &[f64; MAX_BLOCK_SIZE], j_i: u8, book: &[[f32; 4]]) -> u8 {
     if j_i < 3 {
         return 0;
     }
@@ -630,7 +638,7 @@ fn quantize_hoc_block(c_block: &[f64; MAX_BLOCK_SIZE_HALFRATE], j_i: u8, book: &
 
 /// Populate `(b̂₅..b̂₈)` from the per-block HOC coefficients.
 pub fn quantize_hoc_all(
-    c: &[[f64; MAX_BLOCK_SIZE_HALFRATE]; 4],
+    c: &[[f64; MAX_BLOCK_SIZE]; 4],
     blocks: &[u8; 4],
 ) -> (u8, u8, u8, u8) {
     (
@@ -641,15 +649,15 @@ pub fn quantize_hoc_all(
     )
 }
 
-/// Forward per-block DCT — inverse of [`inverse_block_dct_halfrate`].
+/// Forward per-block DCT — inverse of [`inverse_block_dct`].
 /// Uses uniform `1/J̃_i` factor per the asymmetric DCT pairing.
 /// Reads `T̃_l` concatenated across `l = 1..=L̃`, partitions into 4
 /// blocks per Annex N, and produces `C̃_{i, k}` for each.
-pub fn forward_block_dct_halfrate(
+pub fn forward_block_dct(
     t: &[f64; L_MAX as usize],
     blocks: &[u8; 4],
-) -> [[f64; MAX_BLOCK_SIZE_HALFRATE]; 4] {
-    let mut c = [[0f64; MAX_BLOCK_SIZE_HALFRATE]; 4];
+) -> [[f64; MAX_BLOCK_SIZE]; 4] {
+    let mut c = [[0f64; MAX_BLOCK_SIZE]; 4];
     let mut l_offset = 0usize;
     for i in 0..4 {
         let j_i = blocks[i] as usize;
@@ -667,7 +675,7 @@ pub fn forward_block_dct_halfrate(
 }
 
 /// Forward log-magnitude prediction — inverse of
-/// [`apply_log_prediction_halfrate`]. Given the target `Λ̃_l(0)`
+/// [`apply_log_prediction`]. Given the target `Λ̃_l(0)`
 /// values and the previous-frame state, produce `T̃_l` values that
 /// the decoder will reconstruct back into `Λ̃_l(0)`.
 ///
@@ -675,10 +683,10 @@ pub fn forward_block_dct_halfrate(
 /// the infinite valid `T̃` families under Eq. 185; any choice with
 /// mean `m_T` just offsets `Γ̃` by `−m_T`). With `mean(T̃) = 0` the
 /// encoder gain is simply `γ̃(0) = 0.5·log₂(L̃) + mean(Λ̃)`.
-pub fn forward_log_prediction_halfrate(
+pub fn forward_log_prediction(
     lambda: &[f64; L_MAX as usize + 2],
     l: u8,
-    state: &HalfrateDecoderState,
+    state: &DecoderState,
 ) -> ([f64; L_MAX as usize], f64) {
     let l_curr = f64::from(l);
     let l_prev = f64::from(state.prev_l);
@@ -723,7 +731,7 @@ pub fn forward_log_prediction_halfrate(
 /// Convert linear `M̃_l` back to log₂-domain `Λ̃_l` per the inverse
 /// of Eq. 188. The unvoiced rescale factor `(0.2046/√ω̃₀)` is removed
 /// so `Λ̃_l` reflects the *pre-voicing-scale* log-magnitude.
-pub fn m_tilde_to_lambda_halfrate(
+pub fn m_tilde_to_lambda(
     m_tilde: &[f32],
     voiced: &[bool],
     omega_0: f32,
@@ -748,38 +756,38 @@ pub fn m_tilde_to_lambda_halfrate(
 
 /// Top-level half-rate encoder: `(MbeParams, &mut state) → û₀..û₃`.
 ///
-/// Mirrors [`dequantize_halfrate`] exactly. The encoder uses the same
-/// `HalfrateDecoderState` that the decoder would — on successful
+/// Mirrors [`dequantize`] exactly. The encoder uses the same
+/// `DecoderState` that the decoder would — on successful
 /// encode, state advances exactly as the decoder would advance after
 /// re-parsing the produced bits, keeping encoder and decoder
 /// synchronized for multi-frame bit-exact roundtrips.
-pub fn quantize_halfrate(
+pub fn quantize(
     params: &MbeParams,
-    state: &mut HalfrateDecoderState,
+    state: &mut DecoderState,
 ) -> Result<[u16; 4], DecodeError> {
     let l = params.harmonic_count();
     let omega_0 = params.omega_0();
 
-    let b0 = pitch_encode_halfrate(omega_0).ok_or(DecodeError::BadPitch)? as u16;
+    let b0 = encode_pitch(omega_0).ok_or(DecodeError::BadPitch)? as u16;
 
     let voiced_slice = params.voiced_slice();
-    let b1 = u16::from(vuv_encode_halfrate(voiced_slice, omega_0));
+    let b1 = u16::from(encode_vuv(voiced_slice, omega_0));
 
     // Target Λ̃_l from linear M̃_l, then forward log-mag prediction.
-    let lambda = m_tilde_to_lambda_halfrate(
+    let lambda = m_tilde_to_lambda(
         params.amplitudes_slice(),
         voiced_slice,
         omega_0,
     );
-    let (t, gamma) = forward_log_prediction_halfrate(&lambda, l, state);
+    let (t, gamma) = forward_log_prediction(&lambda, l, state);
 
     // Quantize gain: Δ̃_γ = γ̃(0) − 0.5·γ̃(−1); argmin over Annex O.
     let delta_gamma = gamma - 0.5 * state.prev_gamma;
-    let b2 = u16::from(gain_encode_halfrate(delta_gamma));
+    let b2 = u16::from(encode_gain(delta_gamma));
 
     // Forward block DCT → C̃_{i,k}.
     let blocks = AMBE_BLOCK_LENGTHS[(l - 9) as usize];
-    let c = forward_block_dct_halfrate(&t, &blocks);
+    let c = forward_block_dct(&t, &blocks);
 
     // Pair-join block means + k=2 → R̃₁..R̃₈.
     let pair: [(f64, f64); 4] = core::array::from_fn(|i| (c[i][0], c[i][1]));
@@ -803,7 +811,7 @@ pub fn quantize_halfrate(
     b[6] = u16::from(b6);
     b[7] = u16::from(b7);
     b[8] = u16::from(b8);
-    let u = crate::imbe_frames::priority::prioritize_halfrate(&b);
+    let u = prioritize(&b);
 
     // State advance — mirror the decoder's updates so encoder and
     // decoder stay in lockstep frame-by-frame.
@@ -835,7 +843,7 @@ pub fn quantize_halfrate(
 /// First `b̂₀` value that unambiguously signals a tone frame per §2.10.1.
 /// Values `[126, 127]` are tone; `[120, 125]` are erasure/silence per
 /// §13.1 Table 14; `[128, 255]` are reserved.
-pub const HALFRATE_TONE_B0_FIRST: u8 = 126;
+pub const TONE_B0_FIRST: u8 = 126;
 
 /// Annex T sinusoidal-amplitude scale factor per §2.10.3 Eq. 209.
 /// `M̃_l = 16384 · 10^{0.03555·(A_D − 127)}` at the tone's harmonic
@@ -847,7 +855,7 @@ pub const TONE_AMPLITUDE_EXPONENT_STEP: f64 = 0.03555;
 
 /// Classification of a received half-rate frame prior to MBE decode.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub enum HalfrateFrameKind {
+pub enum FrameKind {
     /// Normal voice frame — dequantize per §2.11–§2.13.
     Voice,
     /// Tone frame per §2.10 — parse ID/amplitude and synthesize via
@@ -870,7 +878,7 @@ pub struct ToneFrameFields {
 
 /// Parsed half-rate frame — one of three kinds.
 #[derive(Clone, Debug)]
-pub enum HalfrateDecoded {
+pub enum Decoded {
     /// Normal voice frame with reconstructed [`MbeParams`].
     Voice(MbeParams),
     /// Tone frame with its ID/amplitude fields plus the MBE
@@ -892,22 +900,22 @@ pub enum HalfrateDecoded {
 /// path `b̂₀` value. A legitimate voice frame cannot produce this
 /// signature because voice-path `b̂₀(6..3) = 1111` would require
 /// `b̂₀ ≥ 120`, which is outside Annex L's valid pitch range.
-pub fn classify_halfrate_frame(u: &[u16; 4]) -> HalfrateFrameKind {
+pub fn classify_halfrate_frame(u: &[u16; 4]) -> FrameKind {
     // Signature + trailer check first — tone frames use their own
     // bit layout (Table 20), so voice deprioritization is irrelevant
     // until we've ruled out tone.
     if ((u[0] >> 6) & 0x3F) == 0x3F && (u[3] & 0x0F) == 0 {
-        return HalfrateFrameKind::Tone;
+        return FrameKind::Tone;
     }
     // Not a tone frame — deprioritize and check `b̂₀` against Annex L's
     // valid range `[0, 119]`. Any `b̂₀ ≥ 120` with no signature is an
     // erasure (§13.1 Table 14) or reserved.
-    let b = deprioritize_halfrate(u);
+    let b = deprioritize(u);
     let b0 = b[0] as u8;
-    if b0 <= HALFRATE_PITCH_MAX {
-        HalfrateFrameKind::Voice
+    if b0 <= PITCH_INDEX_MAX {
+        FrameKind::Voice
     } else {
-        HalfrateFrameKind::Erasure
+        FrameKind::Erasure
     }
 }
 
@@ -971,30 +979,30 @@ pub fn tone_to_mbe_params(id: u8, amplitude: u8) -> Option<MbeParams> {
 
 /// Top-level half-rate frame decoder that handles all three frame kinds.
 ///
-/// - Voice: returns `HalfrateDecoded::Voice(MbeParams)`, updates the
-///   `HalfrateDecoderState` (γ̃, Λ̃, L̃(−1)).
-/// - Tone: returns `HalfrateDecoded::Tone { fields, params }`. Does
+/// - Voice: returns `Decoded::Voice(MbeParams)`, updates the
+///   `DecoderState` (γ̃, Λ̃, L̃(−1)).
+/// - Tone: returns `Decoded::Tone { fields, params }`. Does
 ///   **not** update `prev_lambda`, `prev_l`, or `prev_gamma` — per
 ///   §2.8.3 and §2.11, tone/silence/erasure frames do not advance
 ///   voice-path state.
-/// - Erasure: returns `HalfrateDecoded::Erasure`. Caller repeats the
+/// - Erasure: returns `Decoded::Erasure`. Caller repeats the
 ///   previous voice frame (or emits silence on cold start).
-pub fn decode_halfrate_to_params(
+pub fn decode_to_params(
     u: &[u16; 4],
-    state: &mut HalfrateDecoderState,
-) -> Result<HalfrateDecoded, DecodeError> {
+    state: &mut DecoderState,
+) -> Result<Decoded, DecodeError> {
     match classify_halfrate_frame(u) {
-        HalfrateFrameKind::Voice => {
-            let params = dequantize_halfrate(u, state)?;
-            Ok(HalfrateDecoded::Voice(params))
+        FrameKind::Voice => {
+            let params = dequantize(u, state)?;
+            Ok(Decoded::Voice(params))
         }
-        HalfrateFrameKind::Tone => {
+        FrameKind::Tone => {
             let fields = parse_tone_frame(u).ok_or(DecodeError::BadPitch)?;
             let params = tone_to_mbe_params(fields.id, fields.amplitude)
                 .ok_or(DecodeError::BadPitch)?;
-            Ok(HalfrateDecoded::Tone { fields, params })
+            Ok(Decoded::Tone { fields, params })
         }
-        HalfrateFrameKind::Erasure => Ok(HalfrateDecoded::Erasure),
+        FrameKind::Erasure => Ok(Decoded::Erasure),
     }
 }
 
@@ -1006,18 +1014,21 @@ mod tests {
 
     #[test]
     fn pitch_decode_endpoints_match_annex_l() {
-        let p0 = pitch_decode_halfrate(0).unwrap();
+        // Annex L is stored as cycles/sample, converted to rad/sample
+        // at table load (build.rs).
+        use core::f32::consts::PI;
+        let p0 = decode_pitch(0).unwrap();
         assert_eq!(p0.l, 9);
-        assert!((p0.omega_0 - 0.049971).abs() < 1e-6);
-        let p_last = pitch_decode_halfrate(119).unwrap();
+        assert!((p0.omega_0 - 0.049971 * 2.0 * PI).abs() < 1e-5);
+        let p_last = decode_pitch(119).unwrap();
         assert_eq!(p_last.l, 56);
-        assert!((p_last.omega_0 - 0.008125).abs() < 1e-6);
+        assert!((p_last.omega_0 - 0.008125 * 2.0 * PI).abs() < 1e-5);
     }
 
     #[test]
     fn pitch_decode_rejects_tone_and_reserved() {
         for b0 in 120u8..=255 {
-            assert!(pitch_decode_halfrate(b0).is_none(), "b̂₀ = {b0}");
+            assert!(decode_pitch(b0).is_none(), "b̂₀ = {b0}");
         }
     }
 
@@ -1026,7 +1037,7 @@ mod tests {
     #[test]
     fn expand_vuv_all_voiced_codebook_0_gives_voiced() {
         // AMBE_VUV_CODEBOOK[0] is all-voiced (verified in half_rate tests).
-        let v = expand_vuv_halfrate(0, 0.2, 9);
+        let v = expand_vuv(0, 0.2, 9);
         for l_h in 0..9 {
             assert!(v[l_h]);
         }
@@ -1034,7 +1045,7 @@ mod tests {
 
     #[test]
     fn expand_vuv_all_unvoiced_codebook_16_gives_unvoiced() {
-        let v = expand_vuv_halfrate(16, 0.2, 9);
+        let v = expand_vuv(16, 0.2, 9);
         for l_h in 0..9 {
             assert!(!v[l_h]);
         }
@@ -1046,7 +1057,7 @@ mod tests {
         // hit the 7 clamp. Check: ω = 2π/19.875, l = 9
         //   j = floor(9 · 16 / 19.875) = floor(7.245) = 7 → clamp ok.
         let omega = 2.0 * core::f32::consts::PI / 19.875;
-        let _ = expand_vuv_halfrate(0, omega, 9);
+        let _ = expand_vuv(0, omega, 9);
         // With all-voiced codebook (b1=0), all harmonics are voiced
         // regardless of j_l; the test just exercises the clamp path.
     }
@@ -1056,14 +1067,14 @@ mod tests {
     #[test]
     fn decode_gain_first_frame_equals_table_level() {
         // With prev_gamma = 0, γ̃(0) = Δ̃_γ = AMBE_GAIN_LEVELS[b2].
-        assert!((decode_gain_halfrate(0, 0.0) - (-2.0)).abs() < 1e-6);
-        assert!((decode_gain_halfrate(31, 0.0) - 6.874496).abs() < 1e-6);
+        assert!((decode_gain(0, 0.0) - (-2.0)).abs() < 1e-6);
+        assert!((decode_gain(31, 0.0) - 6.874496).abs() < 1e-6);
     }
 
     #[test]
     fn decode_gain_differential_recurrence() {
         // γ̃(0) = Δ̃_γ + 0.5·γ̃(−1).
-        let g0 = decode_gain_halfrate(16, 10.0);
+        let g0 = decode_gain(16, 10.0);
         let d16 = AMBE_GAIN_LEVELS[16] as f64;
         assert!((g0 - (d16 + 5.0)).abs() < 1e-6);
     }
@@ -1133,14 +1144,14 @@ mod tests {
         //   block 4: J̃=3 → HOC range k=3..=3 = {3} → C̃_{4,3} = H̃_{4,1}.
         let pair = [(1.0, 0.1), (2.0, 0.2), (3.0, 0.3), (4.0, 0.4)];
         let blocks = [2u8, 2, 2, 3];
-        let c = assemble_hoc_matrix_halfrate(&pair, 0, 0, 0, 0, &blocks);
+        let c = assemble_hoc_matrix(&pair, 0, 0, 0, 0, &blocks);
         // Block 4 (i=3): means + k=2 + H̃_{4,1} at k=3.
         assert_eq!(c[3][0], 4.0);
         assert_eq!(c[3][1], 0.4);
         assert!((c[3][2] - f64::from(AMBE_HOC_B8[0][0])).abs() < 1e-6);
         // Blocks 1–3 (i=0,1,2): J̃=2 → only k=1,2 populated, k=3..16 zero.
         for i in 0..3 {
-            for k in 2..MAX_BLOCK_SIZE_HALFRATE {
+            for k in 2..MAX_BLOCK_SIZE {
                 assert_eq!(c[i][k], 0.0, "block {i}, k_idx {k}");
             }
         }
@@ -1152,7 +1163,7 @@ mod tests {
         //                 → C̃[i][2..=5], rest zero up to 16.
         let pair = [(0.0, 0.0); 4];
         let blocks = [17u8, 17, 11, 11]; // contrived; sum doesn't matter for this test
-        let c = assemble_hoc_matrix_halfrate(&pair, 0, 0, 0, 0, &blocks);
+        let c = assemble_hoc_matrix(&pair, 0, 0, 0, 0, &blocks);
         // Block 1 (i=0, B5): k=3..=6 → C̃_{1,3}..C̃_{1,6}.
         for k in 3..=6 {
             let expected = f64::from(AMBE_HOC_B5[0][k - 3]);
@@ -1162,7 +1173,7 @@ mod tests {
             );
         }
         // Coefficients beyond k=6 are zero.
-        for k in 7..MAX_BLOCK_SIZE_HALFRATE {
+        for k in 7..MAX_BLOCK_SIZE {
             assert_eq!(c[0][k - 1], 0.0, "block 1, k_idx {k}");
         }
     }
@@ -1173,13 +1184,13 @@ mod tests {
     fn inverse_block_dct_dc_only_propagates() {
         // Same test as the full-rate version: block means as the only
         // non-zero coefficient → c̃_{i,j} = mean for all j.
-        let mut c = [[0f64; MAX_BLOCK_SIZE_HALFRATE]; 4];
+        let mut c = [[0f64; MAX_BLOCK_SIZE]; 4];
         c[0][0] = 1.0;
         c[1][0] = 2.0;
         c[2][0] = 3.0;
         c[3][0] = 4.0;
         let blocks = AMBE_BLOCK_LENGTHS[0]; // L=9: [2, 2, 2, 3]
-        let t = inverse_block_dct_halfrate(&c, &blocks);
+        let t = inverse_block_dct(&c, &blocks);
         let mut offset = 0;
         for (i, &j) in blocks.iter().enumerate() {
             for k in 0..j as usize {
@@ -1203,7 +1214,7 @@ mod tests {
         for i in 0..9 {
             t[i] = (i as f64) * 0.1;
         }
-        let state = HalfrateDecoderState::new();
+        let state = DecoderState::new();
         // Wait — state.prev_lambda is init'd to 1.0 (linear), but
         // prev_lambda_at is supposed to return log₂. Re-check the
         // spec: §2.13 says "Λ̃_l(−1) = 1 for all l". That's 1 in the
@@ -1227,7 +1238,7 @@ mod tests {
         // Predictor sum has 0.65·(1−δ)·1 + 0.65·δ·1 = 0.65 per term.
         // Mean = 0.65. Per-harmonic subtract-mean cancels the
         // per-harmonic term → 0. So Λ̃_l(0) = T̃_l + Γ̃.
-        let lambda = apply_log_prediction_halfrate(&t, 9, 0.0, &state);
+        let lambda = apply_log_prediction(&t, 9, 0.0, &state);
         let l_curr = 9f64;
         let t_sum: f64 = t[..9].iter().sum();
         let gamma_intercept = 0.0 - 0.5 * l_curr.log2() - t_sum / l_curr;
@@ -1244,28 +1255,28 @@ mod tests {
     // ---- Top-level -------------------------------------------------------
 
     #[test]
-    fn dequantize_halfrate_rejects_tone_frame() {
-        use crate::imbe_frames::priority::prioritize_halfrate;
+    fn dequantize_rejects_tone_frame() {
+        use crate::p25_halfrate::priority::prioritize;
         let mut b = [0u16; 9];
         b[0] = 120; // tone frame
-        let u = prioritize_halfrate(&b);
-        let mut state = HalfrateDecoderState::new();
+        let u = prioritize(&b);
+        let mut state = DecoderState::new();
         assert_eq!(
-            dequantize_halfrate(&u, &mut state),
+            dequantize(&u, &mut state),
             Err(DecodeError::BadPitch)
         );
     }
 
     #[test]
-    fn dequantize_halfrate_produces_finite_amplitudes_for_zero_b() {
-        use crate::imbe_frames::priority::prioritize_halfrate;
+    fn dequantize_produces_finite_amplitudes_for_zero_b() {
+        use crate::p25_halfrate::priority::prioritize;
         // b̂₀ = 0 → valid pitch; other params zero.
         let b = [0u16; 9];
-        let u = prioritize_halfrate(&b);
-        let mut state = HalfrateDecoderState::new();
-        let p = dequantize_halfrate(&u, &mut state).expect("decode");
+        let u = prioritize(&b);
+        let mut state = DecoderState::new();
+        let p = dequantize(&u, &mut state).expect("decode");
         assert_eq!(p.harmonic_count(), 9);
-        assert!((p.omega_0() - 0.049971).abs() < 1e-6);
+        assert!((p.omega_0() - 0.049971 * 2.0 * core::f32::consts::PI).abs() < 1e-5);
         // All harmonics finite, non-negative.
         for l_h in 1..=9 {
             let a = p.amplitude(l_h);
@@ -1302,24 +1313,24 @@ mod tests {
 
     #[test]
     fn classify_voice_frame_when_b0_valid() {
-        use crate::imbe_frames::priority::prioritize_halfrate;
+        use crate::p25_halfrate::priority::prioritize;
         let b = [0u16; 9];
-        let u = prioritize_halfrate(&b);
-        assert_eq!(classify_halfrate_frame(&u), HalfrateFrameKind::Voice);
+        let u = prioritize(&b);
+        assert_eq!(classify_halfrate_frame(&u), FrameKind::Voice);
     }
 
     #[test]
     fn classify_erasure_for_b0_range_120_125() {
-        use crate::imbe_frames::priority::prioritize_halfrate;
+        use crate::p25_halfrate::priority::prioritize;
         for b0 in 120..=125u16 {
             let mut b = [0u16; 9];
             b[0] = b0;
-            let u = prioritize_halfrate(&b);
+            let u = prioritize(&b);
             // Without the tone signature in û₀, this classifies as Erasure
             // (the 120–125 range is specifically erasure per §13.1 Table 14).
             assert_eq!(
                 classify_halfrate_frame(&u),
-                HalfrateFrameKind::Erasure,
+                FrameKind::Erasure,
                 "b̂₀ = {b0}"
             );
         }
@@ -1328,18 +1339,18 @@ mod tests {
     #[test]
     fn classify_tone_for_b0_126_and_127_with_signature() {
         let u = build_tone_frame_u(128, 0); // DTMF tone 0 (ID 128)
-        assert_eq!(classify_halfrate_frame(&u), HalfrateFrameKind::Tone);
+        assert_eq!(classify_halfrate_frame(&u), FrameKind::Tone);
     }
 
     #[test]
     fn classify_erasure_when_tone_range_but_signature_missing() {
-        use crate::imbe_frames::priority::prioritize_halfrate;
+        use crate::p25_halfrate::priority::prioritize;
         let mut b = [0u16; 9];
         b[0] = 126; // tone-range b̂₀ but no signature
-        let u = prioritize_halfrate(&b);
+        let u = prioritize(&b);
         // With this synthetic frame, û₀ doesn't have the 0x3F
         // signature — caller should fall back to Erasure.
-        assert_eq!(classify_halfrate_frame(&u), HalfrateFrameKind::Erasure);
+        assert_eq!(classify_halfrate_frame(&u), FrameKind::Erasure);
     }
 
     #[test]
@@ -1437,12 +1448,12 @@ mod tests {
 
     #[test]
     fn decode_halfrate_dispatches_voice() {
-        use crate::imbe_frames::priority::prioritize_halfrate;
+        use crate::p25_halfrate::priority::prioritize;
         let b = [0u16; 9];
-        let u = prioritize_halfrate(&b);
-        let mut state = HalfrateDecoderState::new();
-        match decode_halfrate_to_params(&u, &mut state).unwrap() {
-            HalfrateDecoded::Voice(_) => {}
+        let u = prioritize(&b);
+        let mut state = DecoderState::new();
+        match decode_to_params(&u, &mut state).unwrap() {
+            Decoded::Voice(_) => {}
             other => panic!("expected Voice, got {other:?}"),
         }
     }
@@ -1450,28 +1461,28 @@ mod tests {
     #[test]
     fn decode_halfrate_dispatches_tone() {
         let u = build_tone_frame_u(5, 100); // 156.25 Hz tone
-        let mut state = HalfrateDecoderState::new();
-        match decode_halfrate_to_params(&u, &mut state).unwrap() {
-            HalfrateDecoded::Tone { fields, params: _ } => {
+        let mut state = DecoderState::new();
+        match decode_to_params(&u, &mut state).unwrap() {
+            Decoded::Tone { fields, params: _ } => {
                 assert_eq!(fields.id, 5);
                 assert_eq!(fields.amplitude, 100);
             }
             other => panic!("expected Tone, got {other:?}"),
         }
         // Tone frame must not advance voice-state.
-        assert_eq!(state.previous_l(), HALFRATE_INIT_PREV_L);
+        assert_eq!(state.previous_l(), INIT_PREV_L);
         assert_eq!(state.previous_gamma(), 0.0);
     }
 
     #[test]
     fn decode_halfrate_dispatches_erasure() {
-        use crate::imbe_frames::priority::prioritize_halfrate;
+        use crate::p25_halfrate::priority::prioritize;
         let mut b = [0u16; 9];
         b[0] = 120; // erasure
-        let u = prioritize_halfrate(&b);
-        let mut state = HalfrateDecoderState::new();
-        match decode_halfrate_to_params(&u, &mut state).unwrap() {
-            HalfrateDecoded::Erasure => {}
+        let u = prioritize(&b);
+        let mut state = DecoderState::new();
+        match decode_to_params(&u, &mut state).unwrap() {
+            Decoded::Erasure => {}
             other => panic!("expected Erasure, got {other:?}"),
         }
     }
@@ -1482,15 +1493,15 @@ mod tests {
     fn pitch_encode_roundtrips_every_table_entry() {
         for b0 in 0..=119u8 {
             let w = AMBE_PITCH_TABLE[b0 as usize].omega_0;
-            assert_eq!(pitch_encode_halfrate(w), Some(b0), "b0 = {b0}");
+            assert_eq!(encode_pitch(w), Some(b0), "b0 = {b0}");
         }
     }
 
     #[test]
     fn pitch_encode_rejects_out_of_range() {
-        assert_eq!(pitch_encode_halfrate(0.0), None);
-        assert_eq!(pitch_encode_halfrate(-0.1), None);
-        assert_eq!(pitch_encode_halfrate(1.0), None); // higher than max ω₀ ≈ 0.05
+        assert_eq!(encode_pitch(0.0), None);
+        assert_eq!(encode_pitch(-0.1), None);
+        assert_eq!(encode_pitch(1.0), None); // higher than max ω₀ ≈ 0.05
     }
 
     #[test]
@@ -1498,7 +1509,7 @@ mod tests {
         // AMBE_VUV_CODEBOOK[0] is all-voiced; per-harmonic all-voiced
         // input should encode to it.
         let voiced = vec![true; 9];
-        assert_eq!(vuv_encode_halfrate(&voiced, 0.2), 0);
+        assert_eq!(encode_vuv(&voiced, 0.2), 0);
     }
 
     #[test]
@@ -1510,9 +1521,9 @@ mod tests {
         // unvoiced, matching the input.
         let voiced = vec![false; 9];
         let omega_0 = 0.2f32;
-        let idx = vuv_encode_halfrate(&voiced, omega_0);
+        let idx = encode_vuv(&voiced, omega_0);
         // Re-decode and check per-harmonic output is all unvoiced.
-        let expanded = expand_vuv_halfrate(idx, omega_0, 9);
+        let expanded = expand_vuv(idx, omega_0, 9);
         for l_h in 0..9 {
             assert!(!expanded[l_h], "l={l_h} should decode unvoiced for encoded b̂₁={idx}");
         }
@@ -1522,14 +1533,14 @@ mod tests {
     fn gain_encode_roundtrips_every_annex_o_level() {
         for b2 in 0..32u8 {
             let target = f64::from(AMBE_GAIN_LEVELS[b2 as usize]);
-            assert_eq!(gain_encode_halfrate(target), b2, "b2 = {b2}");
+            assert_eq!(encode_gain(target), b2, "b2 = {b2}");
         }
     }
 
     #[test]
     fn gain_encode_clamps_out_of_range() {
-        assert_eq!(gain_encode_halfrate(-1000.0), 0);
-        assert_eq!(gain_encode_halfrate(1000.0), 31);
+        assert_eq!(encode_gain(-1000.0), 0);
+        assert_eq!(encode_gain(1000.0), 31);
     }
 
     #[test]
@@ -1569,8 +1580,8 @@ mod tests {
         for i in 0..l as usize {
             t_in[i] = (i as f64 * 0.3).sin() * 2.0 - 0.5;
         }
-        let c = forward_block_dct_halfrate(&t_in, &blocks);
-        let t_out = inverse_block_dct_halfrate(&c, &blocks);
+        let c = forward_block_dct(&t_in, &blocks);
+        let t_out = inverse_block_dct(&c, &blocks);
         for i in 0..l as usize {
             assert!(
                 (t_out[i] - t_in[i]).abs() < 1e-6,
@@ -1594,14 +1605,14 @@ mod tests {
         // Build an arbitrary Λ̃, push through forward log-mag pred to
         // get T̃ + γ̃, then run the decoder's apply_log_prediction on T̃
         // with the same state (and γ̃ feeding Γ̃). Should recover Λ̃.
-        let state = HalfrateDecoderState::new();
+        let state = DecoderState::new();
         let l = 20u8;
         let mut lambda_in = [0f64; L_MAX as usize + 2];
         for i in 1..=l as usize {
             lambda_in[i] = (i as f64 * 0.15).sin() * 0.4 - 0.1;
         }
-        let (t, gamma) = forward_log_prediction_halfrate(&lambda_in, l, &state);
-        let lambda_out = apply_log_prediction_halfrate(&t, l, gamma, &state);
+        let (t, gamma) = forward_log_prediction(&lambda_in, l, &state);
+        let lambda_out = apply_log_prediction(&t, l, gamma, &state);
         for i in 1..=l as usize {
             assert!(
                 (lambda_out[i] - lambda_in[i]).abs() < 1e-6,
@@ -1613,7 +1624,7 @@ mod tests {
     }
 
     #[test]
-    fn quantize_halfrate_pitch_and_vuv_roundtrip_on_boundary_cases() {
+    fn quantize_pitch_and_vuv_roundtrip_on_boundary_cases() {
         // Bit-exact roundtrip is only well-defined for V/UV codebook
         // rows that are fully determined by the active harmonic slots.
         // For half-rate's low pitches, only 2–3 of the codebook's 8
@@ -1623,7 +1634,7 @@ mod tests {
         // all-voiced (row 0) and all-unvoiced (row 16) rows are
         // stable endpoints — any per-harmonic pattern derived from
         // those unambiguously maps back to the same row.
-        use crate::imbe_frames::priority::{deprioritize_halfrate, prioritize_halfrate};
+        use crate::p25_halfrate::priority::{deprioritize, prioritize};
 
         // Only b̂₁ = 0 (all voiced) is guaranteed to be the lowest
         // codebook index matching any all-voiced active-slot pattern.
@@ -1636,14 +1647,14 @@ mod tests {
             let mut b = [0u16; 9];
             b[0] = b0_seed;
             b[1] = b1_seed;
-            let u = prioritize_halfrate(&b);
+            let u = prioritize(&b);
 
-            let mut state_dec = HalfrateDecoderState::new();
-            let params = dequantize_halfrate(&u, &mut state_dec).unwrap();
+            let mut state_dec = DecoderState::new();
+            let params = dequantize(&u, &mut state_dec).unwrap();
 
-            let mut state_enc = HalfrateDecoderState::new();
-            let u_back = quantize_halfrate(&params, &mut state_enc).unwrap();
-            let b_back = deprioritize_halfrate(&u_back);
+            let mut state_enc = DecoderState::new();
+            let u_back = quantize(&params, &mut state_enc).unwrap();
+            let b_back = deprioritize(&u_back);
 
             assert_eq!(
                 b_back[0], b[0],
@@ -1657,24 +1668,24 @@ mod tests {
     }
 
     #[test]
-    fn quantize_halfrate_gain_stabilizes_under_iterated_roundtrip() {
+    fn quantize_gain_stabilizes_under_iterated_roundtrip() {
         // Gain (b̂₂) uses a differential quantizer, so the first
         // roundtrip may produce drift as the encoder recomputes γ̃
         // from decoded M̃_l. Iterating a few times should stabilize.
-        use crate::imbe_frames::priority::{deprioritize_halfrate, prioritize_halfrate};
+        use crate::p25_halfrate::priority::{deprioritize, prioritize};
         let mut b = [0u16; 9];
         b[0] = 0;
         b[1] = 0;
         b[2] = 10;
 
-        let u0 = prioritize_halfrate(&b);
-        let mut state_a = HalfrateDecoderState::new();
-        let mut state_b = HalfrateDecoderState::new();
+        let u0 = prioritize(&b);
+        let mut state_a = DecoderState::new();
+        let mut state_b = DecoderState::new();
 
         // Frame 1: dequantize → params → re-encode.
-        let params = dequantize_halfrate(&u0, &mut state_a).unwrap();
-        let u1 = quantize_halfrate(&params, &mut state_b).unwrap();
-        let b1 = deprioritize_halfrate(&u1);
+        let params = dequantize(&u0, &mut state_a).unwrap();
+        let u1 = quantize(&params, &mut state_b).unwrap();
+        let b1 = deprioritize(&u1);
 
         // Pitch and V/UV (all-voiced endpoint) must roundtrip exactly.
         assert_eq!(b1[0], b[0]);
@@ -1684,27 +1695,27 @@ mod tests {
         // (decode b1 → params2, re-encode → b2) — result should be
         // stable (b2 == b1) since both encoder and decoder now use
         // quantized γ̃ values on matching states.
-        let mut state_c = HalfrateDecoderState::new();
-        let params2 = dequantize_halfrate(&u1, &mut state_c).unwrap();
-        let mut state_d = HalfrateDecoderState::new();
-        let u2 = quantize_halfrate(&params2, &mut state_d).unwrap();
-        let b2 = deprioritize_halfrate(&u2);
+        let mut state_c = DecoderState::new();
+        let params2 = dequantize(&u1, &mut state_c).unwrap();
+        let mut state_d = DecoderState::new();
+        let u2 = quantize(&params2, &mut state_d).unwrap();
+        let b2 = deprioritize(&u2);
         assert_eq!(b2[2], b1[2], "gain should be stable on iteration 2");
     }
 
     #[test]
-    fn dequantize_halfrate_advances_state_between_frames() {
-        use crate::imbe_frames::priority::prioritize_halfrate;
+    fn dequantize_advances_state_between_frames() {
+        use crate::p25_halfrate::priority::prioritize;
         let b = [0u16; 9];
-        let u = prioritize_halfrate(&b);
-        let mut state = HalfrateDecoderState::new();
+        let u = prioritize(&b);
+        let mut state = DecoderState::new();
         let g0 = state.previous_gamma();
-        let _ = dequantize_halfrate(&u, &mut state).unwrap();
+        let _ = dequantize(&u, &mut state).unwrap();
         let g1 = state.previous_gamma();
         // gamma_0 = Δ̃_γ + 0.5·0 = -2.0, so ≠ 0.
         assert_ne!(g0, g1);
         // Run another frame — gamma applies differential recurrence.
-        let _ = dequantize_halfrate(&u, &mut state).unwrap();
+        let _ = dequantize(&u, &mut state).unwrap();
         let g2 = state.previous_gamma();
         // g2 = -2.0 + 0.5·g1 = -2.0 + 0.5·(-2.0) = -3.0.
         assert!((g2 - (-3.0)).abs() < 1e-6);

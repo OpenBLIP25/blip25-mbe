@@ -1,7 +1,10 @@
-//! Half-rate IMBE/AMBE frame — 72 bits carrying 49 parameter bits at 3,600 bps.
+//! Half-rate AMBE+2 frame — 72 bits carrying 49 parameter bits at 3,600 bps.
 //!
-//! Per TIA-102.BABA-A §2.4–§2.6. Composes the generic Golay/Hamming
-//! primitives from [`crate::fec`] into the half-rate wire layout:
+//! Per TIA-102.BABA-A §2.4–§2.6 (originally the BABA-1 addendum,
+//! consolidated into BABA-A). The half-rate vocoder is AMBE+2 in
+//! everything but name; BABA-A renames it "Half-Rate Vocoder" to dodge
+//! DVSI's trademark. Composes the generic Golay primitives from
+//! [`crate::fec`] into the half-rate wire layout:
 //!
 //! ```text
 //! c₀ : [24, 12] extended Golay, 24 bits   (from û₀ = 12 info bits)
@@ -84,7 +87,7 @@ pub const INFO_BITS_TOTAL: u16 = 49;
 
 /// Length of the half-rate PN sequence: `p_r(0)` seed plus
 /// `p_r(1..=23)` for the 23-bit `m̂₁` mask.
-pub const PN_SEQ_LEN_HALFRATE: usize = 24;
+pub const PN_SEQ_LEN: usize = 24;
 
 /// Number of dibit symbols per half-rate frame (72 bits / 2 bits per
 /// symbol).
@@ -108,7 +111,7 @@ include!(concat!(env!("OUT_DIR"), "/annex_s.rs"));
 
 /// Deinterleave a 72-bit half-rate frame (36 dibits) into the 4 code
 /// vectors `c₀..c₃`.
-pub fn deinterleave_halfrate(dibits: &[u8; DIBITS_PER_FRAME]) -> [u32; 4] {
+pub fn deinterleave(dibits: &[u8; DIBITS_PER_FRAME]) -> [u32; 4] {
     let mut c = [0u32; 4];
     for (sym, d) in dibits.iter().enumerate() {
         let entry = ANNEX_S[sym];
@@ -121,8 +124,8 @@ pub fn deinterleave_halfrate(dibits: &[u8; DIBITS_PER_FRAME]) -> [u32; 4] {
 }
 
 /// Interleave 4 code vectors `c₀..c₃` into 72 bits (36 dibits) per
-/// Annex S. Inverse of [`deinterleave_halfrate`].
-pub fn interleave_halfrate(codewords: &[u32; 4]) -> [u8; DIBITS_PER_FRAME] {
+/// Annex S. Inverse of [`deinterleave`].
+pub fn interleave(codewords: &[u32; 4]) -> [u8; DIBITS_PER_FRAME] {
     let mut dibits = [0u8; DIBITS_PER_FRAME];
     for (sym, entry) in ANNEX_S.iter().enumerate() {
         let hi = ((codewords[entry.bit1_vec as usize] >> entry.bit1_idx) & 1) as u8;
@@ -141,11 +144,11 @@ pub fn interleave_halfrate(codewords: &[u32; 4]) -> [u8; DIBITS_PER_FRAME] {
 /// Same LCG as full-rate (§1.6 Eq. 84–85), but with only 24 values.
 /// Seed is `16 · û₀` using the 12-bit info word that emerges from the
 /// `[24, 12]` decode of `c₀`.
-pub fn pn_sequence_halfrate(u0: u16) -> [u16; PN_SEQ_LEN_HALFRATE] {
+pub fn pn_sequence(u0: u16) -> [u16; PN_SEQ_LEN] {
     debug_assert!(u0 < 4096, "û₀ is a 12-bit info word");
-    let mut pr = [0u16; PN_SEQ_LEN_HALFRATE];
+    let mut pr = [0u16; PN_SEQ_LEN];
     pr[0] = u0.wrapping_mul(16);
-    for n in 1..PN_SEQ_LEN_HALFRATE {
+    for n in 1..PN_SEQ_LEN {
         pr[n] = (173u32
             .wrapping_mul(pr[n - 1] as u32)
             .wrapping_add(13849)
@@ -163,8 +166,8 @@ pub fn pn_sequence_halfrate(u0: u16) -> [u16; PN_SEQ_LEN_HALFRATE] {
 ///   full-rate DVSI-verified layout.
 /// * `m̂₂ = 0` (11 bits) — `c₂` is uncoded; no PN.
 /// * `m̂₃ = 0` (14 bits) — `c₃` is uncoded; no PN.
-pub fn modulation_masks_halfrate(u0: u16) -> [u32; 4] {
-    let pr = pn_sequence_halfrate(u0);
+pub fn modulation_masks(u0: u16) -> [u32; 4] {
+    let pr = pn_sequence(u0);
     let mut m = 0u32;
     for k in 0..23 {
         let bit = u32::from(pr[1 + k] >> 15); // MSB of p_r(n)
@@ -177,8 +180,8 @@ pub fn modulation_masks_halfrate(u0: u16) -> [u32; 4] {
 /// `v̂₀..v̂₃`. Same shape as the full-rate version: caller Golay-
 /// decodes `c̃₀ → û₀` first to seed the PN generator, then XORs the
 /// masks.
-pub fn demodulate_halfrate(codewords: [u32; 4], u0: u16) -> [u32; 4] {
-    let masks = modulation_masks_halfrate(u0);
+pub fn demodulate(codewords: [u32; 4], u0: u16) -> [u32; 4] {
+    let masks = modulation_masks(u0);
     let mut v = [0u32; 4];
     for i in 0..4 {
         v[i] = codewords[i] ^ masks[i];
@@ -192,7 +195,7 @@ pub fn demodulate_halfrate(codewords: [u32; 4], u0: u16) -> [u32; 4] {
 
 /// Decoded 49-bit information layer of a half-rate AMBE frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct AmbeFrame {
+pub struct Frame {
     /// Decoded info vectors `û₀..û₃`, LSB-aligned. Widths per
     /// [`INFO_WIDTHS`].
     pub info: [u16; 4],
@@ -203,14 +206,14 @@ pub struct AmbeFrame {
     pub errors: [u8; 4],
 }
 
-impl AmbeFrame {
+impl Frame {
     /// Total error count across all vectors.
     pub fn error_total(&self) -> u16 {
         self.errors.iter().map(|&e| u16::from(e)).sum()
     }
 }
 
-/// Decode a half-rate frame: 36 dibits → [`AmbeFrame`].
+/// Decode a half-rate frame: 36 dibits → [`Frame`].
 ///
 /// Pipeline (BABA-A §2.4–§2.6 compose with §2.5):
 /// 1. Deinterleave 36 dibits → `c̃₀..c̃₃`.
@@ -218,25 +221,25 @@ impl AmbeFrame {
 /// 3. Generate PN masks from `û₀`; XOR into `c̃₁`.
 /// 4. `[23, 12]` Golay-decode the result → `û₁`.
 /// 5. Uncoded passthrough: `û₂ = c̃₂`, `û₃ = c̃₃`.
-pub fn decode_halfrate_frame(dibits: &[u8; DIBITS_PER_FRAME]) -> AmbeFrame {
-    let c = deinterleave_halfrate(dibits);
+pub fn decode_frame(dibits: &[u8; DIBITS_PER_FRAME]) -> Frame {
+    let c = deinterleave(dibits);
 
     let d0 = golay_24_12_decode(c[0]);
     let u0 = d0.info;
-    let masks = modulation_masks_halfrate(u0);
+    let masks = modulation_masks(u0);
     let d1 = golay_23_12_decode(c[1] ^ masks[1]);
     let u2 = (c[2] & 0x7FF) as u16; // 11 bits
     let u3 = (c[3] & 0x3FFF) as u16; // 14 bits
 
-    AmbeFrame {
+    Frame {
         info: [d0.info, d1.info, u2, u3],
         errors: [d0.errors, d1.errors, 0, 0],
     }
 }
 
 /// Encode 4 info vectors into 72 half-rate air-interface bits
-/// (36 dibits). Inverse of [`decode_halfrate_frame`].
-pub fn encode_halfrate_frame(info: &[u16; 4]) -> [u8; DIBITS_PER_FRAME] {
+/// (36 dibits). Inverse of [`decode_frame`].
+pub fn encode_frame(info: &[u16; 4]) -> [u8; DIBITS_PER_FRAME] {
     // Mask each input to its declared width so stray high bits can't
     // silently corrupt the frame.
     let u: [u16; 4] = core::array::from_fn(|i| {
@@ -250,9 +253,9 @@ pub fn encode_halfrate_frame(info: &[u16; 4]) -> [u8; DIBITS_PER_FRAME] {
     let v2 = u32::from(u[2]);
     let v3 = u32::from(u[3]);
 
-    let masks = modulation_masks_halfrate(u[0]);
+    let masks = modulation_masks(u[0]);
     let c = [v0, v1 ^ masks[1], v2, v3];
-    interleave_halfrate(&c)
+    interleave(&c)
 }
 
 #[cfg(test)]
@@ -296,11 +299,11 @@ mod tests {
             state = state.wrapping_mul(1664525).wrapping_add(1013904223);
             cw[i] = state & valid_mask(i);
         }
-        let dibits = interleave_halfrate(&cw);
+        let dibits = interleave(&cw);
         for d in dibits.iter() {
             assert!(*d < 4);
         }
-        let back = deinterleave_halfrate(&dibits);
+        let back = deinterleave(&dibits);
         assert_eq!(back, cw);
     }
 
@@ -310,10 +313,10 @@ mod tests {
             for idx in 0..CODE_WIDTHS[v] {
                 let mut cw = [0u32; 4];
                 cw[v] = 1u32 << idx;
-                let dibits = interleave_halfrate(&cw);
+                let dibits = interleave(&cw);
                 let ones: u32 = dibits.iter().map(|d| u32::from(*d).count_ones()).sum();
                 assert_eq!(ones, 1, "(v={v}, idx={idx})");
-                assert_eq!(deinterleave_halfrate(&dibits), cw);
+                assert_eq!(deinterleave(&dibits), cw);
             }
         }
     }
@@ -321,9 +324,9 @@ mod tests {
     #[test]
     fn pn_seed_halfrate_matches_formula() {
         for u0 in [0u16, 1, 42, 4095] {
-            assert_eq!(pn_sequence_halfrate(u0)[0], u0.wrapping_mul(16));
+            assert_eq!(pn_sequence(u0)[0], u0.wrapping_mul(16));
         }
-        let pr = pn_sequence_halfrate(1);
+        let pr = pn_sequence(1);
         assert_eq!(pr[0], 16);
         // pr[1] = (173·16 + 13849) mod 65536 = 16617
         assert_eq!(pr[1], 16617);
@@ -332,7 +335,7 @@ mod tests {
     #[test]
     fn modulation_masks_m0_m2_m3_always_zero() {
         for u0 in [0u16, 1, 123, 4095] {
-            let masks = modulation_masks_halfrate(u0);
+            let masks = modulation_masks(u0);
             assert_eq!(masks[0], 0);
             assert_eq!(masks[2], 0);
             assert_eq!(masks[3], 0);
@@ -342,7 +345,7 @@ mod tests {
     #[test]
     fn modulation_masks_m1_fits_within_23_bits() {
         for u0 in [0u16, 1, 123, 4095] {
-            let masks = modulation_masks_halfrate(u0);
+            let masks = modulation_masks(u0);
             assert!(masks[1] < (1 << 23));
         }
     }
@@ -350,10 +353,10 @@ mod tests {
     #[test]
     fn demodulate_is_self_inverse() {
         let u0 = 0xA5Cu16;
-        let masks = modulation_masks_halfrate(u0);
+        let masks = modulation_masks(u0);
         let v: [u32; 4] = [0x123456, 0x654321, 0x7A5, 0x2F2F];
         let c: [u32; 4] = core::array::from_fn(|i| v[i] ^ masks[i]);
-        let v2 = demodulate_halfrate(c, u0);
+        let v2 = demodulate(c, u0);
         assert_eq!(v2, v);
     }
 
@@ -373,11 +376,11 @@ mod tests {
     fn frame_roundtrip_zero_and_sampled() {
         for seed in [0u32, 1, 0xDEADBEEF, 0xCAFEBABE, 0x12345678] {
             let u = if seed == 0 { [0u16; 4] } else { sample_info(seed) };
-            let dibits = encode_halfrate_frame(&u);
+            let dibits = encode_frame(&u);
             for (s, d) in dibits.iter().enumerate() {
                 assert!(*d < 4, "symbol {s} not a dibit (seed {seed:08x})");
             }
-            let back = decode_halfrate_frame(&dibits);
+            let back = decode_frame(&dibits);
             assert_eq!(back.info, u, "seed 0x{seed:08x}");
             assert_eq!(back.errors, [0u8; 4], "seed 0x{seed:08x}");
         }
@@ -387,13 +390,13 @@ mod tests {
     fn single_bit_flip_in_c0_is_corrected() {
         // c₀ is [24,12] extended Golay → corrects any single bit error.
         let u = sample_info(0xA5A5A5A5);
-        let clean = encode_halfrate_frame(&u);
+        let clean = encode_frame(&u);
         for bit in 0..24 {
-            let c = deinterleave_halfrate(&clean);
+            let c = deinterleave(&clean);
             let mut c_flipped = c;
             c_flipped[0] ^= 1u32 << bit;
-            let dibits = interleave_halfrate(&c_flipped);
-            let out = decode_halfrate_frame(&dibits);
+            let dibits = interleave(&c_flipped);
+            let out = decode_frame(&dibits);
             assert_eq!(out.info, u, "c̃₀ bit {bit}");
             assert_eq!(out.errors[0], 1);
         }
@@ -402,13 +405,13 @@ mod tests {
     #[test]
     fn single_bit_flip_in_c1_is_corrected() {
         let u = sample_info(0x5A5A5A5A);
-        let clean = encode_halfrate_frame(&u);
+        let clean = encode_frame(&u);
         for bit in 0..23 {
-            let c = deinterleave_halfrate(&clean);
+            let c = deinterleave(&clean);
             let mut c_flipped = c;
             c_flipped[1] ^= 1u32 << bit;
-            let dibits = interleave_halfrate(&c_flipped);
-            let out = decode_halfrate_frame(&dibits);
+            let dibits = interleave(&c_flipped);
+            let out = decode_frame(&dibits);
             assert_eq!(out.info, u, "c̃₁ bit {bit}");
             assert_eq!(out.errors[1], 1);
         }
@@ -417,18 +420,18 @@ mod tests {
     #[test]
     fn uncoded_vectors_have_no_error_correction() {
         let u = sample_info(0xFACEFEED);
-        let clean = encode_halfrate_frame(&u);
-        let c = deinterleave_halfrate(&clean);
+        let clean = encode_frame(&u);
+        let c = deinterleave(&clean);
         // Flip bit in c₂ — passes through to û₂.
         let mut c_flip2 = c;
         c_flip2[2] ^= 1u32 << 5;
-        let out2 = decode_halfrate_frame(&interleave_halfrate(&c_flip2));
+        let out2 = decode_frame(&interleave(&c_flip2));
         assert_eq!(out2.info[2], u[2] ^ 0b10_0000);
         assert_eq!(out2.errors[2], 0);
         // Flip bit in c₃ — passes through to û₃.
         let mut c_flip3 = c;
         c_flip3[3] ^= 1u32 << 11;
-        let out3 = decode_halfrate_frame(&interleave_halfrate(&c_flip3));
+        let out3 = decode_frame(&interleave(&c_flip3));
         assert_eq!(out3.info[3], u[3] ^ (1 << 11));
         assert_eq!(out3.errors[3], 0);
     }
@@ -437,15 +440,19 @@ mod tests {
 
     #[test]
     fn annex_l_spot_values_match_spec() {
-        // Spec-provided spot values from impl-spec §12.8 / full-text
-        // Annex L: b₀=0 → (L=9, ω₀=0.049971); b₀=119 → (L=56, ω₀=0.008125).
+        // Annex L stores cycles/sample on disk; the build script
+        // converts to rad/sample at load (× 2π) so values here are in
+        // the same units as MbeParams. b₀=0 → (L=9, 0.049971 c/s →
+        // 0.313977 rad/s); b₀=119 → (L=56, 0.008125 c/s → 0.051051
+        // rad/s). See impl-spec §12.8 + analysis §13.
+        use core::f32::consts::PI;
         assert_eq!(AMBE_PITCH_TABLE.len(), 120);
         let p0 = AMBE_PITCH_TABLE[0];
         assert_eq!(p0.l, 9);
-        assert!((p0.omega_0 - 0.049971).abs() < 1e-6);
+        assert!((p0.omega_0 - 0.049971 * 2.0 * PI).abs() < 1e-5);
         let p_last = AMBE_PITCH_TABLE[119];
         assert_eq!(p_last.l, 56);
-        assert!((p_last.omega_0 - 0.008125).abs() < 1e-6);
+        assert!((p_last.omega_0 - 0.008125 * 2.0 * PI).abs() < 1e-5);
     }
 
     #[test]
@@ -525,8 +532,8 @@ mod tests {
         let mut u = [0xFFFFu16; 4];
         // Reduce within the u16 limits but above the declared widths.
         u[0] = 0xFFFF;
-        let dibits = encode_halfrate_frame(&u);
-        let back = decode_halfrate_frame(&dibits);
+        let dibits = encode_frame(&u);
+        let back = decode_frame(&dibits);
         for i in 0..4 {
             let w = INFO_WIDTHS[i] as u32;
             let m = ((1u32 << w) - 1) as u16;

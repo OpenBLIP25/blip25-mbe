@@ -584,7 +584,15 @@ fn parse_csv_rows(
 
 /// Annex L — half-rate pitch quantization table (120 entries).
 /// Emits `AMBE_PITCH_TABLE: [PitchEntry; 120]` indexed by `b̂₀`.
+///
+/// CSV stores `omega_0` in cycles/sample (= ω₀ / 2π). BABA-A §13.1
+/// states the half-rate voice range as `2π/123.125 ≤ ω̂₀ ≤ 2π/19.875`
+/// rad/sample, which numerically matches `2π × CSV` to six places.
+/// We convert at load time so every consumer reads ω₀ in rad/sample
+/// — the unit MbeParams uses everywhere else.
+/// See `analysis/vocoder_decode_disambiguations.md` §13.
 fn gen_annex_l(out_dir: &PathBuf) {
+    let two_pi = 2.0 * std::f32::consts::PI;
     let mut entries: Vec<(u8, u8, f32)> = Vec::with_capacity(120);
     parse_csv_rows(
         "spec_tables/annex_l_pitch_table.csv",
@@ -592,11 +600,11 @@ fn gen_annex_l(out_dir: &PathBuf) {
         |row_idx, cols| {
             let b0: u8 = cols[0].parse().expect("b0");
             let l: u8 = cols[1].parse().expect("L");
-            let w: f32 = cols[2].parse().expect("omega_0");
+            let w_cycles: f32 = cols[2].parse().expect("omega_0");
             assert_eq!(b0 as usize, row_idx, "Annex L must be sequential");
             assert!((9..=56).contains(&l), "Annex L L={l} out of range");
-            assert!(w > 0.0, "Annex L omega_0 must be positive");
-            entries.push((b0, l, w));
+            assert!(w_cycles > 0.0, "Annex L omega_0 must be positive");
+            entries.push((b0, l, w_cycles * two_pi));
         },
     );
     assert_eq!(entries.len(), 120, "Annex L must have 120 entries");
@@ -607,6 +615,7 @@ fn gen_annex_l(out_dir: &PathBuf) {
 
     let mut out = String::new();
     out.push_str("// Auto-generated from spec_tables/annex_l_pitch_table.csv\n");
+    out.push_str("// CSV stores cycles/sample; values converted to rad/sample at load.\n");
     out.push_str("pub const AMBE_PITCH_TABLE: [PitchEntry; 120] = [\n");
     for (_, l, w) in &entries {
         out.push_str(&format!("    PitchEntry {{ l: {l}, omega_0: {w:.6} }},\n"));
