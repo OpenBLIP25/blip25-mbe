@@ -20,6 +20,9 @@ fn main() {
     gen_annex_e(&out_dir);
     gen_annex_f(&out_dir);
     gen_annex_g(&out_dir);
+    gen_annex_b(&out_dir);
+    gen_annex_c(&out_dir);
+    gen_annex_d(&out_dir);
     gen_annex_i(&out_dir);
     gen_annex_j(&out_dir);
     gen_annex_s(&out_dir);
@@ -330,6 +333,209 @@ fn gen_annex_g(out_dir: &PathBuf) {
 }
 
 /// Parse `spec_tables/annex_i_synthesis_window.csv` into
+/// Parse `spec_tables/annex_b_analysis_window.csv` into
+/// `$OUT_DIR/annex_b_analysis_window.rs`, emitting `IMBE_ANALYSIS_WINDOW`
+/// (`[f32; 301]`) and `ANALYSIS_WINDOW_LEN`.
+///
+/// The window covers `n = −150..=150`. Index 0 corresponds to `n = −150`.
+/// Validates length 301 and even symmetry around `n = 0`.
+fn gen_annex_b(out_dir: &PathBuf) {
+    let csv_path = "spec_tables/annex_b_analysis_window.csv";
+    println!("cargo:rerun-if-changed={csv_path}");
+
+    let content = fs::read_to_string(csv_path)
+        .unwrap_or_else(|e| panic!("failed to read {csv_path}: {e}"));
+
+    let mut samples: Vec<(i32, f32)> = Vec::with_capacity(301);
+    for (lineno, raw) in content.lines().enumerate() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with('n') {
+            continue;
+        }
+        let cols: Vec<&str> = line.split(',').map(str::trim).collect();
+        assert_eq!(
+            cols.len(),
+            2,
+            "annex B line {}: expected 2 columns, got {}: {raw:?}",
+            lineno + 1,
+            cols.len()
+        );
+        let n: i32 = cols[0].parse().expect("n");
+        let w: f32 = cols[1].parse().expect("wI_n");
+        assert!((-150..=150).contains(&n), "annex B: n={n} out of range");
+        let expected_idx = (n + 150) as usize;
+        assert_eq!(
+            samples.len(),
+            expected_idx,
+            "annex B rows must be sequential n = −150..=150"
+        );
+        assert!(w >= 0.0, "annex B: wI({n}) = {w} negative");
+        samples.push((n, w));
+    }
+    assert_eq!(samples.len(), 301, "Annex B must have 301 entries");
+
+    for k in 1..=150 {
+        let a = samples[(150 - k) as usize].1;
+        let b = samples[(150 + k) as usize].1;
+        assert!(
+            (a - b).abs() < 1e-5,
+            "annex B: wI({}) = {a} != wI({}) = {b}",
+            -k,
+            k
+        );
+    }
+
+    let mut out = String::new();
+    out.push_str("// Auto-generated from spec_tables/annex_b_analysis_window.csv\n");
+    out.push_str("// Do not edit — regenerated each build.\n");
+    out.push_str("/// Length of the initial pitch-estimation window (n = −150..=150).\n");
+    out.push_str("pub const ANALYSIS_WINDOW_LEN: usize = 301;\n\n");
+    out.push_str("/// Analysis window wI(n) per BABA-A Annex B.\n");
+    out.push_str("/// Indexed `[n + 150]` so `IMBE_ANALYSIS_WINDOW[0] = wI(−150)`.\n");
+    out.push_str("pub const IMBE_ANALYSIS_WINDOW: [f32; ANALYSIS_WINDOW_LEN] = [\n");
+    for (n, w) in &samples {
+        out.push_str(&format!("    {w:.8}, // n = {n}\n"));
+    }
+    out.push_str("];\n");
+
+    fs::write(out_dir.join("annex_b_analysis_window.rs"), out)
+        .expect("write annex_b_analysis_window.rs");
+}
+
+/// Parse `spec_tables/annex_c_pitch_refinement_window.csv` into
+/// `$OUT_DIR/annex_c_refinement_window.rs`, emitting
+/// `IMBE_REFINEMENT_WINDOW` (`[f32; 221]`) and `REFINEMENT_WINDOW_LEN`.
+///
+/// The window covers `n = −110..=110`. Index 0 corresponds to `n = −110`.
+/// Validates length 221, even symmetry, and peak `wR(0) = 1.0`.
+fn gen_annex_c(out_dir: &PathBuf) {
+    let csv_path = "spec_tables/annex_c_pitch_refinement_window.csv";
+    println!("cargo:rerun-if-changed={csv_path}");
+
+    let content = fs::read_to_string(csv_path)
+        .unwrap_or_else(|e| panic!("failed to read {csv_path}: {e}"));
+
+    let mut samples: Vec<(i32, f32)> = Vec::with_capacity(221);
+    for (lineno, raw) in content.lines().enumerate() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with('n') {
+            continue;
+        }
+        let cols: Vec<&str> = line.split(',').map(str::trim).collect();
+        assert_eq!(
+            cols.len(),
+            2,
+            "annex C line {}: expected 2 columns, got {}: {raw:?}",
+            lineno + 1,
+            cols.len()
+        );
+        let n: i32 = cols[0].parse().expect("n");
+        let w: f32 = cols[1].parse().expect("wR_n");
+        assert!((-110..=110).contains(&n), "annex C: n={n} out of range");
+        let expected_idx = (n + 110) as usize;
+        assert_eq!(
+            samples.len(),
+            expected_idx,
+            "annex C rows must be sequential n = −110..=110"
+        );
+        assert!(w >= 0.0, "annex C: wR({n}) = {w} negative");
+        samples.push((n, w));
+    }
+    assert_eq!(samples.len(), 221, "Annex C must have 221 entries");
+
+    for k in 1..=110 {
+        let a = samples[(110 - k) as usize].1;
+        let b = samples[(110 + k) as usize].1;
+        assert!(
+            (a - b).abs() < 1e-5,
+            "annex C: wR({}) = {a} != wR({}) = {b}",
+            -k,
+            k
+        );
+    }
+    assert!(
+        (samples[110].1 - 1.0).abs() < 1e-6,
+        "annex C: expected wR(0) = 1.0, got {}",
+        samples[110].1
+    );
+
+    let mut out = String::new();
+    out.push_str("// Auto-generated from spec_tables/annex_c_pitch_refinement_window.csv\n");
+    out.push_str("// Do not edit — regenerated each build.\n");
+    out.push_str("/// Length of the pitch refinement window (n = −110..=110).\n");
+    out.push_str("pub const REFINEMENT_WINDOW_LEN: usize = 221;\n\n");
+    out.push_str("/// Pitch refinement window wR(n) per BABA-A Annex C.\n");
+    out.push_str("/// Indexed `[n + 110]` so `IMBE_REFINEMENT_WINDOW[0] = wR(−110)`.\n");
+    out.push_str("pub const IMBE_REFINEMENT_WINDOW: [f32; REFINEMENT_WINDOW_LEN] = [\n");
+    for (n, w) in &samples {
+        out.push_str(&format!("    {w:.8}, // n = {n}\n"));
+    }
+    out.push_str("];\n");
+
+    fs::write(out_dir.join("annex_c_refinement_window.rs"), out)
+        .expect("write annex_c_refinement_window.rs");
+}
+
+/// Emit `$OUT_DIR/annex_d_lpf.rs` containing the 21-tap FIR low-pass
+/// coefficients `h_LPF(n)` from BABA-A Annex D (§7.4 of the
+/// implementation spec). The values are small and come directly from
+/// the derived implementation spec, so there is no CSV to parse —
+/// they are transcribed here and regenerated each build.
+fn gen_annex_d(out_dir: &PathBuf) {
+    // Source: `P25_Vocoder_Implementation_Spec.md` §7.4 (derived work).
+    let taps: [(i32, f64); 21] = [
+        (-10, -0.002898),
+        (-9, -0.002831),
+        (-8, 0.005666),
+        (-7, 0.016601),
+        (-6, 0.008800),
+        (-5, -0.026955),
+        (-4, -0.055990),
+        (-3, -0.015116),
+        (-2, 0.118754),
+        (-1, 0.278990),
+        (0, 0.351338),
+        (1, 0.278990),
+        (2, 0.118754),
+        (3, -0.015116),
+        (4, -0.055990),
+        (5, -0.026955),
+        (6, 0.008800),
+        (7, 0.016601),
+        (8, 0.005666),
+        (9, -0.002831),
+        (10, -0.002898),
+    ];
+
+    // Validate symmetry on the transcribed values.
+    for k in 1..=10 {
+        let a = taps[(10 - k) as usize].1;
+        let b = taps[(10 + k) as usize].1;
+        assert!(
+            (a - b).abs() < 1e-9,
+            "annex D: h_LPF({}) = {a} != h_LPF({}) = {b}",
+            -k,
+            k
+        );
+    }
+
+    let mut out = String::new();
+    out.push_str("// Auto-generated from BABA-A Annex D via the implementation spec.\n");
+    out.push_str("// Do not edit — regenerated each build.\n");
+    out.push_str("/// Length of the Annex D FIR low-pass filter (n = −10..=10).\n");
+    out.push_str("pub const ANNEX_D_LPF_LEN: usize = 21;\n\n");
+    out.push_str("/// Annex D FIR low-pass filter h_LPF(n) used in initial pitch\n");
+    out.push_str("/// autocorrelation. Indexed `[n + 10]`.\n");
+    out.push_str("pub const IMBE_ANNEX_D_LPF: [f32; ANNEX_D_LPF_LEN] = [\n");
+    for (n, h) in &taps {
+        out.push_str(&format!("    {h:.6}, // n = {n}\n"));
+    }
+    out.push_str("];\n");
+
+    fs::write(out_dir.join("annex_d_lpf.rs"), out)
+        .expect("write annex_d_lpf.rs");
+}
+
 /// `$OUT_DIR/annex_i_synth_window.rs`, emitting `IMBE_SYNTH_WINDOW`
 /// (`[f32; 211]`) and the `SYNTH_WINDOW_LEN` constant.
 ///

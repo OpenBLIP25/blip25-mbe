@@ -1,10 +1,12 @@
 //! MBE baseline codec — TIA-102.BABA-A §1.10–§1.13 (synthesis pipeline)
-//! and §1.8 (analysis is shared with the upstream pipeline in
+//! and §1.8 (dequantize-side analysis is shared with the upstream pipeline in
 //! [`crate::p25_fullrate::dequantize`]).
 //!
 //! This module hosts the synthesizer that turns [`MbeParams`] into
-//! 8 kHz 16-bit PCM. The synthesis algorithm follows the 1993 P25
-//! vocoder specification:
+//! 8 kHz 16-bit PCM, plus a (currently unimplemented) forward analysis
+//! encoder at [`analysis`] that would take 8 kHz PCM back to [`MbeParams`].
+//!
+//! Synthesis pipeline (1993 P25 vocoder specification):
 //!
 //! - **§1.10 enhancement** — `M̃_l → M̄_l` via the W_l psycho-acoustic
 //!   weighting.
@@ -24,6 +26,8 @@
 use core::f64::consts::PI as PI64;
 
 use crate::mbe_params::{L_MAX, MbeParams};
+
+pub mod analysis;
 
 include!(concat!(env!("OUT_DIR"), "/annex_i_synth_window.rs"));
 
