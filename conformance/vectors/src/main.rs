@@ -219,6 +219,23 @@ enum Cmd {
         #[arg(long, default_value_t = 1)]
         frame: usize,
     },
+    /// Golay [24,12] error-count histogram across every frame in a
+    /// half-rate `.bit` file. Diagnostic for the
+    /// `analysis/dvsi_test_vector_modes.md` fingerprint: rate-33
+    /// (FEC) input should report 0 errors on every frame; rate-39
+    /// (no-FEC) input fed through the same path produces the
+    /// `C(24,k)/2325` histogram shape that signals a rate-mode mixup.
+    HalfrateFecHistogram {
+        /// Vector name (e.g. `alert`).
+        name: String,
+        /// Rate-mode subdirectory under `tv-rc/` or `tv-std/tv/`
+        /// (`r33`, `r34`, or `r39`).
+        #[arg(long, default_value = "r33")]
+        rate: String,
+        /// Use `tv-rc/` instead of `tv-std/tv/`.
+        #[arg(long)]
+        rc: bool,
+    },
     /// Diagnose PN modulation by re-encoding the no-FEC reference and
     /// XORing against the deinterleaved FEC frame to recover DVSI's
     /// actual mask. Compare to our computed mask to see exactly how
@@ -261,6 +278,9 @@ fn main() -> Result<()> {
             cmd_halfrate_seam_dump(&args.vectors, &name, frame)
         }
         Cmd::HalfrateRoundtrip { name } => cmd_halfrate_roundtrip(&args.vectors, &name),
+        Cmd::HalfrateFecHistogram { name, rate, rc } => {
+            cmd_halfrate_fec_histogram(&args.vectors, &name, &rate, rc)
+        }
         Cmd::ScanTransitions { name, min_transition_ratio, limit } => {
             cmd_scan_transitions(&args.vectors, &name, min_transition_ratio, limit)
         }
@@ -1454,6 +1474,67 @@ fn cmd_halfrate_roundtrip(root: &Path, name: &str) -> Result<()> {
     println!("  pitch   b̂₀:  {pitch_match:>5} / {voice_frames}   {:5.1}%", pct(pitch_match));
     println!("  V/UV    b̂₁:  {vuv_match:>5} / {voice_frames}   {:5.1}%", pct(vuv_match));
     println!("  gain    b̂₂:  {gain_match:>5} / {voice_frames}   {:5.1}%", pct(gain_match));
+    Ok(())
+}
+
+fn cmd_halfrate_fec_histogram(root: &Path, name: &str, rate: &str, rc: bool) -> Result<()> {
+    let base = if rc { root.join("tv-rc") } else { root.join("tv-std").join("tv") };
+    let bit_path = base.join(rate).join(format!("{name}.bit"));
+    let bit_bytes = fs::read(&bit_path)
+        .with_context(|| format!("read half-rate vector {}", bit_path.display()))?;
+    if bit_bytes.len() % BYTES_PER_HALFRATE_FRAME != 0 {
+        return Err(anyhow!(
+            "{} is {} bytes — not a multiple of the 9-byte (72-bit) half-rate frame. \
+             This is the expected shape for rate 33 and rate 39. \
+             Rate 34 is 49-bit payload-only (7 bytes/frame) and the Golay \
+             [24,12] histogram does not apply to it.",
+            bit_path.display(),
+            bit_bytes.len()
+        ));
+    }
+    let n_frames = bit_bytes.len() / BYTES_PER_HALFRATE_FRAME;
+
+    let mut hist = [0usize; 5]; // 0, 1, 2, 3, uncorrectable
+    for f in 0..n_frames {
+        let frame = &bit_bytes[f * BYTES_PER_HALFRATE_FRAME..(f + 1) * BYTES_PER_HALFRATE_FRAME];
+        let dibits = unpack_dibits_halfrate(frame);
+        let ambe = decode_half_frame(&dibits);
+        let e = ambe.errors[0];
+        let bucket = if e == u8::MAX { 4 } else { usize::from(e).min(3) };
+        hist[bucket] += 1;
+    }
+
+    let label = if rc { format!("tv-rc/{rate}") } else { format!("tv-std/tv/{rate}") };
+    println!("vector:  {name} ({label})");
+    println!("frames:  {n_frames}");
+    println!();
+    println!("Golay [24,12] error-count histogram (ĉ₀):");
+    let pct = |n: usize| 100.0 * n as f64 / n_frames as f64;
+    println!("  errors=0:            {:>5}   {:5.1}%", hist[0], pct(hist[0]));
+    println!("  errors=1:            {:>5}   {:5.1}%", hist[1], pct(hist[1]));
+    println!("  errors=2:            {:>5}   {:5.1}%", hist[2], pct(hist[2]));
+    println!("  errors=3:            {:>5}   {:5.1}%", hist[3], pct(hist[3]));
+    println!("  uncorrectable (≥4):  {:>5}   {:5.1}%", hist[4], pct(hist[4]));
+    println!();
+    let correctable = hist[0] + hist[1] + hist[2] + hist[3];
+    println!("correctable frames:    {correctable} / {n_frames}   ({:.1}%)", pct(correctable));
+    println!();
+    // Expected rate-33 chance hit rate for random 24-bit vectors: 2^12/2^24 ≈ 2.4e-4.
+    // One or two "errors=0" frames out of a few hundred is consistent with rate-39
+    // noise matching a codeword by chance; a cluster that dominates is a rate-33 signal.
+    let chance_zero_cap = (n_frames / 100).max(2);
+    let correctable_pct = 100 * correctable / n_frames;
+    if hist[0] == n_frames {
+        println!("PASS — every frame is a valid Golay [24,12] codeword. Input is genuine rate 33 (FEC-encoded).");
+    } else if hist[0] <= chance_zero_cap && (50..=65).contains(&correctable_pct) {
+        println!("FINGERPRINT MATCH — errors=0 count is at chance level and correctable-frame ratio is ~57%.");
+        println!("This is the `C(24,k)/2325` signature of no-FEC bits fed through a Golay decoder.");
+        println!("Input is NOT rate 33. Likely rate 39 (72 raw voice bits, no FEC) — see");
+        println!("~/blip25-specs/analysis/dvsi_test_vector_modes.md.");
+    } else {
+        println!("AMBIGUOUS — neither a clean rate-33 pass nor the rate-39 fingerprint.");
+        println!("Investigate: real channel errors, a different rate mode, or a bit-layout bug.");
+    }
     Ok(())
 }
 
