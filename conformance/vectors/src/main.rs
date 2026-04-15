@@ -312,6 +312,25 @@ enum Cmd {
         /// Use `tv-rc/` instead of `tv-std/tv/`.
         #[arg(long)]
         rc: bool,
+        /// If > 0, print per-frame `(chip ω̂_0, encoder ω̂_0, Δcents,
+        /// chip L, encoder L, voicing)` for the first N post-preroll
+        /// comparable frames. Localizes where in the pitch tracker
+        /// the encoder diverges from the chip reference (sub-multiple,
+        /// cold-start bias, look-back/look-ahead).
+        #[arg(long, default_value_t = 0)]
+        dump_frames: usize,
+        /// Compare encoder output at iteration `f` against chip bit-
+        /// frame `f + chip_offset`. Our encoder has a structural
+        /// 2-frame look-ahead delay (`encode(pcm_f)` for `f ≥ 2`
+        /// emits the analysis of `pcm_{f-2}`). DVSI's chip does not
+        /// visibly delay its output stream (bit-frame N = analysis
+        /// of pcm_N), so default `-2` aligns both to the same
+        /// analyzed PCM frame. Empirically verified on `clean.pcm`:
+        /// voicing 70.7% → 78.2%, amplitude RMS 20.2 → 14.2 dB going
+        /// from offset 0 to −2. Iters where `f + offset` is out of
+        /// range are tallied as non-comparable.
+        #[arg(long, default_value_t = -2, allow_hyphen_values = true)]
+        chip_offset: i32,
     },
 }
 
@@ -372,8 +391,8 @@ fn main() -> Result<()> {
         Cmd::RateConvertRoundtrip { direction, name, rc } => {
             cmd_rate_convert_roundtrip(&args.vectors, direction, &name, rc)
         }
-        Cmd::AnalysisEncode { name, rc } => {
-            cmd_analysis_encode(&args.vectors, &name, rc)
+        Cmd::AnalysisEncode { name, rc, dump_frames, chip_offset } => {
+            cmd_analysis_encode(&args.vectors, &name, rc, dump_frames, chip_offset)
         }
     }
 }
@@ -2367,11 +2386,18 @@ struct AnalysisSkipStats {
     /// Chip-side `dequantize_full` returned `Err` (reserved pitch,
     /// tone, erasure, etc.).
     chip_decode_errors: usize,
+    /// Chip bit-frame index `f + chip_offset` fell outside
+    /// `[0, n_frames)`. Only nonzero when `--chip-offset` is used.
+    chip_out_of_range: usize,
 }
 
 impl AnalysisSkipStats {
     fn non_comparable(&self) -> usize {
-        self.preroll + self.encoder_silence + self.encoder_errors + self.chip_decode_errors
+        self.preroll
+            + self.encoder_silence
+            + self.encoder_errors
+            + self.chip_decode_errors
+            + self.chip_out_of_range
     }
 
     fn print(&self) {
@@ -2392,10 +2418,35 @@ impl AnalysisSkipStats {
         if self.chip_decode_errors > 0 {
             println!("  chip dequantize errors:            {}", self.chip_decode_errors);
         }
+        if self.chip_out_of_range > 0 {
+            println!("  chip bit-frame out of range:       {}", self.chip_out_of_range);
+        }
     }
 }
 
-fn cmd_analysis_encode(root: &Path, name: &str, rc: bool) -> Result<()> {
+/// Format a compact voicing signature: `V`/`U`/`-` per harmonic for
+/// `l = 1..=L`, truncated to at most `cap` entries.
+fn voicing_sig(params: &MbeParams, cap: usize) -> String {
+    let l = params.harmonic_count() as usize;
+    let v = params.voiced_slice();
+    let n = l.min(cap);
+    let mut s = String::with_capacity(n + 2);
+    for i in 0..n {
+        s.push(if v[i] { 'V' } else { 'U' });
+    }
+    if l > n {
+        s.push('…');
+    }
+    s
+}
+
+fn cmd_analysis_encode(
+    root: &Path,
+    name: &str,
+    rc: bool,
+    dump_frames: usize,
+    chip_offset: i32,
+) -> Result<()> {
     let dir = vector_dir(root, rc);
     let pcm_path = dir.join("p25").join(format!("{name}.pcm"));
     let fec_path = dir.join("p25").join(format!("{name}.bit"));
@@ -2441,42 +2492,83 @@ fn cmd_analysis_encode(root: &Path, name: &str, rc: bool) -> Result<()> {
         if rc { " (rc)" } else { "" }
     );
     println!("frames:            {n_frames}");
+    if chip_offset != 0 {
+        println!("chip offset:       {chip_offset:+} (chip[f + offset] vs encoder[f])");
+    }
     println!();
 
-    let mut encoder_state = AnalysisState::new();
+    // Pre-decode every chip bit-frame so we can index by offset.
     let mut chip_state = DecoderState::new();
+    let chip_params: Vec<std::result::Result<MbeParams, DecodeError>> = (0..n_frames)
+        .map(|f| {
+            let fec = &fec_bytes[f * BYTES_PER_FEC_FRAME..(f + 1) * BYTES_PER_FEC_FRAME];
+            let dibits = unpack_dibits(fec);
+            let imbe = decode_full_frame(&dibits);
+            dequantize_full(&imbe.info, &mut chip_state)
+        })
+        .collect();
+
+    let mut encoder_state = AnalysisState::new();
     let mut stats = ConvertStats::default();
     let mut skips = AnalysisSkipStats::default();
+    let mut dumped = 0usize;
+
+    if dump_frames > 0 {
+        println!(
+            "{:>5}  {:>9} {:>9} {:>8}   {:>3} {:>3} {:>4}   {:<16}  {}",
+            "frame", "ω̂_0 chip", "ω̂_0 enc", "Δ cents", "Lc", "Le", "ΔL",
+            "voicing chip", "voicing enc"
+        );
+    }
 
     for f in 0..n_frames {
         let pcm_frame = &pcm[f * FRAME_SAMPLES..(f + 1) * FRAME_SAMPLES];
-        let fec = &fec_bytes[f * BYTES_PER_FEC_FRAME..(f + 1) * BYTES_PER_FEC_FRAME];
-        let dibits = unpack_dibits(fec);
-        let imbe = decode_full_frame(&dibits);
-        let chip_params_res = dequantize_full(&imbe.info, &mut chip_state);
-
         let encoded = analysis_encode(pcm_frame, &mut encoder_state);
 
-        match (encoded, chip_params_res) {
-            (Ok(AnalysisOutput::Voice(enc_params)), Ok(ref_params)) => {
-                // Stats convention: `src` = reference (chip), `dst` =
-                // analysis output. Pitch cents / amp dB then read
-                // "encoder output minus reference" — positive means
-                // the encoder is higher than the chip.
-                stats.push(&ref_params, &enc_params);
+        let chip_idx = f as i32 + chip_offset;
+        let chip_ref: Option<&std::result::Result<MbeParams, DecodeError>> =
+            if chip_idx >= 0 && (chip_idx as usize) < n_frames {
+                Some(&chip_params[chip_idx as usize])
+            } else {
+                None
+            };
+
+        match (encoded, chip_ref) {
+            (Ok(AnalysisOutput::Voice(enc_params)), Some(Ok(ref_params))) => {
+                if dumped < dump_frames {
+                    let wc = f64::from(ref_params.omega_0());
+                    let we = f64::from(enc_params.omega_0());
+                    let cents = 1200.0 * (we / wc).log2();
+                    let lc = ref_params.harmonic_count() as i32;
+                    let le = enc_params.harmonic_count() as i32;
+                    println!(
+                        "{:>5}  {:>9.5} {:>9.5} {:>+8.1}   {:>3} {:>3} {:>+4}   {:<16}  {}",
+                        f,
+                        wc,
+                        we,
+                        cents,
+                        lc,
+                        le,
+                        le - lc,
+                        voicing_sig(ref_params, 16),
+                        voicing_sig(&enc_params, 16),
+                    );
+                    dumped += 1;
+                }
+                stats.push(ref_params, &enc_params);
             }
-            (Ok(AnalysisOutput::Silence), Ok(_)) => {
-                // The encoder-silence / preroll distinction is
-                // structural: preroll is guaranteed for `f <
-                // PREROLL_FRAMES` regardless of signal content.
+            (Ok(AnalysisOutput::Silence), _) => {
                 if f < blip25_mbe::codecs::mbe_baseline::analysis::PREROLL_FRAMES as usize {
                     skips.preroll += 1;
                 } else {
                     skips.encoder_silence += 1;
                 }
             }
-            (Ok(_), Err(_)) => {
+            (Ok(_), Some(Err(_))) => {
                 skips.chip_decode_errors += 1;
+            }
+            (Ok(_), None) => {
+                skips.chip_out_of_range += 1;
             }
             (Err(AnalysisError::WrongFrameLength), _) => {
                 return Err(anyhow!(
@@ -2489,6 +2581,9 @@ fn cmd_analysis_encode(root: &Path, name: &str, rc: bool) -> Result<()> {
         }
     }
 
+    if dump_frames > 0 {
+        println!();
+    }
     skips.print();
     println!();
     stats.print("Analysis encoder vs chip reference (voice frames only)");
