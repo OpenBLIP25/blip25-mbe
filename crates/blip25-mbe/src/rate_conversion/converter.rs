@@ -18,6 +18,22 @@
 //! and the downstream radio's decoder evolve in lockstep with the
 //! converter's encoder and decoder respectively, not with each other.
 //!
+//! ## Boundary behaviour
+//!
+//! The full-rate grid (b̂₀ ∈ [0, 207] → ω̃₀ ∈ [4π/246.5, 4π/39.5] ≈
+//! [0.05098, 0.31819]) and the half-rate Annex L grid (120 entries,
+//! ω̃₀ ∈ [0.05105, 0.31398]) almost but don't quite coincide at the
+//! edges — full-rate extends ~0.14% past half-rate's minimum and
+//! ~1.3% past its maximum. A half-rate frame at the grid endpoint,
+//! round-tripped through full-rate and back, can pick up enough drift
+//! at the first hop to fall outside half-rate's grid at the second.
+//! We snap the source parameters' ω̃₀ to the destination grid's
+//! representable range (keeping L unchanged — the boundary entries
+//! share L across rates) before calling the destination quantizer,
+//! so boundary frames encode to the nearest grid endpoint instead of
+//! rejecting. See `conformance-vectors rate-convert-roundtrip` for
+//! the diagnostic that surfaces this case on DVSI speech.
+//!
 //! ## What this first cut does not do
 //!
 //! - **Voicing-band normalization** and **magnitude interpolation across
@@ -34,8 +50,11 @@
 //!   future revision should detect these on the input side and emit a
 //!   matching frame on the output side instead of erroring.
 
+use core::f32::consts::PI;
+
+use crate::mbe_params::MbeParams;
 use crate::p25_fullrate::dequantize::{
-    DecodeError, DecoderState, EncodeError, dequantize, quantize,
+    DecodeError, DecoderState, EncodeError, PITCH_INDEX_MAX, dequantize, quantize,
 };
 use crate::p25_fullrate::frame::{decode_frame as decode_full, encode_frame as encode_full};
 use crate::p25_fullrate::priority::prioritize as prioritize_full;
@@ -43,8 +62,49 @@ use crate::p25_halfrate::dequantize::{
     DecoderState as HalfDecoderState, dequantize as dequantize_half, quantize as quantize_half,
 };
 use crate::p25_halfrate::frame::{
-    DIBITS_PER_FRAME, decode_frame as decode_half, encode_frame as encode_half,
+    AMBE_PITCH_TABLE, DIBITS_PER_FRAME, decode_frame as decode_half, encode_frame as encode_half,
 };
+
+/// Lowest ω̃₀ in the half-rate Annex L table (entry 119, L = 56).
+/// Used to clamp source parameters to the half-rate grid's range
+/// before handing them to the half-rate quantizer.
+fn halfrate_omega_min() -> f32 {
+    AMBE_PITCH_TABLE[AMBE_PITCH_TABLE.len() - 1].omega_0
+}
+
+/// Highest ω̃₀ in the half-rate Annex L table (entry 0, L = 9).
+fn halfrate_omega_max() -> f32 {
+    AMBE_PITCH_TABLE[0].omega_0
+}
+
+/// Lowest ω̃₀ emittable by the full-rate encoder (b̂₀ = 207): `4π/246.5`.
+fn fullrate_omega_min() -> f32 {
+    4.0 * PI / (f32::from(PITCH_INDEX_MAX) + 39.5)
+}
+
+/// Highest ω̃₀ emittable by the full-rate encoder (b̂₀ = 0): `4π/39.5`.
+fn fullrate_omega_max() -> f32 {
+    4.0 * PI / 39.5
+}
+
+/// If `params.omega_0()` falls outside `[min, max]`, return a copy with
+/// ω̃₀ snapped to the nearest boundary — L, voicing, and amplitudes
+/// unchanged. Returns the input cloned otherwise. Cheap; avoids an
+/// allocation path on the common in-range case.
+fn clamp_omega_to(params: &MbeParams, min: f32, max: f32) -> MbeParams {
+    let w = params.omega_0();
+    if w >= min && w <= max {
+        return params.clone();
+    }
+    let clamped = w.clamp(min, max);
+    MbeParams::new(
+        clamped,
+        params.harmonic_count(),
+        params.voiced_slice(),
+        params.amplitudes_slice(),
+    )
+    .expect("clamped ω₀ stays inside (0, π)")
+}
 
 /// Error from a cross-rate conversion.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -92,7 +152,8 @@ impl FullToHalfConverter {
     pub fn convert(&mut self, dibits: &[u8; 72]) -> Result<[u8; DIBITS_PER_FRAME], ConvertError> {
         let frame = decode_full(dibits);
         let params = dequantize(&frame.info, &mut self.decoder)?;
-        let u = quantize_half(&params, &mut self.encoder).map_err(|e| match e {
+        let clamped = clamp_omega_to(&params, halfrate_omega_min(), halfrate_omega_max());
+        let u = quantize_half(&clamped, &mut self.encoder).map_err(|e| match e {
             DecodeError::BadPitch => ConvertError::HalfPitchOutOfRange,
             other => ConvertError::Decode(other),
         })?;
@@ -126,8 +187,9 @@ impl HalfToFullConverter {
     pub fn convert(&mut self, dibits: &[u8; DIBITS_PER_FRAME]) -> Result<[u8; 72], ConvertError> {
         let frame = decode_half(dibits);
         let params = dequantize_half(&frame.info, &mut self.decoder)?;
-        let l = params.harmonic_count();
-        let b = quantize(&params, &mut self.encoder)?;
+        let clamped = clamp_omega_to(&params, fullrate_omega_min(), fullrate_omega_max());
+        let l = clamped.harmonic_count();
+        let b = quantize(&clamped, &mut self.encoder)?;
         let u = prioritize_full(&b, l);
         Ok(encode_full(&u))
     }
@@ -223,5 +285,66 @@ mod tests {
 
         let rel = (last_omega - params.omega_0()).abs() / params.omega_0();
         assert!(rel < 0.05, "ω₀ drift {rel:.4} exceeds 5%");
+    }
+
+    #[test]
+    fn half_grid_minimum_round_trips_without_rejection() {
+        // Regression: before the boundary clamp, a half-rate frame at
+        // the Annex L minimum (b̂₀=119, ω₀=0.051051, L=56) round-tripped
+        // through full-rate → full-rate decoded it as b̂₀=207 →
+        // ω₀=0.050979, which was just below the half-rate grid
+        // minimum, so FullToHalfConverter rejected with
+        // HalfPitchOutOfRange. The clamp snaps ω₀ to the half-rate
+        // grid edge before quantizing.
+        let mut src_state = HalfDecoderState::new();
+        let l = 56u8;
+        let voiced: Vec<bool> = (1..=l).map(|h| h <= l / 2).collect();
+        let amps: Vec<f32> = (1..=l)
+            .map(|h| 100.0 * (-(h as f32) * 0.05).exp())
+            .collect();
+        let params =
+            MbeParams::new(halfrate_omega_min(), l, &voiced, &amps).unwrap();
+
+        let mut a_to_b = HalfToFullConverter::new();
+        let mut b_to_a = FullToHalfConverter::new();
+        for _ in 0..4 {
+            let a = halfrate_dibits_from(&params, &mut src_state);
+            let b = a_to_b.convert(&a).expect("half → full");
+            let _ = b_to_a.convert(&b).expect("full → half (was failing)");
+        }
+    }
+
+    #[test]
+    fn full_grid_maximum_round_trips_without_rejection() {
+        // Symmetric: full-rate b̂₀=0 → ω₀=0.318194 is above the
+        // half-rate grid maximum (0.313977). FullToHalfConverter
+        // should clamp down to the half-rate max rather than reject.
+        let mut src_state = DecoderState::new();
+        let params = MbeParams::silence(); // ω₀ = 4π/39.5 = full-rate max
+        let mut conv = FullToHalfConverter::new();
+        for _ in 0..4 {
+            let a = fullrate_dibits_from(&params, &mut src_state);
+            let _ = conv.convert(&a).expect("full → half at grid top");
+        }
+    }
+
+    #[test]
+    fn clamp_is_no_op_for_in_range_omega() {
+        let params = sample_params(0.20);
+        let clamped = clamp_omega_to(&params, 0.1, 0.3);
+        assert_eq!(clamped.omega_0(), params.omega_0());
+        assert_eq!(clamped.harmonic_count(), params.harmonic_count());
+    }
+
+    #[test]
+    fn clamp_snaps_to_the_nearest_boundary() {
+        let below = sample_params(0.10);
+        let snapped = clamp_omega_to(&below, 0.15, 0.25);
+        assert!((snapped.omega_0() - 0.15).abs() < 1e-6);
+        assert_eq!(snapped.harmonic_count(), below.harmonic_count());
+
+        let above = sample_params(0.30);
+        let snapped = clamp_omega_to(&above, 0.15, 0.25);
+        assert!((snapped.omega_0() - 0.25).abs() < 1e-6);
     }
 }
