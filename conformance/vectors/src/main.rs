@@ -36,6 +36,9 @@ use std::path::{Path, PathBuf};
 use blip25_mbe::codecs::mbe_baseline::{
     FrameErrorContext, GAMMA_W, SynthState, synthesize_frame,
 };
+use blip25_mbe::codecs::mbe_baseline::analysis::{
+    AnalysisError, AnalysisOutput, AnalysisState, encode as analysis_encode,
+};
 use blip25_mbe::fec::{golay_23_12_encode, hamming_15_11_encode};
 use blip25_mbe::p25_fullrate::dequantize::{
     DecodeError, DecoderState, dequantize as dequantize_full, quantize as quantize_full,
@@ -292,6 +295,24 @@ enum Cmd {
         #[arg(long)]
         rc: bool,
     },
+    /// PCM → `MbeParams` analysis encoder conformance. Drives
+    /// `DVSI/Vectors/.../p25/<name>.pcm` through
+    /// [`blip25_mbe::codecs::mbe_baseline::analysis::encode`] in 20 ms
+    /// frames, dequantizes the parallel `<name>.bit` chip bitstream
+    /// via `p25_fullrate::dequantize` to get the reference per-frame
+    /// `MbeParams`, and reports parameter-level distortion
+    /// (pitch cents, L mismatch %, voicing %, amplitude dB RMSE).
+    /// Preroll frames (first two) are tallied as non-comparable.
+    /// Expected baseline per project memory: pitch/voicing close,
+    /// amplitude RMSE large until §11 / γ_w / M̃_l calibration bugs
+    /// are resolved on live chip.
+    AnalysisEncode {
+        /// Vector name (e.g. `alert`).
+        name: String,
+        /// Use `tv-rc/` instead of `tv-std/tv/`.
+        #[arg(long)]
+        rc: bool,
+    },
 }
 
 /// Direction argument for [`Cmd::RateConvert`] and
@@ -350,6 +371,9 @@ fn main() -> Result<()> {
         }
         Cmd::RateConvertRoundtrip { direction, name, rc } => {
             cmd_rate_convert_roundtrip(&args.vectors, direction, &name, rc)
+        }
+        Cmd::AnalysisEncode { name, rc } => {
+            cmd_analysis_encode(&args.vectors, &name, rc)
         }
     }
 }
@@ -2317,6 +2341,157 @@ fn cmd_rate_convert_roundtrip_half(root: &Path, name: &str, rc: bool) -> Result<
     }
     println!();
     stats.print("Source → full → half");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Analysis-encoder harness (cmd: analysis-encode)
+// ---------------------------------------------------------------------------
+
+/// Non-comparable frame tally for the PCM → `MbeParams` analysis
+/// encoder. Parallels `SkipStats` but tracks categories specific to
+/// the analysis path (preroll, encoder-emitted silence, chip-side
+/// dequantize failures).
+#[derive(Default)]
+struct AnalysisSkipStats {
+    /// Preroll frames — the encoder needs two frames of look-ahead
+    /// before it can emit voice (`PREROLL_FRAMES = 2`). These always
+    /// return `AnalysisOutput::Silence` and are structurally
+    /// non-comparable against chip voice output.
+    preroll: usize,
+    /// Post-preroll frames the encoder dispatched as silence (only
+    /// possible if §0.8 silence detection is enabled; currently off).
+    encoder_silence: usize,
+    /// `encode()` returned `Err` (pitch out of range, spec gap, etc.).
+    encoder_errors: usize,
+    /// Chip-side `dequantize_full` returned `Err` (reserved pitch,
+    /// tone, erasure, etc.).
+    chip_decode_errors: usize,
+}
+
+impl AnalysisSkipStats {
+    fn non_comparable(&self) -> usize {
+        self.preroll + self.encoder_silence + self.encoder_errors + self.chip_decode_errors
+    }
+
+    fn print(&self) {
+        if self.non_comparable() == 0 {
+            println!("non-comparable frames: 0");
+            return;
+        }
+        println!("non-comparable frames: {}", self.non_comparable());
+        if self.preroll > 0 {
+            println!("  preroll (encoder look-ahead fill): {}", self.preroll);
+        }
+        if self.encoder_silence > 0 {
+            println!("  encoder silence dispatch:          {}", self.encoder_silence);
+        }
+        if self.encoder_errors > 0 {
+            println!("  encoder errors:                    {}", self.encoder_errors);
+        }
+        if self.chip_decode_errors > 0 {
+            println!("  chip dequantize errors:            {}", self.chip_decode_errors);
+        }
+    }
+}
+
+fn cmd_analysis_encode(root: &Path, name: &str, rc: bool) -> Result<()> {
+    let dir = vector_dir(root, rc);
+    let pcm_path = dir.join("p25").join(format!("{name}.pcm"));
+    let fec_path = dir.join("p25").join(format!("{name}.bit"));
+
+    let pcm_bytes = fs::read(&pcm_path)
+        .with_context(|| format!("read PCM vector {}", pcm_path.display()))?;
+    let fec_bytes = fs::read(&fec_path)
+        .with_context(|| format!("read FEC vector {}", fec_path.display()))?;
+
+    if pcm_bytes.len() % (FRAME_SAMPLES * 2) != 0 {
+        return Err(anyhow!(
+            "PCM file {} is {} bytes — not a whole number of 20 ms frames",
+            pcm_path.display(),
+            pcm_bytes.len()
+        ));
+    }
+    if fec_bytes.len() % BYTES_PER_FEC_FRAME != 0 {
+        return Err(anyhow!(
+            "FEC file {} is {} bytes — not a multiple of {}",
+            fec_path.display(),
+            fec_bytes.len(),
+            BYTES_PER_FEC_FRAME
+        ));
+    }
+    let n_pcm_frames = pcm_bytes.len() / (FRAME_SAMPLES * 2);
+    let n_fec_frames = fec_bytes.len() / BYTES_PER_FEC_FRAME;
+    if n_pcm_frames != n_fec_frames {
+        return Err(anyhow!(
+            "frame-count mismatch: {} PCM frames vs {} FEC frames",
+            n_pcm_frames,
+            n_fec_frames
+        ));
+    }
+    let n_frames = n_pcm_frames;
+
+    let pcm: Vec<i16> = pcm_bytes
+        .chunks_exact(2)
+        .map(|c| i16::from_le_bytes([c[0], c[1]]))
+        .collect();
+
+    println!(
+        "vector:            {name}{} (analysis encode)",
+        if rc { " (rc)" } else { "" }
+    );
+    println!("frames:            {n_frames}");
+    println!();
+
+    let mut encoder_state = AnalysisState::new();
+    let mut chip_state = DecoderState::new();
+    let mut stats = ConvertStats::default();
+    let mut skips = AnalysisSkipStats::default();
+
+    for f in 0..n_frames {
+        let pcm_frame = &pcm[f * FRAME_SAMPLES..(f + 1) * FRAME_SAMPLES];
+        let fec = &fec_bytes[f * BYTES_PER_FEC_FRAME..(f + 1) * BYTES_PER_FEC_FRAME];
+        let dibits = unpack_dibits(fec);
+        let imbe = decode_full_frame(&dibits);
+        let chip_params_res = dequantize_full(&imbe.info, &mut chip_state);
+
+        let encoded = analysis_encode(pcm_frame, &mut encoder_state);
+
+        match (encoded, chip_params_res) {
+            (Ok(AnalysisOutput::Voice(enc_params)), Ok(ref_params)) => {
+                // Stats convention: `src` = reference (chip), `dst` =
+                // analysis output. Pitch cents / amp dB then read
+                // "encoder output minus reference" — positive means
+                // the encoder is higher than the chip.
+                stats.push(&ref_params, &enc_params);
+            }
+            (Ok(AnalysisOutput::Silence), Ok(_)) => {
+                // The encoder-silence / preroll distinction is
+                // structural: preroll is guaranteed for `f <
+                // PREROLL_FRAMES` regardless of signal content.
+                if f < blip25_mbe::codecs::mbe_baseline::analysis::PREROLL_FRAMES as usize {
+                    skips.preroll += 1;
+                } else {
+                    skips.encoder_silence += 1;
+                }
+            }
+            (Ok(_), Err(_)) => {
+                skips.chip_decode_errors += 1;
+            }
+            (Err(AnalysisError::WrongFrameLength), _) => {
+                return Err(anyhow!(
+                    "encoder rejected frame {f} as wrong length (bug in harness)"
+                ));
+            }
+            (Err(_), _) => {
+                skips.encoder_errors += 1;
+            }
+        }
+    }
+
+    skips.print();
+    println!();
+    stats.print("Analysis encoder vs chip reference (voice frames only)");
     Ok(())
 }
 
