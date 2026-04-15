@@ -1124,6 +1124,17 @@ fn cmd_scan_transitions(
             println!(
                 "  sign split: {neg_peak_count} negative, {pos_peak_count} positive"
             );
+            let mut lag_buckets: Vec<(i32, usize)> = (0..41usize)
+                .filter(|&i| lag_hist[i] > 0)
+                .map(|i| (i as i32 - 20, lag_hist[i]))
+                .collect();
+            lag_buckets.sort_by(|a, b| b.1.cmp(&a.1));
+            let top: Vec<String> = lag_buckets
+                .iter()
+                .take(6)
+                .map(|(l, n)| format!("{l:+}:{n}"))
+                .collect();
+            println!("  lag top-6 (peak:count): {}", top.join("  "));
             let neg_pct = 100.0 * neg_peak_count as f64 / scored as f64;
             if neg_pct > 70.0 && mean_peak_abs > 0.3 {
                 println!(
