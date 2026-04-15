@@ -38,7 +38,7 @@ use blip25_mbe::codecs::mbe_baseline::{
 };
 use blip25_mbe::fec::{golay_23_12_encode, hamming_15_11_encode};
 use blip25_mbe::p25_fullrate::dequantize::{
-    DecoderState, dequantize as dequantize_full, quantize as quantize_full,
+    DecodeError, DecoderState, dequantize as dequantize_full, quantize as quantize_full,
 };
 use blip25_mbe::p25_fullrate::fec::{deinterleave as deinterleave_full, modulation_masks};
 use blip25_mbe::p25_fullrate::frame::{
@@ -1911,34 +1911,53 @@ struct SkipStats {
     src_decode_errors: usize,
     dst_decode_errors: usize,
     convert_errors: usize,
-    tone_or_reserved: usize,
+    /// Source was a tone frame; converter passed it through to the
+    /// destination rate (as voice for full-rate dest, as tone-signal
+    /// dibits for same-rate) successfully. Excluded from parameter
+    /// comparison because tone params aren't voice params.
+    tone_passthrough: usize,
+    /// Source was an erasure/silence frame; converter emitted an
+    /// erasure signal on the destination side.
+    erasure_passthrough: usize,
+    /// Converter was expected to emit an erasure signal on the
+    /// destination side for a non-voice source, but produced
+    /// something else (voice or a different kind). A bug.
+    erasure_mismatch: usize,
 }
 
 impl SkipStats {
-    fn total(&self) -> usize {
+    fn non_comparable(&self) -> usize {
         self.src_decode_errors
             + self.dst_decode_errors
             + self.convert_errors
-            + self.tone_or_reserved
+            + self.tone_passthrough
+            + self.erasure_passthrough
+            + self.erasure_mismatch
     }
 
     fn print(&self) {
-        if self.total() == 0 {
-            println!("skipped frames:    0");
+        if self.non_comparable() == 0 {
+            println!("non-comparable frames: 0");
             return;
         }
-        println!("skipped frames:    {}", self.total());
-        if self.src_decode_errors > 0 {
-            println!("  source dequantize errors:      {}", self.src_decode_errors);
+        println!("non-comparable frames: {}", self.non_comparable());
+        if self.tone_passthrough > 0 {
+            println!("  tone pass-through (src→dst):     {}", self.tone_passthrough);
         }
-        if self.tone_or_reserved > 0 {
-            println!("  tone / reserved pitch (src):   {}", self.tone_or_reserved);
+        if self.erasure_passthrough > 0 {
+            println!("  erasure pass-through (src→dst):  {}", self.erasure_passthrough);
+        }
+        if self.erasure_mismatch > 0 {
+            println!("  erasure MISMATCH (bug — inspect): {}", self.erasure_mismatch);
+        }
+        if self.src_decode_errors > 0 {
+            println!("  source dequantize errors:        {}", self.src_decode_errors);
         }
         if self.convert_errors > 0 {
-            println!("  converter errors (dst pitch):  {}", self.convert_errors);
+            println!("  converter errors (dst pitch):    {}", self.convert_errors);
         }
         if self.dst_decode_errors > 0 {
-            println!("  dst dequantize errors:         {}", self.dst_decode_errors);
+            println!("  dst dequantize errors:           {}", self.dst_decode_errors);
         }
     }
 }
@@ -1984,49 +2003,46 @@ fn cmd_rate_convert_full_to_half(root: &Path, name: &str, rc: bool) -> Result<()
         let frame = &fec_bytes[f * BYTES_PER_FEC_FRAME..(f + 1) * BYTES_PER_FEC_FRAME];
         let dibits = unpack_dibits(frame);
 
-        // Source params: independent decode+dequant using our own state.
-        // Evolves in lockstep with the converter's internal decoder.
         let src_frame = decode_full_frame(&dibits);
-        let src_params = match dequantize_full(&src_frame.info, &mut src_state) {
-            Ok(p) => p,
-            Err(_) => {
-                skips.src_decode_errors += 1;
-                // Keep the converter's state evolving so it stays
-                // in sync with downstream radios. Ignore its output.
-                let _ = conv.convert(&dibits);
-                continue;
-            }
-        };
+        let src_params_res = dequantize_full(&src_frame.info, &mut src_state);
 
-        // Convert to half-rate.
         let dst_dibits = match conv.convert(&dibits) {
             Ok(b) => b,
-            Err(ConvertError::HalfPitchOutOfRange) => {
-                skips.convert_errors += 1;
-                continue;
-            }
             Err(_) => {
                 skips.convert_errors += 1;
                 continue;
             }
         };
 
-        // Re-decode at destination rate.
-        let dst_frame = decode_half_frame(&dst_dibits);
-        let dst_params = match dequantize_half(&dst_frame.info, &mut dst_state) {
-            Ok(p) => p,
-            Err(_) => {
-                skips.dst_decode_errors += 1;
-                continue;
+        match src_params_res {
+            Ok(src_params) => {
+                let dst_frame = decode_half_frame(&dst_dibits);
+                let dst_params = match dequantize_half(&dst_frame.info, &mut dst_state) {
+                    Ok(p) => p,
+                    Err(_) => {
+                        skips.dst_decode_errors += 1;
+                        continue;
+                    }
+                };
+                stats.push(&src_params, &dst_params);
             }
-        };
-
-        stats.push(&src_params, &dst_params);
+            Err(DecodeError::BadPitch) => {
+                // Full-rate reserved pitch — converter should emit a
+                // half-rate erasure signal.
+                let dst_frame = decode_half_frame(&dst_dibits);
+                use blip25_mbe::p25_halfrate::dequantize::{FrameKind, classify_halfrate_frame};
+                match classify_halfrate_frame(&dst_frame.info) {
+                    FrameKind::Erasure => skips.erasure_passthrough += 1,
+                    _ => skips.erasure_mismatch += 1,
+                }
+            }
+            Err(_) => skips.src_decode_errors += 1,
+        }
     }
 
     skips.print();
     println!();
-    stats.print("Source → half-rate");
+    stats.print("Source → half-rate (voice frames only)");
     Ok(())
 }
 
@@ -2059,23 +2075,13 @@ fn cmd_rate_convert_half_to_full(root: &Path, name: &str, rc: bool) -> Result<()
         let frame = &bit_bytes[f * BYTES_PER_HALFRATE_FRAME..(f + 1) * BYTES_PER_HALFRATE_FRAME];
         let dibits = unpack_dibits_halfrate(frame);
 
-        // Source decoder uses the tone-aware dispatch so we can count
-        // tone/erasure frames instead of lumping them into
-        // decode-errors. The converter internally uses the plain
-        // voice-only path, so tone frames will blow up there too; we
-        // pre-filter before calling it.
+        // Classify the source kind via the tone-aware dispatch, then
+        // exercise the converter on ALL kinds — tone/erasure frames
+        // are expected to pass through as voice/erasure on the
+        // destination side, and we now verify that rather than
+        // pre-filtering them out.
         let ambe = decode_half_frame(&dibits);
-        let src_params = match decode_to_params(&ambe.info, &mut src_state) {
-            Ok(Decoded::Voice(p)) => p,
-            Ok(Decoded::Tone { .. }) | Ok(Decoded::Erasure) => {
-                skips.tone_or_reserved += 1;
-                continue;
-            }
-            Err(_) => {
-                skips.src_decode_errors += 1;
-                continue;
-            }
-        };
+        let src_kind = decode_to_params(&ambe.info, &mut src_state);
 
         let dst_dibits = match conv.convert(&dibits) {
             Ok(b) => b,
@@ -2085,21 +2091,47 @@ fn cmd_rate_convert_half_to_full(root: &Path, name: &str, rc: bool) -> Result<()
             }
         };
 
-        let dst_frame = decode_full_frame(&dst_dibits);
-        let dst_params = match dequantize_full(&dst_frame.info, &mut dst_state) {
-            Ok(p) => p,
-            Err(_) => {
-                skips.dst_decode_errors += 1;
-                continue;
+        match src_kind {
+            Ok(Decoded::Voice(src_params)) => {
+                let dst_frame = decode_full_frame(&dst_dibits);
+                let dst_params = match dequantize_full(&dst_frame.info, &mut dst_state) {
+                    Ok(p) => p,
+                    Err(_) => {
+                        skips.dst_decode_errors += 1;
+                        continue;
+                    }
+                };
+                stats.push(&src_params, &dst_params);
             }
-        };
-
-        stats.push(&src_params, &dst_params);
+            Ok(Decoded::Tone { .. }) => {
+                // Tone → full-rate voice. Verify dst re-decodes to
+                // something plausible (or is an erasure signal if
+                // the tone's ω₀ lands outside full-rate grid). Either
+                // outcome is a legitimate pass-through.
+                let dst_frame = decode_full_frame(&dst_dibits);
+                match dequantize_full(&dst_frame.info, &mut dst_state) {
+                    Ok(_) | Err(DecodeError::BadPitch) => {
+                        skips.tone_passthrough += 1;
+                    }
+                    Err(_) => skips.dst_decode_errors += 1,
+                }
+            }
+            Ok(Decoded::Erasure) | Err(_) => {
+                // Erasure → full-rate erasure signal. Destination
+                // must re-decode as BadPitch (frame-repeat trigger
+                // at §1.11).
+                let dst_frame = decode_full_frame(&dst_dibits);
+                match dequantize_full(&dst_frame.info, &mut dst_state) {
+                    Err(DecodeError::BadPitch) => skips.erasure_passthrough += 1,
+                    _ => skips.erasure_mismatch += 1,
+                }
+            }
+        }
     }
 
     skips.print();
     println!();
-    stats.print("Source → full-rate");
+    stats.print("Source → full-rate (voice frames only)");
     Ok(())
 }
 
@@ -2212,8 +2244,12 @@ fn cmd_rate_convert_roundtrip_half(root: &Path, name: &str, rc: bool) -> Result<
         let ambe = decode_half_frame(&dibits);
         let src_params = match decode_to_params(&ambe.info, &mut src_state) {
             Ok(Decoded::Voice(p)) => p,
-            Ok(Decoded::Tone { .. }) | Ok(Decoded::Erasure) => {
-                skips.tone_or_reserved += 1;
+            Ok(Decoded::Tone { .. }) => {
+                skips.tone_passthrough += 1;
+                continue;
+            }
+            Ok(Decoded::Erasure) => {
+                skips.erasure_passthrough += 1;
                 continue;
             }
             Err(_) => {
