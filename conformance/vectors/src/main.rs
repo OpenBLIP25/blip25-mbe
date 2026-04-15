@@ -112,6 +112,11 @@ enum Cmd {
         /// large, so a scale of 1/110 or similar should improve SNR.
         #[arg(long, default_value_t = 1.0)]
         m_scale: f64,
+        /// If set, write the synthesized PCM to this path (raw
+        /// 16-bit little-endian, 8 kHz) for auditory A/B against
+        /// DVSI reference.
+        #[arg(long)]
+        write_pcm: Option<std::path::PathBuf>,
     },
     /// Scan a full-rate vector for V/UV transition frames that
     /// isolate §1.12.2 Eq. 131 vs Eq. 132 candidates, then run xcorr
@@ -260,12 +265,13 @@ fn main() -> Result<()> {
         }
         Cmd::PnDiag { name, rc, frame } => cmd_pn_diag(&args.vectors, &name, rc, frame),
         Cmd::Roundtrip { name, rc } => cmd_roundtrip(&args.vectors, &name, rc),
-        Cmd::DecodePcm { name, rc, gamma_w, m_scale } => cmd_decode_pcm(
+        Cmd::DecodePcm { name, rc, gamma_w, m_scale, write_pcm } => cmd_decode_pcm(
             &args.vectors,
             &name,
             rc,
             gamma_w.unwrap_or(GAMMA_W),
             m_scale,
+            write_pcm.as_deref(),
         ),
         Cmd::DecodePcmHalfrate { name, gamma_w, write_pcm } => {
             cmd_decode_pcm_halfrate(&args.vectors, &name, gamma_w.unwrap_or(GAMMA_W), write_pcm.as_deref())
@@ -315,6 +321,7 @@ fn cmd_decode_pcm(
     rc: bool,
     gamma_w: f64,
     m_scale: f64,
+    write_pcm: Option<&Path>,
 ) -> Result<()> {
     let dir = vector_dir(root, rc);
     let fec_path = dir.join("p25").join(format!("{name}.bit"));
@@ -421,6 +428,16 @@ fn cmd_decode_pcm(
     println!("  RMS error:          {rms_err:.2}");
     println!("  peak error:         {peak_err:.0}");
     println!("  SNR:                {snr_db:.2} dB");
+
+    if let Some(out_path) = write_pcm {
+        let mut bytes = Vec::with_capacity(pcm_out.len() * 2);
+        for s in &pcm_out {
+            bytes.extend_from_slice(&s.to_le_bytes());
+        }
+        fs::write(out_path, &bytes)
+            .with_context(|| format!("write synthesized PCM to {}", out_path.display()))?;
+        println!("wrote {} samples ({} bytes) to {}", pcm_out.len(), bytes.len(), out_path.display());
+    }
     Ok(())
 }
 
