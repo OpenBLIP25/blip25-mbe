@@ -342,8 +342,21 @@ pub fn inverse_block_dct(
 // Inverse log-magnitude prediction (§1.8.5, Eq. 75–79)
 // ---------------------------------------------------------------------------
 
-/// Prediction gain `ρ` per BABA-A §6.3 / §1.8.5.
-pub const RHO: f32 = 0.65;
+/// Prediction gain `ρ` per BABA-A Eq. 55 / §1.8.5.
+///
+/// Full-rate ρ is an L̃(0)-dependent schedule (piecewise-linear in the
+/// current frame's harmonic count), **not** the constant 0.65 that
+/// applies only to half-rate (BABA-A Eq. 200). See spec §1.8.5.
+#[inline]
+pub fn fullrate_rho(l: u8) -> f32 {
+    if l <= 15 {
+        0.40
+    } else if l <= 24 {
+        0.03 * f32::from(l) - 0.05
+    } else {
+        0.70
+    }
+}
 
 /// Initial harmonic count for the very first frame after reset
 /// (`L̃(−1) = 30`), per §1.8.5 / §10 Annex A.
@@ -353,9 +366,9 @@ pub const INIT_PREV_L: u8 = 30;
 ///
 /// Per §1.9: this state must be **preserved through frame mute** and
 /// **updated on every successful or repeated frame**. After a cold
-/// start, all `prev_m_linear` entries are 1.0 (so `log₂ = 0` and the
-/// predictor contributes a constant bias that decays over a few
-/// frames at `ρ = 0.65`).
+/// start, all `prev_m_linear` entries are 1.0, so `log₂ M̃_l(−1) = 0`
+/// and the predictor's contribution vanishes on frame 0 regardless of
+/// the ρ schedule.
 #[derive(Clone, Debug)]
 pub struct DecoderState {
     /// Previous frame's spectral amplitudes `M̃_l(−1)` in **linear**
@@ -442,10 +455,11 @@ pub fn apply_log_prediction(
         let delta = k_l - k_floor;
         let log_lo = state.prev_m_at(k_floor as u8).log2();
         let log_hi = state.prev_m_at(k_floor as u8 + 1).log2();
+        let rho = fullrate_rho(l);
         log_m[l_h as usize] = t[(l_h - 1) as usize]
-            + RHO * (1.0 - delta) * log_lo
-            + RHO * delta * log_hi
-            - RHO * mean;
+            + rho * (1.0 - delta) * log_lo
+            + rho * delta * log_hi
+            - rho * mean;
     }
 
     log_m
@@ -745,10 +759,11 @@ pub fn forward_log_prediction(
         let delta = k_l - k_floor;
         let log_lo = state.prev_m_at(k_floor as u8).log2();
         let log_hi = state.prev_m_at(k_floor as u8 + 1).log2();
+        let rho = fullrate_rho(l);
         t[(l_h - 1) as usize] = log_m[l_h as usize]
-            - RHO * (1.0 - delta) * log_lo
-            - RHO * delta * log_hi
-            + RHO * mean;
+            - rho * (1.0 - delta) * log_lo
+            - rho * delta * log_hi
+            + rho * mean;
     }
 
     t
