@@ -393,6 +393,26 @@ impl DecoderState {
         }
     }
 
+    /// Construct a DecoderState seeded with explicit `M̃_l(−1)`
+    /// amplitudes and harmonic count. `amplitudes` is 0-indexed
+    /// (entry `i` → harmonic `l = i + 1`), matching the
+    /// [`MbeParams`] / `dequantize` convention. Sync bit starts at 0.
+    ///
+    /// Used by the analysis encoder's closed-loop matched-decoder
+    /// roundtrip (addendum §0.6.6): the encoder syncs a fresh
+    /// `DecoderState` from its own `PredictorState`, calls
+    /// [`quantize`] + [`reconstruct_amplitudes_from_bits`] with a
+    /// snapshot so both sides see identical predictor input.
+    pub fn from_amplitudes(amplitudes: &[f32], l_prev: u8) -> Self {
+        let mut s = Self::new();
+        let n = amplitudes.len().min(l_prev as usize);
+        for i in 0..n {
+            s.prev_m_linear[i + 1] = amplitudes[i];
+        }
+        s.prev_l = l_prev;
+        s
+    }
+
     /// Read `M̃_l(−1)` per Eqs. 78–79: index 0 returns 1.0 (virtual),
     /// indices > `prev_l` clamp to `M̃_{prev_l}(−1)`.
     fn prev_m_at(&self, l: u8) -> f32 {
@@ -523,6 +543,36 @@ pub enum DecodeError {
 /// 7. Inverse log-magnitude prediction → `log₂ M̃_l(0)` → `M̃_l`.
 /// 8. Update `state.prev_m_linear`, `state.prev_l`, `state.prev_sync`
 ///    for the next frame.
+/// Matched-decoder reconstruction of `M̃_l(0)` from the raw quantized
+/// `b` array produced by [`quantize`]. Runs the inverse pipeline
+/// (`decode_gain_dct` → residuals → HOC matrix → inverse block DCT →
+/// `apply_log_prediction` → exp2) **without** updating `state`. The
+/// caller is responsible for committing the returned amplitudes at
+/// the right moment in the closed-loop encoder flow (analysis-side
+/// §0.6.6: store as next frame's `M̃_l(−1)` only if the frame was
+/// dispatched as voice).
+///
+/// Unlike [`dequantize`], this does not go through priority-
+/// prioritization — the input `b` is the 59-word bitstream as
+/// produced directly by [`quantize`].
+pub fn reconstruct_amplitudes_from_bits(
+    b: &[u16; 59],
+    l: u8,
+    state: &DecoderState,
+) -> [f32; L_MAX as usize] {
+    let blocks = IMBE_BLOCK_LENGTHS[(l - 9) as usize];
+    let g = decode_gain_dct(b, l);
+    let r_i = gain_to_residuals(&g, &blocks);
+    let c = assemble_hoc_matrix(b, l, &r_i);
+    let t = inverse_block_dct(&c, &blocks);
+    let log_m = apply_log_prediction(&t, l, state);
+    let mut out = [0f32; L_MAX as usize];
+    for i in 0..l as usize {
+        out[i] = log_m[i + 1].exp2();
+    }
+    out
+}
+
 pub fn dequantize(
     u: &[u16; 8],
     state: &mut DecoderState,
