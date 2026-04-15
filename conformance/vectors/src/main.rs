@@ -49,13 +49,16 @@ use blip25_mbe::p25_fullrate::priority::{
 };
 use blip25_mbe::p25_halfrate::dequantize::{
     Decoded, DecoderState as HalfDecoderState, decode_to_params,
-    quantize as quantize_half,
+    dequantize as dequantize_half, quantize as quantize_half,
 };
 use blip25_mbe::p25_halfrate::frame::{
     decode_frame as decode_half_frame, deinterleave as deinterleave_half,
 };
 use blip25_mbe::p25_halfrate::priority::{
     deprioritize as deprioritize_half,
+};
+use blip25_mbe::rate_conversion::converter::{
+    ConvertError, FullToHalfConverter, HalfToFullConverter,
 };
 use blip25_mbe::mbe_params::MbeParams;
 
@@ -255,6 +258,50 @@ enum Cmd {
         #[arg(long, default_value_t = 0)]
         frame: usize,
     },
+    /// Cross-rate conversion end-to-end: feed a full-rate DVSI FEC
+    /// vector (`p25/<name>.bit`) through `FullToHalfConverter` and
+    /// re-decode the 36-dibit half-rate output, or feed a half-rate
+    /// vector (`r33/<name>.bit`) through `HalfToFullConverter` and
+    /// re-decode the 72-dibit full-rate output. Reports per-frame
+    /// parameter-level distortion between the source-rate `MbeParams`
+    /// and the destination-rate `MbeParams` (after one quantization
+    /// pass through the destination rate's grid).
+    RateConvert {
+        /// Direction of conversion.
+        #[arg(long, value_enum)]
+        direction: RateConvertDirection,
+        /// Vector name (e.g. `alert`).
+        name: String,
+        /// Use `tv-rc/` instead of `tv-std/tv/`.
+        #[arg(long)]
+        rc: bool,
+    },
+    /// Cross-rate round-trip: full → half → full, or half → full → half.
+    /// Measures cumulative distortion after two quantization passes
+    /// through both rate grids plus two full decode/re-encode cycles.
+    /// This is the strongest "does it actually work end-to-end" test
+    /// of the parametric rate-conversion chain.
+    RateConvertRoundtrip {
+        /// Direction of the first hop (A→B). The round-trip comes back
+        /// to the A rate.
+        #[arg(long, value_enum)]
+        direction: RateConvertDirection,
+        /// Vector name (e.g. `alert`).
+        name: String,
+        /// Use `tv-rc/` instead of `tv-std/tv/`.
+        #[arg(long)]
+        rc: bool,
+    },
+}
+
+/// Direction argument for [`Cmd::RateConvert`] and
+/// [`Cmd::RateConvertRoundtrip`].
+#[derive(Copy, Clone, Debug, clap::ValueEnum)]
+enum RateConvertDirection {
+    /// Full-rate IMBE (144-bit) → half-rate AMBE+2 (72-bit).
+    FullToHalf,
+    /// Half-rate AMBE+2 (72-bit) → full-rate IMBE (144-bit).
+    HalfToFull,
 }
 
 fn main() -> Result<()> {
@@ -298,6 +345,12 @@ fn main() -> Result<()> {
             gamma_w.unwrap_or(GAMMA_W),
             m_scale,
         ),
+        Cmd::RateConvert { direction, name, rc } => {
+            cmd_rate_convert(&args.vectors, direction, &name, rc)
+        }
+        Cmd::RateConvertRoundtrip { direction, name, rc } => {
+            cmd_rate_convert_roundtrip(&args.vectors, direction, &name, rc)
+        }
     }
 }
 
@@ -1736,6 +1789,499 @@ fn unpack_nofec_info(bytes: &[u8]) -> [u16; 8] {
         info[i] = r.read(INFO_WIDTHS[i]);
     }
     info
+}
+
+// ---------------------------------------------------------------------------
+// Rate-conversion harness (cmd: rate-convert, rate-convert-roundtrip)
+// ---------------------------------------------------------------------------
+
+/// Accumulator for parameter-level distortion between a source
+/// `MbeParams` and a destination `MbeParams` (either the far-side of a
+/// single conversion, or the re-decoded result of an A→B→A round-trip).
+#[derive(Default)]
+struct ConvertStats {
+    frames: usize,
+    /// Sum of |cents error| per comparable frame. `cents = 1200 ·
+    /// log2(ω₀_dst / ω₀_src)`.
+    pitch_cents_abs_sum: f64,
+    /// Sum of squared cents error for RMS.
+    pitch_cents_sq_sum: f64,
+    /// Frames where `L_dst != L_src`.
+    l_mismatches: usize,
+    /// Distribution of |L_dst − L_src|.
+    l_delta_hist: std::collections::BTreeMap<i32, usize>,
+    /// Harmonics where we could compare (min(L_src, L_dst) per frame).
+    harmonics_compared: usize,
+    /// Harmonics where `ṽ` matched.
+    voicing_matches: usize,
+    /// Sum of squared (20·log10) amplitude error per comparable
+    /// harmonic. Uses `max(M, 1e-6)` to guard against log(0).
+    amp_db_sq_sum: f64,
+    /// Sum of |20·log10 ratio| per comparable harmonic.
+    amp_db_abs_sum: f64,
+}
+
+impl ConvertStats {
+    fn push(&mut self, src: &MbeParams, dst: &MbeParams) {
+        self.frames += 1;
+
+        let w_src = f64::from(src.omega_0());
+        let w_dst = f64::from(dst.omega_0());
+        let cents = 1200.0 * (w_dst / w_src).log2();
+        self.pitch_cents_abs_sum += cents.abs();
+        self.pitch_cents_sq_sum += cents * cents;
+
+        let l_src = src.harmonic_count() as i32;
+        let l_dst = dst.harmonic_count() as i32;
+        if l_src != l_dst {
+            self.l_mismatches += 1;
+        }
+        *self.l_delta_hist.entry(l_dst - l_src).or_insert(0) += 1;
+
+        let l_min = l_src.min(l_dst) as usize;
+        let v_src = src.voiced_slice();
+        let v_dst = dst.voiced_slice();
+        let a_src = src.amplitudes_slice();
+        let a_dst = dst.amplitudes_slice();
+        for i in 0..l_min {
+            self.harmonics_compared += 1;
+            if v_src[i] == v_dst[i] {
+                self.voicing_matches += 1;
+            }
+            // Guard against log2(0) — MbeParams enforces non-negative
+            // amplitudes but silence frames can carry exact zeros.
+            let a_s = (a_src[i] as f64).max(1e-6);
+            let a_d = (a_dst[i] as f64).max(1e-6);
+            let db = 20.0 * (a_d / a_s).log10();
+            self.amp_db_abs_sum += db.abs();
+            self.amp_db_sq_sum += db * db;
+        }
+    }
+
+    fn print(&self, label: &str) {
+        if self.frames == 0 {
+            println!("{label}: 0 comparable frames (nothing to report)");
+            return;
+        }
+        let n = self.frames as f64;
+        let hn = self.harmonics_compared.max(1) as f64;
+        let pitch_rms = (self.pitch_cents_sq_sum / n).sqrt();
+        let pitch_mean_abs = self.pitch_cents_abs_sum / n;
+        let l_mismatch_pct = 100.0 * self.l_mismatches as f64 / n;
+        let voicing_pct = 100.0 * self.voicing_matches as f64
+            / (self.harmonics_compared.max(1) as f64);
+        let amp_rms_db = (self.amp_db_sq_sum / hn).sqrt();
+        let amp_mean_abs_db = self.amp_db_abs_sum / hn;
+
+        println!("{label} ({} comparable frames):", self.frames);
+        println!(
+            "  pitch error:       mean |Δ| = {pitch_mean_abs:6.2} cents   RMS = {pitch_rms:6.2} cents"
+        );
+        println!(
+            "  L mismatch:        {} / {} frames ({:.1}%)",
+            self.l_mismatches, self.frames, l_mismatch_pct
+        );
+        if !self.l_delta_hist.is_empty() {
+            let mut entries: Vec<(i32, usize)> = self
+                .l_delta_hist
+                .iter()
+                .map(|(k, v)| (*k, *v))
+                .collect();
+            entries.sort_by(|a, b| b.1.cmp(&a.1));
+            let top: Vec<String> = entries
+                .iter()
+                .take(5)
+                .map(|(d, c)| format!("Δ={d:+}: {c}"))
+                .collect();
+            println!("  L Δ top-5:         {}", top.join(", "));
+        }
+        println!(
+            "  voicing agreement: {} / {} harmonics ({:.1}%)",
+            self.voicing_matches, self.harmonics_compared, voicing_pct
+        );
+        println!(
+            "  amplitude error:   mean |Δ| = {amp_mean_abs_db:5.2} dB   RMS = {amp_rms_db:5.2} dB"
+        );
+    }
+}
+
+/// Tally of frames that couldn't participate in parameter comparison.
+#[derive(Default)]
+struct SkipStats {
+    src_decode_errors: usize,
+    dst_decode_errors: usize,
+    convert_errors: usize,
+    tone_or_reserved: usize,
+}
+
+impl SkipStats {
+    fn total(&self) -> usize {
+        self.src_decode_errors
+            + self.dst_decode_errors
+            + self.convert_errors
+            + self.tone_or_reserved
+    }
+
+    fn print(&self) {
+        if self.total() == 0 {
+            println!("skipped frames:    0");
+            return;
+        }
+        println!("skipped frames:    {}", self.total());
+        if self.src_decode_errors > 0 {
+            println!("  source dequantize errors:      {}", self.src_decode_errors);
+        }
+        if self.tone_or_reserved > 0 {
+            println!("  tone / reserved pitch (src):   {}", self.tone_or_reserved);
+        }
+        if self.convert_errors > 0 {
+            println!("  converter errors (dst pitch):  {}", self.convert_errors);
+        }
+        if self.dst_decode_errors > 0 {
+            println!("  dst dequantize errors:         {}", self.dst_decode_errors);
+        }
+    }
+}
+
+fn cmd_rate_convert(
+    root: &Path,
+    direction: RateConvertDirection,
+    name: &str,
+    rc: bool,
+) -> Result<()> {
+    match direction {
+        RateConvertDirection::FullToHalf => cmd_rate_convert_full_to_half(root, name, rc),
+        RateConvertDirection::HalfToFull => cmd_rate_convert_half_to_full(root, name, rc),
+    }
+}
+
+fn cmd_rate_convert_full_to_half(root: &Path, name: &str, rc: bool) -> Result<()> {
+    let dir = vector_dir(root, rc);
+    let fec_path = dir.join("p25").join(format!("{name}.bit"));
+    let fec_bytes = fs::read(&fec_path)
+        .with_context(|| format!("read FEC vector {}", fec_path.display()))?;
+    if fec_bytes.len() % BYTES_PER_FEC_FRAME != 0 {
+        return Err(anyhow!(
+            "FEC file {} is {} bytes — not a multiple of {}",
+            fec_path.display(),
+            fec_bytes.len(),
+            BYTES_PER_FEC_FRAME
+        ));
+    }
+    let n_frames = fec_bytes.len() / BYTES_PER_FEC_FRAME;
+
+    println!("vector:            {name}{} (full → half)", if rc { " (rc)" } else { "" });
+    println!("frames:            {n_frames}");
+    println!();
+
+    let mut src_state = DecoderState::new();
+    let mut dst_state = HalfDecoderState::new();
+    let mut conv = FullToHalfConverter::new();
+    let mut stats = ConvertStats::default();
+    let mut skips = SkipStats::default();
+
+    for f in 0..n_frames {
+        let frame = &fec_bytes[f * BYTES_PER_FEC_FRAME..(f + 1) * BYTES_PER_FEC_FRAME];
+        let dibits = unpack_dibits(frame);
+
+        // Source params: independent decode+dequant using our own state.
+        // Evolves in lockstep with the converter's internal decoder.
+        let src_frame = decode_full_frame(&dibits);
+        let src_params = match dequantize_full(&src_frame.info, &mut src_state) {
+            Ok(p) => p,
+            Err(_) => {
+                skips.src_decode_errors += 1;
+                // Keep the converter's state evolving so it stays
+                // in sync with downstream radios. Ignore its output.
+                let _ = conv.convert(&dibits);
+                continue;
+            }
+        };
+
+        // Convert to half-rate.
+        let dst_dibits = match conv.convert(&dibits) {
+            Ok(b) => b,
+            Err(ConvertError::HalfPitchOutOfRange) => {
+                skips.convert_errors += 1;
+                continue;
+            }
+            Err(_) => {
+                skips.convert_errors += 1;
+                continue;
+            }
+        };
+
+        // Re-decode at destination rate.
+        let dst_frame = decode_half_frame(&dst_dibits);
+        let dst_params = match dequantize_half(&dst_frame.info, &mut dst_state) {
+            Ok(p) => p,
+            Err(_) => {
+                skips.dst_decode_errors += 1;
+                continue;
+            }
+        };
+
+        stats.push(&src_params, &dst_params);
+    }
+
+    skips.print();
+    println!();
+    stats.print("Source → half-rate");
+    Ok(())
+}
+
+fn cmd_rate_convert_half_to_full(root: &Path, name: &str, rc: bool) -> Result<()> {
+    let base = if rc { root.join("tv-rc") } else { root.join("tv-std").join("tv") };
+    let bit_path = base.join("r33").join(format!("{name}.bit"));
+    let bit_bytes = fs::read(&bit_path)
+        .with_context(|| format!("read half-rate vector {}", bit_path.display()))?;
+    if bit_bytes.len() % BYTES_PER_HALFRATE_FRAME != 0 {
+        return Err(anyhow!(
+            "half-rate .bit file {} is {} bytes — not a multiple of {}",
+            bit_path.display(),
+            bit_bytes.len(),
+            BYTES_PER_HALFRATE_FRAME
+        ));
+    }
+    let n_frames = bit_bytes.len() / BYTES_PER_HALFRATE_FRAME;
+
+    println!("vector:            {name}{} (half → full, r33)", if rc { " (rc)" } else { "" });
+    println!("frames:            {n_frames}");
+    println!();
+
+    let mut src_state = HalfDecoderState::new();
+    let mut dst_state = DecoderState::new();
+    let mut conv = HalfToFullConverter::new();
+    let mut stats = ConvertStats::default();
+    let mut skips = SkipStats::default();
+
+    for f in 0..n_frames {
+        let frame = &bit_bytes[f * BYTES_PER_HALFRATE_FRAME..(f + 1) * BYTES_PER_HALFRATE_FRAME];
+        let dibits = unpack_dibits_halfrate(frame);
+
+        // Source decoder uses the tone-aware dispatch so we can count
+        // tone/erasure frames instead of lumping them into
+        // decode-errors. The converter internally uses the plain
+        // voice-only path, so tone frames will blow up there too; we
+        // pre-filter before calling it.
+        let ambe = decode_half_frame(&dibits);
+        let src_params = match decode_to_params(&ambe.info, &mut src_state) {
+            Ok(Decoded::Voice(p)) => p,
+            Ok(Decoded::Tone { .. }) | Ok(Decoded::Erasure) => {
+                skips.tone_or_reserved += 1;
+                continue;
+            }
+            Err(_) => {
+                skips.src_decode_errors += 1;
+                continue;
+            }
+        };
+
+        let dst_dibits = match conv.convert(&dibits) {
+            Ok(b) => b,
+            Err(_) => {
+                skips.convert_errors += 1;
+                continue;
+            }
+        };
+
+        let dst_frame = decode_full_frame(&dst_dibits);
+        let dst_params = match dequantize_full(&dst_frame.info, &mut dst_state) {
+            Ok(p) => p,
+            Err(_) => {
+                skips.dst_decode_errors += 1;
+                continue;
+            }
+        };
+
+        stats.push(&src_params, &dst_params);
+    }
+
+    skips.print();
+    println!();
+    stats.print("Source → full-rate");
+    Ok(())
+}
+
+fn cmd_rate_convert_roundtrip(
+    root: &Path,
+    direction: RateConvertDirection,
+    name: &str,
+    rc: bool,
+) -> Result<()> {
+    match direction {
+        RateConvertDirection::FullToHalf => cmd_rate_convert_roundtrip_full(root, name, rc),
+        RateConvertDirection::HalfToFull => cmd_rate_convert_roundtrip_half(root, name, rc),
+    }
+}
+
+fn cmd_rate_convert_roundtrip_full(root: &Path, name: &str, rc: bool) -> Result<()> {
+    let dir = vector_dir(root, rc);
+    let fec_path = dir.join("p25").join(format!("{name}.bit"));
+    let fec_bytes = fs::read(&fec_path)
+        .with_context(|| format!("read FEC vector {}", fec_path.display()))?;
+    if fec_bytes.len() % BYTES_PER_FEC_FRAME != 0 {
+        return Err(anyhow!("FEC file is not a whole number of frames"));
+    }
+    let n_frames = fec_bytes.len() / BYTES_PER_FEC_FRAME;
+
+    println!("vector:            {name}{} (full → half → full)", if rc { " (rc)" } else { "" });
+    println!("frames:            {n_frames}");
+    println!();
+
+    let mut src_state = DecoderState::new();
+    let mut final_state = DecoderState::new();
+    let mut a_to_b = FullToHalfConverter::new();
+    let mut b_to_a = HalfToFullConverter::new();
+    let mut stats = ConvertStats::default();
+    let mut skips = SkipStats::default();
+
+    for f in 0..n_frames {
+        let frame = &fec_bytes[f * BYTES_PER_FEC_FRAME..(f + 1) * BYTES_PER_FEC_FRAME];
+        let dibits = unpack_dibits(frame);
+
+        let src_frame = decode_full_frame(&dibits);
+        let src_params = match dequantize_full(&src_frame.info, &mut src_state) {
+            Ok(p) => p,
+            Err(_) => {
+                skips.src_decode_errors += 1;
+                continue;
+            }
+        };
+
+        let mid = match a_to_b.convert(&dibits) {
+            Ok(b) => b,
+            Err(_) => {
+                skips.convert_errors += 1;
+                continue;
+            }
+        };
+        let back = match b_to_a.convert(&mid) {
+            Ok(b) => b,
+            Err(_) => {
+                skips.convert_errors += 1;
+                continue;
+            }
+        };
+        let final_frame = decode_full_frame(&back);
+        let final_params = match dequantize_full(&final_frame.info, &mut final_state) {
+            Ok(p) => p,
+            Err(_) => {
+                skips.dst_decode_errors += 1;
+                continue;
+            }
+        };
+
+        stats.push(&src_params, &final_params);
+    }
+
+    skips.print();
+    println!();
+    stats.print("Source → half → full");
+    Ok(())
+}
+
+fn cmd_rate_convert_roundtrip_half(root: &Path, name: &str, rc: bool) -> Result<()> {
+    let base = if rc { root.join("tv-rc") } else { root.join("tv-std").join("tv") };
+    let bit_path = base.join("r33").join(format!("{name}.bit"));
+    let bit_bytes = fs::read(&bit_path)
+        .with_context(|| format!("read half-rate vector {}", bit_path.display()))?;
+    if bit_bytes.len() % BYTES_PER_HALFRATE_FRAME != 0 {
+        return Err(anyhow!("half-rate file is not a whole number of frames"));
+    }
+    let n_frames = bit_bytes.len() / BYTES_PER_HALFRATE_FRAME;
+
+    println!("vector:            {name}{} (half → full → half, r33)", if rc { " (rc)" } else { "" });
+    println!("frames:            {n_frames}");
+    println!();
+
+    let mut src_state = HalfDecoderState::new();
+    let mut final_state = HalfDecoderState::new();
+    let mut a_to_b = HalfToFullConverter::new();
+    let mut b_to_a = FullToHalfConverter::new();
+    let mut stats = ConvertStats::default();
+    let mut skips = SkipStats::default();
+    let mut outbound_errs = 0usize;
+    let mut inbound_errs = 0usize;
+    let mut inbound_examples: Vec<(usize, f32, u8, f32)> = Vec::new();
+
+    for f in 0..n_frames {
+        let frame = &bit_bytes[f * BYTES_PER_HALFRATE_FRAME..(f + 1) * BYTES_PER_HALFRATE_FRAME];
+        let dibits = unpack_dibits_halfrate(frame);
+
+        let ambe = decode_half_frame(&dibits);
+        let src_params = match decode_to_params(&ambe.info, &mut src_state) {
+            Ok(Decoded::Voice(p)) => p,
+            Ok(Decoded::Tone { .. }) | Ok(Decoded::Erasure) => {
+                skips.tone_or_reserved += 1;
+                continue;
+            }
+            Err(_) => {
+                skips.src_decode_errors += 1;
+                continue;
+            }
+        };
+
+        let mid = match a_to_b.convert(&dibits) {
+            Ok(b) => b,
+            Err(_) => {
+                skips.convert_errors += 1;
+                outbound_errs += 1;
+                continue;
+            }
+        };
+        let back = match b_to_a.convert(&mid) {
+            Ok(b) => b,
+            Err(_) => {
+                skips.convert_errors += 1;
+                inbound_errs += 1;
+                if inbound_examples.len() < 5 {
+                    // Decode the `mid` full-rate frame to see what ω₀ the
+                    // full-rate encoder actually emitted for this
+                    // source frame.
+                    let mf = decode_full_frame(&mid);
+                    let mut probe = DecoderState::new();
+                    let mid_omega = dequantize_full(&mf.info, &mut probe)
+                        .map(|p| p.omega_0())
+                        .unwrap_or(f32::NAN);
+                    inbound_examples.push((
+                        f,
+                        src_params.omega_0(),
+                        src_params.harmonic_count(),
+                        mid_omega,
+                    ));
+                }
+                continue;
+            }
+        };
+        let final_frame = decode_half_frame(&back);
+        let final_params = match dequantize_half(&final_frame.info, &mut final_state) {
+            Ok(p) => p,
+            Err(_) => {
+                skips.dst_decode_errors += 1;
+                continue;
+            }
+        };
+
+        stats.push(&src_params, &final_params);
+    }
+
+    skips.print();
+    if outbound_errs > 0 || inbound_errs > 0 {
+        println!(
+            "  (breakdown: outbound a→b {outbound_errs}, inbound b→a {inbound_errs})"
+        );
+    }
+    if !inbound_examples.is_empty() {
+        println!();
+        println!("First {} inbound-hop failures (ω₀ src → full-rate mid):", inbound_examples.len());
+        for (f, src_w, src_l, mid_w) in &inbound_examples {
+            println!("  frame {f:>3}: src ω₀={src_w:.6} (L={src_l}) → mid ω₀={mid_w:.6}");
+        }
+    }
+    println!();
+    stats.print("Source → full → half");
+    Ok(())
 }
 
 #[cfg(test)]
