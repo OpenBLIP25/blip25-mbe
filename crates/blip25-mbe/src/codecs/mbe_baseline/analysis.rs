@@ -1420,9 +1420,12 @@ const SILENCE_BETA: f64 = 4.0;
 const SILENCE_ENTER_FRAMES: u8 = 5;
 /// Frame-count hysteresis for exiting silence.
 const SILENCE_EXIT_FRAMES: u8 = 3;
-/// Cold-start noise floor (small positive value to avoid 0-divides
-/// on the first comparison).
-const SILENCE_ETA_INIT: f64 = 1.0;
+/// Cold-start noise floor. Set high so the ratio test `E_f < α·η`
+/// fires immediately on quiet input: silent audio enters silence
+/// within the 5-frame hysteresis, while voiced audio (`E_f > β·η`)
+/// immediately casts voice votes and never false-triggers. The value
+/// matches `XI_MAX_FLOOR` (§0.7 Eq. 41) in order of magnitude.
+const SILENCE_ETA_INIT: f64 = 20000.0;
 
 /// Running silence-detector state per addendum §0.8.4.
 ///
