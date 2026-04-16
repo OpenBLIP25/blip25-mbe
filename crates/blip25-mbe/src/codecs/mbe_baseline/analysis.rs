@@ -397,18 +397,19 @@ pub fn compute_s_lpf(s_input: &[f64; PITCH_INPUT_LEN]) -> [f64; (2 * W_I_HALF + 
 
 /// Quantizer state for one frame of pitch analysis.
 ///
-/// Caches the Eq. 5 denominator's energy term and the Eq. 7 squared-
-/// envelope autocorrelation `r(t)` for integer `t ∈ [0, 122]`, so
-/// `E(P)` can be evaluated cheaply for any grid candidate. The
-/// fourth-moment of `w_I` (a window-dependent constant) is also
-/// precomputed so the denominator is one multiply + one subtract away.
+/// Caches the Eq. 5 energy term and the Eq. 7 autocorrelation `r(t)`
+/// for integer `t ∈ [0, 122]`, so `E(P)` can be evaluated cheaply for
+/// any grid candidate. The fourth moment of `w_I` (a window-dependent
+/// constant) is also precomputed so the denominator is one multiply +
+/// one subtract away.
 #[derive(Clone, Debug)]
 pub struct PitchSearch {
     /// `Σ_{j} s²_LPF(j) · w²_I(j)` — total windowed energy.
     energy: f64,
     /// `Σ w_I⁴(j)` — window-dependent denominator constant (Eq. 5).
     w_i_fourth_moment: f64,
-    /// `r(t)` for `t ∈ [0, R_MAX_LAG]` per Eq. 7.
+    /// `r(t) = Σ_{j} s_LPF(j)·w²_I(j) · s_LPF(j+t)·w²_I(j+t)` for
+    /// `t ∈ [0, R_MAX_LAG]` per addendum §0.3.2 Eq. 7.
     ///
     /// `R_MAX_LAG = W_I_HALF = 150`: Eq. 5's sum reaches lags
     /// `n·P` with `|n| ≤ ⌊150/P⌋`, so `|n·P| ≤ 150` by construction.
@@ -429,35 +430,32 @@ impl PitchSearch {
     /// to inject a synthetic `s_LPF(n)` without round-tripping through
     /// [`compute_s_lpf`].
     pub fn from_lpf(s_lpf: &[f64; (2 * W_I_HALF + 1) as usize]) -> Self {
-        // Precompute the windowed samples s_LPF(j)·w_I(j).
-        let mut sw = [0.0f64; (2 * W_I_HALF + 1) as usize];
-        for j in -W_I_HALF..=W_I_HALF {
-            let idx = (j + W_I_HALF) as usize;
-            sw[idx] = s_lpf[idx] * f64::from(analysis_window(j));
-        }
-        // Energy Σ (s_LPF·w_I)² and fourth moment Σ w_I⁴.
+        // Energy Σ s²_LPF·w²_I, fourth moment Σ w_I⁴, and the
+        // per-frame envelope sw2[j] = s_LPF(j)·w²_I(j) that feeds the
+        // Eq. 7 autocorrelation. Addendum §0.3.8: note s_LPF is
+        // linear and the window is squared — see
+        // analysis/vocoder_analysis_eq7_correction.md.
+        let mut sw2 = [0.0f64; (2 * W_I_HALF + 1) as usize];
         let mut energy = 0.0;
         let mut w4 = 0.0;
         for j in -W_I_HALF..=W_I_HALF {
             let idx = (j + W_I_HALF) as usize;
-            energy += sw[idx] * sw[idx];
+            let s = s_lpf[idx];
             let w = f64::from(analysis_window(j));
-            w4 += w * w * w * w;
+            let w2 = w * w;
+            sw2[idx] = s * w2;
+            energy += s * s * w2;
+            w4 += w2 * w2;
         }
-        // Autocorrelation r(t): Σ (s_LPF(j)·w_I(j))² · (s_LPF(j+t)·w_I(j+t))².
+        // Eq. 7 via hoisted envelope — r(t) = Σ sw2[j]·sw2[j+t].
         let mut r = [0.0f64; R_MAX_LAG + 1];
-        let mut sw_sq = [0.0f64; (2 * W_I_HALF + 1) as usize];
-        for j in 0..sw.len() {
-            sw_sq[j] = sw[j] * sw[j];
-        }
         for t in 0..=R_MAX_LAG as i32 {
             let mut acc = 0.0;
-            // j runs over the subset of [-150, 150] where j+t is also in support.
             let j_lo = (-W_I_HALF).max(-W_I_HALF - t);
             let j_hi = W_I_HALF.min(W_I_HALF - t);
             for j in j_lo..=j_hi {
-                let a = sw_sq[(j + W_I_HALF) as usize];
-                let b = sw_sq[(j + t + W_I_HALF) as usize];
+                let a = sw2[(j + W_I_HALF) as usize];
+                let b = sw2[(j + t + W_I_HALF) as usize];
                 acc += a * b;
             }
             r[t as usize] = acc;
@@ -1534,6 +1532,35 @@ pub enum AnalysisOutput {
     Voice(MbeParams),
 }
 
+/// Diagnostic trace from [`encode_with_trace`] capturing the §0.3
+/// pitch-tracker scalars for the current frame. `None` when pitch
+/// search did not run (preroll).
+///
+/// All fields are in the encoder's native units: pitch periods in
+/// samples, `E(P)` as the unitless Eq. 5 error. Carries the full
+/// [`PitchSearch`] for the current frame so callers can query `E(P)`
+/// at arbitrary pitches (e.g., the chip's reference pitch) without
+/// re-running the HPF + LPF + autocorrelation pipeline.
+#[derive(Clone, Debug)]
+pub struct EncodeTrace {
+    /// `P̂_B` from [`look_back`].
+    pub p_hat_b: f64,
+    /// `CE_B` — 3-frame cumulative error at the look-back pick.
+    pub ce_b: f64,
+    /// `P̂_F` from [`look_ahead`] (post-cascade).
+    pub p_hat_f: f64,
+    /// `CE_F` — 3-frame cumulative error at the look-ahead pick.
+    pub ce_f: f64,
+    /// `P̂_I` — [`decide_initial_pitch`] pick.
+    pub p_hat_i: f64,
+    /// `E(P̂_I)` — current-frame Eq. 5 error at the tracker's pick.
+    pub e_p_hat_i: f64,
+    /// Current frame's [`PitchSearch`] — callable via
+    /// [`PitchSearch::e_of_p`] to evaluate Eq. 5 at any pitch on the
+    /// same analyzed PCM window.
+    pub pitch_search_current: PitchSearch,
+}
+
 /// Shared [`HarmonicBasis`] — the Eq. 30 `W_R(k)` table is signal-
 /// independent, so it is built once at first use and reused across
 /// all `encode` calls.
@@ -1848,6 +1875,21 @@ pub fn encode(
     pcm: &[i16],
     state: &mut AnalysisState,
 ) -> Result<AnalysisOutput, AnalysisError> {
+    encode_with_trace(pcm, state).map(|(out, _)| out)
+}
+
+/// Identical to [`encode`] but additionally returns an [`EncodeTrace`]
+/// capturing the §0.3 pitch-tracker scalars for the analyzed frame.
+/// The trace is `None` during preroll (pitch search does not run).
+///
+/// Intended for conformance diagnostics that need to evaluate `E(P)`
+/// at arbitrary pitches (e.g., a reference chip's pitch) on the same
+/// PCM window the encoder analyzed — see
+/// [`PitchSearch::e_of_p`].
+pub fn encode_with_trace(
+    pcm: &[i16],
+    state: &mut AnalysisState,
+) -> Result<(AnalysisOutput, Option<EncodeTrace>), AnalysisError> {
     if pcm.len() != SAMPLES_PER_FRAME as usize {
         return Err(AnalysisError::WrongFrameLength);
     }
@@ -1869,7 +1911,7 @@ pub fn encode(
     // Step 3: preroll check.
     if state.in_preroll() {
         state.advance_preroll();
-        return Ok(AnalysisOutput::Silence);
+        return Ok((AnalysisOutput::Silence, None));
     }
 
     // Steps 4-5: pitch tracking over the three-frame PitchSearch window.
@@ -1883,6 +1925,15 @@ pub fn encode(
     let (p_f, ce_f) = look_ahead(&search_cur, &search_f1, &search_f2);
     let p_hat_i = decide_initial_pitch(p_b, ce_b, p_f, ce_f);
     let e_p_hat_i = search_cur.e_of_p(p_hat_i);
+    let trace = EncodeTrace {
+        p_hat_b: p_b,
+        ce_b,
+        p_hat_f: p_f,
+        ce_f,
+        p_hat_i,
+        e_p_hat_i,
+        pitch_search_current: search_cur.clone(),
+    };
 
     // Step 6: signal DFT.
     let basis = shared_basis();
@@ -1906,7 +1957,7 @@ pub fn encode(
     if state.silence_detection_enabled && silent {
         state.commit_pitch(p_hat_i, e_p_hat_i);
         state.advance_preroll();
-        return Ok(AnalysisOutput::Silence);
+        return Ok((AnalysisOutput::Silence, Some(trace)));
     }
 
     // Step 10: matched-decoder roundtrip (closed-loop §0.6.6).
@@ -1933,7 +1984,7 @@ pub fn encode(
     )
     .map_err(|_| AnalysisError::PitchOutOfRange)?;
     state.advance_preroll();
-    Ok(AnalysisOutput::Voice(params))
+    Ok((AnalysisOutput::Voice(params), Some(trace)))
 }
 
 #[cfg(test)]

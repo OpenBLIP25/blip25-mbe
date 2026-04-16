@@ -37,7 +37,8 @@ use blip25_mbe::codecs::mbe_baseline::{
     FrameErrorContext, GAMMA_W, SynthState, synthesize_frame,
 };
 use blip25_mbe::codecs::mbe_baseline::analysis::{
-    AnalysisError, AnalysisOutput, AnalysisState, encode as analysis_encode,
+    AnalysisError, AnalysisOutput, AnalysisState,
+    encode_with_trace as analysis_encode_with_trace,
 };
 use blip25_mbe::fec::{golay_23_12_encode, hamming_15_11_encode};
 use blip25_mbe::p25_fullrate::dequantize::{
@@ -331,6 +332,15 @@ enum Cmd {
         /// range are tallied as non-comparable.
         #[arg(long, default_value_t = -2, allow_hyphen_values = true)]
         chip_offset: i32,
+        /// Enable the encoder's §0.8.4 silence detector. Silent frames
+        /// emit `AnalysisOutput::Silence` and are tallied under
+        /// `encoder silence` rather than compared. Off by default per
+        /// addendum §0.8.8 (pass-through); enable when the chip
+        /// reference is known to dispatch silence via a default pitch
+        /// index (e.g. b̂_0=25 on low-energy frames), which otherwise
+        /// pollutes aggregate pitch/L stats.
+        #[arg(long)]
+        silence_dispatch: bool,
     },
 }
 
@@ -391,8 +401,8 @@ fn main() -> Result<()> {
         Cmd::RateConvertRoundtrip { direction, name, rc } => {
             cmd_rate_convert_roundtrip(&args.vectors, direction, &name, rc)
         }
-        Cmd::AnalysisEncode { name, rc, dump_frames, chip_offset } => {
-            cmd_analysis_encode(&args.vectors, &name, rc, dump_frames, chip_offset)
+        Cmd::AnalysisEncode { name, rc, dump_frames, chip_offset, silence_dispatch } => {
+            cmd_analysis_encode(&args.vectors, &name, rc, dump_frames, chip_offset, silence_dispatch)
         }
     }
 }
@@ -2446,6 +2456,7 @@ fn cmd_analysis_encode(
     rc: bool,
     dump_frames: usize,
     chip_offset: i32,
+    silence_dispatch: bool,
 ) -> Result<()> {
     let dir = vector_dir(root, rc);
     let pcm_path = dir.join("p25").join(format!("{name}.pcm"));
@@ -2495,6 +2506,9 @@ fn cmd_analysis_encode(
     if chip_offset != 0 {
         println!("chip offset:       {chip_offset:+} (chip[f + offset] vs encoder[f])");
     }
+    if silence_dispatch {
+        println!("silence dispatch:  on (silent frames tallied, not compared)");
+    }
     println!();
 
     // Pre-decode every chip bit-frame so we can index by offset.
@@ -2509,21 +2523,27 @@ fn cmd_analysis_encode(
         .collect();
 
     let mut encoder_state = AnalysisState::new();
+    if silence_dispatch {
+        encoder_state.set_silence_detection(true);
+    }
     let mut stats = ConvertStats::default();
     let mut skips = AnalysisSkipStats::default();
     let mut dumped = 0usize;
 
     if dump_frames > 0 {
         println!(
-            "{:>5}  {:>9} {:>9} {:>8}   {:>3} {:>3} {:>4}   {:<16}  {}",
-            "frame", "ω̂_0 chip", "ω̂_0 enc", "Δ cents", "Lc", "Le", "ΔL",
+            "{:>5}  {:>9} {:>9} {:>8}   {:>3} {:>3} {:>4}   \
+             {:>6} {:>6} {:>8} {:>8} {:>8} {:>8}   {:<16}  {}",
+            "frame", "ω̂_0 chip", "ω̂_0 enc", "Δ cents",
+            "Lc", "Le", "ΔL",
+            "P̂_I", "P_chip", "E(P̂_B)", "E(P̂_F)", "E(P̂_I)", "E(P_ch)",
             "voicing chip", "voicing enc"
         );
     }
 
     for f in 0..n_frames {
         let pcm_frame = &pcm[f * FRAME_SAMPLES..(f + 1) * FRAME_SAMPLES];
-        let encoded = analysis_encode(pcm_frame, &mut encoder_state);
+        let encoded = analysis_encode_with_trace(pcm_frame, &mut encoder_state);
 
         let chip_idx = f as i32 + chip_offset;
         let chip_ref: Option<&std::result::Result<MbeParams, DecodeError>> =
@@ -2534,15 +2554,21 @@ fn cmd_analysis_encode(
             };
 
         match (encoded, chip_ref) {
-            (Ok(AnalysisOutput::Voice(enc_params)), Some(Ok(ref_params))) => {
+            (Ok((AnalysisOutput::Voice(enc_params), trace)), Some(Ok(ref_params))) => {
                 if dumped < dump_frames {
                     let wc = f64::from(ref_params.omega_0());
                     let we = f64::from(enc_params.omega_0());
                     let cents = 1200.0 * (we / wc).log2();
                     let lc = ref_params.harmonic_count() as i32;
                     let le = enc_params.harmonic_count() as i32;
+                    let tr = trace.as_ref().expect("voice frame always carries trace");
+                    let p_chip = 2.0 * std::f64::consts::PI / wc;
+                    let e_pb = tr.pitch_search_current.e_of_p(tr.p_hat_b);
+                    let e_pf = tr.pitch_search_current.e_of_p(tr.p_hat_f);
+                    let e_pchip = tr.pitch_search_current.e_of_p(p_chip);
                     println!(
-                        "{:>5}  {:>9.5} {:>9.5} {:>+8.1}   {:>3} {:>3} {:>+4}   {:<16}  {}",
+                        "{:>5}  {:>9.5} {:>9.5} {:>+8.1}   {:>3} {:>3} {:>+4}   \
+                         {:>6.2} {:>6.2} {:>8.4} {:>8.4} {:>8.4} {:>8.4}   {:<16}  {}",
                         f,
                         wc,
                         we,
@@ -2550,6 +2576,12 @@ fn cmd_analysis_encode(
                         lc,
                         le,
                         le - lc,
+                        tr.p_hat_i,
+                        p_chip,
+                        e_pb,
+                        e_pf,
+                        tr.e_p_hat_i,
+                        e_pchip,
                         voicing_sig(ref_params, 16),
                         voicing_sig(&enc_params, 16),
                     );
@@ -2557,7 +2589,7 @@ fn cmd_analysis_encode(
                 }
                 stats.push(ref_params, &enc_params);
             }
-            (Ok(AnalysisOutput::Silence), _) => {
+            (Ok((AnalysisOutput::Silence, _)), _) => {
                 if f < blip25_mbe::codecs::mbe_baseline::analysis::PREROLL_FRAMES as usize {
                     skips.preroll += 1;
                 } else {
