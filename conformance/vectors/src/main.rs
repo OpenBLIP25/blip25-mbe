@@ -47,7 +47,8 @@ use blip25_mbe::p25_fullrate::dequantize::{
 };
 use blip25_mbe::p25_fullrate::fec::{deinterleave as deinterleave_full, modulation_masks};
 use blip25_mbe::p25_fullrate::frame::{
-    Frame as FullFrame, INFO_WIDTHS, decode_frame as decode_full_frame,
+    Frame as FullFrame, INFO_WIDTHS,
+    decode_frame as decode_full_frame, encode_frame as encode_full_frame,
 };
 use blip25_mbe::p25_fullrate::priority::{
     deprioritize as deprioritize_full, prioritize as prioritize_full,
@@ -358,6 +359,13 @@ enum Cmd {
         /// divergence is the dominant cause of voicing mismatch.
         #[arg(long)]
         chip_seed_vuv: bool,
+        /// Wire each voice frame through the full encode path
+        /// (quantize → prioritize → encode_frame) and compare the
+        /// resulting info vectors and dibits against the chip's
+        /// `.bit` file. Reports per-info-vector and per-parameter
+        /// bit match rates.
+        #[arg(long)]
+        bitstream: bool,
     },
 }
 
@@ -418,8 +426,8 @@ fn main() -> Result<()> {
         Cmd::RateConvertRoundtrip { direction, name, rc } => {
             cmd_rate_convert_roundtrip(&args.vectors, direction, &name, rc)
         }
-        Cmd::AnalysisEncode { name, rc, dump_frames, chip_offset, silence_dispatch, quantizer_roundtrip, chip_seed_vuv } => {
-            cmd_analysis_encode(&args.vectors, &name, rc, dump_frames, chip_offset, silence_dispatch, quantizer_roundtrip, chip_seed_vuv)
+        Cmd::AnalysisEncode { name, rc, dump_frames, chip_offset, silence_dispatch, quantizer_roundtrip, chip_seed_vuv, bitstream } => {
+            cmd_analysis_encode(&args.vectors, &name, rc, dump_frames, chip_offset, silence_dispatch, quantizer_roundtrip, chip_seed_vuv, bitstream)
         }
     }
 }
@@ -2587,6 +2595,78 @@ impl VuvBandStats {
     }
 }
 
+/// Bitstream-level conformance statistics: info vectors and dibits.
+struct BitstreamStats {
+    frames: usize,
+    /// Per-info-vector match counts.
+    vec_matches: [usize; 8],
+    /// Parameter-level: pitch (b₀) matches.
+    pitch_matches: usize,
+    /// Parameter-level: V/UV (b₁) matches.
+    vuv_matches: usize,
+    /// Parameter-level: all gain DCT bits (b₂..b₇) match.
+    gain_matches: usize,
+    /// Dibit-level: total dibits compared.
+    dibits_compared: usize,
+    /// Dibit-level: dibits that matched.
+    dibits_matched: usize,
+}
+
+impl Default for BitstreamStats {
+    fn default() -> Self {
+        Self {
+            frames: 0,
+            vec_matches: [0; 8],
+            pitch_matches: 0,
+            vuv_matches: 0,
+            gain_matches: 0,
+            dibits_compared: 0,
+            dibits_matched: 0,
+        }
+    }
+}
+
+impl BitstreamStats {
+    fn print(&self) {
+        if self.frames == 0 {
+            println!("Bitstream comparison: 0 frames");
+            return;
+        }
+        let n = self.frames;
+        println!("Bitstream comparison ({n} frames):");
+        println!("  parameter bits:");
+        println!(
+            "    pitch (b̂₀):   {:>5} / {n} ({:.1}%)",
+            self.pitch_matches,
+            100.0 * self.pitch_matches as f64 / n as f64
+        );
+        println!(
+            "    V/UV (b̂₁):    {:>5} / {n} ({:.1}%)",
+            self.vuv_matches,
+            100.0 * self.vuv_matches as f64 / n as f64
+        );
+        println!(
+            "    gain (b̂₂₋₇):  {:>5} / {n} ({:.1}%)",
+            self.gain_matches,
+            100.0 * self.gain_matches as f64 / n as f64
+        );
+        println!("  info vectors:");
+        for i in 0..8 {
+            let pct = 100.0 * self.vec_matches[i] as f64 / n as f64;
+            println!(
+                "    û_{i}  width {:>3}   {:>5} / {n}   {:5.1}%",
+                INFO_WIDTHS[i], self.vec_matches[i], pct
+            );
+        }
+        let dpct = 100.0 * self.dibits_matched as f64
+            / self.dibits_compared.max(1) as f64;
+        println!(
+            "  dibits:          {} / {} ({:.1}%)",
+            self.dibits_matched, self.dibits_compared, dpct
+        );
+    }
+}
+
 fn cmd_analysis_encode(
     root: &Path,
     name: &str,
@@ -2596,6 +2676,7 @@ fn cmd_analysis_encode(
     silence_dispatch: bool,
     quantizer_roundtrip: bool,
     chip_seed_vuv: bool,
+    bitstream: bool,
 ) -> Result<()> {
     let dir = vector_dir(root, rc);
     let pcm_path = dir.join("p25").join(format!("{name}.pcm"));
@@ -2654,15 +2735,23 @@ fn cmd_analysis_encode(
     if chip_seed_vuv {
         println!("chip-seed V/UV:    on (override encoder vuv_prev with chip decisions each frame)");
     }
+    if bitstream {
+        println!("bitstream:         on (full encode path → dibit/info-vector comparison)");
+    }
     println!();
 
     // Pre-decode every chip bit-frame so we can index by offset.
+    // Also store per-frame dibits and info vectors for bitstream comparison.
     let mut chip_state = DecoderState::new();
+    let mut chip_dibits_all: Vec<[u8; 72]> = Vec::with_capacity(n_frames);
+    let mut chip_info_all: Vec<[u16; 8]> = Vec::with_capacity(n_frames);
     let chip_params: Vec<std::result::Result<MbeParams, DecodeError>> = (0..n_frames)
         .map(|f| {
             let fec = &fec_bytes[f * BYTES_PER_FEC_FRAME..(f + 1) * BYTES_PER_FEC_FRAME];
             let dibits = unpack_dibits(fec);
+            chip_dibits_all.push(dibits);
             let imbe = decode_full_frame(&dibits);
+            chip_info_all.push(imbe.info);
             dequantize_full(&imbe.info, &mut chip_state)
         })
         .collect();
@@ -2681,6 +2770,8 @@ fn cmd_analysis_encode(
     let mut q_loss_stats = ConvertStats::default();
     let mut rt_state = DecoderState::new();
     let mut rt_errors = 0usize;
+    let mut bs_state = DecoderState::new();
+    let mut bs_stats = BitstreamStats::default();
     let mut skips = AnalysisSkipStats::default();
     let mut dumped = 0usize;
 
@@ -2782,6 +2873,52 @@ fn cmd_analysis_encode(
                         Err(_) => { rt_errors += 1; }
                     }
                 }
+
+                if bitstream {
+                    let ci = chip_idx as usize;
+                    let mut q_state = bs_state.clone();
+                    if let Ok(bits) = quantize_full(&enc_params, &mut q_state) {
+                        let l = enc_params.harmonic_count();
+                        let enc_info = prioritize_full(&bits, l);
+                        let enc_dibits = encode_full_frame(&enc_info);
+                        let chip_info = &chip_info_all[ci];
+                        let chip_dibits = &chip_dibits_all[ci];
+
+                        bs_stats.frames += 1;
+                        for i in 0..8 {
+                            if enc_info[i] == chip_info[i] {
+                                bs_stats.vec_matches[i] += 1;
+                            }
+                        }
+                        // Parameter-level: deprioritize both to compare
+                        // at the b̂ parameter level.
+                        let b_enc = deprioritize_full(&enc_info, l);
+                        // Chip's L may differ; use chip's L for its own
+                        // deprioritize (pitch index determines L).
+                        let chip_l = ref_params.harmonic_count();
+                        let b_chip = deprioritize_full(chip_info, chip_l);
+                        if b_enc[0] == b_chip[0] {
+                            bs_stats.pitch_matches += 1;
+                        }
+                        if b_enc[1] == b_chip[1] {
+                            bs_stats.vuv_matches += 1;
+                        }
+                        let gain_ok = (2..8).all(|i| b_enc[i] == b_chip[i]);
+                        if gain_ok {
+                            bs_stats.gain_matches += 1;
+                        }
+                        for i in 0..72 {
+                            bs_stats.dibits_compared += 1;
+                            if enc_dibits[i] == chip_dibits[i] {
+                                bs_stats.dibits_matched += 1;
+                            }
+                        }
+
+                        // Advance bs_state with reconstructed amplitudes
+                        // (matching encoder's internal predictor).
+                        let _ = dequantize_full(&enc_info, &mut bs_state);
+                    }
+                }
             }
             (Ok((AnalysisOutput::Silence, _)), _) => {
                 if f < blip25_mbe::codecs::mbe_baseline::analysis::PREROLL_FRAMES as usize {
@@ -2858,6 +2995,10 @@ fn cmd_analysis_encode(
         if rt_errors > 0 {
             println!("  roundtrip errors:  {rt_errors}");
         }
+    }
+    if bitstream {
+        println!();
+        bs_stats.print();
     }
     Ok(())
 }
