@@ -905,6 +905,25 @@ impl VuvState {
             0
         }
     }
+
+    /// Override the per-band V/UV history with external decisions.
+    /// Used for conformance diagnostics that inject the chip's V/UV
+    /// trajectory to measure feedback-divergence contribution.
+    /// `decisions` is 1-indexed (`decisions[k]` for band `k`);
+    /// `k_hat` is the band count to write.
+    pub fn override_vuv_prev(&mut self, decisions: &[u8], k_hat: u8) {
+        self.vuv_prev.fill(0);
+        let n = (k_hat as usize).min(decisions.len()).min(K_HAT_MAX as usize);
+        for k in 1..=n {
+            self.vuv_prev[k] = decisions[k];
+        }
+        self.k_prev = k_hat;
+    }
+
+    /// Override ξ_max with an external value.
+    pub fn override_xi_max(&mut self, xi_max: f64) {
+        self.xi_max = xi_max;
+    }
 }
 
 impl Default for VuvState {
@@ -924,6 +943,13 @@ pub struct VuvResult {
     /// Values of `D_k` per band (useful for debugging / DVSI diffing).
     /// 1-indexed; slots past `k_hat` are zero.
     pub d_k: [f64; (K_HAT_MAX + 1) as usize],
+    /// Per-band Θ_ξ thresholds (Eq. 37). 1-indexed; slots past `k_hat`
+    /// are zero. `D_k < Θ_ξ(k)` → voiced.
+    pub theta_k: [f64; (K_HAT_MAX + 1) as usize],
+    /// Frame energy ratio `M(ξ)` (Eq. 42).
+    pub m_xi: f64,
+    /// Total spectral energy `ξ_0 = ξ_LF + ξ_HF` (Eq. 38–39).
+    pub xi_0: f64,
     /// `ξ_max(0)` committed to state (same as `state.xi_max` after
     /// this call returns).
     pub xi_max_after: f64,
@@ -1000,6 +1026,7 @@ pub fn determine_vuv(
     // Per-band D_k (Eq. 35/36) and decision (Eq. 37 + strict-less-than).
     let mut vuv = [0u8; (K_HAT_MAX + 1) as usize];
     let mut d_k = [0f64; (K_HAT_MAX + 1) as usize];
+    let mut theta_k = [0f64; (K_HAT_MAX + 1) as usize];
     for k in 1..=k_hat {
         let l_lo = 3 * u32::from(k) - 2;
         let l_hi = if k < k_hat {
@@ -1040,6 +1067,7 @@ pub fn determine_vuv(
             (base * modulation * m_xi).max(0.0)
         };
 
+        theta_k[k as usize] = theta;
         vuv[k as usize] = if d < theta { 1 } else { 0 };
     }
 
@@ -1055,6 +1083,9 @@ pub fn determine_vuv(
         k_hat,
         vuv,
         d_k,
+        theta_k,
+        m_xi,
+        xi_0,
         xi_max_after: xi_max_new,
     }
 }
@@ -1562,6 +1593,9 @@ pub struct EncodeTrace {
     /// [`PitchSearch::e_of_p`] to evaluate Eq. 5 at any pitch on the
     /// same analyzed PCM window.
     pub pitch_search_current: PitchSearch,
+    /// V/UV determination result (per-band D_k, Θ_ξ, decisions).
+    /// `None` during preroll or silence-dispatched frames.
+    pub vuv_result: Option<VuvResult>,
 }
 
 /// Shared [`HarmonicBasis`] — the Eq. 30 `W_R(k)` table is signal-
@@ -1713,6 +1747,14 @@ impl AnalysisState {
     #[inline]
     pub fn silence_detector(&self) -> &SilenceDetector {
         &self.silence
+    }
+
+    /// Mutable access to the V/UV state for conformance diagnostics
+    /// (e.g., injecting chip-side V/UV history to measure feedback
+    /// divergence).
+    #[inline]
+    pub fn vuv_state_mut(&mut self) -> &mut VuvState {
+        &mut self.vuv
     }
 
     /// Shift the lookahead buffer left by `SAMPLES_PER_FRAME` and
@@ -1928,7 +1970,7 @@ pub fn encode_with_trace(
     let (p_f, ce_f) = look_ahead(&search_cur, &search_f1, &search_f2);
     let p_hat_i = decide_initial_pitch(p_b, ce_b, p_f, ce_f);
     let e_p_hat_i = search_cur.e_of_p(p_hat_i);
-    let trace = EncodeTrace {
+    let mut trace = EncodeTrace {
         p_hat_b: p_b,
         ce_b,
         p_hat_f: p_f,
@@ -1936,6 +1978,7 @@ pub fn encode_with_trace(
         p_hat_i,
         e_p_hat_i,
         pitch_search_current: search_cur.clone(),
+        vuv_result: None,
     };
 
     // Step 6: signal DFT.
@@ -1948,6 +1991,7 @@ pub fn encode_with_trace(
 
     // Step 8: V/UV (must precede §0.5 per Figure 5).
     let vuv_result = determine_vuv(&sw, basis, &refinement, e_p_hat_i, &mut state.vuv);
+    trace.vuv_result = Some(vuv_result.clone());
 
     // Step 9: spectral amplitude estimation.
     let m_hat = estimate_spectral_amplitudes(&sw, basis, &refinement, &vuv_result);

@@ -37,7 +37,8 @@ use blip25_mbe::codecs::mbe_baseline::{
     FrameErrorContext, GAMMA_W, SynthState, synthesize_frame,
 };
 use blip25_mbe::codecs::mbe_baseline::analysis::{
-    AnalysisError, AnalysisOutput, AnalysisState,
+    AnalysisError, AnalysisOutput, AnalysisState, VuvResult,
+    band_count_for, band_for_harmonic,
     encode_with_trace as analysis_encode_with_trace,
 };
 use blip25_mbe::fec::{golay_23_12_encode, hamming_15_11_encode};
@@ -341,6 +342,22 @@ enum Cmd {
         /// pollutes aggregate pitch/L stats.
         #[arg(long)]
         silence_dispatch: bool,
+        /// Run each voice frame through quantize → prioritize →
+        /// dequantize and report three stat blocks: (1) pre-quantizer
+        /// encoder vs chip (the existing metric), (2) post-roundtrip
+        /// encoder vs chip (apples-to-apples, both post-quantizer),
+        /// (3) quantizer distortion (encoder pre-Q vs its own
+        /// roundtrip). Isolates whether the amplitude residual is
+        /// pre- or post-quantizer.
+        #[arg(long)]
+        quantizer_roundtrip: bool,
+        /// After each frame, override the encoder's V/UV history
+        /// (`vuv_prev`) with the chip's band-level voicing decisions.
+        /// Breaks the self-reinforcing feedback loop: if disagreement
+        /// drops significantly vs the unseeded run, the feedback
+        /// divergence is the dominant cause of voicing mismatch.
+        #[arg(long)]
+        chip_seed_vuv: bool,
     },
 }
 
@@ -401,8 +418,8 @@ fn main() -> Result<()> {
         Cmd::RateConvertRoundtrip { direction, name, rc } => {
             cmd_rate_convert_roundtrip(&args.vectors, direction, &name, rc)
         }
-        Cmd::AnalysisEncode { name, rc, dump_frames, chip_offset, silence_dispatch } => {
-            cmd_analysis_encode(&args.vectors, &name, rc, dump_frames, chip_offset, silence_dispatch)
+        Cmd::AnalysisEncode { name, rc, dump_frames, chip_offset, silence_dispatch, quantizer_roundtrip, chip_seed_vuv } => {
+            cmd_analysis_encode(&args.vectors, &name, rc, dump_frames, chip_offset, silence_dispatch, quantizer_roundtrip, chip_seed_vuv)
         }
     }
 }
@@ -2450,6 +2467,126 @@ fn voicing_sig(params: &MbeParams, cap: usize) -> String {
     s
 }
 
+/// Per-band V/UV disagreement tracker for analysis-encode diagnostics.
+/// Accumulates statistics on which bands disagree between encoder and chip,
+/// and the D_k / Θ_ξ margins at disagreeing bands.
+struct VuvBandStats {
+    /// Max band index seen (for printing).
+    max_k: u8,
+    /// Total frames analyzed.
+    frames: usize,
+    /// Per-band: total frames where this band was compared.
+    band_compared: [usize; 13],
+    /// Per-band: frames where encoder and chip disagree.
+    band_disagree: [usize; 13],
+    /// Per-band: encoder voiced → chip unvoiced.
+    band_v_to_u: [usize; 13],
+    /// Per-band: encoder unvoiced → chip voiced.
+    band_u_to_v: [usize; 13],
+    /// Per-band: sum of D_k on disagree frames (for mean D_k at disagree).
+    band_dk_sum_disagree: [f64; 13],
+    /// Per-band: sum of Θ_ξ on disagree frames.
+    band_theta_sum_disagree: [f64; 13],
+    /// Per-band: sum of (D_k - Θ_ξ) on all frames (for mean margin).
+    band_margin_sum: [f64; 13],
+    /// Per-band: sum of |D_k - Θ_ξ| on all frames.
+    band_margin_abs_sum: [f64; 13],
+}
+
+impl Default for VuvBandStats {
+    fn default() -> Self {
+        Self {
+            max_k: 0,
+            frames: 0,
+            band_compared: [0; 13],
+            band_disagree: [0; 13],
+            band_v_to_u: [0; 13],
+            band_u_to_v: [0; 13],
+            band_dk_sum_disagree: [0.0; 13],
+            band_theta_sum_disagree: [0.0; 13],
+            band_margin_sum: [0.0; 13],
+            band_margin_abs_sum: [0.0; 13],
+        }
+    }
+}
+
+impl VuvBandStats {
+    fn push(&mut self, chip: &MbeParams, enc: &MbeParams, vuv: &VuvResult) {
+        self.frames += 1;
+        let l_chip = chip.harmonic_count();
+        let l_enc = enc.harmonic_count();
+        let k_enc = vuv.k_hat;
+        let k_chip = band_count_for(l_chip);
+        let k_min = k_enc.min(k_chip);
+        if k_min > self.max_k {
+            self.max_k = k_min;
+        }
+
+        for k in 1..=k_min {
+            let ki = k as usize;
+            self.band_compared[ki] += 1;
+
+            // Encoder band-level decision from VuvResult.
+            let enc_voiced = vuv.vuv[ki] == 1;
+
+            // Chip band-level decision: sample the first harmonic in
+            // this band from the chip's per-harmonic voicing.
+            let first_l_in_band = 3 * u32::from(k) - 2;
+            let chip_voiced = if (first_l_in_band as u8) <= l_chip {
+                chip.voiced_slice()[(first_l_in_band - 1) as usize]
+            } else {
+                false
+            };
+
+            let d_k = vuv.d_k[ki];
+            let theta = vuv.theta_k[ki];
+            let margin = d_k - theta;
+            self.band_margin_sum[ki] += margin;
+            self.band_margin_abs_sum[ki] += margin.abs();
+
+            if enc_voiced != chip_voiced {
+                self.band_disagree[ki] += 1;
+                self.band_dk_sum_disagree[ki] += d_k;
+                self.band_theta_sum_disagree[ki] += theta;
+                if enc_voiced {
+                    self.band_v_to_u[ki] += 1;
+                } else {
+                    self.band_u_to_v[ki] += 1;
+                }
+            }
+        }
+    }
+
+    fn print(&self) {
+        if self.frames == 0 {
+            println!("V/UV band analysis: 0 frames");
+            return;
+        }
+        println!("V/UV per-band analysis ({} frames):", self.frames);
+        println!(
+            "  {:>4}  {:>6} {:>6} {:>6}  {:>5} {:>5}  {:>8} {:>8}  {:>8}",
+            "band", "compar", "disag", "dis%",
+            "V→U", "U→V",
+            "D̄_k dis", "Θ̄_ξ dis", "|margin|"
+        );
+        for k in 1..=self.max_k as usize {
+            let c = self.band_compared[k];
+            if c == 0 { continue; }
+            let d = self.band_disagree[k];
+            let pct = 100.0 * d as f64 / c as f64;
+            let dk_mean = if d > 0 { self.band_dk_sum_disagree[k] / d as f64 } else { 0.0 };
+            let th_mean = if d > 0 { self.band_theta_sum_disagree[k] / d as f64 } else { 0.0 };
+            let margin_abs = self.band_margin_abs_sum[k] / c as f64;
+            println!(
+                "  {:>4}  {:>6} {:>6} {:>5.1}%  {:>5} {:>5}  {:>8.4} {:>8.4}  {:>8.4}",
+                k, c, d, pct,
+                self.band_v_to_u[k], self.band_u_to_v[k],
+                dk_mean, th_mean, margin_abs
+            );
+        }
+    }
+}
+
 fn cmd_analysis_encode(
     root: &Path,
     name: &str,
@@ -2457,6 +2594,8 @@ fn cmd_analysis_encode(
     dump_frames: usize,
     chip_offset: i32,
     silence_dispatch: bool,
+    quantizer_roundtrip: bool,
+    chip_seed_vuv: bool,
 ) -> Result<()> {
     let dir = vector_dir(root, rc);
     let pcm_path = dir.join("p25").join(format!("{name}.pcm"));
@@ -2509,6 +2648,12 @@ fn cmd_analysis_encode(
     if silence_dispatch {
         println!("silence dispatch:  on (silent frames tallied, not compared)");
     }
+    if quantizer_roundtrip {
+        println!("quantizer roundtrip: on (encode → quantize → dequantize decomposition)");
+    }
+    if chip_seed_vuv {
+        println!("chip-seed V/UV:    on (override encoder vuv_prev with chip decisions each frame)");
+    }
     println!();
 
     // Pre-decode every chip bit-frame so we can index by offset.
@@ -2527,6 +2672,15 @@ fn cmd_analysis_encode(
         encoder_state.set_silence_detection(true);
     }
     let mut stats = ConvertStats::default();
+    let mut stats_l_match = ConvertStats::default();
+    let mut stats_pitch_close = ConvertStats::default();
+    let mut stats_l_and_pitch = ConvertStats::default();
+    let mut vuv_band_stats = VuvBandStats::default();
+    let mut vuv_band_stats_l_match = VuvBandStats::default();
+    let mut rt_vs_chip_stats = ConvertStats::default();
+    let mut q_loss_stats = ConvertStats::default();
+    let mut rt_state = DecoderState::new();
+    let mut rt_errors = 0usize;
     let mut skips = AnalysisSkipStats::default();
     let mut dumped = 0usize;
 
@@ -2588,6 +2742,46 @@ fn cmd_analysis_encode(
                     dumped += 1;
                 }
                 stats.push(ref_params, &enc_params);
+
+                let l_match = ref_params.harmonic_count() == enc_params.harmonic_count();
+                let cents_abs = (1200.0
+                    * (f64::from(enc_params.omega_0()) / f64::from(ref_params.omega_0())).log2())
+                .abs();
+                let pitch_close = cents_abs < 50.0;
+                if l_match {
+                    stats_l_match.push(ref_params, &enc_params);
+                }
+                if pitch_close {
+                    stats_pitch_close.push(ref_params, &enc_params);
+                }
+                if l_match && pitch_close {
+                    stats_l_and_pitch.push(ref_params, &enc_params);
+                }
+
+                if let Some(ref vuv) = trace.as_ref().and_then(|t| t.vuv_result.as_ref()) {
+                    vuv_band_stats.push(ref_params, &enc_params, vuv);
+                    if l_match {
+                        vuv_band_stats_l_match.push(ref_params, &enc_params, vuv);
+                    }
+                }
+
+                if quantizer_roundtrip {
+                    let mut q_state = rt_state.clone();
+                    match quantize_full(&enc_params, &mut q_state) {
+                        Ok(bits) => {
+                            let l = enc_params.harmonic_count();
+                            let info = prioritize_full(&bits, l);
+                            match dequantize_full(&info, &mut rt_state) {
+                                Ok(rt_params) => {
+                                    rt_vs_chip_stats.push(ref_params, &rt_params);
+                                    q_loss_stats.push(&enc_params, &rt_params);
+                                }
+                                Err(_) => { rt_errors += 1; }
+                            }
+                        }
+                        Err(_) => { rt_errors += 1; }
+                    }
+                }
             }
             (Ok((AnalysisOutput::Silence, _)), _) => {
                 if f < blip25_mbe::codecs::mbe_baseline::analysis::PREROLL_FRAMES as usize {
@@ -2611,6 +2805,30 @@ fn cmd_analysis_encode(
                 skips.encoder_errors += 1;
             }
         }
+
+        // Chip-seed V/UV: override the encoder's vuv_prev with the
+        // chip's band-level voicing for the aligned frame, so the
+        // next encoder frame uses the chip's V/UV history instead of
+        // its own. This breaks the self-reinforcing feedback loop.
+        if chip_seed_vuv {
+            if let Some(Ok(ref_params)) = chip_ref {
+                let l_chip = ref_params.harmonic_count();
+                let k_chip = band_count_for(l_chip);
+                let chip_v = ref_params.voiced_slice();
+                // Extract per-band decisions from chip's per-harmonic
+                // voicing: sample the first harmonic in each band.
+                let mut band_decisions = [0u8; 13];
+                for k in 1..=k_chip {
+                    let first_l = 3 * u32::from(k) - 2;
+                    if (first_l as u8) <= l_chip {
+                        band_decisions[k as usize] =
+                            if chip_v[(first_l - 1) as usize] { 1 } else { 0 };
+                    }
+                }
+                encoder_state.vuv_state_mut()
+                    .override_vuv_prev(&band_decisions, k_chip);
+            }
+        }
     }
 
     if dump_frames > 0 {
@@ -2618,7 +2836,29 @@ fn cmd_analysis_encode(
     }
     skips.print();
     println!();
-    stats.print("Analysis encoder vs chip reference (voice frames only)");
+    stats.print("All voice frames (pre-quantizer)");
+    println!();
+    stats_l_match.print("L-matching frames only (enc L == chip L)");
+    println!();
+    stats_pitch_close.print("Pitch-close frames only (|Δ| < 50 cents)");
+    println!();
+    stats_l_and_pitch.print("L-matching AND pitch-close frames");
+    println!();
+    vuv_band_stats.print();
+    if vuv_band_stats_l_match.frames > 0 {
+        println!();
+        println!("V/UV per-band (L-matching frames only, {} frames):", vuv_band_stats_l_match.frames);
+        vuv_band_stats_l_match.print();
+    }
+    if quantizer_roundtrip {
+        println!();
+        rt_vs_chip_stats.print("Roundtrip vs chip (post-quantizer, apples-to-apples)");
+        println!();
+        q_loss_stats.print("Quantizer distortion (encoder pre-Q vs own roundtrip)");
+        if rt_errors > 0 {
+            println!("  roundtrip errors:  {rt_errors}");
+        }
+    }
     Ok(())
 }
 
