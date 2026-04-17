@@ -1273,19 +1273,23 @@ fn matched_decoder_roundtrip_halfrate(
     let _ = halfrate_dequantize(&u, &mut ds_for_dequantize)
         .map_err(|_| AnalysisError::PitchOutOfRange)?;
 
-    // Extract the reconstructed state. `prev_l` should equal `l_hat`
-    // after a voice-frame dequantize.
-    debug_assert_eq!(ds_for_dequantize.previous_l(), l_hat);
+    // Extract the reconstructed state. The wire decoder's `prev_l`
+    // may differ from the frontend's `l_hat` by ±1 near Annex L
+    // pitch-grid boundaries — the wire encoder re-quantizes ω̂_0
+    // which can shift L per Eq. 187. Use whatever the wire decoder
+    // committed; the predictor state must match what the receiver
+    // sees, not the frontend's L̂(0).
+    let committed_l = ds_for_dequantize.previous_l();
     let lambda_snapshot = ds_for_dequantize.lambda_tilde_snapshot();
     let mut lambda_tilde_zero = [0.0f64; L_HAT_MAX as usize + 1];
-    for l in 1..=l_hat as usize {
+    for l in 1..=committed_l as usize {
         if l < lambda_snapshot.len() {
             lambda_tilde_zero[l] = lambda_snapshot[l];
         }
     }
     Ok(HalfrateRoundtrip {
         lambda_tilde_zero,
-        l_tilde_zero: l_hat,
+        l_tilde_zero: committed_l,
         gamma_tilde_zero: ds_for_dequantize.previous_gamma(),
     })
 }

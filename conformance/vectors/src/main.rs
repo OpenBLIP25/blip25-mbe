@@ -39,6 +39,7 @@ use blip25_mbe::codecs::mbe_baseline::{
 use blip25_mbe::codecs::mbe_baseline::analysis::{
     AnalysisError, AnalysisOutput, AnalysisState, VuvResult,
     band_count_for, band_for_harmonic,
+    encode_halfrate as analysis_encode_halfrate,
     encode_with_trace as analysis_encode_with_trace,
 };
 use blip25_mbe::fec::{golay_23_12_encode, hamming_15_11_encode};
@@ -315,6 +316,29 @@ enum Cmd {
     /// the predictor's smoothing effect. Reports both baseline
     /// (predictor off) and with-predictor numbers in one run for
     /// direct A/B comparison.
+    /// Half-rate PCM → MbeParams analysis encoder conformance. Drives
+    /// `DVSI/Vectors/.../r33/<name>.pcm` through
+    /// `codecs::mbe_baseline::analysis::encode_halfrate` in 20 ms frames,
+    /// dequantizes the parallel `<name>.bit` chip bitstream via
+    /// `p25_halfrate::dequantize` for the reference `MbeParams`, and
+    /// reports parameter-level distortion (pitch cents, L mismatch %,
+    /// voicing %, amplitude dB RMSE). Analogous to `analysis-encode`
+    /// but for the half-rate wire format. Preroll frames (first two)
+    /// are tallied non-comparable.
+    HalfrateAnalysisEncode {
+        /// Vector name (e.g. `clean`, `alert`).
+        name: String,
+        /// Compare encoder output at iteration `f` against chip bit-frame
+        /// `f + chip_offset`. Default −2 matches the encoder's 2-frame
+        /// look-ahead delay (same convention as `analysis-encode`).
+        #[arg(long, default_value_t = -2)]
+        chip_offset: i32,
+        /// Enable the encoder's §0.8.4 silence detector. Silent frames
+        /// emit `AnalysisOutput::Silence` and are tallied under
+        /// "encoder silence" rather than compared.
+        #[arg(long)]
+        silence_dispatch: bool,
+    },
     RateConvertSmoothness {
         /// Conversion direction — i.e. which target stream's
         /// smoothness we measure.
@@ -472,6 +496,9 @@ fn main() -> Result<()> {
         }
         Cmd::RateConvertSmoothness { direction, name, rc } => {
             cmd_rate_convert_smoothness(&args.vectors, direction, &name, rc)
+        }
+        Cmd::HalfrateAnalysisEncode { name, chip_offset, silence_dispatch } => {
+            cmd_halfrate_analysis_encode(&args.vectors, &name, chip_offset, silence_dispatch)
         }
         Cmd::AnalysisEncode { name, rc, dump_frames, chip_offset, silence_dispatch, quantizer_roundtrip, chip_seed_vuv, bitstream } => {
             cmd_analysis_encode(&args.vectors, &name, rc, dump_frames, chip_offset, silence_dispatch, quantizer_roundtrip, chip_seed_vuv, bitstream)
@@ -2749,6 +2776,169 @@ fn print_smoothness_delta(off: &SmoothnessStats, on: &SmoothnessStats) {
             println!("  ✗ Predictor does NOT reduce smoothness in either domain — investigate.");
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Half-rate analysis-encoder harness (cmd: halfrate-analysis-encode)
+//
+// Parallels `cmd_analysis_encode` but drives `encode_halfrate` against
+// tv-rc/r33 PCM + bits. Compares per-frame MbeParams between the
+// analysis encoder and the chip's dequantize of the r33 reference
+// bitstream. Same chip_offset = −2 convention as full-rate.
+// ---------------------------------------------------------------------------
+
+fn cmd_halfrate_analysis_encode(
+    root: &Path,
+    name: &str,
+    chip_offset: i32,
+    silence_dispatch: bool,
+) -> Result<()> {
+    // Half-rate vectors live under tv-rc/r33/ per the existing
+    // cmd_decode_pcm_halfrate convention.
+    let dir = root.join("tv-rc").join("r33");
+    let pcm_path = dir.join(format!("{name}.pcm"));
+    let bit_path = dir.join(format!("{name}.bit"));
+
+    let pcm_bytes = fs::read(&pcm_path)
+        .with_context(|| format!("read PCM vector {}", pcm_path.display()))?;
+    let bit_bytes = fs::read(&bit_path)
+        .with_context(|| format!("read half-rate bit vector {}", bit_path.display()))?;
+
+    if pcm_bytes.len() % (FRAME_SAMPLES * 2) != 0 {
+        return Err(anyhow!(
+            "PCM file {} is {} bytes — not a whole number of 20 ms frames",
+            pcm_path.display(),
+            pcm_bytes.len()
+        ));
+    }
+    if bit_bytes.len() % BYTES_PER_HALFRATE_FRAME != 0 {
+        return Err(anyhow!(
+            "half-rate bit file {} is {} bytes — not a multiple of {}",
+            bit_path.display(),
+            bit_bytes.len(),
+            BYTES_PER_HALFRATE_FRAME
+        ));
+    }
+    let n_pcm_frames = pcm_bytes.len() / (FRAME_SAMPLES * 2);
+    let n_bit_frames = bit_bytes.len() / BYTES_PER_HALFRATE_FRAME;
+    if n_pcm_frames != n_bit_frames {
+        return Err(anyhow!(
+            "frame-count mismatch: {} PCM frames vs {} bit frames",
+            n_pcm_frames,
+            n_bit_frames
+        ));
+    }
+    let n_frames = n_pcm_frames;
+
+    let pcm: Vec<i16> = pcm_bytes
+        .chunks_exact(2)
+        .map(|c| i16::from_le_bytes([c[0], c[1]]))
+        .collect();
+
+    println!(
+        "vector:            {name} (half-rate r33, analysis-encode)"
+    );
+    println!("frames:            {n_frames}");
+    if chip_offset != 0 {
+        println!(
+            "chip offset:       {chip_offset:+} (chip[f + offset] vs encoder[f])"
+        );
+    }
+    if silence_dispatch {
+        println!("silence dispatch:  on (silent frames tallied, not compared)");
+    }
+    println!();
+
+    // Pre-decode every chip bit-frame. Only Voice frames feed into
+    // stats; Tone / Erasure get tallied separately.
+    let mut chip_state = HalfDecoderState::new();
+    let chip_frames: Vec<Decoded> = (0..n_frames)
+        .map(|f| {
+            let fec = &bit_bytes[f * BYTES_PER_HALFRATE_FRAME..(f + 1) * BYTES_PER_HALFRATE_FRAME];
+            let dibits = unpack_dibits_halfrate(fec);
+            let ambe = decode_half_frame(&dibits);
+            decode_to_params(&ambe.info, &mut chip_state).unwrap_or(Decoded::Erasure)
+        })
+        .collect();
+
+    let mut encoder_state = AnalysisState::new();
+    if silence_dispatch {
+        encoder_state.set_silence_detection(true);
+    }
+    let mut stats = ConvertStats::default();
+    let mut stats_l_match = ConvertStats::default();
+    let mut stats_pitch_close = ConvertStats::default();
+    let mut stats_l_and_pitch = ConvertStats::default();
+    let mut preroll_skips = 0usize;
+    let mut encoder_silence = 0usize;
+    let mut tone_frames = 0usize;
+    let mut erasure_frames = 0usize;
+
+    for f in 0..n_frames {
+        let pcm_frame = &pcm[f * FRAME_SAMPLES..(f + 1) * FRAME_SAMPLES];
+        let encoded = analysis_encode_halfrate(pcm_frame, &mut encoder_state);
+
+        let chip_idx = f as i32 + chip_offset;
+        let chip_ref: Option<&Decoded> = if chip_idx >= 0 && (chip_idx as usize) < n_frames {
+            Some(&chip_frames[chip_idx as usize])
+        } else {
+            None
+        };
+
+        match (encoded, chip_ref) {
+            (Ok(AnalysisOutput::Voice(enc_params)), Some(Decoded::Voice(ref_params))) => {
+                stats.push(ref_params, &enc_params);
+                let lc = ref_params.harmonic_count();
+                let le = enc_params.harmonic_count();
+                let l_match = lc == le;
+                let wc = f64::from(ref_params.omega_0());
+                let we = f64::from(enc_params.omega_0());
+                let cents = 1200.0 * (we / wc).log2();
+                let pitch_close = cents.abs() < 50.0;
+                if l_match {
+                    stats_l_match.push(ref_params, &enc_params);
+                }
+                if pitch_close {
+                    stats_pitch_close.push(ref_params, &enc_params);
+                }
+                if l_match && pitch_close {
+                    stats_l_and_pitch.push(ref_params, &enc_params);
+                }
+            }
+            (Ok(AnalysisOutput::Voice(_)), Some(Decoded::Tone { .. })) => {
+                tone_frames += 1;
+            }
+            (Ok(AnalysisOutput::Voice(_)), Some(Decoded::Erasure)) => {
+                erasure_frames += 1;
+            }
+            (Ok(AnalysisOutput::Silence), _) => {
+                if chip_ref.is_none() {
+                    preroll_skips += 1;
+                } else {
+                    encoder_silence += 1;
+                }
+            }
+            (Err(_), _) | (_, None) => {
+                preroll_skips += 1;
+            }
+        }
+    }
+
+    println!(
+        "non-comparable frames: preroll {preroll_skips}, encoder silence {encoder_silence}, \
+         chip tone {tone_frames}, chip erasure {erasure_frames}"
+    );
+    println!();
+
+    stats.print("All voice frames");
+    println!();
+    stats_l_match.print("L-matching frames only");
+    println!();
+    stats_pitch_close.print("Pitch-close (<50¢) frames only");
+    println!();
+    stats_l_and_pitch.print("L-matching AND pitch-close frames");
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
