@@ -3244,6 +3244,9 @@ mod tests {
             k_hat,
             vuv,
             d_k: [0.0; (K_HAT_MAX + 1) as usize],
+            theta_k: [0.0; (K_HAT_MAX + 1) as usize],
+            m_xi: 0.0,
+            xi_0: 0.0,
             xi_max_after: XI_MAX_FLOOR,
         }
     }
@@ -3253,6 +3256,9 @@ mod tests {
             k_hat,
             vuv: [0; (K_HAT_MAX + 1) as usize],
             d_k: [1.0; (K_HAT_MAX + 1) as usize],
+            theta_k: [0.0; (K_HAT_MAX + 1) as usize],
+            m_xi: 0.0,
+            xi_0: 0.0,
             xi_max_after: XI_MAX_FLOOR,
         }
     }
@@ -3703,6 +3709,9 @@ mod tests {
             k_hat,
             vuv: vuv_bits,
             d_k: [0.0; (K_HAT_MAX + 1) as usize],
+            theta_k: [0.0; (K_HAT_MAX + 1) as usize],
+            m_xi: 0.0,
+            xi_0: 0.0,
             xi_max_after: XI_MAX_FLOOR,
         };
         let amps_split = estimate_spectral_amplitudes(&sw, &basis, &refinement, &vuv);
