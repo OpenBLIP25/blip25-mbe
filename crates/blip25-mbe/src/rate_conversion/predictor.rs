@@ -128,8 +128,13 @@ pub fn blend(
 
     let l_curr = target_l;
     let amps_curr = params.amplitudes_slice();
+    let l_source = amps_curr.len().min(l_curr as usize);
     let mut blended = [0f32; L_MAX as usize];
-    blended[..l_curr as usize].copy_from_slice(&amps_curr[..l_curr as usize]);
+    // For target harmonics l ≤ min(L_source, L_target), seed with the
+    // source magnitude (first-cut §4.3.1 fast-path: no resampling).
+    // For l > L_source the slot stays zero — matches the spec's
+    // zero-pad rule when L_B > L_A.
+    blended[..l_source].copy_from_slice(&amps_curr[..l_source]);
 
     if (r_prev - 1.0).abs() > R_FAST_PATH_THRESHOLD {
         // Slow path: resample prior magnitudes onto current target
@@ -176,11 +181,18 @@ pub fn blend(
     // mix. State still advances (next frame's R_prev is computed
     // against this frame's ω̂₀_B regardless of whether the blend fired).
 
-    // Build result MbeParams, preserving voicing.
+    // Build result MbeParams. Extend voicing to cover the target
+    // harmonic range: harmonics past source L_A default to unvoiced
+    // (matches §4.3 zero-pad convention and the decoder's §1.8.1
+    // invariant that out-of-range harmonics are unvoiced).
+    let voiced_src = params.voiced_slice();
+    let mut voiced_out = [false; L_MAX as usize];
+    let l_voiced = voiced_src.len().min(l_curr as usize);
+    voiced_out[..l_voiced].copy_from_slice(&voiced_src[..l_voiced]);
     let result = MbeParams::new(
         target_omega_0,
         l_curr,
-        &params.voiced_slice()[..l_curr as usize],
+        &voiced_out[..l_curr as usize],
         &blended[..l_curr as usize],
     )
     .expect("blend result has valid MbeParams constraints");

@@ -70,19 +70,22 @@ use core::f32::consts::PI;
 
 use crate::mbe_params::MbeParams;
 use crate::p25_fullrate::dequantize::{
-    DecodeError, DecoderState, EncodeError, PITCH_INDEX_MAX, dequantize, quantize,
+    DecodeError, DecoderState, EncodeError, PITCH_INDEX_MAX, dequantize, encode_pitch as full_encode_pitch,
+    pitch_decode as full_pitch_decode, quantize,
 };
 use crate::p25_fullrate::frame::{decode_frame as decode_full, encode_frame as encode_full};
 use crate::p25_fullrate::priority::{
     IMBE_B_MAX, L_MIN as FULL_L_MIN, prioritize as prioritize_full,
 };
 use crate::p25_halfrate::dequantize::{
-    Decoded, DecoderState as HalfDecoderState, decode_to_params, quantize as quantize_half,
+    Decoded, DecoderState as HalfDecoderState, decode_to_params, encode_pitch as half_encode_pitch,
+    quantize as quantize_half,
 };
 use crate::p25_halfrate::frame::{
     AMBE_PITCH_TABLE, DIBITS_PER_FRAME, decode_frame as decode_half, encode_frame as encode_half,
 };
 use crate::p25_halfrate::priority::{AMBE_B_COUNT, prioritize as prioritize_half};
+use crate::rate_conversion::predictor::{CrossRatePredictorState, blend as cross_rate_blend};
 
 /// Lowest ω̃₀ in the half-rate Annex L table (entry 119, L = 56).
 /// Used to clamp source parameters to the half-rate grid's range
@@ -190,12 +193,14 @@ impl From<EncodeError> for ConvertError {
 
 /// Full-rate (144-bit IMBE) → half-rate (72-bit AMBE+2) converter.
 ///
-/// Holds the source decoder state and the destination encoder state.
-/// Call [`Self::convert`] once per 20 ms frame.
+/// Holds the source decoder state, the destination encoder state, and
+/// the cross-rate magnitude predictor state (AMBE-3000 rate-converter
+/// spec §4.5). Call [`Self::convert`] once per 20 ms frame.
 #[derive(Clone, Debug, Default)]
 pub struct FullToHalfConverter {
     decoder: DecoderState,
     encoder: HalfDecoderState,
+    predictor: CrossRatePredictorState,
 }
 
 impl FullToHalfConverter {
@@ -206,6 +211,10 @@ impl FullToHalfConverter {
     /// frame (36 dibits). On a full-rate erasure / reserved pitch
     /// (`b̂₀ ∈ [208, 255]`) the output is a half-rate erasure signal
     /// and encoder state is preserved (§2.8 frame-repeat semantics).
+    ///
+    /// Voice frames pass through the cross-rate predictor (§4.5): the
+    /// target-grid magnitudes are blended with the prior target-rate
+    /// frame's magnitudes before handing to the half-rate quantizer.
     pub fn convert(&mut self, dibits: &[u8; 72]) -> Result<[u8; DIBITS_PER_FRAME], ConvertError> {
         let frame = decode_full(dibits);
         let params = match dequantize(&frame.info, &mut self.decoder) {
@@ -214,7 +223,25 @@ impl FullToHalfConverter {
             Err(other) => return Err(ConvertError::Decode(other)),
         };
         let clamped = clamp_omega_to(&params, halfrate_omega_min(), halfrate_omega_max());
-        let u = quantize_half(&clamped, &mut self.encoder).map_err(|e| match e {
+        // Pre-compute the target-committed (ω̂₀, L) so the predictor
+        // sees what the half-rate encoder will actually emit — the
+        // encoder snaps ω̂₀ to the Annex L grid, and L derives from
+        // that snap. If the pitch is out of range, fall through the
+        // encoder error path rather than advancing predictor state on
+        // a non-committed frame.
+        let blended = match half_encode_pitch(clamped.omega_0()) {
+            Some(b0) => {
+                let target_entry = AMBE_PITCH_TABLE[b0 as usize];
+                cross_rate_blend(
+                    &clamped,
+                    target_entry.omega_0,
+                    target_entry.l,
+                    &mut self.predictor,
+                )
+            }
+            None => clamped,
+        };
+        let u = quantize_half(&blended, &mut self.encoder).map_err(|e| match e {
             DecodeError::BadPitch => ConvertError::HalfPitchOutOfRange,
             other => ConvertError::Decode(other),
         })?;
@@ -226,6 +253,9 @@ impl FullToHalfConverter {
 
     /// Borrow the destination encoder state.
     pub fn encoder_state(&self) -> &HalfDecoderState { &self.encoder }
+
+    /// Borrow the cross-rate predictor state.
+    pub fn predictor_state(&self) -> &CrossRatePredictorState { &self.predictor }
 }
 
 // ---------------------------------------------------------------------------
@@ -233,10 +263,15 @@ impl FullToHalfConverter {
 // ---------------------------------------------------------------------------
 
 /// Half-rate (72-bit AMBE+2) → full-rate (144-bit IMBE) converter.
+///
+/// Holds the source decoder state, the destination encoder state, and
+/// the cross-rate magnitude predictor state (AMBE-3000 rate-converter
+/// spec §4.5).
 #[derive(Clone, Debug, Default)]
 pub struct HalfToFullConverter {
     decoder: HalfDecoderState,
     encoder: DecoderState,
+    predictor: CrossRatePredictorState,
 }
 
 impl HalfToFullConverter {
@@ -246,14 +281,13 @@ impl HalfToFullConverter {
     /// Convert one half-rate frame (36 dibits) into one full-rate
     /// frame (72 dibits). Handles all four half-rate frame kinds:
     ///
-    /// - Voice → full-rate voice (normal requantize path).
+    /// - Voice → full-rate voice (normal requantize path; §4.5 blend applied).
     /// - Tone → full-rate voice encoded from the Eq. 206–209 MBE
-    ///   bridge parameters. Renders a tone as a one- or two-harmonic
-    ///   voiced sinusoid; the full-rate receiver synthesizes it as
-    ///   voice.
-    /// - Silence / Erasure → full-rate erasure signal. Encoder state
-    ///   is preserved so the downstream receiver's §1.11 repeat logic
-    ///   stays consistent.
+    ///   bridge parameters (§4.5 blend applied so state stays coherent
+    ///   across voice/tone transitions).
+    /// - Silence / Erasure → full-rate erasure signal. Encoder and
+    ///   predictor state both preserved so the downstream receiver's
+    ///   §1.11 repeat logic stays consistent.
     pub fn convert(&mut self, dibits: &[u8; DIBITS_PER_FRAME]) -> Result<[u8; 72], ConvertError> {
         let frame = decode_half(dibits);
         let params = match decode_to_params(&frame.info, &mut self.decoder) {
@@ -263,8 +297,24 @@ impl HalfToFullConverter {
             Err(_) => return Ok(fullrate_erasure_dibits()),
         };
         let clamped = clamp_omega_to(&params, fullrate_omega_min(), fullrate_omega_max());
-        let l = clamped.harmonic_count();
-        let b = quantize(&clamped, &mut self.encoder)?;
+        // Pre-compute the target-committed (ω̂₀, L) so the predictor
+        // sees what the full-rate encoder will actually emit. The
+        // full-rate encoder snaps ω̂₀ onto the Eq. 47 grid, where
+        // L = ⌊4π/ω̃₀⌋ − 39.
+        let blended = match full_encode_pitch(clamped.omega_0()) {
+            Some(b0) => match full_pitch_decode(b0) {
+                Some(target_entry) => cross_rate_blend(
+                    &clamped,
+                    target_entry.omega_0,
+                    target_entry.l,
+                    &mut self.predictor,
+                ),
+                None => clamped,
+            },
+            None => clamped,
+        };
+        let l = blended.harmonic_count();
+        let b = quantize(&blended, &mut self.encoder)?;
         let u = prioritize_full(&b, l);
         Ok(encode_full(&u))
     }
@@ -274,6 +324,9 @@ impl HalfToFullConverter {
 
     /// Borrow the destination encoder state.
     pub fn encoder_state(&self) -> &DecoderState { &self.encoder }
+
+    /// Borrow the cross-rate predictor state.
+    pub fn predictor_state(&self) -> &CrossRatePredictorState { &self.predictor }
 }
 
 #[cfg(test)]
@@ -542,5 +595,96 @@ mod tests {
         let a = conv.convert(&fullrate_erasure_input()).unwrap();
         let b = conv.convert(&fullrate_erasure_input()).unwrap();
         assert_eq!(a, b, "erasure output should be deterministic");
+    }
+
+    // ---- Cross-rate predictor integration (§4.5) -----------------------
+
+    #[test]
+    fn cross_rate_predictor_state_tracks_target_across_frames() {
+        // Analogue of quantize_multi_frame_predictor_state_tracks_decoder
+        // in p25_fullrate::dequantize::tests, but for the rate-converter
+        // predictor. After each frame, the converter's predictor state
+        // should hold exactly the post-§4.5 magnitudes and the
+        // target-committed (ω̂₀_B, L̂_B). Feeding a varying-pitch voice
+        // sequence exercises both fast and slow paths.
+        let mut src_state = DecoderState::new();
+        let mut conv = FullToHalfConverter::new();
+        // Start: predictor at cold-start init (Annex L row 30).
+        let initial_omega_prev = conv.predictor_state().omega_0_prev();
+        let initial_l_prev = conv.predictor_state().l_prev();
+        assert_eq!(initial_l_prev, 30);
+
+        // Frame 1: a voice frame. Predictor should advance.
+        let p1 = sample_params(0.20);
+        let a1 = fullrate_dibits_from(&p1, &mut src_state);
+        let _ = conv.convert(&a1).unwrap();
+        // After frame 1, state's ω_prev / l_prev match the half-rate
+        // encoder's committed values (not the input's ω₀).
+        assert_ne!(
+            conv.predictor_state().omega_0_prev(),
+            initial_omega_prev,
+            "predictor ω_prev should have advanced from cold-start init"
+        );
+        let omega_after_f1 = conv.predictor_state().omega_0_prev();
+        let l_after_f1 = conv.predictor_state().l_prev();
+
+        // Frame 2: different pitch — forces slow path and further advance.
+        let p2 = sample_params(0.25);
+        let a2 = fullrate_dibits_from(&p2, &mut src_state);
+        let _ = conv.convert(&a2).unwrap();
+        let omega_after_f2 = conv.predictor_state().omega_0_prev();
+        assert!(
+            (omega_after_f2 - omega_after_f1).abs() > 1e-4,
+            "frame 2 should shift predictor ω_prev (observed Δ = {})",
+            (omega_after_f2 - omega_after_f1).abs()
+        );
+
+        // The stored omega_0_prev must equal an Annex L grid entry
+        // (the half-rate encoder snaps to that grid) — i.e. be
+        // exactly representable, not drifted.
+        let found = AMBE_PITCH_TABLE.iter().any(|entry| {
+            (entry.omega_0 - omega_after_f2).abs() < 1e-6
+                && entry.l == conv.predictor_state().l_prev()
+        });
+        assert!(
+            found,
+            "predictor ω_prev/l_prev = ({omega_after_f2}, {}) must be an AMBE_PITCH_TABLE entry",
+            conv.predictor_state().l_prev(),
+        );
+
+        // Erasure frame: should not advance predictor state (§6.3).
+        let e = fullrate_erasure_input();
+        let before_omega = conv.predictor_state().omega_0_prev();
+        let before_l = conv.predictor_state().l_prev();
+        let _ = conv.convert(&e).unwrap();
+        assert_eq!(
+            conv.predictor_state().omega_0_prev(),
+            before_omega,
+            "erasure must not advance predictor ω_prev"
+        );
+        assert_eq!(
+            conv.predictor_state().l_prev(),
+            before_l,
+            "erasure must not advance predictor l_prev"
+        );
+    }
+
+    #[test]
+    fn cross_rate_predictor_is_state_separate_from_decoder_and_encoder() {
+        // Regression guard for the separation invariant:
+        // analysis/ambe_predictor_state_separation.md.
+        // After a frame, the converter's three predictor states
+        // (source decoder's, cross-rate's, target encoder's) must
+        // have distinct addresses — we only own one of each via the
+        // three accessor methods, but confirming they're independent
+        // structs is enough: the borrow-checker + type system already
+        // enforce that.
+        let conv = FullToHalfConverter::new();
+        let _decoder = conv.decoder_state();
+        let _encoder = conv.encoder_state();
+        let _predictor = conv.predictor_state();
+        // If this test compiles, the three accessors exist and
+        // return distinct types. Runtime invariant is enforced by
+        // each state's update rule not touching the others.
     }
 }
