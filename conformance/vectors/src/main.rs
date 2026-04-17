@@ -419,6 +419,43 @@ enum Cmd {
         #[arg(long)]
         bitstream: bool,
     },
+    /// Run the normative P25 full-rate DVSI test vector sweep driven by
+    /// `tv-std/tv/cmpp25.txt` (576 test lines × {alert, clean, cp*,
+    /// dam*, dtmf*, dtone*, sine*, t*, tambf*, tia*, ucarf*, ucarm*,
+    /// xfer, zero}). Each line is one of:
+    ///
+    ///   * `-dec <input.bit> -cmp <ref.pcm>` — bit → PCM (via §1.10/§1.11/§1.12)
+    ///   * `-enc <input.pcm> -cmp <ref.bit>` — PCM → bit (via §0 analysis + §5/§8 wire encode)
+    ///   * `-encdec <input.pcm> -cmp <ref.pcm>` — PCM → bit → PCM round-trip
+    ///
+    /// FEC mode is determined by the config words on each line: `0x1030`
+    /// enables FEC (→ `p25/` target dir), `0x0000` disables it (→
+    /// `p25_nofec/` target dir).
+    ///
+    /// Reports per-op and per-content-category summaries with bit-exact
+    /// rates on decode paths and PCM RMS / SNR on encode/encdec paths.
+    /// Soft-decision decode lines (`-sdbits 4`) are skipped — that
+    /// feature is not implemented.
+    P25Sweep {
+        /// Path to the test-command file. Defaults to
+        /// `<vectors>/tv-std/tv/cmpp25.txt`.
+        #[arg(long)]
+        cmp: Option<PathBuf>,
+        /// Optional input-stem filter (substring match on the input
+        /// filename, e.g. `clean`, `dtmf`, `dam`). When set, only
+        /// matching lines run — useful for debugging one content
+        /// category.
+        #[arg(long)]
+        filter: Option<String>,
+        /// Optional op filter: run only `dec`, `enc`, or `encdec`
+        /// lines. When unset, runs all three.
+        #[arg(long)]
+        op: Option<String>,
+        /// Stop on first failure within each op, printing the failing
+        /// line plus per-line diagnostics.
+        #[arg(long)]
+        stop_on_first: bool,
+    },
 }
 
 /// Direction argument for [`Cmd::RateConvert`] and
@@ -502,6 +539,9 @@ fn main() -> Result<()> {
         }
         Cmd::AnalysisEncode { name, rc, dump_frames, chip_offset, silence_dispatch, quantizer_roundtrip, chip_seed_vuv, bitstream } => {
             cmd_analysis_encode(&args.vectors, &name, rc, dump_frames, chip_offset, silence_dispatch, quantizer_roundtrip, chip_seed_vuv, bitstream)
+        }
+        Cmd::P25Sweep { cmp, filter, op, stop_on_first } => {
+            cmd_p25_sweep(&args.vectors, cmp.as_deref(), filter.as_deref(), op.as_deref(), stop_on_first)
         }
     }
 }
@@ -1930,6 +1970,53 @@ impl<'a> BitReader<'a> {
         }
         v
     }
+}
+
+/// MSB-first bit packer — inverse of [`BitReader`]. Writes bits
+/// into a caller-owned byte buffer; the buffer must be pre-zeroed
+/// and sized to hold the full bit payload.
+struct BitWriter<'a> {
+    bytes: &'a mut [u8],
+    pos: usize,
+}
+
+impl<'a> BitWriter<'a> {
+    fn new(bytes: &'a mut [u8]) -> Self {
+        Self { bytes, pos: 0 }
+    }
+
+    fn write(&mut self, value: u16, n_bits: u8) {
+        for i in (0..n_bits).rev() {
+            let bit = ((value >> i) & 1) as u8;
+            let byte_idx = self.pos / 8;
+            let bit_idx = 7 - (self.pos % 8);
+            self.bytes[byte_idx] |= bit << bit_idx;
+            self.pos += 1;
+        }
+    }
+}
+
+/// Pack 72 dibits into 18 FEC bytes (inverse of [`unpack_dibits`]).
+fn pack_dibits(dibits: &[u8; DIBITS_PER_FRAME]) -> [u8; BYTES_PER_FEC_FRAME] {
+    let mut out = [0u8; BYTES_PER_FEC_FRAME];
+    let mut w = BitWriter::new(&mut out);
+    for &d in dibits {
+        let hi = (d >> 1) & 1;
+        let lo = d & 1;
+        w.write(u16::from(hi), 1);
+        w.write(u16::from(lo), 1);
+    }
+    out
+}
+
+/// Pack 8 info vectors into 11 no-FEC bytes (inverse of [`unpack_nofec_info`]).
+fn pack_nofec_info(info: &[u16; 8]) -> [u8; BYTES_PER_NOFEC_FRAME] {
+    let mut out = [0u8; BYTES_PER_NOFEC_FRAME];
+    let mut w = BitWriter::new(&mut out);
+    for (i, &v) in info.iter().enumerate() {
+        w.write(v, INFO_WIDTHS[i]);
+    }
+    out
 }
 
 /// Unpack 18 FEC bytes into 72 dibits in transmission order. Each dibit's
@@ -3546,6 +3633,736 @@ fn cmd_analysis_encode(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// P25 normative-vector sweep (cmd: p25-sweep)
+// ---------------------------------------------------------------------------
+
+/// FEC config word that enables on-the-wire FEC per the
+/// AMBE-3000_Test_Vector_Reference. When this flag appears at position
+/// `-r` index 2 (third rate word), lines target `p25/<name>.bit`;
+/// otherwise (`0x0000`) they target `p25_nofec/<name>.bit`.
+const FEC_ENABLE_WORD: &str = "0x1030";
+
+/// One parsed line from `cmpp25.txt`.
+#[derive(Clone, Debug)]
+struct TestLine {
+    /// 1-based line number in the source file (for error reporting).
+    line_no: usize,
+    /// Operation: `-dec`, `-enc`, or `-encdec`.
+    op: SweepOp,
+    /// Whether FEC is enabled (determines target subdir).
+    fec: bool,
+    /// Input file path relative to the cmp file's directory.
+    input: String,
+    /// Reference file path relative to the cmp file's directory.
+    reference: String,
+    /// Soft-decision bit width — only set for `-dec -sdbits N` lines,
+    /// which we skip (feature not implemented).
+    sdbits: Option<u8>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+enum SweepOp {
+    Dec,
+    Enc,
+    EncDec,
+}
+
+impl SweepOp {
+    fn as_str(&self) -> &'static str {
+        match self {
+            SweepOp::Dec => "dec",
+            SweepOp::Enc => "enc",
+            SweepOp::EncDec => "encdec",
+        }
+    }
+}
+
+/// Content-category buckets used for per-category aggregate reporting.
+/// The category is the alphabetic-prefix of the input stem, e.g.
+/// `clean`, `dam`, `dtmf`, `dtone`, `sine`, `t`, `tambf`, `tia`,
+/// `ucarf`, `ucarm`, `xfer`, `zero`. For paths like `p25/clean.bit`
+/// (which appear as the input on `-dec` lines), the leading directory
+/// is stripped before computing the prefix.
+fn content_category(path: &str) -> String {
+    // Strip directory prefix (`p25/`, `p25_nofec/`) so `-dec` inputs
+    // bucket by speech name, not by output dir.
+    let base = path.rsplit('/').next().unwrap_or(path);
+    // Strip the `.pcm` / `.bit` suffix.
+    let stem = base.rsplit_once('.').map(|(s, _)| s).unwrap_or(base);
+    // Category = longest leading alphabetic run. `_` and digits end
+    // the run: `dam_e1_hd` → `dam`, `dtone_1` → `dtone`, `sine0_1k` →
+    // `sine`. Empty prefix (no leading alpha) → fall back to full stem.
+    let prefix: String = stem
+        .chars()
+        .take_while(|c| c.is_ascii_alphabetic())
+        .collect();
+    if prefix.is_empty() { stem.to_string() } else { prefix }
+}
+
+fn parse_cmpp25_line(line: &str, line_no: usize) -> Result<Option<TestLine>> {
+    // Strip trailing / leading whitespace. Skip blank lines and comments.
+    let line = line.trim();
+    if line.is_empty() || line.starts_with('#') {
+        return Ok(None);
+    }
+    let toks: Vec<&str> = line.split_whitespace().collect();
+    if toks.is_empty() {
+        return Ok(None);
+    }
+    // Expected form:
+    //   -c P25 -q [-sdbits N] -{enc,dec,encdec} -r W0 W1 W2 W3 W4 W5 <input> -cmp <ref>
+    // Required anchors: `-c P25`, an op in {-enc, -dec, -encdec},
+    // `-r` followed by six hex rate words, and `-cmp <ref>` at the end.
+    let mut op: Option<SweepOp> = None;
+    let mut sdbits: Option<u8> = None;
+    let mut rate_words: Vec<&str> = Vec::new();
+    let mut input: Option<String> = None;
+    let mut reference: Option<String> = None;
+    let mut i = 0;
+    while i < toks.len() {
+        let t = toks[i];
+        match t {
+            "-c" => {
+                if toks.get(i + 1) != Some(&"P25") {
+                    return Err(anyhow!("line {line_no}: non-P25 codec `{:?}`", toks.get(i + 1)));
+                }
+                i += 2;
+            }
+            "-q" => {
+                i += 1;
+            }
+            "-enc" => {
+                op = Some(SweepOp::Enc);
+                i += 1;
+            }
+            "-dec" => {
+                op = Some(SweepOp::Dec);
+                i += 1;
+            }
+            "-encdec" => {
+                op = Some(SweepOp::EncDec);
+                i += 1;
+            }
+            "-sdbits" => {
+                let n = toks.get(i + 1).ok_or_else(|| {
+                    anyhow!("line {line_no}: -sdbits missing value")
+                })?;
+                sdbits = Some(
+                    n.parse::<u8>()
+                        .map_err(|e| anyhow!("line {line_no}: bad sdbits `{n}`: {e}"))?,
+                );
+                i += 2;
+            }
+            "-r" => {
+                // Six rate words follow.
+                for j in 1..=6 {
+                    let w = toks.get(i + j).ok_or_else(|| {
+                        anyhow!("line {line_no}: -r needs 6 words, only {} present", j - 1)
+                    })?;
+                    rate_words.push(w);
+                }
+                i += 7;
+            }
+            "-cmp" => {
+                reference = Some(
+                    toks.get(i + 1)
+                        .ok_or_else(|| anyhow!("line {line_no}: -cmp missing value"))?
+                        .to_string(),
+                );
+                i += 2;
+            }
+            other => {
+                // Positional input path (first bare token after all flags).
+                if input.is_none() {
+                    input = Some(other.to_string());
+                } else {
+                    return Err(anyhow!(
+                        "line {line_no}: unexpected extra positional token `{other}`"
+                    ));
+                }
+                i += 1;
+            }
+        }
+    }
+    let op = op.ok_or_else(|| anyhow!("line {line_no}: missing operation flag"))?;
+    let input = input.ok_or_else(|| anyhow!("line {line_no}: missing input filename"))?;
+    let reference = reference.ok_or_else(|| anyhow!("line {line_no}: missing -cmp target"))?;
+    if rate_words.len() != 6 {
+        return Err(anyhow!(
+            "line {line_no}: expected 6 -r words, got {}",
+            rate_words.len()
+        ));
+    }
+    // FEC enable word lives at rate_words[2] per the Test_Vector_Reference §4.3.
+    let fec = rate_words[2] == FEC_ENABLE_WORD;
+    Ok(Some(TestLine {
+        line_no,
+        op,
+        fec,
+        input,
+        reference,
+        sdbits,
+    }))
+}
+
+/// Rolling accumulator for one (op, fec_mode) stratum of the sweep.
+#[derive(Default)]
+struct SweepStratum {
+    lines: usize,
+    passed: usize,
+    skipped_sdbits: usize,
+    errored: usize,
+    // Decode/round-trip path metrics — PCM sample stats.
+    pcm_lines: usize,
+    pcm_total_samples: u64,
+    pcm_bit_exact: u64,
+    pcm_sum_sq_err: f64,
+    pcm_sum_sq_ref: f64,
+    pcm_peak_err: f64,
+    // Encode path metrics — bit stats.
+    bit_lines: usize,
+    bit_total_frames: u64,
+    bit_exact_frames: u64,
+    bit_byte_exact: u64,
+    bit_total_bytes: u64,
+    // Decoder bad-pitch frames (silenced by our decoder).
+    bad_pitch_frames: u64,
+}
+
+impl SweepStratum {
+    fn record_pcm(
+        &mut self,
+        total: u64,
+        exact: u64,
+        sum_sq_err: f64,
+        sum_sq_ref: f64,
+        peak_err: f64,
+        bad_pitch: u64,
+    ) {
+        self.pcm_lines += 1;
+        self.pcm_total_samples += total;
+        self.pcm_bit_exact += exact;
+        self.pcm_sum_sq_err += sum_sq_err;
+        self.pcm_sum_sq_ref += sum_sq_ref;
+        self.pcm_peak_err = self.pcm_peak_err.max(peak_err);
+        self.bad_pitch_frames += bad_pitch;
+    }
+
+    fn record_bits(
+        &mut self,
+        total_frames: u64,
+        exact_frames: u64,
+        total_bytes: u64,
+        exact_bytes: u64,
+    ) {
+        self.bit_lines += 1;
+        self.bit_total_frames += total_frames;
+        self.bit_exact_frames += exact_frames;
+        self.bit_total_bytes += total_bytes;
+        self.bit_byte_exact += exact_bytes;
+    }
+
+    fn pcm_snr_db(&self) -> f64 {
+        if self.pcm_sum_sq_err > 0.0 && self.pcm_sum_sq_ref > 0.0 {
+            10.0 * (self.pcm_sum_sq_ref / self.pcm_sum_sq_err).log10()
+        } else if self.pcm_sum_sq_err == 0.0 && self.pcm_total_samples > 0 {
+            f64::INFINITY
+        } else {
+            f64::NAN
+        }
+    }
+
+    fn pcm_rms(&self) -> f64 {
+        if self.pcm_total_samples > 0 {
+            (self.pcm_sum_sq_err / self.pcm_total_samples as f64).sqrt()
+        } else {
+            f64::NAN
+        }
+    }
+
+    fn pcm_bit_exact_pct(&self) -> f64 {
+        if self.pcm_total_samples > 0 {
+            100.0 * self.pcm_bit_exact as f64 / self.pcm_total_samples as f64
+        } else {
+            f64::NAN
+        }
+    }
+
+    fn bit_frame_pct(&self) -> f64 {
+        if self.bit_total_frames > 0 {
+            100.0 * self.bit_exact_frames as f64 / self.bit_total_frames as f64
+        } else {
+            f64::NAN
+        }
+    }
+
+    fn bit_byte_pct(&self) -> f64 {
+        if self.bit_total_bytes > 0 {
+            100.0 * self.bit_byte_exact as f64 / self.bit_total_bytes as f64
+        } else {
+            f64::NAN
+        }
+    }
+}
+
+/// Outcome of running a single cmpp25 line.
+#[derive(Clone, Copy, Debug)]
+enum LineOutcome {
+    SkippedSdbits,
+    Pcm {
+        total: u64,
+        exact: u64,
+        sum_sq_err: f64,
+        sum_sq_ref: f64,
+        peak_err: f64,
+        bad_pitch: u64,
+    },
+    Bits {
+        total_frames: u64,
+        exact_frames: u64,
+        total_bytes: u64,
+        exact_bytes: u64,
+    },
+}
+
+fn run_line(cmp_dir: &Path, line: &TestLine) -> Result<LineOutcome> {
+    if line.sdbits.is_some() {
+        return Ok(LineOutcome::SkippedSdbits);
+    }
+    match line.op {
+        SweepOp::Dec => run_dec(cmp_dir, line),
+        SweepOp::Enc => run_enc(cmp_dir, line),
+        SweepOp::EncDec => run_encdec(cmp_dir, line),
+    }
+}
+
+fn run_dec(cmp_dir: &Path, line: &TestLine) -> Result<LineOutcome> {
+    let input_path = cmp_dir.join(&line.input);
+    let ref_path = cmp_dir.join(&line.reference);
+    let bit_bytes = fs::read(&input_path)
+        .with_context(|| format!("read input {}", input_path.display()))?;
+    let ref_pcm_bytes = fs::read(&ref_path)
+        .with_context(|| format!("read reference {}", ref_path.display()))?;
+
+    let frame_bytes = if line.fec { BYTES_PER_FEC_FRAME } else { BYTES_PER_NOFEC_FRAME };
+    if bit_bytes.len() % frame_bytes != 0 {
+        return Err(anyhow!(
+            "{}: {} bytes not a multiple of {}",
+            input_path.display(),
+            bit_bytes.len(),
+            frame_bytes
+        ));
+    }
+    if ref_pcm_bytes.len() % 2 != 0 {
+        return Err(anyhow!("reference PCM not whole number of i16 samples"));
+    }
+    let n_frames = bit_bytes.len() / frame_bytes;
+    let ref_pcm: Vec<i16> = ref_pcm_bytes
+        .chunks_exact(2)
+        .map(|c| i16::from_le_bytes([c[0], c[1]]))
+        .collect();
+
+    let (pcm_out, bad_pitch) = decode_to_pcm(&bit_bytes, line.fec, n_frames)?;
+    Ok(summarize_pcm(&pcm_out, &ref_pcm, bad_pitch))
+}
+
+fn run_enc(cmp_dir: &Path, line: &TestLine) -> Result<LineOutcome> {
+    let input_path = cmp_dir.join(&line.input);
+    let ref_path = cmp_dir.join(&line.reference);
+    let pcm_bytes = fs::read(&input_path)
+        .with_context(|| format!("read input {}", input_path.display()))?;
+    let ref_bit_bytes = fs::read(&ref_path)
+        .with_context(|| format!("read reference {}", ref_path.display()))?;
+
+    let frame_bytes = if line.fec { BYTES_PER_FEC_FRAME } else { BYTES_PER_NOFEC_FRAME };
+    if ref_bit_bytes.len() % frame_bytes != 0 {
+        return Err(anyhow!("reference .bit not a multiple of {}", frame_bytes));
+    }
+    let n_ref_frames = ref_bit_bytes.len() / frame_bytes;
+    let pcm = load_pcm_padded_to_frames(&pcm_bytes, n_ref_frames);
+
+    let our_bits = encode_pcm_to_bits(&pcm, n_ref_frames, line.fec)?;
+    Ok(summarize_bits(&our_bits, &ref_bit_bytes, frame_bytes))
+}
+
+fn run_encdec(cmp_dir: &Path, line: &TestLine) -> Result<LineOutcome> {
+    let input_path = cmp_dir.join(&line.input);
+    let ref_path = cmp_dir.join(&line.reference);
+    let pcm_bytes = fs::read(&input_path)
+        .with_context(|| format!("read input {}", input_path.display()))?;
+    let ref_pcm_bytes = fs::read(&ref_path)
+        .with_context(|| format!("read reference {}", ref_path.display()))?;
+
+    if ref_pcm_bytes.len() % (FRAME_SAMPLES * 2) != 0 {
+        return Err(anyhow!("reference PCM not whole number of 20 ms frames"));
+    }
+    let n_frames = ref_pcm_bytes.len() / (FRAME_SAMPLES * 2);
+    let pcm = load_pcm_padded_to_frames(&pcm_bytes, n_frames);
+    let ref_pcm: Vec<i16> = ref_pcm_bytes
+        .chunks_exact(2)
+        .map(|c| i16::from_le_bytes([c[0], c[1]]))
+        .collect();
+
+    // PCM → bits → PCM.
+    let our_bits = encode_pcm_to_bits(&pcm, n_frames, line.fec)?;
+    let (pcm_out, bad_pitch) = decode_to_pcm(&our_bits, line.fec, n_frames)?;
+    Ok(summarize_pcm(&pcm_out, &ref_pcm, bad_pitch))
+}
+
+/// Load an input `.pcm` file as `Vec<i16>`, zero-padding or truncating
+/// to exactly `n_frames * FRAME_SAMPLES` samples. DVSI input PCMs are
+/// often not whole-frame lengths (the final frame is zero-padded by
+/// the encoder); reference outputs are always frame-aligned.
+fn load_pcm_padded_to_frames(pcm_bytes: &[u8], n_frames: usize) -> Vec<i16> {
+    let target = n_frames * FRAME_SAMPLES;
+    let mut pcm: Vec<i16> = pcm_bytes
+        .chunks_exact(2)
+        .map(|c| i16::from_le_bytes([c[0], c[1]]))
+        .collect();
+    pcm.resize(target, 0);
+    pcm
+}
+
+/// Decode `bit_bytes` (FEC or no-FEC) to `i16` PCM samples, returning
+/// the output and the count of frames replaced with silence because
+/// dequantize rejected the pitch index.
+fn decode_to_pcm(
+    bit_bytes: &[u8],
+    fec: bool,
+    n_frames: usize,
+) -> Result<(Vec<i16>, u64)> {
+    let mut decoder_state = DecoderState::new();
+    let mut synth_state = SynthState::new();
+    let mut pcm_out: Vec<i16> = Vec::with_capacity(n_frames * FRAME_SAMPLES);
+    let mut bad_pitch = 0u64;
+
+    for f in 0..n_frames {
+        let (info, err) = if fec {
+            let fec_frame = &bit_bytes[f * BYTES_PER_FEC_FRAME..(f + 1) * BYTES_PER_FEC_FRAME];
+            let dibits = unpack_dibits(fec_frame);
+            let imbe = decode_full_frame(&dibits);
+            let err = FrameErrorContext {
+                epsilon_0: imbe.errors[0],
+                epsilon_4: imbe.errors[4],
+                epsilon_t: imbe.error_total().min(255) as u8,
+                bad_pitch: false,
+            };
+            (imbe.info, err)
+        } else {
+            let nofec_frame =
+                &bit_bytes[f * BYTES_PER_NOFEC_FRAME..(f + 1) * BYTES_PER_NOFEC_FRAME];
+            let info = unpack_nofec_info(nofec_frame);
+            // No-FEC frames have no error context (nothing to correct).
+            let err = FrameErrorContext {
+                epsilon_0: 0,
+                epsilon_4: 0,
+                epsilon_t: 0,
+                bad_pitch: false,
+            };
+            (info, err)
+        };
+
+        let params = match dequantize_full(&info, &mut decoder_state) {
+            Ok(p) => p,
+            Err(_) => {
+                bad_pitch += 1;
+                pcm_out.extend(std::iter::repeat(0i16).take(FRAME_SAMPLES));
+                continue;
+            }
+        };
+        let pcm = synthesize_frame(&params, &err, GAMMA_W, &mut synth_state);
+        pcm_out.extend_from_slice(&pcm);
+    }
+    Ok((pcm_out, bad_pitch))
+}
+
+/// Encode PCM through `AnalysisState::encode` + quantize + (optional
+/// FEC) into a contiguous byte buffer matching the DVSI `.bit` frame
+/// format. Frames where analysis returns Silence (including the
+/// preroll frames 0 and 1) are emitted as the `MbeParams::silence()`
+/// frame so that byte counts stay aligned with the reference.
+fn encode_pcm_to_bits(pcm: &[i16], n_frames: usize, fec: bool) -> Result<Vec<u8>> {
+    let frame_bytes = if fec { BYTES_PER_FEC_FRAME } else { BYTES_PER_NOFEC_FRAME };
+    let mut out = Vec::with_capacity(n_frames * frame_bytes);
+    let mut enc_state = AnalysisState::new();
+    let mut quant_state = DecoderState::new();
+
+    for f in 0..n_frames {
+        let frame = &pcm[f * FRAME_SAMPLES..(f + 1) * FRAME_SAMPLES];
+        let params = match analysis_encode_with_trace(frame, &mut enc_state) {
+            Ok((AnalysisOutput::Voice(p), _)) => p,
+            Ok((AnalysisOutput::Silence, _)) => MbeParams::silence(),
+            Err(_) => MbeParams::silence(),
+        };
+        let b = match quantize_full(&params, &mut quant_state) {
+            Ok(b) => b,
+            Err(_) => {
+                // Quantizer rejected the frame — emit zero bits so the
+                // buffer stays aligned. Chip-side reference will also
+                // have encoded something for this frame, so we count
+                // this as a mismatch downstream.
+                out.extend(std::iter::repeat(0u8).take(frame_bytes));
+                continue;
+            }
+        };
+        let u = prioritize_full(&b, params.harmonic_count());
+        if fec {
+            let dibits = encode_full_frame(&u);
+            // `encode_full_frame` returns 72 dibits as `[u8; 72]`;
+            // re-pack into 18 bytes in transmission order.
+            let packed = pack_dibits(&dibits);
+            out.extend_from_slice(&packed);
+        } else {
+            let packed = pack_nofec_info(&u);
+            out.extend_from_slice(&packed);
+        }
+    }
+    Ok(out)
+}
+
+fn summarize_pcm(our: &[i16], reference: &[i16], bad_pitch: u64) -> LineOutcome {
+    let n = our.len().min(reference.len());
+    let mut exact = 0u64;
+    let mut sum_sq_err = 0.0f64;
+    let mut sum_sq_ref = 0.0f64;
+    let mut peak_err = 0.0f64;
+    for i in 0..n {
+        let a = f64::from(our[i]);
+        let b = f64::from(reference[i]);
+        let e = a - b;
+        sum_sq_err += e * e;
+        sum_sq_ref += b * b;
+        peak_err = peak_err.max(e.abs());
+        if our[i] == reference[i] {
+            exact += 1;
+        }
+    }
+    LineOutcome::Pcm {
+        total: n as u64,
+        exact,
+        sum_sq_err,
+        sum_sq_ref,
+        peak_err,
+        bad_pitch,
+    }
+}
+
+fn summarize_bits(our: &[u8], reference: &[u8], frame_bytes: usize) -> LineOutcome {
+    let n = our.len().min(reference.len());
+    let n_frames = n / frame_bytes;
+    let mut exact_bytes = 0u64;
+    for i in 0..n {
+        if our[i] == reference[i] {
+            exact_bytes += 1;
+        }
+    }
+    let mut exact_frames = 0u64;
+    for f in 0..n_frames {
+        let start = f * frame_bytes;
+        let end = start + frame_bytes;
+        if our[start..end] == reference[start..end] {
+            exact_frames += 1;
+        }
+    }
+    LineOutcome::Bits {
+        total_frames: n_frames as u64,
+        exact_frames,
+        total_bytes: n as u64,
+        exact_bytes,
+    }
+}
+
+fn cmd_p25_sweep(
+    root: &Path,
+    cmp_path: Option<&Path>,
+    filter: Option<&str>,
+    op_filter: Option<&str>,
+    stop_on_first: bool,
+) -> Result<()> {
+    let cmp_path_owned;
+    let cmp_path: &Path = match cmp_path {
+        Some(p) => p,
+        None => {
+            cmp_path_owned = root.join("tv-std").join("tv").join("cmpp25.txt");
+            &cmp_path_owned
+        }
+    };
+    let cmp_dir = cmp_path
+        .parent()
+        .ok_or_else(|| anyhow!("cmp file has no parent directory"))?;
+
+    let contents = fs::read_to_string(cmp_path)
+        .with_context(|| format!("read {}", cmp_path.display()))?;
+
+    // Parse every line.
+    let mut lines: Vec<TestLine> = Vec::new();
+    for (idx, raw) in contents.lines().enumerate() {
+        let line_no = idx + 1;
+        if let Some(tl) = parse_cmpp25_line(raw, line_no)? {
+            lines.push(tl);
+        }
+    }
+
+    // Apply filters.
+    let op_filter = op_filter.map(|s| s.to_ascii_lowercase());
+    let lines: Vec<TestLine> = lines
+        .into_iter()
+        .filter(|tl| {
+            filter.is_none_or(|f| tl.input.contains(f))
+                && op_filter
+                    .as_deref()
+                    .is_none_or(|o| tl.op.as_str() == o)
+        })
+        .collect();
+
+    println!("cmp file:    {}", cmp_path.display());
+    println!("lines:       {} (after filters)", lines.len());
+    if let Some(f) = filter {
+        println!("filter:      --filter {f}");
+    }
+    if let Some(o) = op_filter.as_deref() {
+        println!("op filter:   --op {o}");
+    }
+    println!();
+
+    // Stratified stats by (op, fec_mode) and by (op, fec_mode, category).
+    use std::collections::BTreeMap;
+    let mut strata: BTreeMap<(SweepOp, bool), SweepStratum> = BTreeMap::new();
+    let mut cat_strata: BTreeMap<(SweepOp, bool, String), SweepStratum> = BTreeMap::new();
+
+    for tl in &lines {
+        let key = (tl.op, tl.fec);
+        let cat = content_category(&tl.input);
+        let cat_key = (tl.op, tl.fec, cat);
+        let stratum = strata.entry(key).or_default();
+        let cat_stratum = cat_strata.entry(cat_key).or_default();
+        stratum.lines += 1;
+        cat_stratum.lines += 1;
+
+        match run_line(cmp_dir, tl) {
+            Ok(LineOutcome::SkippedSdbits) => {
+                stratum.skipped_sdbits += 1;
+                cat_stratum.skipped_sdbits += 1;
+            }
+            Ok(LineOutcome::Pcm {
+                total,
+                exact,
+                sum_sq_err,
+                sum_sq_ref,
+                peak_err,
+                bad_pitch,
+            }) => {
+                stratum.passed += 1;
+                cat_stratum.passed += 1;
+                stratum.record_pcm(total, exact, sum_sq_err, sum_sq_ref, peak_err, bad_pitch);
+                cat_stratum.record_pcm(total, exact, sum_sq_err, sum_sq_ref, peak_err, bad_pitch);
+            }
+            Ok(LineOutcome::Bits {
+                total_frames,
+                exact_frames,
+                total_bytes,
+                exact_bytes,
+            }) => {
+                stratum.passed += 1;
+                cat_stratum.passed += 1;
+                stratum.record_bits(total_frames, exact_frames, total_bytes, exact_bytes);
+                cat_stratum.record_bits(total_frames, exact_frames, total_bytes, exact_bytes);
+            }
+            Err(e) => {
+                stratum.errored += 1;
+                cat_stratum.errored += 1;
+                eprintln!(
+                    "line {}: {} {} -cmp {} — ERROR: {e:#}",
+                    tl.line_no,
+                    tl.op.as_str(),
+                    tl.input,
+                    tl.reference
+                );
+                if stop_on_first {
+                    return Err(e);
+                }
+            }
+        }
+    }
+
+    // Report by (op, fec).
+    println!("=== Per-op / per-fec aggregate ===");
+    println!(
+        "{:<8} {:<6} {:>6} {:>6} {:>6} {:>6}  {}",
+        "op", "fec", "lines", "pass", "err", "skip", "metrics"
+    );
+    for ((op, fec), s) in &strata {
+        let metrics = stratum_metrics_line(*op, s);
+        println!(
+            "{:<8} {:<6} {:>6} {:>6} {:>6} {:>6}  {metrics}",
+            op.as_str(),
+            if *fec { "FEC" } else { "nofec" },
+            s.lines,
+            s.passed,
+            s.errored,
+            s.skipped_sdbits,
+        );
+    }
+
+    // Per-category breakdown (sorted by category name within each op/fec).
+    println!();
+    println!("=== Per-content-category breakdown ===");
+    println!(
+        "{:<8} {:<6} {:<10} {:>5}  {}",
+        "op", "fec", "category", "lines", "metrics"
+    );
+    for ((op, fec, cat), s) in &cat_strata {
+        let metrics = stratum_metrics_line(*op, s);
+        println!(
+            "{:<8} {:<6} {:<10} {:>5}  {metrics}",
+            op.as_str(),
+            if *fec { "FEC" } else { "nofec" },
+            cat,
+            s.lines,
+        );
+    }
+
+    // Overall result — pass if every non-skipped line ran without errors.
+    let total_err: usize = strata.values().map(|s| s.errored).sum();
+    if total_err > 0 {
+        return Err(anyhow!("{total_err} line(s) errored"));
+    }
+    Ok(())
+}
+
+fn stratum_metrics_line(op: SweepOp, s: &SweepStratum) -> String {
+    match op {
+        SweepOp::Dec | SweepOp::EncDec => {
+            if s.pcm_lines == 0 {
+                return String::from("(no PCM runs)");
+            }
+            format!(
+                "bit-exact {:5.2}%  RMS {:7.2}  peak {:>5.0}  SNR {:>6.2} dB  bad-pitch frames {}",
+                s.pcm_bit_exact_pct(),
+                s.pcm_rms(),
+                s.pcm_peak_err,
+                s.pcm_snr_db(),
+                s.bad_pitch_frames,
+            )
+        }
+        SweepOp::Enc => {
+            if s.bit_lines == 0 {
+                return String::from("(no bit runs)");
+            }
+            format!(
+                "frames-exact {:5.2}%  bytes-exact {:5.2}%  ({}/{} frames, {}/{} bytes)",
+                s.bit_frame_pct(),
+                s.bit_byte_pct(),
+                s.bit_exact_frames,
+                s.bit_total_frames,
+                s.bit_byte_exact,
+                s.bit_total_bytes,
+            )
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3599,5 +4416,98 @@ mod tests {
         bytes[1] = 0b1100_0000;
         let info = unpack_nofec_info(&bytes);
         assert_eq!(info[0], 0xABC);
+    }
+
+    #[test]
+    fn bit_writer_roundtrips_with_bit_reader() {
+        let mut bytes = [0u8; 4];
+        let mut w = BitWriter::new(&mut bytes);
+        w.write(0b1011, 4);
+        w.write(0b0100, 4);
+        w.write(0b1111_0000_1111, 12);
+        drop(w);
+        let mut r = BitReader::new(&bytes);
+        assert_eq!(r.read(4), 0b1011);
+        assert_eq!(r.read(4), 0b0100);
+        assert_eq!(r.read(12), 0b1111_0000_1111);
+    }
+
+    #[test]
+    fn pack_dibits_is_inverse_of_unpack() {
+        // Patterned input: dibit i = i % 4 → 0,1,2,3,0,1,...
+        let mut src = [0u8; DIBITS_PER_FRAME];
+        for (i, s) in src.iter_mut().enumerate() {
+            *s = (i as u8) % 4;
+        }
+        let packed = pack_dibits(&src);
+        let back = unpack_dibits(&packed);
+        assert_eq!(back, src);
+    }
+
+    #[test]
+    fn pack_nofec_info_is_inverse_of_unpack() {
+        // Values that fill their widths: 0xABC, 0x555, ..., 0x7F.
+        let src: [u16; 8] = [0xABC, 0x555, 0xFFF, 0x123, 0x7AB, 0x456, 0x1A5, 0x7F];
+        let packed = pack_nofec_info(&src);
+        let back = unpack_nofec_info(&packed);
+        assert_eq!(back, src);
+    }
+
+    #[test]
+    fn content_category_strips_digits_and_dots() {
+        assert_eq!(content_category("alert.pcm"), "alert");
+        assert_eq!(content_category("clean.pcm"), "clean");
+        assert_eq!(content_category("cp31.pcm"), "cp");
+        assert_eq!(content_category("dam_10ov.pcm"), "dam");
+        assert_eq!(content_category("dtmf15n.pcm"), "dtmf");
+        assert_eq!(content_category("dtone_1.pcm"), "dtone");
+        assert_eq!(content_category("sine0_1k.pcm"), "sine");
+        assert_eq!(content_category("t01.pcm"), "t");
+        assert_eq!(content_category("tambf22a.pcm"), "tambf");
+        assert_eq!(content_category("ucarf15a.pcm"), "ucarf");
+        assert_eq!(content_category("zero.pcm"), "zero");
+    }
+
+    #[test]
+    fn content_category_strips_leading_directory() {
+        assert_eq!(content_category("p25/clean.bit"), "clean");
+        assert_eq!(content_category("p25_nofec/alert.bit"), "alert");
+        assert_eq!(content_category("p25/dam_e1_hd.bit"), "dam");
+    }
+
+    #[test]
+    fn parse_cmpp25_encdec_fec_line() {
+        let line = "-c P25 -q -encdec -r 0x0558 0x086b 0x1030 0x0000 0x0000 0x0190 alert.pcm -cmp p25/alert.pcm";
+        let tl = parse_cmpp25_line(line, 1).unwrap().unwrap();
+        assert_eq!(tl.op, SweepOp::EncDec);
+        assert!(tl.fec);
+        assert_eq!(tl.input, "alert.pcm");
+        assert_eq!(tl.reference, "p25/alert.pcm");
+        assert!(tl.sdbits.is_none());
+    }
+
+    #[test]
+    fn parse_cmpp25_enc_nofec_line() {
+        let line = "-c P25 -q -enc -r 0x0558 0x086b 0x0000 0x0000 0x0000 0x0158 clean.pcm -cmp p25_nofec/clean.bit";
+        let tl = parse_cmpp25_line(line, 1).unwrap().unwrap();
+        assert_eq!(tl.op, SweepOp::Enc);
+        assert!(!tl.fec);
+        assert_eq!(tl.input, "clean.pcm");
+        assert_eq!(tl.reference, "p25_nofec/clean.bit");
+    }
+
+    #[test]
+    fn parse_cmpp25_dec_sdbits_line() {
+        let line = "-c P25 -q -dec -sdbits 4 -r 0x0558 0x086b 0x1030 0x0000 0x0000 0x0190 p25/dam_e1_sd.bit -cmp p25/dam_e1_sd.pcm";
+        let tl = parse_cmpp25_line(line, 1).unwrap().unwrap();
+        assert_eq!(tl.op, SweepOp::Dec);
+        assert_eq!(tl.sdbits, Some(4));
+    }
+
+    #[test]
+    fn parse_cmpp25_skips_blank_and_comment_lines() {
+        assert!(parse_cmpp25_line("", 1).unwrap().is_none());
+        assert!(parse_cmpp25_line("   ", 2).unwrap().is_none());
+        assert!(parse_cmpp25_line("# comment", 3).unwrap().is_none());
     }
 }
