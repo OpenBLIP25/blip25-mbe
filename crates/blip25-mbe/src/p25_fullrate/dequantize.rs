@@ -229,27 +229,29 @@ pub fn decode_gain_dct(b: &[u16; 59], l: u8) -> [f32; 6] {
 }
 
 /// Reconstruct the 6 per-block prediction-residual means `R̃_1..R̃_6`
-/// from the dequantized gain DCT vector via §1.8.3 Eq. 69:
+/// from the dequantized gain DCT vector via §1.8.3 Eq. 69 (corrected):
 ///
 /// ```text
-/// R̃_i = Σ_{m=1}^{6} α(m) · G̃_m · cos[π·(m−1)·(i − 0.5) / J̃_i]
+/// R̃_i = Σ_{m=1}^{6} α(m) · G̃_m · cos[π·(m−1)·(i − 0.5) / 6]
 ///         for 1 ≤ i ≤ 6
 /// α(1) = 1,  α(m) = 2 for m > 1
 /// ```
 ///
-/// Per the spec note, this is a *per-block* inverse DCT — the cosine
-/// denominator is `J̃_i` (the i-th block's length), not 6. The basis
-/// frequency therefore changes block-by-block.
-pub fn gain_to_residuals(g: &[f32; 6], blocks: &[u8; 6]) -> [f32; 6] {
+/// Eq. 69 as printed in BABA-A page 30 shows `J̃_i` in the denominator,
+/// but that is an editorial carry-over from Eq. 73 (HOC inverse DCT,
+/// which is genuinely per-block). Eq. 61 (the forward gain DCT) uses
+/// `/6`, and round-trip identity at `L̃ = 36` (where `J̃_i = 6` for all
+/// `i`) requires the inverse to match. See
+/// `analysis/vocoder_decode_disambiguations.md §2` (2026-04-16
+/// correction) for the full derivation.
+pub fn gain_to_residuals(g: &[f32; 6]) -> [f32; 6] {
     let mut r = [0f32; 6];
     for i_0 in 0..6 {
-        let j_i = f32::from(blocks[i_0]);
-        debug_assert!(j_i > 0.0, "Annex J: J̃_i must be positive");
         let i_half = i_0 as f32 + 0.5;
         let mut acc = 0.0f32;
         for m_0 in 0..6 {
             let alpha = if m_0 == 0 { 1.0 } else { 2.0 };
-            let arg = PI * (m_0 as f32) * i_half / j_i;
+            let arg = PI * (m_0 as f32) * i_half / 6.0;
             acc += alpha * g[m_0] * arg.cos();
         }
         r[i_0] = acc;
@@ -562,7 +564,7 @@ pub fn reconstruct_amplitudes_from_bits(
 ) -> [f32; L_MAX as usize] {
     let blocks = IMBE_BLOCK_LENGTHS[(l - 9) as usize];
     let g = decode_gain_dct(b, l);
-    let r_i = gain_to_residuals(&g, &blocks);
+    let r_i = gain_to_residuals(&g);
     let c = assemble_hoc_matrix(b, l, &r_i);
     let t = inverse_block_dct(&c, &blocks);
     let log_m = apply_log_prediction(&t, l, state);
@@ -586,7 +588,7 @@ pub fn dequantize(
     let voiced = expand_vuv(b[1], l, k);
     let g = decode_gain_dct(&b, l);
     let blocks = IMBE_BLOCK_LENGTHS[(l - 9) as usize];
-    let r_i = gain_to_residuals(&g, &blocks);
+    let r_i = gain_to_residuals(&g);
     let c = assemble_hoc_matrix(&b, l, &r_i);
     let t = inverse_block_dct(&c, &blocks);
     let log_m = apply_log_prediction(&t, l, state);
@@ -707,14 +709,11 @@ pub fn encode_gain_dct(g: &[f32; 6], l: u8) -> [u16; 6] {
 ///         for 1 ≤ m ≤ 6
 /// ```
 ///
-/// **Important — this is *not* the inverse of [`gain_to_residuals`].**
-/// The encoder uses uniform `1/6` (matching a 6-point DCT) while the
-/// decoder uses `/J̃_i` per output block (Eq. 69). The gain DCT step
-/// is therefore intentionally lossy by design: the decoder reshapes
-/// the 6 transmitted coefficients into per-block-size residuals.
-///
-/// See `analysis/vocoder_decode_disambiguations.md` §9 for the full
-/// asymmetric pairing.
+/// Exact inverse of [`gain_to_residuals`] post-Eq. 69 correction. Both
+/// directions use denominator `6`; the forward DCT's `1/6` normalization
+/// is what makes the pair self-inverse for 6-element vectors. See
+/// `analysis/vocoder_decode_disambiguations.md` §2 (2026-04-16
+/// correction) for the derivation.
 pub fn residuals_to_gain(r: &[f32; 6]) -> [f32; 6] {
     let mut g = [0f32; 6];
     for m_0 in 0..6 {
@@ -1192,33 +1191,41 @@ mod tests {
     }
 
     #[test]
-    fn gain_to_residuals_constant_g1_propagates_to_all_blocks() {
-        // If only G̃_1 = c (DC term) and the rest are zero, the per-
-        // block inverse DCT must produce R̃_i = c for every block,
-        // independent of J̃_i.
+    fn gain_to_residuals_constant_g1_propagates_uniformly() {
+        // If only G̃_1 = c (DC term) and the rest are zero, the inverse
+        // 6-point DCT must produce R̃_i = c for every i.
         let g = [3.5f32, 0.0, 0.0, 0.0, 0.0, 0.0];
-        // Try a non-trivial block layout.
-        let blocks: [u8; 6] = IMBE_BLOCK_LENGTHS[(56 - 9) as usize]; // L=56
-        let r = gain_to_residuals(&g, &blocks);
+        let r = gain_to_residuals(&g);
         for i in 0..6 {
             assert!((r[i] - 3.5).abs() < 1e-5, "R̃_{}: {}", i + 1, r[i]);
         }
     }
 
     #[test]
-    fn gain_to_residuals_uses_per_block_denominator() {
-        // Two blocks with different J̃_i → DCT phase differs, so R̃_i
-        // should differ when only a higher-order G̃_m is non-zero.
+    fn gain_to_residuals_uses_fixed_six_denominator() {
+        // Post-2026-04-16 correction: Eq. 69 uses `/6` uniformly, so the
+        // output does NOT depend on the per-block lengths (Annex J). With
+        // only G̃_3 = 1 and α(3) = 2, the six outputs form a cosine
+        // sequence at frequency m=3 over the six i-indices.
+        //
+        //   arg(i_0) = π · 2 · (i_0 + 0.5) / 6
+        //   R̃_{i_0+1} = 2 · cos(arg)
+        //
+        // Check the full sequence.
         let mut g = [0f32; 6];
         g[2] = 1.0; // G̃_3 only (m_0 = 2)
-        // Contrived blocks: block 0 length 1, block 1 length 5.
-        // Eq. 69 with α(3)=2 and arg = π·(m-1)·(i-0.5)/J̃_i:
-        //   block 0 (i_0=0, J̃=1): arg = π·2·0.5/1 = π   → cos=-1   → 2·1·(-1)   = -2.0
-        //   block 1 (i_0=1, J̃=5): arg = π·2·1.5/5 = 3π/5 → cos≈-0.309 → 2·1·(-0.309) ≈ -0.618
-        let blocks = [1u8, 5, 1, 1, 1, 1];
-        let r = gain_to_residuals(&g, &blocks);
-        assert!((r[0] - (-2.0)).abs() < 1e-5, "block 0: {}", r[0]);
-        assert!((r[1] - (-0.618_034)).abs() < 1e-3, "block 1: {}", r[1]);
+        let r = gain_to_residuals(&g);
+        for i_0 in 0..6usize {
+            let expected =
+                2.0 * (std::f32::consts::PI * 2.0 * (i_0 as f32 + 0.5) / 6.0).cos();
+            assert!(
+                (r[i_0] - expected).abs() < 1e-5,
+                "R̃_{}: got {}, expected {}",
+                i_0 + 1,
+                r[i_0],
+                expected
+            );
+        }
     }
 
     // ---- HOC reconstruction (§1.8.4) -------------------------------------
@@ -1539,21 +1546,18 @@ mod tests {
     }
 
     #[test]
-    fn gain_dct_is_lossy_by_design_but_invertible_when_blocks_uniform_six() {
-        // The encoder/decoder pair (Eq. 61 / Eq. 69) is intentionally
-        // asymmetric — forward uses /6 uniformly, inverse uses /J̃_i.
-        // They are exact inverses *only* when J̃_i = 6 for all i (i.e.
-        // never, since L_MAX = 56 and 6·6 = 36).
-        // Synthesize that hypothetical case explicitly to verify the
-        // forward function behaves like a 6-point DCT-II.
+    fn gain_dct_is_self_inverse_post_eq_69_correction() {
+        // Post-2026-04-16 correction: both Eq. 61 (forward) and Eq. 69
+        // (inverse) use denominator 6, so the pair is exact-inverse for
+        // all 6-element vectors regardless of the Annex J block layout
+        // the decoder later applies downstream.
         let r: [f32; 6] = [1.0, -2.5, 0.3, 0.0, -0.7, 1.8];
-        let blocks_uniform_six = [6u8; 6];
         let g = residuals_to_gain(&r);
-        let r2 = gain_to_residuals(&g, &blocks_uniform_six);
+        let r2 = gain_to_residuals(&g);
         for i in 0..6 {
             assert!(
                 (r2[i] - r[i]).abs() < 1e-4,
-                "uniform J̃=6: i={i}: {} vs {}",
+                "round-trip: i={i}: {} vs {}",
                 r2[i],
                 r[i]
             );
