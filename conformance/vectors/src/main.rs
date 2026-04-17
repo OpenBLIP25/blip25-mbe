@@ -34,7 +34,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use blip25_mbe::codecs::mbe_baseline::{
-    FrameErrorContext, GAMMA_W, SynthState, synthesize_frame,
+    FrameErrorContext, GAMMA_W, SynthState, synthesize_frame, synthesize_frame_ambe_plus,
 };
 use blip25_mbe::codecs::mbe_baseline::analysis::{
     AnalysisError, AnalysisOutput, AnalysisState, VuvResult,
@@ -806,13 +806,16 @@ fn cmd_decode_pcm_halfrate(root: &Path, name: &str, gamma_w: f64, write_pcm: Opt
         match decode_to_params(&ambe.info, &mut dec_state) {
             Ok(Decoded::Voice(params)) => {
                 voice_frames += 1;
-                let pcm = synthesize_frame(&params, &err, gamma_w, &mut synth_state);
+                // Half-rate (AMBE+2) uses US5701390 phase regeneration
+                // per AMBE-3000_Decoder_Implementation_Spec.md §5.
+                let pcm = synthesize_frame_ambe_plus(&params, &err, gamma_w, &mut synth_state);
                 pcm_out.extend_from_slice(&pcm);
             }
             Ok(Decoded::Tone { fields: _, params }) => {
                 tone_frames += 1;
-                // Tone frames feed the MBE synthesizer per §2.10.3.
-                let pcm = synthesize_frame(&params, &err, gamma_w, &mut synth_state);
+                // Tone frames feed the MBE synthesizer per §2.10.3;
+                // half-rate takes the AMBE+2 synthesis path.
+                let pcm = synthesize_frame_ambe_plus(&params, &err, gamma_w, &mut synth_state);
                 pcm_out.extend_from_slice(&pcm);
             }
             Ok(Decoded::Erasure) | Err(_) => {

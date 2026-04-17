@@ -633,6 +633,25 @@ fn wrap_phase(delta_phi: f64) -> f64 {
     delta_phi - 2.0 * PI64 * ((delta_phi + PI64) / (2.0 * PI64)).floor()
 }
 
+/// Phase computation mode for the voiced synthesizer.
+///
+/// - [`PhaseMode::Baseline`] follows BABA-A §1.12.2 Eq. 141 — noise-
+///   perturbed phase driven by the LCG u(n) sequence. Used by full-rate
+///   IMBE (P25 Phase 1).
+/// - [`PhaseMode::AmbePlus`] replaces Eq. 141 with US5701390 phase
+///   regeneration (Hilbert-transform of log-magnitude). Used by
+///   half-rate AMBE+2 (P25 Phase 2). See
+///   `~/blip25-specs/DVSI/AMBE-3000/AMBE-3000_Decoder_Implementation_Spec.md`
+///   §5 and [`phase_regen`].
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum PhaseMode {
+    /// BABA-A Eq. 141 noise-perturbed phase. Full-rate IMBE default.
+    Baseline,
+    /// US5701390 §5 Hilbert-transform phase regeneration.
+    /// AMBE+2 / P25 half-rate.
+    AmbePlus,
+}
+
 /// Synthesize the voiced component for one 20 ms frame per BABA-A
 /// §1.12.2 Eq. 127–141.
 ///
@@ -642,12 +661,16 @@ fn wrap_phase(delta_phi: f64) -> f64 {
 ///
 /// `noise_samples` carries `u(l)` for `l = 1..=56` (index 0 = `u(1)`),
 /// extracted from [`voiced_noise_samples`] after the unvoiced synth's
-/// noise advance.
+/// noise advance. Consumed only when `phase_mode == PhaseMode::Baseline`.
+///
+/// `phase_mode` selects between BABA-A Eq. 141 (baseline IMBE) and
+/// US5701390 phase regeneration (AMBE+2 half-rate). See [`PhaseMode`].
 pub fn synthesize_voiced(
     omega_0: f32,
     m_bar: &[f32],
     v_bar: &[bool],
     noise_samples: &[f64; L_MAX as usize],
+    phase_mode: PhaseMode,
     state: &mut VoicedSynthState,
 ) -> [f64; FRAME_SAMPLES] {
     let l_curr = m_bar.len() as u8;
@@ -666,24 +689,49 @@ pub fn synthesize_voiced(
         psi_curr[l] = state.psi[l] + (omega_prev + omega_curr) * l_f * n_f / 2.0;
     }
 
-    // φ_l(0) — Eq. 140 + 141.
-    // Branch 1 for 1 ≤ l ≤ ⌊L̃/4⌋: φ = ψ.
-    // Branch 2 for ⌊L̃/4⌋ < l ≤ max(L̃(−1), L̃(0)): φ = ψ + L̃_uv·ρ_l/L̃·l.
+    // φ_l(0) — Eq. 140 with branch dispatched by phase_mode.
+    // Branch 1 for 1 ≤ l ≤ ⌊L̃/4⌋: φ = ψ  (both modes agree).
+    // Branch 2 for ⌊L̃/4⌋ < l ≤ max(L̃(−1), L̃(0)):
+    //   Baseline (Eq. 141): φ = ψ + L̃_uv · ρ_l / L̃ · l
+    //     where ρ_l = (2π/53125)·u(l) − π.
+    //   AmbePlus (US5701390 §5.3): φ = ψ + φ_regen,l
+    //     where φ_regen,l = γ · Σ h(m)·log₂(M̄_{l+m}).
     // For l beyond max (up to 56): apply branch 2 too — these harmonics
     // are out-of-range (treated as unvoiced per Eq. 128–129) and their
     // phase still evolves for next-frame continuity.
-    let l_uv: u8 = (0..l_curr as usize).filter(|&i| !v_bar[i]).count() as u8;
     let l_quarter = (l_curr as usize) / 4;
     let mut phi_curr = [0f64; L_MAX as usize + 1];
-    for l in 1..=L_MAX as usize {
-        if l <= l_quarter {
-            phi_curr[l] = psi_curr[l];
-        } else {
-            let u_l = noise_samples[l - 1];
-            let rho_l = (2.0 * PI64 / 53125.0) * u_l - PI64; // Eq. 141
-            let l_curr_f = if l_curr > 0 { f64::from(l_curr) } else { 1.0 };
-            phi_curr[l] = psi_curr[l]
-                + f64::from(l_uv) * rho_l / l_curr_f * (l as f64);
+    match phase_mode {
+        PhaseMode::Baseline => {
+            let l_uv: u8 = (0..l_curr as usize).filter(|&i| !v_bar[i]).count() as u8;
+            for l in 1..=L_MAX as usize {
+                if l <= l_quarter {
+                    phi_curr[l] = psi_curr[l];
+                } else {
+                    let u_l = noise_samples[l - 1];
+                    let rho_l = (2.0 * PI64 / 53125.0) * u_l - PI64; // Eq. 141
+                    let l_curr_f = if l_curr > 0 { f64::from(l_curr) } else { 1.0 };
+                    phi_curr[l] = psi_curr[l]
+                        + f64::from(l_uv) * rho_l / l_curr_f * (l as f64);
+                }
+            }
+        }
+        PhaseMode::AmbePlus => {
+            // Compute φ_regen,l for l = 1..=L̃ from the current frame's
+            // M̄_l. noise_samples is ignored in this branch.
+            let mut phi_regen = [0f64; L_MAX as usize + 1];
+            phase_regen::ambe_phase_regen(m_bar, &mut phi_regen);
+            for l in 1..=L_MAX as usize {
+                if l <= l_quarter {
+                    phi_curr[l] = psi_curr[l];
+                } else {
+                    // Harmonic indices past L̃(0) get φ_regen = 0 from
+                    // the untouched-slot convention in ambe_phase_regen,
+                    // so φ = ψ there (consistent with the spec's
+                    // zero-padding of B_l beyond L̃).
+                    phi_curr[l] = psi_curr[l] + phi_regen[l];
+                }
+            }
         }
     }
 
@@ -863,15 +911,43 @@ pub fn pcm_from_f64(samples: &[f64; FRAME_SAMPLES]) -> [i16; FRAME_SAMPLES] {
 }
 
 /// Synthesize one 20 ms frame (160 PCM samples) from `MbeParams` per
-/// the §1.10–§1.12 pipeline, with the §1.11 disposition deciding
-/// whether to use, repeat, or mute the current frame.
+/// the §1.10–§1.12 pipeline, using baseline BABA-A Eq. 141 phase
+/// (full-rate IMBE / P25 Phase 1).
 ///
 /// `gamma_w` is the §1.12.1 spectral scale; pass [`GAMMA_W`]
 /// until a calibrated value is available.
+///
+/// For AMBE+2 / half-rate P25 Phase 2 use
+/// [`synthesize_frame_ambe_plus`] instead, which replaces Eq. 141
+/// with US5701390 phase regeneration.
 pub fn synthesize_frame(
     params: &MbeParams,
     err: &FrameErrorContext,
     gamma_w: f64,
+    state: &mut SynthState,
+) -> [i16; FRAME_SAMPLES] {
+    synthesize_frame_with_mode(params, err, gamma_w, PhaseMode::Baseline, state)
+}
+
+/// AMBE+2 variant of [`synthesize_frame`] — applies US5701390 §5
+/// phase regeneration in place of BABA-A Eq. 141. Used for P25
+/// half-rate (Phase 2 TDMA) decoding.
+pub fn synthesize_frame_ambe_plus(
+    params: &MbeParams,
+    err: &FrameErrorContext,
+    gamma_w: f64,
+    state: &mut SynthState,
+) -> [i16; FRAME_SAMPLES] {
+    synthesize_frame_with_mode(params, err, gamma_w, PhaseMode::AmbePlus, state)
+}
+
+/// Core of [`synthesize_frame`] / [`synthesize_frame_ambe_plus`]
+/// parameterized by [`PhaseMode`].
+fn synthesize_frame_with_mode(
+    params: &MbeParams,
+    err: &FrameErrorContext,
+    gamma_w: f64,
+    phase_mode: PhaseMode,
     state: &mut SynthState,
 ) -> [i16; FRAME_SAMPLES] {
     let (disp, epsilon_r) = frame_disposition(err, state.epsilon_r);
@@ -941,6 +1017,7 @@ pub fn synthesize_frame(
         &smoothed.m_bar[..l as usize],
         &smoothed.v_bar[..l as usize],
         &noise_samples,
+        phase_mode,
         &mut state.voiced,
     );
 
@@ -1369,7 +1446,7 @@ mod tests {
         let noise = [0f64; L_MAX as usize];
         let mut state = VoicedSynthState::new();
         // First call: prev is also init (all UV by Annex A).
-        let pcm = synthesize_voiced(0.2, &m_bar, &v_bar, &noise, &mut state);
+        let pcm = synthesize_voiced(0.2, &m_bar, &v_bar, &noise, PhaseMode::Baseline, &mut state);
         for &s in pcm.iter() {
             assert!(s.abs() < 1e-9);
         }
@@ -1383,7 +1460,7 @@ mod tests {
         let mut state = VoicedSynthState::new();
         // First frame: prev is all UV (Annex A init), so harmonics use
         // Branch::UvV with M̄_curr = 0 → output is zero.
-        let pcm = synthesize_voiced(0.2, &m_bar, &v_bar, &noise, &mut state);
+        let pcm = synthesize_voiced(0.2, &m_bar, &v_bar, &noise, PhaseMode::Baseline, &mut state);
         for &s in pcm.iter() {
             assert!(s.abs() < 1e-9, "{s}");
         }
@@ -1398,7 +1475,7 @@ mod tests {
         let noise = [0f64; L_MAX as usize];
         let mut state = VoicedSynthState::new();
         let psi_init = state.psi;
-        let _ = synthesize_voiced(0.2, &m_bar, &v_bar, &noise, &mut state);
+        let _ = synthesize_voiced(0.2, &m_bar, &v_bar, &noise, PhaseMode::Baseline, &mut state);
         // Every harmonic's ψ should have advanced.
         for l in 1..=L_MAX as usize {
             assert!(
@@ -1423,8 +1500,8 @@ mod tests {
         v_bar[0] = true;
         let noise = [0f64; L_MAX as usize];
         let mut state = VoicedSynthState::new();
-        let _ = synthesize_voiced(omega_0, &m_bar, &v_bar, &noise, &mut state);
-        let pcm = synthesize_voiced(omega_0, &m_bar, &v_bar, &noise, &mut state);
+        let _ = synthesize_voiced(omega_0, &m_bar, &v_bar, &noise, PhaseMode::Baseline, &mut state);
+        let pcm = synthesize_voiced(omega_0, &m_bar, &v_bar, &noise, PhaseMode::Baseline, &mut state);
 
         // Output should have measurable energy concentrated around
         // ω₀. We just sanity-check non-zero variance.
@@ -1450,10 +1527,10 @@ mod tests {
         let noise = [0f64; L_MAX as usize];
         let mut state = VoicedSynthState::new();
         // Warm up.
-        let _ = synthesize_voiced(omega_0, &m_bar, &v_bar, &noise, &mut state);
-        let _ = synthesize_voiced(omega_0, &m_bar, &v_bar, &noise, &mut state);
-        let pcm_a = synthesize_voiced(omega_0, &m_bar, &v_bar, &noise, &mut state);
-        let pcm_b = synthesize_voiced(omega_0, &m_bar, &v_bar, &noise, &mut state);
+        let _ = synthesize_voiced(omega_0, &m_bar, &v_bar, &noise, PhaseMode::Baseline, &mut state);
+        let _ = synthesize_voiced(omega_0, &m_bar, &v_bar, &noise, PhaseMode::Baseline, &mut state);
+        let pcm_a = synthesize_voiced(omega_0, &m_bar, &v_bar, &noise, PhaseMode::Baseline, &mut state);
+        let pcm_b = synthesize_voiced(omega_0, &m_bar, &v_bar, &noise, PhaseMode::Baseline, &mut state);
         let last_a = pcm_a[FRAME_SAMPLES - 1];
         let first_b = pcm_b[0];
         // Approximate continuity: difference well below the typical
@@ -1471,8 +1548,78 @@ mod tests {
         let v_bar = [false; 9];
         let noise = [0f64; L_MAX as usize];
         let mut state = VoicedSynthState::new();
-        let pcm = synthesize_voiced(0.2, &m_bar, &v_bar, &noise, &mut state);
+        let pcm = synthesize_voiced(0.2, &m_bar, &v_bar, &noise, PhaseMode::Baseline, &mut state);
         assert_eq!(pcm.len(), FRAME_SAMPLES);
+    }
+
+    #[test]
+    fn voiced_ambe_plus_mode_diverges_from_baseline_on_high_l() {
+        // Same MbeParams and cold-start state run through Baseline
+        // (Eq. 141 noise-perturbed phase) and AmbePlus (Hilbert regen)
+        // must produce different PCM on high-l harmonics because the
+        // phase computation differs there. Low-l region (l ≤ L/4) is
+        // common to both and should agree.
+        let omega_0 = 0.15f32;
+        // L = 12, so L/4 = 3. Harmonics 1..=3 use the common ψ branch;
+        // 4..=12 differ between modes.
+        let mut m_bar = [0f32; 12];
+        for (l, m) in m_bar.iter_mut().enumerate() {
+            *m = 100.0 * ((l as f32) + 1.0).sqrt();
+        }
+        let v_bar = [true; 12];
+        let noise = [100f64; L_MAX as usize]; // non-trivial noise so Eq. 141 fires
+
+        let mut state_base = VoicedSynthState::new();
+        let _ = synthesize_voiced(
+            omega_0, &m_bar, &v_bar, &noise, PhaseMode::Baseline, &mut state_base,
+        );
+        let pcm_base = synthesize_voiced(
+            omega_0, &m_bar, &v_bar, &noise, PhaseMode::Baseline, &mut state_base,
+        );
+
+        let mut state_amb = VoicedSynthState::new();
+        let _ = synthesize_voiced(
+            omega_0, &m_bar, &v_bar, &noise, PhaseMode::AmbePlus, &mut state_amb,
+        );
+        let pcm_amb = synthesize_voiced(
+            omega_0, &m_bar, &v_bar, &noise, PhaseMode::AmbePlus, &mut state_amb,
+        );
+
+        // Overall waveforms should differ.
+        let diff_rms: f64 = pcm_base
+            .iter()
+            .zip(pcm_amb.iter())
+            .map(|(a, b)| (a - b).powi(2))
+            .sum::<f64>()
+            / FRAME_SAMPLES as f64;
+        assert!(
+            diff_rms.sqrt() > 1.0,
+            "Baseline and AmbePlus produced identical voiced output — phase mode not wired through"
+        );
+    }
+
+    #[test]
+    fn voiced_ambe_plus_matches_baseline_on_all_unvoiced() {
+        // When no harmonics are voiced, both phase modes produce
+        // identical (zero) output — the phase branch never activates.
+        let m_bar = vec![100f32; 9];
+        let v_bar = vec![false; 9];
+        let noise = [50f64; L_MAX as usize];
+
+        let mut state_base = VoicedSynthState::new();
+        let pcm_base = synthesize_voiced(
+            0.2, &m_bar, &v_bar, &noise, PhaseMode::Baseline, &mut state_base,
+        );
+        let mut state_amb = VoicedSynthState::new();
+        let pcm_amb = synthesize_voiced(
+            0.2, &m_bar, &v_bar, &noise, PhaseMode::AmbePlus, &mut state_amb,
+        );
+        for (i, (a, b)) in pcm_base.iter().zip(pcm_amb.iter()).enumerate() {
+            assert!(
+                (a - b).abs() < 1e-9,
+                "i={i}: Baseline {a} vs AmbePlus {b} — should match on all-UV frame"
+            );
+        }
     }
 
     #[test]
