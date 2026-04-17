@@ -8,6 +8,9 @@
 # DVSI material — free to download but not redistributable
 /DVSI/
 
+# Listening-test drop zone (A/B PCM files, user-side only)
+/audition/
+
 # Editor / OS
 .vscode/
 .idea/

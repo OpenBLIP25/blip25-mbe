@@ -191,6 +191,14 @@ enum Cmd {
         /// comparison against the DVSI reference.
         #[arg(long)]
         write_pcm: Option<std::path::PathBuf>,
+        /// Phase mode for voiced synthesis. `ambe-plus` (default,
+        /// spec-conformant for half-rate per AMBE-3000_Decoder §5) uses
+        /// US5701390 Hilbert phase regeneration; `baseline` uses
+        /// BABA-A Eq. 141 noise-perturbed phase. Exposed for A/B
+        /// listening tests of the phase regeneration's perceptual
+        /// claim.
+        #[arg(long, value_enum, default_value_t = HalfratePhaseMode::AmbePlus)]
+        phase_mode: HalfratePhaseMode,
     },
     /// Round-trip test: decode each `p25_nofec/<name>.bit` frame to
     /// `MbeParams` then re-encode. Pitch (`b̂₀`) and V/UV (`b̂₁`) are
@@ -399,6 +407,16 @@ enum RateConvertDirection {
     HalfToFull,
 }
 
+/// Phase-mode selector for [`Cmd::DecodePcmHalfrate`]. Default is
+/// `AmbePlus` (spec-conformant for half-rate per AMBE-3000_Decoder §5).
+#[derive(Copy, Clone, Debug, clap::ValueEnum)]
+enum HalfratePhaseMode {
+    /// BABA-A Eq. 141 noise-perturbed phase (full-rate default).
+    Baseline,
+    /// US5701390 §5 Hilbert phase regeneration (half-rate default).
+    AmbePlus,
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
     match args.command {
@@ -415,8 +433,14 @@ fn main() -> Result<()> {
             m_scale,
             write_pcm.as_deref(),
         ),
-        Cmd::DecodePcmHalfrate { name, gamma_w, write_pcm } => {
-            cmd_decode_pcm_halfrate(&args.vectors, &name, gamma_w.unwrap_or(GAMMA_W), write_pcm.as_deref())
+        Cmd::DecodePcmHalfrate { name, gamma_w, write_pcm, phase_mode } => {
+            cmd_decode_pcm_halfrate(
+                &args.vectors,
+                &name,
+                gamma_w.unwrap_or(GAMMA_W),
+                write_pcm.as_deref(),
+                phase_mode,
+            )
         }
         Cmd::HalfrateInspect { name, frames } => {
             cmd_halfrate_inspect(&args.vectors, &name, frames)
@@ -769,7 +793,13 @@ fn unpack_dibits_halfrate(bytes: &[u8]) -> [u8; DIBITS_PER_HALFRATE_FRAME] {
     out
 }
 
-fn cmd_decode_pcm_halfrate(root: &Path, name: &str, gamma_w: f64, write_pcm: Option<&Path>) -> Result<()> {
+fn cmd_decode_pcm_halfrate(
+    root: &Path,
+    name: &str,
+    gamma_w: f64,
+    write_pcm: Option<&Path>,
+    phase_mode: HalfratePhaseMode,
+) -> Result<()> {
     // Half-rate DVSI vectors live under tv-std/tv/r33/ (rate index 33 — P25 half-rate with FEC
     // per USB-3000 manual §3.3.4 = 3600 bps AMBE+2).
     let dir = root.join("tv-std").join("tv").join("r33");
@@ -826,19 +856,27 @@ fn cmd_decode_pcm_halfrate(root: &Path, name: &str, gamma_w: f64, write_pcm: Opt
             epsilon_t: ambe.error_total().min(255) as u8,
             bad_pitch: false,
         };
+        // `phase_mode` dispatches between Baseline (BABA-A Eq. 141
+        // noise-perturbed phase) and AmbePlus (US5701390 §5 Hilbert
+        // phase regeneration). Default is AmbePlus per
+        // AMBE-3000_Decoder_Implementation_Spec §5; Baseline is
+        // available for A/B listening tests of the phase-regen
+        // perceptual claim.
+        let synth: fn(&MbeParams, &FrameErrorContext, f64, &mut SynthState) -> [i16; FRAME_SAMPLES] =
+            match phase_mode {
+                HalfratePhaseMode::Baseline => synthesize_frame,
+                HalfratePhaseMode::AmbePlus => synthesize_frame_ambe_plus,
+            };
         match decode_to_params(&ambe.info, &mut dec_state) {
             Ok(Decoded::Voice(params)) => {
                 voice_frames += 1;
-                // Half-rate (AMBE+2) uses US5701390 phase regeneration
-                // per AMBE-3000_Decoder_Implementation_Spec.md §5.
-                let pcm = synthesize_frame_ambe_plus(&params, &err, gamma_w, &mut synth_state);
+                let pcm = synth(&params, &err, gamma_w, &mut synth_state);
                 pcm_out.extend_from_slice(&pcm);
             }
             Ok(Decoded::Tone { fields: _, params }) => {
                 tone_frames += 1;
-                // Tone frames feed the MBE synthesizer per §2.10.3;
-                // half-rate takes the AMBE+2 synthesis path.
-                let pcm = synthesize_frame_ambe_plus(&params, &err, gamma_w, &mut synth_state);
+                // Tone frames feed the MBE synthesizer per §2.10.3.
+                let pcm = synth(&params, &err, gamma_w, &mut synth_state);
                 pcm_out.extend_from_slice(&pcm);
             }
             Ok(Decoded::Erasure) | Err(_) => {
