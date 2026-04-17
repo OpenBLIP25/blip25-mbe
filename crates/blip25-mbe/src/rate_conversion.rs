@@ -19,7 +19,9 @@
 //! used for FEC cleanup or retransmission without a rate change.
 
 pub mod converter;
+pub mod predictor;
 pub mod repeater;
 
 pub use converter::{ConvertError, FullToHalfConverter, HalfToFullConverter};
+pub use predictor::{CrossRatePredictorState, RHO_CROSS_RATE};
 pub use repeater::{FullRateRepeater, HalfRateRepeater};
