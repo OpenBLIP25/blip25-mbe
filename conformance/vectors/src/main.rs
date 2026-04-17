@@ -298,6 +298,26 @@ enum Cmd {
         #[arg(long)]
         rc: bool,
     },
+    /// Measure target-stream magnitude smoothness: RMS of
+    /// `|M̃_l(frame N+1) − M̃_l(frame N)|` averaged over target-rate
+    /// frames. This is the metric the §4.5 cross-rate predictor
+    /// actually targets (US7634399 col. 7 "frame-to-frame magnitude
+    /// instability over ~50 frames"); per-frame source-vs-output
+    /// comparison (as `rate-convert-roundtrip` does) doesn't detect
+    /// the predictor's smoothing effect. Reports both baseline
+    /// (predictor off) and with-predictor numbers in one run for
+    /// direct A/B comparison.
+    RateConvertSmoothness {
+        /// Conversion direction — i.e. which target stream's
+        /// smoothness we measure.
+        #[arg(long, value_enum)]
+        direction: RateConvertDirection,
+        /// Vector name (e.g. `alert`, `clean`).
+        name: String,
+        /// Use `tv-rc/` instead of `tv-std/tv/`.
+        #[arg(long)]
+        rc: bool,
+    },
     /// PCM → `MbeParams` analysis encoder conformance. Drives
     /// `DVSI/Vectors/.../p25/<name>.pcm` through
     /// [`blip25_mbe::codecs::mbe_baseline::analysis::encode`] in 20 ms
@@ -425,6 +445,9 @@ fn main() -> Result<()> {
         }
         Cmd::RateConvertRoundtrip { direction, name, rc } => {
             cmd_rate_convert_roundtrip(&args.vectors, direction, &name, rc)
+        }
+        Cmd::RateConvertSmoothness { direction, name, rc } => {
+            cmd_rate_convert_smoothness(&args.vectors, direction, &name, rc)
         }
         Cmd::AnalysisEncode { name, rc, dump_frames, chip_offset, silence_dispatch, quantizer_roundtrip, chip_seed_vuv, bitstream } => {
             cmd_analysis_encode(&args.vectors, &name, rc, dump_frames, chip_offset, silence_dispatch, quantizer_roundtrip, chip_seed_vuv, bitstream)
@@ -2399,6 +2422,295 @@ fn cmd_rate_convert_roundtrip_half(root: &Path, name: &str, rc: bool) -> Result<
     println!();
     stats.print("Source → full → half");
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Rate-convert smoothness metric (cmd: rate-convert-smoothness)
+//
+// Measures RMS of `|M̃_l(frame N+1) − M̃_l(frame N)|` across target-stream
+// voice frames, averaged over the comparable harmonics of each pair.
+// This is the metric the §4.5 cross-rate predictor actually targets
+// (US7634399 col. 7 frame-to-frame magnitude smoothing); the existing
+// rate-convert-roundtrip metric is insensitive because it compares
+// unsmoothed source to output rather than output-vs-output.
+// ---------------------------------------------------------------------------
+
+/// Per-run smoothness statistics. Aggregated across frame pairs where
+/// both the prior and current target-stream frames decoded as Voice
+/// and share the same L̂ (cross-frame diff is well-defined only on a
+/// common harmonic grid; L̂ changes are counted separately).
+#[derive(Default)]
+struct SmoothnessStats {
+    /// Comparable frame pairs (prior + current both Voice, same L̂).
+    comparable_pairs: usize,
+    /// Frame pairs where L̂ changed — diff undefined, tallied.
+    l_transition_pairs: usize,
+    /// Pairs skipped because at least one side wasn't Voice (erasure,
+    /// tone, silence, decode error).
+    non_voice_pairs: usize,
+    /// Σ|Δ M̃_l|² over all comparable harmonics (log2 domain), used to
+    /// compute RMS. Log-domain so the metric is a scale-invariant
+    /// smoothness measure rather than a linear-dB that conflates
+    /// amplitude range with smoothness.
+    sum_sq_log_delta: f64,
+    /// Number of harmonic samples contributing to `sum_sq_log_delta`.
+    n_harmonic_samples: usize,
+    /// Linear-domain Σ|Δ M̃_l|² and count — for reporting alongside
+    /// the log-domain metric (the chip's predictor operates in log
+    /// domain per US7634399 col. 6, but linear is more intuitive).
+    sum_sq_linear_delta: f64,
+    n_linear_samples: usize,
+}
+
+impl SmoothnessStats {
+    fn push_pair(&mut self, prev: &MbeParams, curr: &MbeParams) {
+        if prev.harmonic_count() != curr.harmonic_count() {
+            self.l_transition_pairs += 1;
+            return;
+        }
+        self.comparable_pairs += 1;
+        let l = prev.harmonic_count() as usize;
+        let prev_a = prev.amplitudes_slice();
+        let curr_a = curr.amplitudes_slice();
+        // Linear-domain diff includes all harmonics — near-zero
+        // amplitudes contribute ≈0 and don't distort the RMS.
+        for i in 0..l {
+            let d_lin = f64::from(curr_a[i]) - f64::from(prev_a[i]);
+            self.sum_sq_linear_delta += d_lin * d_lin;
+            self.n_linear_samples += 1;
+        }
+        // Log-domain diff is only meaningful when both sides have
+        // non-trivial magnitudes. A harmonic that ping-pongs between
+        // voiced and unvoiced-near-zero would dominate log-RMS via
+        // the floor, which reflects voicing changes rather than the
+        // smoothness the predictor targets. Gate at 1.0 (a generous
+        // threshold — voiced M̃_l typically exceeds 10 on speech).
+        const LOG_DOMAIN_THRESHOLD: f32 = 1.0;
+        for i in 0..l {
+            if prev_a[i] >= LOG_DOMAIN_THRESHOLD && curr_a[i] >= LOG_DOMAIN_THRESHOLD {
+                let d_log = f64::from(curr_a[i]).log2() - f64::from(prev_a[i]).log2();
+                self.sum_sq_log_delta += d_log * d_log;
+                self.n_harmonic_samples += 1;
+            }
+        }
+    }
+
+    fn non_voice(&mut self) {
+        self.non_voice_pairs += 1;
+    }
+
+    fn log_rms(&self) -> f64 {
+        if self.n_harmonic_samples == 0 {
+            return 0.0;
+        }
+        (self.sum_sq_log_delta / self.n_harmonic_samples as f64).sqrt()
+    }
+
+    fn linear_rms(&self) -> f64 {
+        if self.n_linear_samples == 0 {
+            return 0.0;
+        }
+        (self.sum_sq_linear_delta / self.n_linear_samples as f64).sqrt()
+    }
+
+    fn print(&self, label: &str) {
+        println!("{label}:");
+        println!(
+            "  comparable pairs:      {} (L-transitions {}, non-voice {})",
+            self.comparable_pairs, self.l_transition_pairs, self.non_voice_pairs,
+        );
+        println!(
+            "  |Δ M̃_l| log2-RMS:      {:.4}    (linear-domain equivalent: {:.4}×)",
+            self.log_rms(),
+            (2.0_f64).powf(self.log_rms()),
+        );
+        println!("  |Δ M̃_l| linear-RMS:    {:.2}", self.linear_rms());
+    }
+}
+
+fn cmd_rate_convert_smoothness(
+    root: &Path,
+    direction: RateConvertDirection,
+    name: &str,
+    rc: bool,
+) -> Result<()> {
+    match direction {
+        RateConvertDirection::FullToHalf => smoothness_full_to_half(root, name, rc),
+        RateConvertDirection::HalfToFull => smoothness_half_to_full(root, name, rc),
+    }
+}
+
+/// Run one pass of full → half conversion with the predictor either on
+/// or off, collecting smoothness statistics on the target (half-rate)
+/// stream.
+fn measure_smoothness_full_to_half(
+    fec_bytes: &[u8],
+    n_frames: usize,
+    predictor_enabled: bool,
+) -> SmoothnessStats {
+    let mut conv = FullToHalfConverter::new();
+    conv.set_predictor_enabled(predictor_enabled);
+    let mut target_state = HalfDecoderState::new();
+    let mut stats = SmoothnessStats::default();
+    let mut prev: Option<MbeParams> = None;
+
+    for f in 0..n_frames {
+        let frame = &fec_bytes[f * BYTES_PER_FEC_FRAME..(f + 1) * BYTES_PER_FEC_FRAME];
+        let dibits = unpack_dibits(frame);
+        let dst_dibits = match conv.convert(&dibits) {
+            Ok(b) => b,
+            Err(_) => {
+                stats.non_voice();
+                prev = None;
+                continue;
+            }
+        };
+        let dst_frame = decode_half_frame(&dst_dibits);
+        match decode_to_params(&dst_frame.info, &mut target_state) {
+            Ok(Decoded::Voice(params)) => {
+                if let Some(prev_p) = &prev {
+                    stats.push_pair(prev_p, &params);
+                }
+                prev = Some(params);
+            }
+            _ => {
+                stats.non_voice();
+                prev = None;
+            }
+        }
+    }
+    stats
+}
+
+fn smoothness_full_to_half(root: &Path, name: &str, rc: bool) -> Result<()> {
+    let dir = vector_dir(root, rc);
+    let fec_path = dir.join("p25").join(format!("{name}.bit"));
+    let fec_bytes = fs::read(&fec_path)
+        .with_context(|| format!("read FEC vector {}", fec_path.display()))?;
+    if fec_bytes.len() % BYTES_PER_FEC_FRAME != 0 {
+        return Err(anyhow!("FEC file is not a whole number of frames"));
+    }
+    let n_frames = fec_bytes.len() / BYTES_PER_FEC_FRAME;
+
+    println!(
+        "vector:            {name}{} (full → half smoothness)",
+        if rc { " (rc)" } else { "" }
+    );
+    println!("frames:            {n_frames}");
+    println!();
+
+    let off = measure_smoothness_full_to_half(&fec_bytes, n_frames, false);
+    off.print("Predictor OFF (§4.5 bypassed)");
+    println!();
+    let on = measure_smoothness_full_to_half(&fec_bytes, n_frames, true);
+    on.print("Predictor ON  (§4.5 blend active)");
+    println!();
+
+    print_smoothness_delta(&off, &on);
+    Ok(())
+}
+
+/// Run one pass of half → full conversion with the predictor either on
+/// or off, collecting smoothness statistics on the target (full-rate)
+/// stream.
+fn measure_smoothness_half_to_full(
+    bit_bytes: &[u8],
+    n_frames: usize,
+    predictor_enabled: bool,
+) -> SmoothnessStats {
+    let mut conv = HalfToFullConverter::new();
+    conv.set_predictor_enabled(predictor_enabled);
+    let mut target_state = DecoderState::new();
+    let mut stats = SmoothnessStats::default();
+    let mut prev: Option<MbeParams> = None;
+
+    for f in 0..n_frames {
+        let frame = &bit_bytes[f * BYTES_PER_HALFRATE_FRAME..(f + 1) * BYTES_PER_HALFRATE_FRAME];
+        let dibits = unpack_dibits_halfrate(frame);
+        let dst_dibits = match conv.convert(&dibits) {
+            Ok(b) => b,
+            Err(_) => {
+                stats.non_voice();
+                prev = None;
+                continue;
+            }
+        };
+        let dst_frame = decode_full_frame(&dst_dibits);
+        match dequantize_full(&dst_frame.info, &mut target_state) {
+            Ok(params) => {
+                if let Some(prev_p) = &prev {
+                    stats.push_pair(prev_p, &params);
+                }
+                prev = Some(params);
+            }
+            Err(_) => {
+                stats.non_voice();
+                prev = None;
+            }
+        }
+    }
+    stats
+}
+
+fn smoothness_half_to_full(root: &Path, name: &str, rc: bool) -> Result<()> {
+    let base = if rc { root.join("tv-rc") } else { root.join("tv-std").join("tv") };
+    let bit_path = base.join("r33").join(format!("{name}.bit"));
+    let bit_bytes = fs::read(&bit_path)
+        .with_context(|| format!("read half-rate vector {}", bit_path.display()))?;
+    if bit_bytes.len() % BYTES_PER_HALFRATE_FRAME != 0 {
+        return Err(anyhow!("half-rate file is not a whole number of frames"));
+    }
+    let n_frames = bit_bytes.len() / BYTES_PER_HALFRATE_FRAME;
+
+    println!(
+        "vector:            {name}{} (half → full smoothness, r33)",
+        if rc { " (rc)" } else { "" }
+    );
+    println!("frames:            {n_frames}");
+    println!();
+
+    let off = measure_smoothness_half_to_full(&bit_bytes, n_frames, false);
+    off.print("Predictor OFF (§4.5 bypassed)");
+    println!();
+    let on = measure_smoothness_half_to_full(&bit_bytes, n_frames, true);
+    on.print("Predictor ON  (§4.5 blend active)");
+    println!();
+
+    print_smoothness_delta(&off, &on);
+    Ok(())
+}
+
+fn print_smoothness_delta(off: &SmoothnessStats, on: &SmoothnessStats) {
+    let off_log = off.log_rms();
+    let on_log = on.log_rms();
+    let delta_log = on_log - off_log;
+    let off_lin = off.linear_rms();
+    let on_lin = on.linear_rms();
+    let delta_lin = on_lin - off_lin;
+    println!("A/B comparison:");
+    println!("  log2-RMS   OFF = {off_log:.4}, ON = {on_log:.4}, Δ = {delta_log:+.4}");
+    println!("  linear-RMS OFF = {off_lin:.2},   ON = {on_lin:.2},   Δ = {delta_lin:+.2}");
+    let lin_better = delta_lin < 0.0;
+    let log_better = delta_log < 0.0;
+    match (lin_better, log_better) {
+        (true, true) => {
+            println!("  ✓ Predictor reduces frame-to-frame magnitude swings in both domains.");
+        }
+        (true, false) => {
+            println!(
+                "  ~ Mixed: linear-RMS improves (predictor IS smoothing in magnitude domain)\n    \
+                   but log-RMS regresses (investigating — likely the §4.3.3 energy-preserving\n    \
+                   offset `+0.5·log₂(R_prev)` introducing log-domain variation on pitch\n    \
+                   transitions). Per-vector behavior varies."
+            );
+        }
+        (false, true) => {
+            println!("  ~ Mixed: log-RMS improves but linear-RMS regresses — unusual pattern.");
+        }
+        (false, false) => {
+            println!("  ✗ Predictor does NOT reduce smoothness in either domain — investigate.");
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
