@@ -111,6 +111,62 @@ impl DecoderState {
     pub fn previous_gamma(&self) -> f64 {
         self.prev_gamma
     }
+
+    /// Snapshot `Λ̃_l(−1)` for `l = 1..=prev_l` as a 1-indexed vector
+    /// of length `prev_l + 1` (entry `[0]` is filler; the reader side
+    /// applies Eq. 186 to derive it). Used by the half-rate analysis
+    /// encoder's matched-decoder roundtrip
+    /// (`codecs::mbe_baseline::analysis` + addendum §0.6.10) to commit
+    /// `Λ̃_l(0)` back into the cross-frame predictor state.
+    pub fn lambda_tilde_snapshot(&self) -> Vec<f64> {
+        let n = self.prev_l as usize;
+        let mut out = Vec::with_capacity(n + 1);
+        out.push(0.0);
+        for l in 1..=n {
+            out.push(self.prev_lambda[l]);
+        }
+        out
+    }
+
+    /// Construct a `DecoderState` from cross-frame half-rate predictor
+    /// values. Used by the analysis encoder's matched-decoder roundtrip
+    /// to seed a wire-decoder with the same `Λ̃(−1)` / `L̃(−1)` / `γ̃(−1)`
+    /// that the just-called `quantize` saw, so the inverse reconstruction
+    /// lands on the bit-exact values the receiver will compute.
+    ///
+    /// `lambda_tilde_prev` is 1-indexed (entry `[0]` ignored) with length
+    /// at least `l_tilde_prev + 1`. Entries past `l_tilde_prev` are
+    /// constant-extrapolated per Eq. 187 at read time.
+    pub fn from_lambda_state(
+        lambda_tilde_prev: &[f64],
+        l_tilde_prev: u8,
+        gamma_tilde_prev: f64,
+    ) -> Self {
+        debug_assert!(l_tilde_prev as usize <= L_MAX as usize);
+        debug_assert!(lambda_tilde_prev.len() > l_tilde_prev as usize);
+        let mut state = Self::new();
+        // Seed the in-range slots; the reader-side Eq. 187 clamping
+        // handles slots past `l_tilde_prev` automatically, but we
+        // populate up to L_MAX for simplicity / round-trip parity
+        // with the decoder's own writeback loop.
+        for l in 1..=l_tilde_prev as usize {
+            state.prev_lambda[l] = lambda_tilde_prev[l];
+        }
+        // Extrapolate to stay symmetric with `dequantize`'s own
+        // writeback: harmonics past l_tilde_prev clamp to the final
+        // value (Eq. 187).
+        let tail = if l_tilde_prev == 0 {
+            1.0
+        } else {
+            lambda_tilde_prev[l_tilde_prev as usize]
+        };
+        for l in (l_tilde_prev as usize + 1)..(L_MAX as usize + 2) {
+            state.prev_lambda[l] = tail;
+        }
+        state.prev_l = l_tilde_prev;
+        state.prev_gamma = gamma_tilde_prev;
+        state
+    }
 }
 
 impl Default for DecoderState {
