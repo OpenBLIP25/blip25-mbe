@@ -196,11 +196,26 @@ impl From<EncodeError> for ConvertError {
 /// Holds the source decoder state, the destination encoder state, and
 /// the cross-rate magnitude predictor state (AMBE-3000 rate-converter
 /// spec §4.5). Call [`Self::convert`] once per 20 ms frame.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct FullToHalfConverter {
     decoder: DecoderState,
     encoder: HalfDecoderState,
     predictor: CrossRatePredictorState,
+    /// Controls whether [`Self::convert`] applies the §4.5 blend. On
+    /// (spec-conformant) by default. Off for A/B validation of the
+    /// predictor's smoothing effect against an unpredicted baseline.
+    predictor_enabled: bool,
+}
+
+impl Default for FullToHalfConverter {
+    fn default() -> Self {
+        Self {
+            decoder: DecoderState::default(),
+            encoder: HalfDecoderState::default(),
+            predictor: CrossRatePredictorState::default(),
+            predictor_enabled: true,
+        }
+    }
 }
 
 impl FullToHalfConverter {
@@ -229,17 +244,21 @@ impl FullToHalfConverter {
         // that snap. If the pitch is out of range, fall through the
         // encoder error path rather than advancing predictor state on
         // a non-committed frame.
-        let blended = match half_encode_pitch(clamped.omega_0()) {
-            Some(b0) => {
-                let target_entry = AMBE_PITCH_TABLE[b0 as usize];
-                cross_rate_blend(
-                    &clamped,
-                    target_entry.omega_0,
-                    target_entry.l,
-                    &mut self.predictor,
-                )
+        let blended = if self.predictor_enabled {
+            match half_encode_pitch(clamped.omega_0()) {
+                Some(b0) => {
+                    let target_entry = AMBE_PITCH_TABLE[b0 as usize];
+                    cross_rate_blend(
+                        &clamped,
+                        target_entry.omega_0,
+                        target_entry.l,
+                        &mut self.predictor,
+                    )
+                }
+                None => clamped,
             }
-            None => clamped,
+        } else {
+            clamped
         };
         let u = quantize_half(&blended, &mut self.encoder).map_err(|e| match e {
             DecodeError::BadPitch => ConvertError::HalfPitchOutOfRange,
@@ -256,6 +275,15 @@ impl FullToHalfConverter {
 
     /// Borrow the cross-rate predictor state.
     pub fn predictor_state(&self) -> &CrossRatePredictorState { &self.predictor }
+
+    /// Enable or disable the §4.5 cross-rate magnitude blend. `true`
+    /// (default, spec-conformant) applies the predictor on every
+    /// voice / tone frame; `false` routes parameters straight from
+    /// source decoder to target encoder without the log-domain blend.
+    /// Intended for A/B validation against an unpredicted baseline.
+    pub fn set_predictor_enabled(&mut self, enabled: bool) {
+        self.predictor_enabled = enabled;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -267,11 +295,25 @@ impl FullToHalfConverter {
 /// Holds the source decoder state, the destination encoder state, and
 /// the cross-rate magnitude predictor state (AMBE-3000 rate-converter
 /// spec §4.5).
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct HalfToFullConverter {
     decoder: HalfDecoderState,
     encoder: DecoderState,
     predictor: CrossRatePredictorState,
+    /// Controls whether [`Self::convert`] applies the §4.5 blend. See
+    /// [`FullToHalfConverter::set_predictor_enabled`] for semantics.
+    predictor_enabled: bool,
+}
+
+impl Default for HalfToFullConverter {
+    fn default() -> Self {
+        Self {
+            decoder: HalfDecoderState::default(),
+            encoder: DecoderState::default(),
+            predictor: CrossRatePredictorState::default(),
+            predictor_enabled: true,
+        }
+    }
 }
 
 impl HalfToFullConverter {
@@ -301,17 +343,21 @@ impl HalfToFullConverter {
         // sees what the full-rate encoder will actually emit. The
         // full-rate encoder snaps ω̂₀ onto the Eq. 47 grid, where
         // L = ⌊4π/ω̃₀⌋ − 39.
-        let blended = match full_encode_pitch(clamped.omega_0()) {
-            Some(b0) => match full_pitch_decode(b0) {
-                Some(target_entry) => cross_rate_blend(
-                    &clamped,
-                    target_entry.omega_0,
-                    target_entry.l,
-                    &mut self.predictor,
-                ),
+        let blended = if self.predictor_enabled {
+            match full_encode_pitch(clamped.omega_0()) {
+                Some(b0) => match full_pitch_decode(b0) {
+                    Some(target_entry) => cross_rate_blend(
+                        &clamped,
+                        target_entry.omega_0,
+                        target_entry.l,
+                        &mut self.predictor,
+                    ),
+                    None => clamped,
+                },
                 None => clamped,
-            },
-            None => clamped,
+            }
+        } else {
+            clamped
         };
         let l = blended.harmonic_count();
         let b = quantize(&blended, &mut self.encoder)?;
@@ -327,6 +373,12 @@ impl HalfToFullConverter {
 
     /// Borrow the cross-rate predictor state.
     pub fn predictor_state(&self) -> &CrossRatePredictorState { &self.predictor }
+
+    /// Enable or disable the §4.5 cross-rate magnitude blend. See
+    /// [`FullToHalfConverter::set_predictor_enabled`] for semantics.
+    pub fn set_predictor_enabled(&mut self, enabled: bool) {
+        self.predictor_enabled = enabled;
+    }
 }
 
 #[cfg(test)]
@@ -666,6 +718,34 @@ mod tests {
             conv.predictor_state().l_prev(),
             before_l,
             "erasure must not advance predictor l_prev"
+        );
+    }
+
+    #[test]
+    fn set_predictor_enabled_false_skips_blend() {
+        // With the predictor off, the converter should route parameters
+        // directly from source decoder to target encoder without
+        // advancing CrossRatePredictorState. Confirmed by observing
+        // that predictor state stays at cold-start across a frame.
+        let mut src_state = DecoderState::new();
+        let mut conv = FullToHalfConverter::new();
+        conv.set_predictor_enabled(false);
+        let initial_omega = conv.predictor_state().omega_0_prev();
+        let initial_l = conv.predictor_state().l_prev();
+
+        let p = sample_params(0.18);
+        let a = fullrate_dibits_from(&p, &mut src_state);
+        let _ = conv.convert(&a).unwrap();
+
+        assert_eq!(
+            conv.predictor_state().omega_0_prev(),
+            initial_omega,
+            "predictor should not advance when disabled"
+        );
+        assert_eq!(
+            conv.predictor_state().l_prev(),
+            initial_l,
+            "predictor l_prev should not advance when disabled"
         );
     }
 
