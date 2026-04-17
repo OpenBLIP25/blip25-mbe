@@ -840,7 +840,9 @@ pub enum EncodeError {
 /// 6. Quantize `G̃` → `b̂₂..b̂₇` (Annex E + F).
 /// 7. Quantize HOC `C̃_{i,k≥2}` → `b̂₈..b̂_{L+1}` (Annex G).
 /// 8. `b̂_{L+2}` is a single sync bit — toggled from `state.prev_sync`.
-/// 9. Update `state.prev_m_linear`, `state.prev_l`, `state.prev_sync`.
+/// 9. Update `state.prev_m_linear` with the matched-decoder reconstruction
+///    of `b` (closed-loop predictor feedback), plus `state.prev_l` and
+///    `state.prev_sync`.
 pub fn quantize(
     params: &MbeParams,
     state: &mut DecoderState,
@@ -893,13 +895,21 @@ pub fn quantize(
     let sync = !state.prev_sync;
     b[(l + 2) as usize] = u16::from(sync);
 
-    // Update state for the next frame: prev_m = the *quantized*
-    // amplitudes of this frame as the decoder would reconstruct them
-    // (so encoder and decoder evolve in lockstep). For an exact
-    // round-trip-able pipeline we use the input M̃ directly.
+    // Update state for the next frame: prev_m must be the matched-decoder
+    // reconstruction of this frame's amplitudes, so the encoder's predictor
+    // state evolves in lockstep with what the wire decoder sees (closed-loop
+    // predictor feedback, per analysis/ambe_encoder_closed_loop_predictor.md).
+    // Feeding the raw input amplitudes here instead would diverge after a
+    // few frames on synthetic sequences — masked on natural speech because
+    // the quantizer is near-lossless there.
+    //
+    // The reconstruction uses `state` unchanged (still holding the prior
+    // frame's `prev_m_linear` and `prev_l`), so it re-runs exactly the
+    // inverse pipeline the wire decoder will run on the same bits.
+    let m_reconstructed = reconstruct_amplitudes_from_bits(&b, l, state);
     state.prev_m_linear[0] = 1.0;
     for i in 1..=l as usize {
-        state.prev_m_linear[i] = params.amplitudes_slice()[i - 1];
+        state.prev_m_linear[i] = m_reconstructed[i - 1];
     }
     state.prev_l = l;
     state.prev_sync = sync;
@@ -1624,6 +1634,62 @@ mod tests {
 
         assert_eq!(b_back[0], b[0], "b̂₀ pitch");
         assert_eq!(b_back[1], b[1], "b̂₁ V/UV");
+    }
+
+    #[test]
+    fn quantize_multi_frame_predictor_state_tracks_decoder() {
+        // Closed-loop invariant (analysis/ambe_encoder_closed_loop_predictor.md):
+        // after each call to quantize(), the encoder's predictor state must
+        // equal what a fresh decoder reconstructs from the same bits. If
+        // the encoder instead stored raw input amplitudes (the pre-2026-04-17
+        // code path), states diverge after the first non-silent frame.
+        use crate::p25_fullrate::priority::prioritize;
+
+        // Use an ω₀ whose decoder pairing lands at L=9 so encoder's
+        // caller-supplied L matches decoder's Eq. 47 lookup — otherwise
+        // the test conflates predictor-state drift with L-pairing disagreement.
+        // b̂₀ = 0 pairs with L=9 at the decoder; encoder inverse uses
+        // encode_pitch to land on the same index.
+        let target_b0 = 0u8;
+        let pitch = pitch_decode(target_b0).unwrap();
+        let l = pitch.l;
+        assert_eq!(l, 9, "sanity: b̂₀=0 pairs with L=9");
+        let omega_0 = pitch.omega_0;
+        // Round-trip the pitch through encode_pitch to make sure quantize()
+        // emits the same b̂₀ (defensive; encoder uses a half-step floor that
+        // can drift if the midpoint is borderline).
+        assert_eq!(encode_pitch(omega_0), Some(target_b0));
+
+        let voiced = [true; 9];
+        let frames: Vec<MbeParams> = [[100.0f32; 9], [400.0; 9], [200.0; 9]]
+            .iter()
+            .map(|amps| MbeParams::new(omega_0, l, &voiced, amps).unwrap())
+            .collect();
+
+        let mut enc = DecoderState::new();
+        let mut dec = DecoderState::new();
+
+        for (i, params) in frames.iter().enumerate() {
+            let b = quantize(params, &mut enc).unwrap();
+            let u = prioritize(&b, l);
+            let _ = dequantize(&u, &mut dec).unwrap();
+
+            // Both state vectors track the same log-magnitude predictor
+            // history after each frame; closed-loop feedback requires them
+            // to be numerically identical.
+            assert_eq!(
+                enc.prev_l, dec.prev_l,
+                "frame {i}: prev_l {} vs {}", enc.prev_l, dec.prev_l
+            );
+            for k in 0..=l as usize {
+                assert!(
+                    (enc.prev_m_linear[k] - dec.prev_m_linear[k]).abs() < 1e-4,
+                    "frame {i}, harmonic {k}: enc={} dec={}",
+                    enc.prev_m_linear[k],
+                    dec.prev_m_linear[k]
+                );
+            }
+        }
     }
 
     // ---- V/UV expansion --------------------------------------------------
