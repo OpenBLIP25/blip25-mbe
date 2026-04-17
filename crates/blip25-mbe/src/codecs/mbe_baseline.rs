@@ -28,6 +28,7 @@ use core::f64::consts::PI as PI64;
 use crate::mbe_params::{L_MAX, MbeParams};
 
 pub mod analysis;
+pub mod phase_regen;
 
 include!(concat!(env!("OUT_DIR"), "/annex_i_synth_window.rs"));
 
