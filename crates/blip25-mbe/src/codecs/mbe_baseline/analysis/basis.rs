@@ -229,7 +229,7 @@ pub fn packed_index(m: i32) -> usize {
 /// in the two-sided range. Slots `0..=128` map to positive `m`;
 /// slots `129..=255` map to `m − 256`.
 #[inline]
-pub(super) fn unpacked_m(idx: usize) -> i32 {
+fn unpacked_m(idx: usize) -> i32 {
     if idx <= DFT_SIZE / 2 {
         idx as i32
     } else {
@@ -245,4 +245,229 @@ pub(super) fn ceil_i32(x: f64) -> i32 {
 #[inline]
 pub(super) fn floor_i32(x: f64) -> i32 {
     x.floor() as i32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::f64::consts::PI;
+
+    #[test]
+    fn bin_endpoints_match_addendum_numerical_example() {
+        let omega0 = 2.0 * PI / 50.0;
+        assert_eq!(HarmonicBasis::bin_endpoints(0, omega0), (-2, 3));
+        assert_eq!(HarmonicBasis::bin_endpoints(1, omega0), (3, 8));
+        assert_eq!(HarmonicBasis::bin_endpoints(2, omega0), (8, 13));
+    }
+
+    /// Per Eq. 27 / Eq. 26, adjacent harmonics share a bin endpoint
+    /// (`b_l = a_{l+1}` exactly), so the supports are contiguous and
+    /// non-overlapping in the integer grid.
+    #[test]
+    fn bin_endpoints_are_contiguous_across_harmonics() {
+        for omega_denom in [20i32, 50, 100, 123] {
+            let omega0 = 2.0 * PI / f64::from(omega_denom);
+            for l in 0..10 {
+                let (_, b_this) = HarmonicBasis::bin_endpoints(l, omega0);
+                let (a_next, _) = HarmonicBasis::bin_endpoints(l + 1, omega0);
+                assert_eq!(
+                    b_this, a_next,
+                    "ω₀ = 2π/{omega_denom}, harmonic {l}: b_l = {b_this}, a_(l+1) = {a_next}"
+                );
+            }
+        }
+    }
+
+    /// `W_R(0) = Σ w_R(n)` falls out of Eq. 30 directly (cosine with
+    /// `k = 0` is identically 1). Sanity check the precomputed table.
+    #[test]
+    fn w_r_zero_equals_window_sum() {
+        let basis = HarmonicBasis::new();
+        let expected: f64 = (-W_R_HALF..=W_R_HALF)
+            .map(|n| f64::from(refinement_window(n)))
+            .sum();
+        assert!(
+            (basis.w_r(0) - expected).abs() < 1e-9,
+            "W_R(0) = {}, expected {}",
+            basis.w_r(0),
+            expected
+        );
+    }
+
+    /// The window is real and symmetric so `W_R(k) = W_R(−k)`.
+    #[test]
+    fn w_r_is_symmetric_in_k() {
+        let basis = HarmonicBasis::new();
+        for k in [1, 7, 64, 100, 500, 1023, 8000] {
+            assert_eq!(basis.w_r(k), basis.w_r(-k), "W_R({k}) != W_R(−{k})");
+        }
+    }
+
+    /// Outside the stored range the accessor clamps to zero.
+    #[test]
+    fn w_r_returns_zero_out_of_range() {
+        let basis = HarmonicBasis::new();
+        assert_eq!(basis.w_r(WINDOW_DFT_SIZE as i32), 0.0);
+        assert_eq!(basis.w_r(-(WINDOW_DFT_SIZE as i32)), 0.0);
+    }
+
+    #[test]
+    fn packed_index_roundtrips_two_sided_range() {
+        for m in -127..=128 {
+            let idx = packed_index(m);
+            assert!(idx < DFT_SIZE, "packed_index({m}) out of bounds");
+            assert_eq!(unpacked_m(idx), m, "roundtrip failed for m = {m}");
+        }
+    }
+
+    /// DFT of the all-zero signal is all-zero.
+    #[test]
+    fn signal_spectrum_of_zero_is_zero() {
+        let signal = [0.0f64; (2 * W_R_HALF + 1) as usize];
+        let sw = signal_spectrum(&signal);
+        for (i, s) in sw.iter().enumerate() {
+            assert!(s.norm_sqr() < 1e-18, "S_w[{i}] = ({}, {})", s.re, s.im);
+        }
+    }
+
+    /// For the constant signal `s(n) = 1`, `S_w(0) = Σ w_R(n) = W_R(0)`.
+    /// A cheap invariant that catches window-indexing mistakes.
+    #[test]
+    fn signal_spectrum_of_constant_matches_w_r_at_dc() {
+        let signal = [1.0f64; (2 * W_R_HALF + 1) as usize];
+        let sw = signal_spectrum(&signal);
+        let basis = HarmonicBasis::new();
+        let s0 = sw[packed_index(0)];
+        assert!(
+            (s0.re - basis.w_r(0)).abs() < 1e-9 && s0.im.abs() < 1e-9,
+            "S_w(0) = ({}, {}), expected ({}, 0)",
+            s0.re,
+            s0.im,
+            basis.w_r(0)
+        );
+    }
+
+    fn cosine_tone(omega0: f64) -> [f64; (2 * W_R_HALF + 1) as usize] {
+        let mut signal = [0.0f64; (2 * W_R_HALF + 1) as usize];
+        for n in -W_R_HALF..=W_R_HALF {
+            signal[(n + W_R_HALF) as usize] = (omega0 * f64::from(n)).cos();
+        }
+        signal
+    }
+
+    fn sine_tone(omega0: f64) -> [f64; (2 * W_R_HALF + 1) as usize] {
+        let mut signal = [0.0f64; (2 * W_R_HALF + 1) as usize];
+        for n in -W_R_HALF..=W_R_HALF {
+            signal[(n + W_R_HALF) as usize] = (omega0 * f64::from(n)).sin();
+        }
+        signal
+    }
+
+    /// For `s(n) = cos(ω₀·n)`, the Eq. 28 projection at the fundamental
+    /// should recover `A_1(ω₀) ≈ 1/2 + 0j` — the `1/2` comes from
+    /// Euler's identity (`cos = (e^{jω₀n} + e^{−jω₀n})/2`), and Eq. 28
+    /// is a least-squares projection onto the window-shifted basis so
+    /// the window-energy denominator normalizes the response to the
+    /// cosine coefficient. Tolerance is loose enough to absorb the
+    /// small image spillover from the `e^{−jω₀n}` term at `−ω₀`.
+    #[test]
+    fn harmonic_projection_recovers_cosine_amplitude() {
+        let basis = HarmonicBasis::new();
+        let omega0 = 2.0 * PI / 50.0;
+        let signal = cosine_tone(omega0);
+        let sw = signal_spectrum(&signal);
+        let a1 = basis.harmonic_amplitude(&sw, 1, omega0);
+        assert!(
+            (a1.re - 0.5).abs() < 0.01 && a1.im.abs() < 0.01,
+            "A_1 = ({}, {}), expected ≈ (0.5, 0)",
+            a1.re,
+            a1.im
+        );
+    }
+
+    /// For `s(n) = sin(ω₀·n)`, `A_1(ω₀) ≈ 0 − j/2`: the `1/(2j)` from
+    /// Euler contributes a pure-imaginary projection.
+    #[test]
+    fn harmonic_projection_recovers_sine_amplitude() {
+        let basis = HarmonicBasis::new();
+        let omega0 = 2.0 * PI / 50.0;
+        let signal = sine_tone(omega0);
+        let sw = signal_spectrum(&signal);
+        let a1 = basis.harmonic_amplitude(&sw, 1, omega0);
+        assert!(
+            a1.re.abs() < 0.01 && (a1.im + 0.5).abs() < 0.01,
+            "A_1 = ({}, {}), expected ≈ (0, −0.5)",
+            a1.re,
+            a1.im
+        );
+    }
+
+    /// A 2nd-harmonic cosine projects onto `A_2(ω₀) ≈ 1/2` and onto
+    /// `A_1(ω₀) ≈ 0` (no fundamental present). Exercises the `l·ω₀`
+    /// offset in the `W_R` index.
+    #[test]
+    fn harmonic_projection_isolates_second_harmonic() {
+        let basis = HarmonicBasis::new();
+        let omega0 = 2.0 * PI / 50.0;
+        let mut signal = [0.0f64; (2 * W_R_HALF + 1) as usize];
+        for n in -W_R_HALF..=W_R_HALF {
+            signal[(n + W_R_HALF) as usize] = (2.0 * omega0 * f64::from(n)).cos();
+        }
+        let sw = signal_spectrum(&signal);
+        let a1 = basis.harmonic_amplitude(&sw, 1, omega0);
+        let a2 = basis.harmonic_amplitude(&sw, 2, omega0);
+        assert!(
+            a1.re.abs() < 0.05 && a1.im.abs() < 0.05,
+            "A_1 leak = ({}, {})",
+            a1.re,
+            a1.im
+        );
+        assert!(
+            (a2.re - 0.5).abs() < 0.01 && a2.im.abs() < 0.01,
+            "A_2 = ({}, {}), expected ≈ (0.5, 0)",
+            a2.re,
+            a2.im
+        );
+    }
+
+    /// `synthetic_bin` reconstructs `A_l · W_R(k)` on each bin. Given
+    /// `A_l(ω₀)` from Eq. 28, the reconstructed `S_w(m, ω₀)` must match
+    /// the signal DFT `S_w(m)` closely on a clean sinusoid (the whole
+    /// point of the projection).
+    #[test]
+    fn synthetic_bin_reconstructs_clean_sinusoid() {
+        let basis = HarmonicBasis::new();
+        let omega0 = 2.0 * PI / 50.0;
+        let signal = cosine_tone(omega0);
+        let sw = signal_spectrum(&signal);
+        let a1 = basis.harmonic_amplitude(&sw, 1, omega0);
+        let (m_lo, m_hi) = HarmonicBasis::bin_endpoints(1, omega0);
+        let mut residual_energy = 0.0;
+        let mut signal_energy = 0.0;
+        for m in m_lo..m_hi {
+            let observed = sw[packed_index(m)];
+            let synthetic = basis.synthetic_bin(m, 1, omega0, a1);
+            let dre = observed.re - synthetic.re;
+            let dim = observed.im - synthetic.im;
+            residual_energy += dre * dre + dim * dim;
+            signal_energy += observed.norm_sqr();
+        }
+        // Well under 1% relative residual on a pure cosine.
+        assert!(
+            residual_energy / signal_energy.max(1e-12) < 0.01,
+            "residual/signal = {}, expected < 0.01",
+            residual_energy / signal_energy.max(1e-12)
+        );
+    }
+
+    /// Zero-denominator guard: when the harmonic's support is empty
+    /// (degenerate `ω₀ = 0` collapses every `⌈a_l⌉ = ⌈b_l⌉ = 0`),
+    /// `harmonic_amplitude` returns `Complex64::ZERO` instead of NaN.
+    #[test]
+    fn harmonic_amplitude_empty_support_returns_zero() {
+        let basis = HarmonicBasis::new();
+        let sw = [Complex64::new(1.0, 1.0); DFT_SIZE];
+        let a0 = basis.harmonic_amplitude(&sw, 0, 0.0);
+        assert_eq!(a0, Complex64::ZERO);
+    }
 }

@@ -172,3 +172,185 @@ pub fn refine_pitch(
         e_r: best_e_r,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use super::super::{W_R_HALF, signal_spectrum};
+
+    #[test]
+    fn refine_offsets_are_symmetric_and_quarter_sample_spaced() {
+        // Spacing 0.25, symmetric around 0, excludes 0.
+        assert!(!REFINE_OFFSETS.contains(&0.0));
+        for i in 1..N_REFINE_CANDIDATES {
+            let step = REFINE_OFFSETS[i] - REFINE_OFFSETS[i - 1];
+            assert!((step - 0.25).abs() < 1e-12, "step at i={i}: {step}");
+        }
+        let sum: f64 = REFINE_OFFSETS.iter().sum();
+        assert!(sum.abs() < 1e-12, "offsets not symmetric, sum = {sum}");
+        // Range is ±9/8.
+        assert_eq!(REFINE_OFFSETS[0], -9.0 / 8.0);
+        assert_eq!(REFINE_OFFSETS[9], 9.0 / 8.0);
+    }
+
+    #[test]
+    fn harmonic_count_respects_admissible_range() {
+        // At ω̂_0 = 2π/123.125 (smallest pitch period): L̂ = ⌊0.9254·(π·123.125/(2π) + 0.25)⌋
+        //                                                  = ⌊0.9254·62.0625⌋ = ⌊57.4⌋ = 57.
+        // Clamped to 56.
+        let omega_lo = 2.0 * core::f64::consts::PI / 123.125;
+        assert_eq!(harmonic_count_for(omega_lo), 56);
+        // At ω̂_0 = 2π/19.875 (largest pitch period): L̂ = ⌊0.9254·(9.9375 + 0.25)⌋
+        //                                                 = ⌊0.9254·10.1875⌋ = ⌊9.43⌋ = 9.
+        let omega_hi = 2.0 * core::f64::consts::PI / 19.875;
+        assert_eq!(harmonic_count_for(omega_hi), 9);
+        // Mid-range spot check: ω̂_0 = 2π/50 → L̂ = ⌊0.9254·(25 + 0.25)⌋ = ⌊23.4⌋ = 23.
+        let omega_mid = 2.0 * core::f64::consts::PI / 50.0;
+        assert_eq!(harmonic_count_for(omega_mid), 23);
+    }
+
+    #[test]
+    fn quantize_pitch_index_covers_full_range() {
+        // Lowest ω̂_0 → b̂_0 = 207.
+        let omega_lo = 2.0 * core::f64::consts::PI / 123.125;
+        assert_eq!(quantize_pitch_index(omega_lo), Some(207));
+        // Highest ω̂_0 → b̂_0 = 0.
+        let omega_hi = 2.0 * core::f64::consts::PI / 19.875;
+        assert_eq!(quantize_pitch_index(omega_hi), Some(0));
+        // Out of range returns None.
+        let omega_too_hi = 2.0 * core::f64::consts::PI / 10.0; // P=10, very high ω
+        assert_eq!(quantize_pitch_index(omega_too_hi), None);
+        let omega_too_lo = 2.0 * core::f64::consts::PI / 250.0; // P=250, very low
+        assert_eq!(quantize_pitch_index(omega_too_lo), None);
+    }
+
+    /// `quantize_pitch_index` and the fullrate decoder's pitch_decode
+    /// must round-trip within one quantization step — the encoder's
+    /// `−39` floor pairs with the decoder's `+39.5` offset to
+    /// implement midtread quantization per addendum §0.4.4.
+    #[test]
+    fn quantize_pitch_index_roundtrips_through_decoder() {
+        use core::f64::consts::PI;
+        // Sweep P and check that quantize(2π/P) reconstructs to within
+        // one quantization step of the input ω.
+        for p_times_2 in 42u32..=244 {
+            // P in half-sample units: 21.0 to 122.0.
+            let p = f64::from(p_times_2) * 0.5;
+            let omega_hat = 2.0 * PI / p;
+            let b0 = quantize_pitch_index(omega_hat).expect("in range");
+            // Decoder: ω̃_0 = 4π / (b̂_0 + 39.5).
+            let omega_tilde = 4.0 * PI / (f64::from(b0) + 39.5);
+            // One quantization step ≈ |dω̃/db̂| = 4π / (b̂+39.5)².
+            let step = 4.0 * PI / (f64::from(b0) + 39.5).powi(2);
+            assert!(
+                (omega_hat - omega_tilde).abs() <= step,
+                "P={p}: ω̂={omega_hat:.6}, ω̃={omega_tilde:.6}, step={step:.6}"
+            );
+        }
+    }
+
+    /// Build a broadband periodic signal: harmonics 1..=max_h at
+    /// amplitudes `1/h` (natural glottal-like rolloff). Populates
+    /// spectral bins across the full range `m ∈ [0, 128]`, so the
+    /// Eq. 24 residual (summed from m=50 upward) has non-trivial
+    /// signal content to fit.
+    fn broadband_periodic(period: f64, max_h: u32) -> [f64; (2 * W_R_HALF + 1) as usize] {
+        let mut signal = [0.0f64; (2 * W_R_HALF + 1) as usize];
+        let omega = 2.0 * core::f64::consts::PI / period;
+        for (idx, slot) in signal.iter_mut().enumerate() {
+            let n = idx as i32 - W_R_HALF;
+            let nf = f64::from(n);
+            let mut s = 0.0;
+            for h in 1..=max_h {
+                s += (f64::from(h) * omega * nf).cos() / f64::from(h);
+            }
+            *slot = s;
+        }
+        signal
+    }
+
+    /// `refine_pitch` returns a refinement within ±1.125 samples of
+    /// `P̂_I` (quarter-sample resolution). Broadband signal so E_R
+    /// above m=50 has non-trivial content.
+    #[test]
+    fn refine_pitch_returns_candidate_within_offset_range() {
+        use core::f64::consts::PI;
+        let basis = HarmonicBasis::new();
+        let signal = broadband_periodic(50.0, 20);
+        let sw = signal_spectrum(&signal);
+        let refined = refine_pitch(&sw, &basis, 50.0);
+        let p_refined = 2.0 * PI / refined.omega_hat;
+        assert!(
+            (p_refined - 50.0).abs() <= 9.0 / 8.0 + 1e-6,
+            "P refined = {p_refined}, out of ±1.125 around 50"
+        );
+        let matches_a_candidate = REFINE_OFFSETS
+            .iter()
+            .any(|&offset| (p_refined - (50.0 + offset)).abs() < 1e-9);
+        assert!(matches_a_candidate, "P refined = {p_refined} not a candidate");
+    }
+
+    /// For a broadband harmonic signal at period 50 with `P̂_I = 50`,
+    /// the refinement should pick a candidate close to 50. Allow ±3/8
+    /// tolerance — the residual landscape around the truth is shallow
+    /// and finite-precision DFT evaluation can push the minimum one
+    /// or two steps off the nearest-to-truth candidate.
+    #[test]
+    fn refine_pitch_picks_close_candidate_on_broadband_signal() {
+        use core::f64::consts::PI;
+        let basis = HarmonicBasis::new();
+        let signal = broadband_periodic(50.0, 20);
+        let sw = signal_spectrum(&signal);
+        let refined = refine_pitch(&sw, &basis, 50.0);
+        let p_refined = 2.0 * PI / refined.omega_hat;
+        assert!(
+            (p_refined - 50.0).abs() <= 3.0 / 8.0 + 1e-6,
+            "P refined = {p_refined}, expected within ±3/8 of 50"
+        );
+    }
+
+    /// L̂, â_l, b̂_l derived parameters are consistent with the refined
+    /// ω̂_0 (matches `harmonic_count_for` and `HarmonicBasis::bin_endpoints`).
+    #[test]
+    fn refine_pitch_derived_parameters_are_consistent() {
+        let basis = HarmonicBasis::new();
+        let signal = broadband_periodic(50.0, 20);
+        let sw = signal_spectrum(&signal);
+        let refined = refine_pitch(&sw, &basis, 50.0);
+        assert_eq!(refined.l_hat, harmonic_count_for(refined.omega_hat));
+        assert_eq!(refined.b0, quantize_pitch_index(refined.omega_hat).unwrap());
+        assert!((L_HAT_MIN..=L_HAT_MAX).contains(&refined.l_hat));
+        assert!(refined.b0 <= B0_MAX);
+    }
+
+    /// Diagnostic: dump E_R for each candidate.
+    #[test]
+    #[ignore]
+    fn probe_dump_residual_e_r() {
+        use core::f64::consts::PI;
+        let basis = HarmonicBasis::new();
+        let omega_truth = 2.0 * PI / 50.0;
+        let mut signal = [0.0f64; (2 * W_R_HALF + 1) as usize];
+        for n in -W_R_HALF..=W_R_HALF {
+            signal[(n + W_R_HALF) as usize] = (omega_truth * f64::from(n)).cos();
+        }
+        let sw = signal_spectrum(&signal);
+        for &offset in &REFINE_OFFSETS {
+            let p = 50.0 + offset;
+            let omega0 = 2.0 * PI / p;
+            let e_r = residual_e_r(&sw, &basis, omega0);
+            println!("  P = {p:6.3} (offset {offset:+.3})  ω₀ = {omega0:.6}  E_R = {e_r:.6e}");
+        }
+    }
+
+    /// Residual is nonnegative (sum of squared magnitudes).
+    #[test]
+    fn refine_pitch_residual_is_nonnegative() {
+        let basis = HarmonicBasis::new();
+        let signal = broadband_periodic(40.0, 15);
+        let sw = signal_spectrum(&signal);
+        let refined = refine_pitch(&sw, &basis, 40.0);
+        assert!(refined.e_r >= 0.0, "E_R = {}", refined.e_r);
+        assert!(refined.e_r.is_finite());
+    }
+}

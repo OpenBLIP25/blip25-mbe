@@ -108,3 +108,56 @@ impl Default for SilenceDetector {
         Self::cold_start()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn silence_detector_cold_start_is_not_silent() {
+        let d = SilenceDetector::cold_start();
+        assert!(!d.is_silent());
+        assert_eq!(d.noise_floor(), SILENCE_ETA_INIT);
+    }
+
+    /// Sustained high energy exits silence after 3 consecutive voice
+    /// votes (cold start begins not-in-silence, so first we need to
+    /// enter silence to test the exit).
+    #[test]
+    fn silence_detector_exits_silence_after_voice_hysteresis() {
+        let mut d = SilenceDetector::cold_start();
+        // Force into silence by feeding many low-energy frames.
+        for _ in 0..20 {
+            d.update(0.0);
+        }
+        assert!(d.is_silent(), "should have entered silence");
+        // Feed loud frames; should exit after SILENCE_EXIT_FRAMES.
+        d.update(1e12);
+        d.update(1e12);
+        assert!(d.is_silent(), "should still be silent after 2 voice frames");
+        d.update(1e12);
+        assert!(
+            !d.is_silent(),
+            "should have exited silence after {SILENCE_EXIT_FRAMES} voice frames"
+        );
+    }
+
+    /// Sustained low energy enters silence after 5 consecutive silent
+    /// votes. First need to establish a nonzero noise floor.
+    #[test]
+    fn silence_detector_enters_silence_after_hysteresis() {
+        let mut d = SilenceDetector::cold_start();
+        // Bring η up to a high value first by feeding loud frames,
+        // so subsequent 0-energy frames cleanly vote silent.
+        for _ in 0..30 {
+            d.update(1e8);
+        }
+        assert!(!d.is_silent(), "loud frames should not be silent");
+        // Now feed silent frames.
+        for i in 0..SILENCE_ENTER_FRAMES {
+            assert!(!d.is_silent(), "should not be silent before {i} silent frames");
+            d.update(0.0);
+        }
+        assert!(d.is_silent(), "should have entered silence after enter-hysteresis");
+    }
+}

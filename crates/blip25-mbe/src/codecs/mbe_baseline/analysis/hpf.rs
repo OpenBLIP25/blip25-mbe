@@ -55,3 +55,75 @@ impl HpfState {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Zero input → zero output (HPF is LTI and has zero state at cold start).
+    #[test]
+    fn hpf_zero_input_is_zero_output() {
+        let mut hpf = HpfState::new();
+        for _ in 0..1000 {
+            assert_eq!(hpf.step(0.0), 0.0);
+        }
+    }
+
+    /// DC input → output decays to zero. With input `x = 1.0` forever,
+    /// `y[n] = y[n−1] · 0.99 + (1 − 1) = 0.99·y[n−1]` after the first
+    /// step. The first step is `y[0] = 1 − 0 + 0 = 1`, then `y[1] =
+    /// 1 − 1 + 0.99·1 = 0.99`, `y[2] = 0.99² · 1 = 0.9801`, etc.
+    /// After many samples the output should asymptote to zero.
+    #[test]
+    fn hpf_blocks_dc() {
+        let mut hpf = HpfState::new();
+        let mut last = 0.0;
+        for i in 0..2000 {
+            last = hpf.step(1.0);
+            if i == 0 {
+                assert!((last - 1.0).abs() < 1e-12, "y[0] = {last}");
+            }
+        }
+        assert!(last.abs() < 1e-6, "DC not blocked: y[1999] = {last}");
+    }
+
+    /// Run_pcm promotes i16 samples to f64 correctly.
+    #[test]
+    fn hpf_run_pcm_matches_step_loop() {
+        let pcm: Vec<i16> = (0..32).map(|i| (i * 100) as i16).collect();
+        let mut expected = vec![0.0; pcm.len()];
+        let mut hpf_a = HpfState::new();
+        for (i, &x) in pcm.iter().enumerate() {
+            expected[i] = hpf_a.step(f64::from(x));
+        }
+        let mut actual = vec![0.0; pcm.len()];
+        let mut hpf_b = HpfState::new();
+        hpf_b.run_pcm(&pcm, &mut actual);
+        assert_eq!(actual, expected);
+    }
+
+    /// HPF is LTI: `filter(a·x + b·y) = a·filter(x) + b·filter(y)`,
+    /// subject to matched initial state.
+    #[test]
+    fn hpf_is_linear_and_time_invariant() {
+        let x: Vec<f64> = (0..200).map(|n| (n as f64 * 0.1).sin()).collect();
+        let y: Vec<f64> = (0..200).map(|n| (n as f64 * 0.05).cos()).collect();
+        let mut a_buf = x.clone();
+        let mut b_buf = y.clone();
+        HpfState::new().run_in_place(&mut a_buf);
+        HpfState::new().run_in_place(&mut b_buf);
+        let mut combined: Vec<f64> = x
+            .iter()
+            .zip(y.iter())
+            .map(|(xi, yi)| 2.0 * xi + 3.0 * yi)
+            .collect();
+        HpfState::new().run_in_place(&mut combined);
+        for (i, (&c, (&a, &b))) in combined.iter().zip(a_buf.iter().zip(b_buf.iter())).enumerate() {
+            let expected = 2.0 * a + 3.0 * b;
+            assert!(
+                (c - expected).abs() < 1e-9,
+                "LTI violated at i={i}: {c} vs {expected}"
+            );
+        }
+    }
+}

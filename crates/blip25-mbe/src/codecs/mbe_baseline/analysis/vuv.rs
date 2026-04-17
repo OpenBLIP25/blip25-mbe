@@ -31,12 +31,12 @@ const THETA_PITCH_BAND_COEF: f64 = 0.3096;
 #[derive(Clone, Debug)]
 pub struct VuvState {
     /// `ξ_max(−1)` — previous frame's tracked peak envelope.
-    pub(super) xi_max: f64,
+    xi_max: f64,
     /// `v̂_k(−1)` — previous frame's decisions, 1-indexed.
-    pub(super) vuv_prev: [u8; (K_HAT_MAX + 1) as usize],
+    vuv_prev: [u8; (K_HAT_MAX + 1) as usize],
     /// `K̂(−1)` — previous frame's band count (unused slots past this
     /// index are 0).
-    pub(super) k_prev: u8,
+    k_prev: u8,
 }
 
 impl VuvState {
@@ -247,5 +247,250 @@ pub fn determine_vuv(
         m_xi,
         xi_0,
         xi_max_after: xi_max_new,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use super::super::{L_HAT_MAX, L_HAT_MIN, W_R_HALF, refine_pitch, signal_spectrum};
+
+    /// Helper: broadband periodic signal for VUV tests (same as §0.4/§0.5).
+    fn broadband_periodic(period: f64, max_h: u32) -> [f64; (2 * W_R_HALF + 1) as usize] {
+        let mut signal = [0.0f64; (2 * W_R_HALF + 1) as usize];
+        let omega = 2.0 * core::f64::consts::PI / period;
+        for (idx, slot) in signal.iter_mut().enumerate() {
+            let n = idx as i32 - W_R_HALF;
+            let nf = f64::from(n);
+            let mut s = 0.0;
+            for h in 1..=max_h {
+                s += (f64::from(h) * omega * nf).cos() / f64::from(h);
+            }
+            *slot = s;
+        }
+        signal
+    }
+
+    #[test]
+    fn band_count_matches_eq34_table() {
+        // Table values from addendum §0.7.1.
+        assert_eq!(band_count_for(9), 3);
+        assert_eq!(band_count_for(10), 4);
+        assert_eq!(band_count_for(11), 4);
+        assert_eq!(band_count_for(12), 4);
+        assert_eq!(band_count_for(36), 12);
+        assert_eq!(band_count_for(37), 12);
+        assert_eq!(band_count_for(56), 12);
+        // Spot-check monotonicity across the admissible range.
+        let mut prev = 0u8;
+        for l in L_HAT_MIN..=L_HAT_MAX {
+            let k = band_count_for(l);
+            assert!(k >= prev, "K̂({l}) = {k}, prev = {prev}");
+            assert!(k <= K_HAT_MAX);
+            prev = k;
+        }
+    }
+
+    #[test]
+    fn vuv_state_cold_start_matches_spec() {
+        let s = VuvState::cold_start();
+        assert_eq!(s.xi_max(), XI_MAX_FLOOR);
+        for k in 0..=K_HAT_MAX {
+            assert_eq!(s.vuv_prev(k), 0);
+        }
+        // Out-of-range access is zero, not a panic.
+        assert_eq!(s.vuv_prev(K_HAT_MAX + 1), 0);
+    }
+
+    /// `ξ_max` attack case (Eq. 41 Case 1): when `ξ_0 > ξ_max(−1)`,
+    /// the tracker moves halfway toward the current frame's `ξ_0`.
+    /// Drive this directly by constructing a signal with `ξ_0` larger
+    /// than the cold-start floor.
+    #[test]
+    fn vuv_xi_max_attack_blends_50_50() {
+        let basis = HarmonicBasis::new();
+        // Broadband signal → non-trivial ξ_0.
+        let signal = broadband_periodic(50.0, 20);
+        let sw = signal_spectrum(&signal);
+        let refinement = refine_pitch(&sw, &basis, 50.0);
+        let mut state = VuvState::cold_start();
+        let prev_xi_max = state.xi_max;
+        let res = determine_vuv(&sw, &basis, &refinement, 0.1, &mut state);
+
+        // Compute the ξ_0 we expect internally.
+        let wr_dc = basis.w_r(0);
+        let inv = 1.0 / (wr_dc * wr_dc);
+        let mut xi_lf = 0.0;
+        for m in 0..=63 {
+            xi_lf += sw[m].norm_sqr();
+        }
+        xi_lf *= inv;
+        let mut xi_hf = 0.0;
+        for m in 64..=128 {
+            xi_hf += sw[m].norm_sqr();
+        }
+        xi_hf *= inv;
+        let xi_0 = xi_lf + xi_hf;
+        if xi_0 > prev_xi_max {
+            let expected = 0.5 * prev_xi_max + 0.5 * xi_0;
+            assert!(
+                (res.xi_max_after - expected).abs() < 1e-6 * expected.abs().max(1.0),
+                "xi_max_after = {}, expected = {}",
+                res.xi_max_after,
+                expected
+            );
+        }
+    }
+
+    /// Silent frame: `ξ_0 ≈ 0`, Eq. 41 Case 2 would give decay ≈ 0.99·20000 = 19800
+    /// (below floor), so Case 3 clamps to the floor.
+    #[test]
+    fn vuv_xi_max_stays_at_floor_on_silence() {
+        let basis = HarmonicBasis::new();
+        let signal = [0.0f64; (2 * W_R_HALF + 1) as usize];
+        let sw = signal_spectrum(&signal);
+        // Fabricate a refinement for silence — exact values don't
+        // matter here since all D_k denominators are zero.
+        let refinement = PitchRefinement {
+            omega_hat: 2.0 * core::f64::consts::PI / 50.0,
+            l_hat: 23,
+            b0: 41,
+            e_r: 0.0,
+        };
+        let mut state = VuvState::cold_start();
+        let res = determine_vuv(&sw, &basis, &refinement, 0.1, &mut state);
+        assert_eq!(res.xi_max_after, XI_MAX_FLOOR);
+    }
+
+    /// `K̂` matches the band count derived from the refinement's `L̂`.
+    #[test]
+    fn vuv_result_k_hat_matches_band_count() {
+        let basis = HarmonicBasis::new();
+        let signal = broadband_periodic(50.0, 20);
+        let sw = signal_spectrum(&signal);
+        let refinement = refine_pitch(&sw, &basis, 50.0);
+        let mut state = VuvState::cold_start();
+        let res = determine_vuv(&sw, &basis, &refinement, 0.1, &mut state);
+        assert_eq!(res.k_hat, band_count_for(refinement.l_hat));
+        assert!(res.k_hat <= K_HAT_MAX);
+    }
+
+    /// On silent input, every `D_k` falls back to 1.0 (denominator
+    /// zero → "no confidence" convention), forcing unvoiced.
+    #[test]
+    fn vuv_silent_input_yields_all_unvoiced() {
+        let basis = HarmonicBasis::new();
+        let signal = [0.0f64; (2 * W_R_HALF + 1) as usize];
+        let sw = signal_spectrum(&signal);
+        let refinement = PitchRefinement {
+            omega_hat: 2.0 * core::f64::consts::PI / 50.0,
+            l_hat: 23,
+            b0: 41,
+            e_r: 0.0,
+        };
+        let mut state = VuvState::cold_start();
+        let res = determine_vuv(&sw, &basis, &refinement, 0.1, &mut state);
+        for k in 1..=res.k_hat {
+            assert_eq!(res.vuv[k as usize], 0, "band {k} voiced on silence");
+            assert_eq!(res.d_k[k as usize], 1.0);
+        }
+    }
+
+    /// Poor-pitch-match case (Eq. 37 Case 1): when `E(P̂_I) > 0.5`,
+    /// bands `k ≥ 2` get `Θ_ξ = 0`, forcing unvoiced for those bands.
+    /// Band 1 is exempt from this forcing rule.
+    #[test]
+    fn vuv_poor_pitch_match_forces_bands_2_plus_unvoiced() {
+        let basis = HarmonicBasis::new();
+        // Broadband signal makes some bands naturally voiced with a
+        // good pitch. We'll then tell determine_vuv that E(P̂_I) is
+        // high to trigger the poor-match rule on bands 2+.
+        let signal = broadband_periodic(50.0, 20);
+        let sw = signal_spectrum(&signal);
+        let refinement = refine_pitch(&sw, &basis, 50.0);
+        let mut state = VuvState::cold_start();
+        let res = determine_vuv(&sw, &basis, &refinement, 0.75, &mut state);
+        for k in 2..=res.k_hat {
+            assert_eq!(
+                res.vuv[k as usize], 0,
+                "band {k} voiced under poor pitch match"
+            );
+        }
+    }
+
+    /// Hysteresis: a band that was voiced last frame uses the higher
+    /// threshold `0.5625` vs the lower `0.45` from cold start. For a
+    /// borderline `D_k` between the two thresholds, the band flips
+    /// from voiced (with history) to unvoiced (without).
+    #[test]
+    fn vuv_hysteresis_threshold_depends_on_previous_decision() {
+        // This test checks the structural property: with identical
+        // inputs, a state carrying v̂_k(−1) = 1 produces at least as
+        // many voiced bands as a cold-start state (higher threshold
+        // = easier to stay voiced). It does not claim a specific band
+        // flips — that depends on the exact D_k values.
+        let basis = HarmonicBasis::new();
+        let signal = broadband_periodic(50.0, 20);
+        let sw = signal_spectrum(&signal);
+        let refinement = refine_pitch(&sw, &basis, 50.0);
+        let mut cold = VuvState::cold_start();
+        let res_cold = determine_vuv(&sw, &basis, &refinement, 0.1, &mut cold);
+
+        let mut warm = VuvState::cold_start();
+        // Pre-seed warm state with v̂_k(−1) = 1 for all bands.
+        for k in 1..=K_HAT_MAX {
+            warm.vuv_prev[k as usize] = 1;
+        }
+        warm.k_prev = K_HAT_MAX;
+        let res_warm = determine_vuv(&sw, &basis, &refinement, 0.1, &mut warm);
+
+        let count_cold: u32 = (1..=res_cold.k_hat)
+            .map(|k| u32::from(res_cold.vuv[k as usize]))
+            .sum();
+        let count_warm: u32 = (1..=res_warm.k_hat)
+            .map(|k| u32::from(res_warm.vuv[k as usize]))
+            .sum();
+        assert!(
+            count_warm >= count_cold,
+            "warm voiced count {count_warm} < cold voiced count {count_cold}"
+        );
+    }
+
+    /// State commit: after `determine_vuv`, the `state`'s `vuv_prev`
+    /// and `xi_max` reflect the current frame's decisions and tracker.
+    #[test]
+    fn vuv_state_is_committed_after_call() {
+        let basis = HarmonicBasis::new();
+        let signal = broadband_periodic(50.0, 20);
+        let sw = signal_spectrum(&signal);
+        let refinement = refine_pitch(&sw, &basis, 50.0);
+        let mut state = VuvState::cold_start();
+        let res = determine_vuv(&sw, &basis, &refinement, 0.1, &mut state);
+        assert_eq!(state.xi_max, res.xi_max_after);
+        for k in 1..=res.k_hat {
+            assert_eq!(state.vuv_prev[k as usize], res.vuv[k as usize]);
+        }
+        // Slots past k_hat are zeroed.
+        for k in (res.k_hat + 1)..=K_HAT_MAX {
+            assert_eq!(state.vuv_prev[k as usize], 0);
+        }
+    }
+
+    /// `D_k` is in `[0, ~2]` on realistic inputs — it's a ratio of
+    /// L2 residual to L2 signal, so exactly 0 means perfect fit and
+    /// exactly 1 means synth is orthogonal to the observation.
+    /// Degenerate denominator → 1.0 fallback.
+    #[test]
+    fn vuv_d_k_values_are_bounded_and_finite() {
+        let basis = HarmonicBasis::new();
+        let signal = broadband_periodic(50.0, 20);
+        let sw = signal_spectrum(&signal);
+        let refinement = refine_pitch(&sw, &basis, 50.0);
+        let mut state = VuvState::cold_start();
+        let res = determine_vuv(&sw, &basis, &refinement, 0.1, &mut state);
+        for k in 1..=res.k_hat {
+            let d = res.d_k[k as usize];
+            assert!(d.is_finite() && d >= 0.0, "D_{k} = {d}");
+        }
     }
 }

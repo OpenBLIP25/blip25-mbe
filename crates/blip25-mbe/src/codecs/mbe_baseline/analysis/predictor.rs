@@ -186,6 +186,177 @@ pub fn compute_prediction_residual(
     t_hat
 }
 
+#[cfg(test)]
+mod fullrate_tests {
+    use super::*;
+
+    #[test]
+    fn predictor_state_cold_start_matches_spec() {
+        let st = PredictorState::cold_start();
+        assert_eq!(st.l_tilde_prev(), L_TILDE_COLD_START);
+        // M̃_l(−1) = 1.0 for all l per §6.3 prose; log₂ 1 = 0 makes the
+        // first-frame predictor contribution vanish.
+        for l in 0..=L_HAT_MAX as u32 {
+            assert_eq!(st.read(l), 1.0, "M̃_{l}(−1) = {}", st.read(l));
+        }
+    }
+
+    #[test]
+    fn predictor_state_read_applies_eq56_eq57_boundaries() {
+        let mut st = PredictorState::cold_start();
+        // Commit a short vector with distinct values to see the boundaries.
+        let mut m_tilde = [0.0f64; L_HAT_MAX as usize + 1];
+        m_tilde[1] = 2.0;
+        m_tilde[2] = 4.0;
+        m_tilde[3] = 8.0;
+        st.commit(&m_tilde, 3);
+        // Eq. 56: M̃_0 = 1.0.
+        assert_eq!(st.read(0), 1.0);
+        // Interior values.
+        assert_eq!(st.read(1), 2.0);
+        assert_eq!(st.read(3), 8.0);
+        // Eq. 57: beyond L̃(−1), clamp to last.
+        assert_eq!(st.read(4), 8.0);
+        assert_eq!(st.read(30), 8.0);
+    }
+
+    /// On cold start, `M̃_l(−1) = 1.0` for all l, so `log₂` of every
+    /// past value is 0 and the predictor contributes zero. The
+    /// residual `T̂_l` equals `log₂ M̂_l(0)` exactly.
+    #[test]
+    fn compute_prediction_residual_cold_start_equals_log2_amplitude() {
+        let st = PredictorState::cold_start();
+        let mut m_hat = [0.0f64; L_HAT_MAX as usize + 1];
+        // Fill with distinct positive values.
+        for l in 1..=12u32 {
+            m_hat[l as usize] = f64::from(l) * 0.5 + 1.0;
+        }
+        let t_hat = compute_prediction_residual(&m_hat, 12, &st);
+        for l in 1..=12u32 {
+            let expected = m_hat[l as usize].log2();
+            assert!(
+                (t_hat[l as usize] - expected).abs() < 1e-12,
+                "T̂_{l} = {}, expected log₂({}) = {}",
+                t_hat[l as usize],
+                m_hat[l as usize],
+                expected
+            );
+        }
+    }
+
+    /// Mean-preservation invariant: `mean_l T̂_l = mean_l log₂ M̂_l(0)`
+    /// by construction (the mean-removed predictor term has mean 0).
+    #[test]
+    fn compute_prediction_residual_preserves_mean_of_log2_amplitude() {
+        let mut st = PredictorState::cold_start();
+        // Seed past state with non-trivial values so ρ·P has teeth.
+        let mut past = [0.0f64; L_HAT_MAX as usize + 1];
+        for l in 1..=20u32 {
+            past[l as usize] = 1.0 + f64::from(l) * 0.1; // M̃ ∈ [1.1, 3.0]
+        }
+        st.commit(&past, 20);
+
+        let mut m_hat = [0.0f64; L_HAT_MAX as usize + 1];
+        for l in 1..=18u32 {
+            m_hat[l as usize] = 0.5 + f64::from(l) * 0.2;
+        }
+        let l_hat = 18u8;
+        let t_hat = compute_prediction_residual(&m_hat, l_hat, &st);
+
+        let t_mean: f64 = (1..=u32::from(l_hat))
+            .map(|l| t_hat[l as usize])
+            .sum::<f64>()
+            / f64::from(l_hat);
+        let log_m_mean: f64 = (1..=u32::from(l_hat))
+            .map(|l| m_hat[l as usize].log2())
+            .sum::<f64>()
+            / f64::from(l_hat);
+        assert!(
+            (t_mean - log_m_mean).abs() < 1e-12,
+            "mean(T̂) = {t_mean}, mean(log₂ M̂) = {log_m_mean}"
+        );
+    }
+
+    /// When `M̂_l(0) = M̃_l(−1)` exactly (perfect prediction),
+    /// `T̂_l = (1−ρ)·log₂ M̂_l + ρ·mean(log₂ M̂)` — a partial blend
+    /// toward the mean weighted by the predictor coefficient.
+    #[test]
+    fn compute_prediction_residual_partial_blend_when_prediction_perfect() {
+        let mut st = PredictorState::cold_start();
+        let mut m_same = [0.0f64; L_HAT_MAX as usize + 1];
+        for l in 1..=16u32 {
+            m_same[l as usize] = 1.0 + f64::from(l) * 0.3;
+        }
+        st.commit(&m_same, 16);
+        let t_hat = compute_prediction_residual(&m_same, 16, &st);
+
+        let log_mean: f64 = (1..=16u32)
+            .map(|l| m_same[l as usize].log2())
+            .sum::<f64>()
+            / 16.0;
+        let rho = fullrate_rho_f64(16);
+        for l in 1..=16u32 {
+            let log_m = m_same[l as usize].log2();
+            let expected = (1.0 - rho) * log_m + rho * log_mean;
+            assert!(
+                (t_hat[l as usize] - expected).abs() < 1e-9,
+                "T̂_{l} = {}, expected (1-ρ)·log + ρ·mean = {}",
+                t_hat[l as usize],
+                expected
+            );
+        }
+    }
+
+    /// `L̂ ≠ L̃(−1)` mismatch: Eq. 52/53 linear interpolation handles
+    /// the harmonic-index mapping. Sanity-check that the residual is
+    /// well-defined (finite) across a rising/falling L̂ transition.
+    #[test]
+    fn compute_prediction_residual_handles_l_hat_mismatch() {
+        let mut st = PredictorState::cold_start();
+        let mut past = [0.0f64; L_HAT_MAX as usize + 1];
+        for l in 1..=10u32 {
+            past[l as usize] = 2.0_f64.powf(f64::from(l) * 0.1);
+        }
+        st.commit(&past, 10); // L̃(−1) = 10
+
+        let mut m_hat = [0.0f64; L_HAT_MAX as usize + 1];
+        for l in 1..=25u32 {
+            m_hat[l as usize] = 2.0_f64.powf(f64::from(l) * 0.05);
+        }
+        // Current frame has more harmonics than the past frame.
+        let t_hat = compute_prediction_residual(&m_hat, 25, &st);
+        for l in 1..=25u32 {
+            assert!(t_hat[l as usize].is_finite(), "T̂_{l} = {}", t_hat[l as usize]);
+        }
+        // And the other direction: current frame has fewer harmonics.
+        let t_hat_shrink = compute_prediction_residual(&m_hat, 5, &st);
+        for l in 1..=5u32 {
+            assert!(
+                t_hat_shrink[l as usize].is_finite(),
+                "T̂_{l} (shrink) = {}",
+                t_hat_shrink[l as usize]
+            );
+        }
+    }
+
+    /// `fullrate_rho_f64` matches the Eq. 55 schedule (within the
+    /// f32→f64 cast precision of the underlying helper).
+    #[test]
+    fn fullrate_rho_matches_eq55_schedule_points() {
+        let tol = 1e-5;
+        // L̂ ≤ 15 → 0.40.
+        assert!((fullrate_rho_f64(9) - 0.40).abs() < tol);
+        assert!((fullrate_rho_f64(15) - 0.40).abs() < tol);
+        // 15 < L̂ ≤ 24 → 0.03·L − 0.05.
+        assert!((fullrate_rho_f64(16) - 0.43).abs() < tol);
+        assert!((fullrate_rho_f64(20) - 0.55).abs() < tol);
+        assert!((fullrate_rho_f64(24) - 0.67).abs() < tol);
+        // L̂ > 24 → 0.70.
+        assert!((fullrate_rho_f64(25) - 0.70).abs() < tol);
+        assert!((fullrate_rho_f64(56) - 0.70).abs() < tol);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Half-rate predictor (addendum §0.6.10 / BABA-A §14.3, Eq. 150–157).
 //

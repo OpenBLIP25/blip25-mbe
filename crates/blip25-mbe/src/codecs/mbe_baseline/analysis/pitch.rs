@@ -83,15 +83,15 @@ pub fn compute_s_lpf(s_input: &[f64; PITCH_INPUT_LEN]) -> [f64; (2 * W_I_HALF + 
 #[derive(Clone, Debug)]
 pub struct PitchSearch {
     /// `Σ_{j} s²_LPF(j) · w²_I(j)` — total windowed energy.
-    pub(super) energy: f64,
+    energy: f64,
     /// `Σ w_I⁴(j)` — window-dependent denominator constant (Eq. 5).
-    pub(super) w_i_fourth_moment: f64,
+    w_i_fourth_moment: f64,
     /// `r(t) = Σ_{j} s_LPF(j)·w²_I(j) · s_LPF(j+t)·w²_I(j+t)` for
     /// `t ∈ [0, R_MAX_LAG]` per addendum §0.3.2 Eq. 7.
     ///
     /// `R_MAX_LAG = W_I_HALF = 150`: Eq. 5's sum reaches lags
     /// `n·P` with `|n| ≤ ⌊150/P⌋`, so `|n·P| ≤ 150` by construction.
-    pub(super) r: [f64; R_MAX_LAG + 1],
+    r: [f64; R_MAX_LAG + 1],
 }
 
 const R_MAX_LAG: usize = W_I_HALF as usize;
@@ -338,5 +338,228 @@ pub fn decide_initial_pitch(p_b: f64, ce_b: f64, p_f: f64, ce_f: f64) -> f64 {
         p_b
     } else {
         p_f
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn snap_to_pitch_grid_rounds_to_half_sample() {
+        assert_eq!(snap_to_pitch_grid(50.0), Some(50.0));
+        assert_eq!(snap_to_pitch_grid(50.1), Some(50.0));
+        assert_eq!(snap_to_pitch_grid(50.25), Some(50.5)); // round-half-to-even on doubles
+        assert_eq!(snap_to_pitch_grid(50.3), Some(50.5));
+        assert_eq!(snap_to_pitch_grid(50.7), Some(50.5));
+        assert_eq!(snap_to_pitch_grid(50.8), Some(51.0));
+    }
+
+    #[test]
+    fn snap_to_pitch_grid_rejects_out_of_range() {
+        // 20.9 rounds up to 21.0 (borderline in-range).
+        assert_eq!(snap_to_pitch_grid(20.9), Some(21.0));
+        // 20.6 rounds to 20.5, out of range — rejected.
+        assert_eq!(snap_to_pitch_grid(20.6), None);
+        // Values well below the grid are rejected.
+        assert_eq!(snap_to_pitch_grid(10.0), None);
+        assert_eq!(snap_to_pitch_grid(200.0), None);
+        // Exactly on the boundaries: in-range.
+        assert_eq!(snap_to_pitch_grid(21.0), Some(21.0));
+        assert_eq!(snap_to_pitch_grid(122.0), Some(122.0));
+    }
+
+    /// On a silent frame `E(P) = 1.0` per the Eq. 5 silence guard.
+    #[test]
+    fn e_of_p_is_one_on_silence() {
+        let s = [0.0f64; PITCH_INPUT_LEN];
+        let search = PitchSearch::new(&s);
+        for p in [21.0, 50.0, 100.0, 122.0] {
+            assert_eq!(search.e_of_p(p), 1.0, "P = {p}");
+        }
+    }
+
+    /// `argmin_in_range` returns a grid value and restricts to the
+    /// requested window (clamped to the full grid bounds).
+    #[test]
+    fn argmin_in_range_clamps_and_returns_grid_value() {
+        let s = [0.1f64; PITCH_INPUT_LEN]; // non-silent, unstructured
+        let search = PitchSearch::new(&s);
+        let (p, _) = search.argmin_in_range(40.0, 60.0);
+        assert!((40.0..=60.0).contains(&p), "P = {p} out of [40, 60]");
+        // P is on the half-sample grid.
+        let doubled = (p * 2.0).round();
+        assert!((doubled / 2.0 - p).abs() < 1e-9, "P = {p} not on grid");
+    }
+
+    fn periodic_input(period: f64) -> [f64; PITCH_INPUT_LEN] {
+        // Sum of a few harmonics so the *squared* envelope has
+        // fundamental period equal to `period`, not period/2. A pure
+        // cosine would have period/2 in its squared envelope.
+        let mut s = [0.0f64; PITCH_INPUT_LEN];
+        let omega = 2.0 * core::f64::consts::PI / period;
+        for (idx, slot) in s.iter_mut().enumerate() {
+            let n = idx as i32 - PITCH_INPUT_HALF;
+            let nf = f64::from(n);
+            *slot = (omega * nf).cos()
+                + 0.5 * (2.0 * omega * nf).cos()
+                + 0.25 * (3.0 * omega * nf).cos();
+        }
+        s
+    }
+
+    /// `argmin_in_range` actually finds the minimum `E(P)` in the
+    /// requested window — confirmed by brute-force sweep. (This is a
+    /// pure correctness check on the search loop, not a claim about
+    /// which pitch "should" win for a given signal; that end-to-end
+    /// property depends on real PCM against DVSI vectors, since
+    /// perfectly periodic synthetic signals can't exercise the
+    /// tracking + cascade semantics — every `E(nP)` is too negative
+    /// for the Eq. 18/19/20 thresholds to prune spurious
+    /// sub-multiples.)
+    #[test]
+    fn argmin_in_range_matches_brute_force_sweep() {
+        let s = periodic_input(50.0);
+        let search = PitchSearch::new(&s);
+        for (p_lo, p_hi) in [(21.0, 122.0), (40.0, 60.0), (80.0, 100.0), (45.0, 55.0)] {
+            let (p_hat, e_hat) = search.argmin_in_range(p_lo, p_hi);
+            // Sweep the grid within [p_lo, p_hi] and collect the true minimum.
+            let mut brute_min = f64::INFINITY;
+            let mut brute_p = p_hat;
+            let mut p = PITCH_GRID_MIN;
+            while p <= PITCH_GRID_MAX {
+                if p >= p_lo && p <= p_hi {
+                    let e = search.e_of_p(p);
+                    if e < brute_min {
+                        brute_min = e;
+                        brute_p = p;
+                    }
+                }
+                p += PITCH_GRID_STEP;
+            }
+            assert!(
+                (e_hat - brute_min).abs() < 1e-12 && (p_hat - brute_p).abs() < 1e-9,
+                "[{p_lo}, {p_hi}]: argmin_in_range returned ({p_hat}, {e_hat}), \
+                 brute = ({brute_p}, {brute_min})"
+            );
+        }
+    }
+
+    /// Diagnostic probe: dump E(P) across the grid for a synthetic
+    /// periodic signal. Not a true test — just prints the curve so
+    /// failures can be reasoned about. Gated behind nocapture.
+    #[test]
+    #[ignore]
+    fn probe_dump_e_of_p() {
+        for true_p in [50.0, 65.0, 80.0, 100.0] {
+            let s = periodic_input(true_p);
+            let search = PitchSearch::new(&s);
+            let (p_hat, e_hat) = search.argmin_in_range(PITCH_GRID_MIN, PITCH_GRID_MAX);
+            println!("\n=== true_p = {true_p} ===");
+            println!("argmin: P̂ = {p_hat}, E = {e_hat:.4}");
+            println!("energy = {:.4e}", search.energy);
+            println!("w_i_fourth_moment = {:.4e}", search.w_i_fourth_moment);
+            let mut p = PITCH_GRID_MIN;
+            while p <= PITCH_GRID_MAX {
+                let e = search.e_of_p(p);
+                if p == true_p || p == p_hat || (p - PITCH_GRID_MIN) % 10.0 == 0.0 {
+                    println!("  E({p:6.1}) = {e:+.4}");
+                }
+                p += PITCH_GRID_STEP;
+            }
+        }
+    }
+
+    /// `look_back` with cold-start context returns `CE_B = E(P̂_B)`
+    /// because `E_{−1} = E_{−2} = 0` per §0.3.7.
+    #[test]
+    fn look_back_cold_start_has_zero_history_contribution() {
+        let s = periodic_input(50.0);
+        let search = PitchSearch::new(&s);
+        let ctx = LookBackContext::cold_start();
+        let (p_b, ce_b) = look_back(&search, ctx);
+        // P̂_B falls in [0.8·100, 1.2·100] = [80, 120].
+        assert!(
+            (80.0..=120.0).contains(&p_b),
+            "P̂_B = {p_b} out of [80, 120]"
+        );
+        // CE_B = E(P̂_B) + 0 + 0.
+        let e_b = search.e_of_p(p_b);
+        assert!((ce_b - e_b).abs() < 1e-12, "CE_B = {ce_b}, E(P̂_B) = {e_b}");
+    }
+
+    /// `look_back` with a small `CE_B` (Eq. 21 path) drives the
+    /// decision toward `P̂_B` regardless of `P̂_F`.
+    #[test]
+    fn decide_initial_pitch_eq21_wins_when_ce_b_is_small() {
+        assert_eq!(decide_initial_pitch(50.0, 0.3, 70.0, 0.2), 50.0);
+        assert_eq!(decide_initial_pitch(50.0, 0.48, 70.0, 0.1), 50.0);
+    }
+
+    /// Eq. 22: when `CE_B > 0.48` but still ≤ `CE_F`, backward wins.
+    #[test]
+    fn decide_initial_pitch_eq22_wins_when_ce_b_leq_ce_f() {
+        assert_eq!(decide_initial_pitch(50.0, 0.6, 70.0, 0.65), 50.0);
+        assert_eq!(decide_initial_pitch(50.0, 0.6, 70.0, 0.6), 50.0);
+    }
+
+    /// Eq. 23: when `CE_B > CE_F` and `CE_B > 0.48`, forward wins.
+    #[test]
+    fn decide_initial_pitch_eq23_picks_forward_when_ce_b_is_larger() {
+        assert_eq!(decide_initial_pitch(50.0, 0.7, 70.0, 0.5), 70.0);
+    }
+
+    /// `look_ahead` returns a pitch on the half-sample grid and
+    /// some finite cumulative-error value. End-to-end correctness
+    /// (does it pick the "right" pitch on real speech?) requires
+    /// DVSI PCM vectors — see the comment on
+    /// [`e_of_p_local_minimum_within_continuity_window`].
+    #[test]
+    fn look_ahead_returns_grid_value_and_finite_ce() {
+        let s = periodic_input(50.0);
+        let cur = PitchSearch::new(&s);
+        let n1 = PitchSearch::new(&s);
+        let n2 = PitchSearch::new(&s);
+        let (p_f, ce_f) = look_ahead(&cur, &n1, &n2);
+        assert!(
+            (PITCH_GRID_MIN..=PITCH_GRID_MAX).contains(&p_f),
+            "P̂_F = {p_f} out of grid"
+        );
+        assert!(ce_f.is_finite(), "CE_F = {ce_f} not finite");
+        let doubled = (p_f / PITCH_GRID_STEP).round();
+        assert!(
+            (doubled * PITCH_GRID_STEP - p_f).abs() < 1e-9,
+            "P̂_F = {p_f} not on grid"
+        );
+    }
+
+    /// Boundary conditions: `compute_s_lpf` zero-extends the input.
+    /// For an all-zero input it produces an all-zero output.
+    #[test]
+    fn compute_s_lpf_of_zero_is_zero() {
+        let s = [0.0f64; PITCH_INPUT_LEN];
+        let s_lpf = compute_s_lpf(&s);
+        for (i, &v) in s_lpf.iter().enumerate() {
+            assert!(v.abs() < 1e-12, "s_LPF[{i}] = {v}");
+        }
+    }
+
+    /// `compute_s_lpf` applied to a DC input recovers the filter's DC
+    /// gain on the interior (away from zero-padded edges). Annex D
+    /// `h_LPF` is a symmetric lowpass, so its DC gain is `Σ h_LPF(j)`.
+    #[test]
+    fn compute_s_lpf_interior_matches_filter_dc_gain() {
+        let s = [1.0f64; PITCH_INPUT_LEN];
+        let s_lpf = compute_s_lpf(&s);
+        let dc_gain: f64 = (-H_LPF_HALF..=H_LPF_HALF)
+            .map(|j| f64::from(lpf_tap(j)))
+            .sum();
+        // Interior samples (far from the ±150 edges) see the full
+        // filter. Sample at n=0.
+        let center = s_lpf[W_I_HALF as usize];
+        assert!(
+            (center - dc_gain).abs() < 1e-9,
+            "s_LPF(0) = {center}, expected DC gain {dc_gain}"
+        );
     }
 }
