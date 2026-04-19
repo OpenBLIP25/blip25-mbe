@@ -124,6 +124,45 @@ can pull them from a single place. If a consumer emerges that needs these
 without the rest of `blip25-mbe`, factor them into a small `blip25-fec`
 crate both depend on. Do not factor preemptively.
 
+### Loudness calibration reference
+
+`blip25-mbe` targets **DVSI chip PCM parity per BABA-A**. The only
+valid calibration references are:
+
+1. **Canonical DVSI test-vector PCM** — `DVSI/Vectors/tv-rc/r33/*.pcm`
+   (half-rate) and `DVSI/Vectors/tv-std/tv/*.pcm` (full-rate).
+2. **Live DVSI chip PCM** via `conformance/chip/` (subject to the
+   chip-oracle caveats in `~/blip25-specs/analysis/ambe3000_chip_oracle_caveats.md`).
+
+**Other P25 open-source decoders (SDRTrunk / JMBE / OP25) are NOT
+valid references.** Their PCM output contains post-synthesis gain
+(typically ~8× for SDRTrunk) that is layered on top of the BABA-A
+synthesis pipeline. Calibrating `γ_w` or any other codec constant
+against those outputs would require values far outside the spec's
+plausible range and would break DVSI-chip conformance.
+
+Measured 2026-04-19 on canonical DVSI tv-rc/r33 half-rate reference
+PCM across 5 vectors (`alert`, `clean`, `cp0`, `cp1`, `cp31`): our
+output RMS is **0.999× to 1.067× of DVSI reference** — within the
+§1.10+§1.12 processing envelope documented in the chip-oracle
+caveats analysis. This is the correct target; loudness parity with
+SDRTrunk is not.
+
+**Consumers requiring SDRTrunk-parity loudness for operational UX**
+should apply post-vocoder gain in the consumer (e.g. multiply the
+i16 PCM by the desired factor before handing to the WAV writer).
+That is an application-layer concern, not a codec concern.
+
+Reproducing the DVSI-parity measurement:
+
+```
+cargo run -p blip25-conformance-vectors --release -- \
+    decode-pcm-halfrate clean --write-pcm /tmp/ours.pcm
+```
+
+and compare RMS to `DVSI/Vectors/tv-rc/r33/clean.pcm` — expect
+ratio ≈ 1.0×.
+
 ### Parameter type unification
 
 Consumers that predate `blip25-mbe` (such as p25-decoder) may have
