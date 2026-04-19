@@ -52,10 +52,15 @@ pub struct PitchRefinement {
     pub e_r: f64,
 }
 
-/// Number of harmonics `L̂` from `ω̂_0` per Eq. 31.
+/// Number of harmonics `L̂` from `ω̂_0` per Eq. 31:
+/// `L̂ = ⌊0.9254 · ⌊π/ω̂_0 + 0.25⌋⌋`. The inner floor is load-bearing
+/// — it rounds π/ω̂_0 to the nearest integer (pitch period in samples)
+/// before the `0.9254` scale. Omitting it biases `L̂` by +1 on ~40% of
+/// admissible ω̂_0 (addendum §0.4.3, specs commit `d20f5ab`).
 #[inline]
 pub fn harmonic_count_for(omega_hat: f64) -> u8 {
-    let raw = (0.9254 * (core::f64::consts::PI / omega_hat + 0.25)).floor();
+    let inner = (core::f64::consts::PI / omega_hat + 0.25).floor();
+    let raw = (0.9254 * inner).floor();
     raw.clamp(f64::from(L_HAT_MIN), f64::from(L_HAT_MAX)) as u8
 }
 
@@ -195,18 +200,27 @@ mod tests {
 
     #[test]
     fn harmonic_count_respects_admissible_range() {
-        // At ω̂_0 = 2π/123.125 (smallest pitch period): L̂ = ⌊0.9254·(π·123.125/(2π) + 0.25)⌋
-        //                                                  = ⌊0.9254·62.0625⌋ = ⌊57.4⌋ = 57.
-        // Clamped to 56.
+        // At ω̂_0 = 2π/123.125: π/ω̂_0 = 61.5625, inner floor = 61,
+        //                      ·0.9254 = 56.4494, floor = 56.
         let omega_lo = 2.0 * core::f64::consts::PI / 123.125;
         assert_eq!(harmonic_count_for(omega_lo), 56);
-        // At ω̂_0 = 2π/19.875 (largest pitch period): L̂ = ⌊0.9254·(9.9375 + 0.25)⌋
-        //                                                 = ⌊0.9254·10.1875⌋ = ⌊9.43⌋ = 9.
+        // At ω̂_0 = 2π/19.875: π/ω̂_0 = 9.9375, inner floor = 10,
+        //                      ·0.9254 = 9.254, floor = 9.
         let omega_hi = 2.0 * core::f64::consts::PI / 19.875;
         assert_eq!(harmonic_count_for(omega_hi), 9);
-        // Mid-range spot check: ω̂_0 = 2π/50 → L̂ = ⌊0.9254·(25 + 0.25)⌋ = ⌊23.4⌋ = 23.
+        // Mid-range: ω̂_0 = 2π/50 → π/ω̂_0 = 25, inner floor = 25,
+        //                           ·0.9254 = 23.135, floor = 23.
         let omega_mid = 2.0 * core::f64::consts::PI / 50.0;
         assert_eq!(harmonic_count_for(omega_mid), 23);
+    }
+
+    #[test]
+    fn harmonic_count_applies_inner_floor() {
+        // π/ω̂_0 = 13.8: buggy form = ⌊0.9254·14.05⌋ = 13, correct form
+        // = ⌊0.9254·⌊14.05⌋⌋ = ⌊0.9254·14⌋ = 12. Regression guard for
+        // specs commit d20f5ab (addendum §0.4.3).
+        let omega_hat = core::f64::consts::PI / 13.8;
+        assert_eq!(harmonic_count_for(omega_hat), 12);
     }
 
     #[test]
