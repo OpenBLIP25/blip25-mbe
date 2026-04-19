@@ -956,6 +956,47 @@ pub fn synthesize_frame_ambe_plus(
     synthesize_frame_with_mode(params, err, gamma_w, PhaseMode::AmbePlus, state)
 }
 
+/// Synthesize a repeated frame for an erasure, using `state.last_good`
+/// as the source parameters. Cold-start (no prior good frame) emits
+/// silence.
+///
+/// This is the decode-side counterpart to the
+/// [`crate::p25_halfrate::dequantize::Decoded::Erasure`] /
+/// [`crate::p25_fullrate::dequantize::Decoded::Erasure`] variants —
+/// consumers call it when the wire layer signals an erasure without
+/// constructing any `MbeParams` of their own. `phase_mode` selects
+/// baseline vs. AMBE+ phase handling; the codec-generation modules
+/// pre-pick the right value for their generation.
+///
+/// The underlying synth still advances per-frame state (`s_e`, `τ_M`,
+/// `ε_R`, phase/noise substates), so re-acquisition remains smooth
+/// after the erasure clears.
+pub fn synthesize_repeat_with_mode(
+    phase_mode: PhaseMode,
+    state: &mut SynthState,
+) -> [i16; FRAME_SAMPLES] {
+    // Force Repeat disposition by setting bad_pitch on a local err
+    // copy; do not touch state.err so consumer-driven error accounting
+    // is preserved.
+    let err = FrameErrorContext { bad_pitch: true, ..state.err };
+    let params = MbeParams::silence();
+    synthesize_frame_with_mode(&params, &err, state.gamma_w, phase_mode, state)
+}
+
+/// Baseline-phase convenience wrapper around
+/// [`synthesize_repeat_with_mode`]. Used by
+/// [`crate::codecs::ambe::synthesize_repeat`].
+pub fn synthesize_repeat(state: &mut SynthState) -> [i16; FRAME_SAMPLES] {
+    synthesize_repeat_with_mode(PhaseMode::Baseline, state)
+}
+
+/// AMBE+ phase-regen wrapper around [`synthesize_repeat_with_mode`].
+/// Used by [`crate::codecs::ambe_plus::synthesize_repeat`] and
+/// [`crate::codecs::ambe_plus2::synthesize_repeat`].
+pub fn synthesize_repeat_ambe_plus(state: &mut SynthState) -> [i16; FRAME_SAMPLES] {
+    synthesize_repeat_with_mode(PhaseMode::AmbePlus, state)
+}
+
 /// Core of [`synthesize_frame`] / [`synthesize_frame_ambe_plus`]
 /// parameterized by [`PhaseMode`].
 fn synthesize_frame_with_mode(

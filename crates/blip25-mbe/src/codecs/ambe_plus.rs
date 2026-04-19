@@ -16,7 +16,8 @@
 //! phase-regen variant of the §1.10–§1.12 synth.
 
 use crate::codecs::mbe_baseline::{
-    synthesize_frame_ambe_plus as baseline_synthesize_ambe_plus, FRAME_SAMPLES,
+    synthesize_frame_ambe_plus as baseline_synthesize_ambe_plus,
+    synthesize_repeat_ambe_plus as baseline_synthesize_repeat, FRAME_SAMPLES,
 };
 use crate::mbe_params::MbeParams;
 
@@ -46,6 +47,12 @@ pub fn synthesize_tone(
     state: &mut SynthState,
 ) -> [i16; SAMPLES_PER_FRAME] {
     synthesize_frame(params, state)
+}
+
+/// Synthesize a repeated frame in response to a wire-layer erasure.
+/// AMBE+ uses US5701390 phase regeneration on the repeated frame.
+pub fn synthesize_repeat(state: &mut SynthState) -> [i16; SAMPLES_PER_FRAME] {
+    baseline_synthesize_repeat(state)
 }
 
 #[cfg(test)]

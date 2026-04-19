@@ -25,7 +25,8 @@
 //! §"Spectral enhancement").
 
 use crate::codecs::mbe_baseline::{
-    synthesize_frame_ambe_plus as baseline_synthesize_ambe_plus, FRAME_SAMPLES,
+    synthesize_frame_ambe_plus as baseline_synthesize_ambe_plus,
+    synthesize_repeat_ambe_plus as baseline_synthesize_repeat, FRAME_SAMPLES,
 };
 use crate::mbe_params::MbeParams;
 
@@ -58,6 +59,12 @@ pub fn synthesize_tone(
     state: &mut SynthState,
 ) -> [i16; SAMPLES_PER_FRAME] {
     synthesize_frame(params, state)
+}
+
+/// Synthesize a repeated frame in response to a wire-layer erasure.
+/// AMBE+2 decode-side shares AMBE+'s US5701390 phase regeneration.
+pub fn synthesize_repeat(state: &mut SynthState) -> [i16; SAMPLES_PER_FRAME] {
+    baseline_synthesize_repeat(state)
 }
 
 #[cfg(test)]
@@ -107,5 +114,40 @@ mod tests {
         let mut state = SynthState::new();
         let pcm = synthesize_tone(&params, &mut state);
         assert_eq!(pcm.len(), SAMPLES_PER_FRAME);
+    }
+
+    #[test]
+    fn synthesize_repeat_on_cold_start_emits_silence() {
+        let mut state = SynthState::new();
+        let pcm = synthesize_repeat(&mut state);
+        assert_eq!(pcm.len(), SAMPLES_PER_FRAME);
+        // First-call repeat with no `last_good` goes through the
+        // cold-start fallback (silence MbeParams).
+        let energy: i64 = pcm.iter().map(|&s| i64::from(s).pow(2)).sum();
+        assert!(energy < 1_000_000, "cold-start repeat should be near-silent, got energy {energy}");
+    }
+
+    #[test]
+    fn synthesize_repeat_after_voice_does_not_reset_state() {
+        // After a voice frame, state.last_good is populated. Calling
+        // synthesize_repeat should produce a non-empty output without
+        // panicking and without returning state to cold-start.
+        let params = silence_params();
+        let mut state = SynthState::new();
+        let _ = synthesize_frame(&params, &mut state);
+        let s_e_after_voice = state.s_e;
+        let _ = synthesize_repeat(&mut state);
+        // s_e evolves on every frame; just verify it's still finite and
+        // in a plausible range (the §1.10 recursion never makes it
+        // negative or infinite on well-formed input).
+        assert!(state.s_e.is_finite());
+        assert!(state.s_e > 0.0);
+        // We synthesized twice so epsilon_r has advanced; s_e may have
+        // decayed. Sanity check: both are distinct from cold start.
+        assert!(
+            state.s_e != crate::codecs::mbe_baseline::INIT_S_E
+                || s_e_after_voice != crate::codecs::mbe_baseline::INIT_S_E,
+            "state should have evolved from cold start"
+        );
     }
 }

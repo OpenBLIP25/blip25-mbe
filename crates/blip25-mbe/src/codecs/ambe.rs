@@ -20,7 +20,10 @@
 //! API. Re-exports [`SynthState`] and [`SAMPLES_PER_FRAME`] so the
 //! consumer gets the state type from the same module as the synth.
 
-use crate::codecs::mbe_baseline::{synthesize_frame as baseline_synthesize, FRAME_SAMPLES};
+use crate::codecs::mbe_baseline::{
+    synthesize_frame as baseline_synthesize,
+    synthesize_repeat as baseline_synthesize_repeat, FRAME_SAMPLES,
+};
 use crate::mbe_params::MbeParams;
 
 pub use crate::codecs::mbe_baseline::SynthState;
@@ -57,6 +60,13 @@ pub fn synthesize_tone(
     state: &mut SynthState,
 ) -> [i16; SAMPLES_PER_FRAME] {
     synthesize_frame(params, state)
+}
+
+/// Synthesize a repeated frame in response to a wire-layer erasure
+/// (`Decoded::Erasure` from either rate). Uses [`SynthState`]'s
+/// `last_good` as the source; emits silence on cold-start.
+pub fn synthesize_repeat(state: &mut SynthState) -> [i16; SAMPLES_PER_FRAME] {
+    baseline_synthesize_repeat(state)
 }
 
 #[cfg(test)]
