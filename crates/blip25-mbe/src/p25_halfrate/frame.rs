@@ -29,7 +29,8 @@
 //! verified against DVSI).
 
 use crate::fec::{
-    golay_23_12_decode, golay_23_12_encode, golay_24_12_decode, golay_24_12_encode,
+    golay_23_12_decode, golay_23_12_decode_soft, golay_23_12_encode, golay_24_12_decode,
+    golay_24_12_decode_soft, golay_24_12_encode,
 };
 
 // ---------------------------------------------------------------------------
@@ -135,6 +136,73 @@ pub fn interleave(codewords: &[u32; 4]) -> [u8; DIBITS_PER_FRAME] {
     dibits
 }
 
+/// Total soft-bit count for a half-rate AMBE+2 frame (36 dibits × 2).
+pub const SOFT_BITS: usize = 72;
+
+/// Soft-deinterleaved code vectors for a half-rate AMBE+2 frame.
+/// `c̃₀` is 24-bit extended Golay, `c̃₁` is 23-bit Golay, `c̃₂`/`c̃₃`
+/// are uncoded (11 and 14 bits). All MSB-first.
+#[derive(Clone, Copy, Debug)]
+pub struct SoftCodeVectors {
+    /// `c̃₀` — soft extended Golay(24,12) codeword, MSB at index 0.
+    pub c0: [i8; 24],
+    /// `c̃₁` — soft Golay(23,12) codeword, MSB at index 0.
+    pub c1: [i8; 23],
+    /// `c̃₂` — 11-bit uncoded, MSB at index 0.
+    pub c2: [i8; 11],
+    /// `c̃₃` — 14-bit uncoded, MSB at index 0.
+    pub c3: [i8; 14],
+}
+
+impl Default for SoftCodeVectors {
+    fn default() -> Self {
+        Self { c0: [0i8; 24], c1: [0i8; 23], c2: [0i8; 11], c3: [0i8; 14] }
+    }
+}
+
+/// Soft-deinterleave a 72-bit soft stream into the 4 MSB-first soft
+/// code vectors per Annex S.
+///
+/// Input layout: `soft[2*sym]` = high bit of dibit `sym`,
+/// `soft[2*sym + 1]` = low bit. Output vectors are MSB-first so they
+/// can be fed directly into the soft FEC decoders.
+pub fn soft_deinterleave(soft: &[i8; SOFT_BITS]) -> SoftCodeVectors {
+    let mut out = SoftCodeVectors::default();
+    for (sym, entry) in ANNEX_S.iter().enumerate() {
+        let hi = soft[2 * sym];
+        let lo = soft[2 * sym + 1];
+        place_soft(&mut out, entry.bit1_vec as usize, entry.bit1_idx as usize, hi);
+        place_soft(&mut out, entry.bit0_vec as usize, entry.bit0_idx as usize, lo);
+    }
+    out
+}
+
+/// Place a soft bit into MSB-first position inside the addressed
+/// half-rate code vector. `idx` is LSB-first from Annex S; `W - 1 -
+/// idx` is the MSB-first position.
+fn place_soft(out: &mut SoftCodeVectors, vec_idx: usize, idx: usize, s: i8) {
+    match vec_idx {
+        0 => out.c0[24 - 1 - idx] = s,
+        1 => out.c1[23 - 1 - idx] = s,
+        2 => out.c2[11 - 1 - idx] = s,
+        3 => out.c3[14 - 1 - idx] = s,
+        _ => unreachable!(),
+    }
+}
+
+/// XOR a hard PN mask into a soft codeword, preserving magnitudes.
+/// Same semantics as the full-rate `soft_demodulate_vector`: mask bit
+/// 1 flips the sign of the corresponding soft bit. `mask` is LSB-first
+/// in a u32; `soft` is MSB-first of width `W`.
+pub fn soft_demodulate_vector<const W: usize>(soft: &mut [i8; W], mask: u32) {
+    for (i, s) in soft.iter_mut().enumerate() {
+        let mask_bit = (mask >> (W - 1 - i)) & 1;
+        if mask_bit == 1 {
+            *s = s.saturating_neg();
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // PN modulation (§2.5)
 // ---------------------------------------------------------------------------
@@ -230,6 +298,47 @@ pub fn decode_frame(dibits: &[u8; DIBITS_PER_FRAME]) -> Frame {
     let d1 = golay_23_12_decode(c[1] ^ masks[1]);
     let u2 = (c[2] & 0x7FF) as u16; // 11 bits
     let u3 = (c[3] & 0x3FFF) as u16; // 14 bits
+
+    Frame {
+        info: [d0.info, d1.info, u2, u3],
+        errors: [d0.errors, d1.errors, 0, 0],
+    }
+}
+
+/// Soft-decision decode of a half-rate AMBE+2 frame from 72 soft bits.
+///
+/// Input convention matches the full-rate soft entry point:
+/// `[hi_dibit_0, lo_dibit_0, …]`, sign = hard decision, magnitude =
+/// confidence.
+///
+/// Pipeline mirrors [`decode_frame`]:
+/// 1. Soft-deinterleave 72 bits → `c̃₀..c̃₃` (MSB-first).
+/// 2. Soft-Golay-24 decode `c̃₀` (no PN) → `û₀`.
+/// 3. Hard-demodulate `c̃₁` by flipping soft signs per the PN mask.
+/// 4. Soft-Golay-23 decode `c̃₁` → `û₁`.
+/// 5. Project `c̃₂` / `c̃₃` to hard bits for `û₂` / `û₃` (uncoded).
+pub fn decode_frame_soft(soft: &[i8; SOFT_BITS]) -> Frame {
+    let mut c = soft_deinterleave(soft);
+
+    let d0 = golay_24_12_decode_soft(&c.c0);
+    let u0 = d0.info;
+
+    let masks = modulation_masks(u0);
+    soft_demodulate_vector(&mut c.c1, masks[1]);
+    let d1 = golay_23_12_decode_soft(&c.c1);
+
+    let mut u2 = 0u16;
+    for (i, &s) in c.c2.iter().enumerate() {
+        if s > 0 {
+            u2 |= 1u16 << (11 - 1 - i);
+        }
+    }
+    let mut u3 = 0u16;
+    for (i, &s) in c.c3.iter().enumerate() {
+        if s > 0 {
+            u3 |= 1u16 << (14 - 1 - i);
+        }
+    }
 
     Frame {
         info: [d0.info, d1.info, u2, u3],
@@ -539,5 +648,64 @@ mod tests {
             let m = ((1u32 << w) - 1) as u16;
             assert_eq!(back.info[i], m, "vector {i} mask mismatch");
         }
+    }
+
+    // ---- Soft-decision path (Gap B) -------------------------------------
+
+    fn dibits_to_soft(dibits: &[u8; DIBITS_PER_FRAME], confidence: i8) -> [i8; SOFT_BITS] {
+        let mut out = [0i8; SOFT_BITS];
+        for (sym, &d) in dibits.iter().enumerate() {
+            let hi = (d >> 1) & 1;
+            let lo = d & 1;
+            out[2 * sym] = if hi == 1 { confidence } else { -confidence };
+            out[2 * sym + 1] = if lo == 1 { confidence } else { -confidence };
+        }
+        out
+    }
+
+    #[test]
+    fn soft_decode_matches_hard_on_clean_input() {
+        for seed in [0u32, 1, 0xDEADBEEF, 0xCAFEBABE, 0x12345678] {
+            let u = if seed == 0 { [0u16; 4] } else { sample_info(seed) };
+            let dibits = encode_frame(&u);
+            let soft = dibits_to_soft(&dibits, 120);
+            let soft_frame = decode_frame_soft(&soft);
+            let hard_frame = decode_frame(&dibits);
+            assert_eq!(soft_frame.info, hard_frame.info, "seed 0x{seed:08x}");
+            assert_eq!(soft_frame.info, u, "seed 0x{seed:08x}");
+            assert_eq!(soft_frame.errors, [0u8; 4]);
+        }
+    }
+
+    #[test]
+    fn soft_decode_recovers_weak_bit_error_on_c0() {
+        // Extended Golay(24,12) only corrects 1 error. Flipping 2 bits
+        // leaves hard decode to miscorrect or flag uncorrectable; soft
+        // with low confidence on both should recover via Chase-II
+        // flipping over the least-reliable positions.
+        let u = sample_info(0xA5A5A5A5);
+        let dibits = encode_frame(&u);
+        let mut soft = dibits_to_soft(&dibits, 120);
+        // Weaken and flip 2 positions inside c₀ (MSB-first 0 and 5).
+        let targets = [(0u8, 0u8), (0, 5)]; // (vec_idx, msb_pos)
+        for (vi, msb_pos) in targets {
+            let lsb_pos = CODE_WIDTHS[vi as usize] - 1 - msb_pos;
+            let (sym, is_hi) = (0..ANNEX_S.len())
+                .find_map(|s| {
+                    let e = ANNEX_S[s];
+                    if e.bit1_vec == vi && e.bit1_idx == lsb_pos {
+                        Some((s, true))
+                    } else if e.bit0_vec == vi && e.bit0_idx == lsb_pos {
+                        Some((s, false))
+                    } else {
+                        None
+                    }
+                })
+                .expect("annex S covers every (vec, idx)");
+            let soft_idx = 2 * sym + if is_hi { 0 } else { 1 };
+            soft[soft_idx] = -soft[soft_idx].signum() * 4;
+        }
+        let frame = decode_frame_soft(&soft);
+        assert_eq!(frame.info, u, "soft recovered 2-error c̃₀");
     }
 }

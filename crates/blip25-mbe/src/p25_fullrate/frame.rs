@@ -11,11 +11,13 @@
 //! `MbeParams` — live downstream.
 
 use crate::fec::{
-    golay_23_12_decode, golay_23_12_encode, hamming_15_11_decode, hamming_15_11_encode,
+    golay_23_12_decode, golay_23_12_decode_soft, golay_23_12_encode, hamming_15_11_decode,
+    hamming_15_11_decode_soft, hamming_15_11_encode,
 };
 
 use super::fec::{
-    deinterleave, interleave, modulation_masks,
+    deinterleave, interleave, modulation_masks, soft_deinterleave, soft_demodulate_vector,
+    SOFT_BITS,
 };
 
 /// Width in bits of each info vector `û₀..û₇`. BABA-A §1.2.
@@ -89,6 +91,67 @@ pub fn decode_frame(dibits: &[u8; 72]) -> Frame {
 
     // Step 6: û₇ is uncoded (7 bits, also unmodulated).
     let u7 = (c[7] & 0x7F) as u16;
+
+    Frame {
+        info: [d0.info, d1.info, d2.info, d3.info, d4.info, d5.info, d6.info, u7],
+        errors: [d0.errors, d1.errors, d2.errors, d3.errors, d4.errors, d5.errors, d6.errors, 0],
+    }
+}
+
+/// Soft-decision decode of a full-rate IMBE frame from 144 soft bits.
+///
+/// Input layout matches the C4FM soft-bit convention in p25-decoder:
+/// one `i8` per bit, sign = hard decision (`>0` → 1, `≤0` → 0),
+/// magnitude = confidence / LLR. Bits are ordered
+/// `[hi_dibit_0, lo_dibit_0, hi_dibit_1, lo_dibit_1, …]` — matching
+/// the high/low bit pairing the hard path reads from the dibit stream.
+///
+/// Pipeline mirrors [`decode_frame`]:
+/// 1. Soft-deinterleave 144 bits → 8 MSB-first soft code vectors.
+/// 2. Soft-Golay-decode `c̃₀` (no PN) → `û₀`.
+/// 3. Compute hard masks from `û₀`; soft-demodulate `c̃₁..c̃₆` (mask
+///    bit 1 flips the soft bit's sign, preserving magnitude).
+/// 4. Soft-Golay-decode `c̃₁..c̃₃`, soft-Hamming-decode `c̃₄..c̃₆`.
+/// 5. `û₇` hard-projects from the uncoded 7-bit soft vector (no FEC).
+///
+/// The `errors` field on the returned [`Frame`] reports the Chase-II
+/// winner's hard error count on each FEC-coded vector. Across the
+/// soft path, valid soft inputs can recover frames with more channel
+/// errors than the bounded-distance hard decoder admits — the typical
+/// ~2 dB coding gain over hard Golay and the usual single-bit gain
+/// over hard Hamming.
+pub fn decode_frame_soft(soft: &[i8; SOFT_BITS]) -> Frame {
+    let mut c = soft_deinterleave(soft);
+
+    // Step 2: soft-Golay-decode c̃₀ (no PN modulation).
+    let d0 = golay_23_12_decode_soft(&c.golay[0]);
+    let u0 = d0.info;
+
+    // Step 3: derive hard masks and soft-demodulate c̃₁..c̃₆.
+    let masks = modulation_masks(u0);
+    soft_demodulate_vector(&mut c.golay[1], masks[1]);
+    soft_demodulate_vector(&mut c.golay[2], masks[2]);
+    soft_demodulate_vector(&mut c.golay[3], masks[3]);
+    soft_demodulate_vector(&mut c.hamming[0], masks[4]);
+    soft_demodulate_vector(&mut c.hamming[1], masks[5]);
+    soft_demodulate_vector(&mut c.hamming[2], masks[6]);
+
+    // Step 4: soft FEC decode.
+    let d1 = golay_23_12_decode_soft(&c.golay[1]);
+    let d2 = golay_23_12_decode_soft(&c.golay[2]);
+    let d3 = golay_23_12_decode_soft(&c.golay[3]);
+    let d4 = hamming_15_11_decode_soft(&c.hamming[0]);
+    let d5 = hamming_15_11_decode_soft(&c.hamming[1]);
+    let d6 = hamming_15_11_decode_soft(&c.hamming[2]);
+
+    // Step 5: û₇ — project the 7-bit uncoded soft vector to hard bits,
+    // MSB-first in element `k` at bit `k` order.
+    let mut u7 = 0u16;
+    for (i, &s) in c.uncoded.iter().enumerate() {
+        if s > 0 {
+            u7 |= 1u16 << (7 - 1 - i);
+        }
+    }
 
     Frame {
         info: [d0.info, d1.info, d2.info, d3.info, d4.info, d5.info, d6.info, u7],
@@ -272,5 +335,73 @@ mod tests {
         assert_eq!(INFO_WIDTHS.iter().map(|&w| w as u16).sum::<u16>(), 88);
         assert_eq!(CODE_WIDTHS.iter().map(|&w| w as u16).sum::<u16>(), 144);
         assert_eq!(INFO_BITS_TOTAL, 88);
+    }
+
+    // ---- Soft-decision path (Gap B) -----------------------------------
+
+    /// Inflate a 72-dibit hard stream into 144 soft bits at uniform
+    /// confidence. Dibit order: `hi = (d >> 1) & 1`, `lo = d & 1`.
+    fn dibits_to_soft(dibits: &[u8; 72], confidence: i8) -> [i8; 144] {
+        let mut out = [0i8; 144];
+        for (sym, &d) in dibits.iter().enumerate() {
+            let hi = (d >> 1) & 1;
+            let lo = d & 1;
+            out[2 * sym] = if hi == 1 { confidence } else { -confidence };
+            out[2 * sym + 1] = if lo == 1 { confidence } else { -confidence };
+        }
+        out
+    }
+
+    #[test]
+    fn soft_decode_matches_hard_on_clean_input() {
+        for seed in [0u32, 1, 0xDEADBEEF, 0xCAFEBABE, 0x12345678] {
+            let u = if seed == 0 { [0u16; 8] } else { sample_info(seed) };
+            let dibits = encode_frame(&u);
+            let soft = dibits_to_soft(&dibits, 120);
+            let soft_frame = decode_frame_soft(&soft);
+            let hard_frame = decode_frame(&dibits);
+            assert_eq!(soft_frame.info, hard_frame.info, "seed 0x{seed:08x}");
+            assert_eq!(soft_frame.info, u, "seed 0x{seed:08x}");
+            assert_eq!(soft_frame.errors, [0u8; 8]);
+        }
+    }
+
+    #[test]
+    fn soft_decode_recovers_weak_bit_errors_on_golay_vector() {
+        // Four weak-bit flips inside c̃₁ after demodulation — beyond
+        // Golay-23's bounded-distance capacity (t = 3). Hard decode
+        // miscorrects; soft should still recover.
+        let u = sample_info(0x01020304);
+        let dibits = encode_frame(&u);
+        let mut soft = dibits_to_soft(&dibits, 120);
+        // Locate the 4 bits that belong to c₁'s MSB-first positions
+        // 0, 4, 10, 18 and lower their magnitudes to 4 (well below
+        // confidence 120) while flipping their signs.
+        //
+        // We perturb the soft stream directly rather than the dibit
+        // stream: find each target soft index via the Annex H reverse
+        // lookup and weaken+flip it.
+        use super::super::fec::ANNEX_H;
+        let targets = [(1u8, 0u8), (1, 4), (1, 10), (1, 18)]; // (vec_idx, msb_pos)
+        for (vi, msb_pos) in targets {
+            let lsb_pos = CODE_WIDTHS[vi as usize] - 1 - msb_pos;
+            // Find the dibit symbol + hi/lo role covering (vi, lsb_pos).
+            let (sym, is_hi) = (0..ANNEX_H.len())
+                .find_map(|s| {
+                    let e = ANNEX_H[s];
+                    if e.bit1_vec == vi && e.bit1_idx == lsb_pos {
+                        Some((s, true))
+                    } else if e.bit0_vec == vi && e.bit0_idx == lsb_pos {
+                        Some((s, false))
+                    } else {
+                        None
+                    }
+                })
+                .expect("annex H covers every (vec, idx)");
+            let soft_idx = 2 * sym + if is_hi { 0 } else { 1 };
+            soft[soft_idx] = -soft[soft_idx].signum() * 4;
+        }
+        let frame = decode_frame_soft(&soft);
+        assert_eq!(frame.info, u, "soft recovered 4-error c̃₁");
     }
 }

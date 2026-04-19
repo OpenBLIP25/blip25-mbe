@@ -194,6 +194,89 @@ pub fn interleave(codewords: &[u32; 8]) -> [u8; 72] {
     dibits
 }
 
+/// Total soft-bit count for a full-rate IMBE frame (72 dibits × 2).
+pub const SOFT_BITS: usize = 144;
+
+/// Soft-deinterleave a 144-bit soft stream into 8 MSB-first soft code
+/// vectors sized per [`VECTOR_LENGTHS`]: four 23-bit, three 15-bit,
+/// one 7-bit.
+///
+/// Input layout: `soft[2*sym]` is the high bit of dibit `sym`,
+/// `soft[2*sym + 1]` is the low bit. This matches the `hi,lo` pairing
+/// produced by the hard [`deinterleave`] + the common C4FM dibit
+/// convention.
+///
+/// Each output vector is MSB-first so it can be fed directly into the
+/// soft FEC decoders ([`crate::fec::golay_23_12_decode_soft`] /
+/// [`crate::fec::hamming_15_11_decode_soft`]) without further
+/// re-ordering.
+///
+/// Returns three arrays sized for the three wire-format regimes
+/// (Golay-23, Hamming-15, uncoded) rather than a ragged `[[i8; W]; 8]`
+/// so the caller can pass each vector directly to the appropriately-
+/// typed soft decoder without slicing.
+pub fn soft_deinterleave(soft: &[i8; SOFT_BITS]) -> SoftCodeVectors {
+    let mut out = SoftCodeVectors::default();
+    for (sym, entry) in ANNEX_H.iter().enumerate() {
+        let hi = soft[2 * sym];
+        let lo = soft[2 * sym + 1];
+        place_soft(&mut out, entry.bit1_vec as usize, entry.bit1_idx as usize, hi);
+        place_soft(&mut out, entry.bit0_vec as usize, entry.bit0_idx as usize, lo);
+    }
+    out
+}
+
+/// Place a soft bit into its MSB-first position inside the correct
+/// output vector. `vec_idx` is 0..=7 per [`VECTOR_LENGTHS`]; `idx` is
+/// the LSB-first element index from Annex H.
+fn place_soft(out: &mut SoftCodeVectors, vec_idx: usize, idx: usize, s: i8) {
+    let width = VECTOR_LENGTHS[vec_idx] as usize;
+    let msb_pos = width - 1 - idx;
+    match vec_idx {
+        0..=3 => out.golay[vec_idx][msb_pos] = s,
+        4..=6 => out.hamming[vec_idx - 4][msb_pos] = s,
+        7 => out.uncoded[msb_pos] = s,
+        _ => unreachable!(),
+    }
+}
+
+/// Soft-deinterleaved code vectors for a full-rate IMBE frame. Four
+/// 23-bit Golay-coded vectors (`c̃₀..c̃₃`), three 15-bit Hamming-coded
+/// vectors (`c̃₄..c̃₆`), and one 7-bit uncoded vector (`c̃₇`). All
+/// vectors are MSB-first.
+#[derive(Clone, Copy, Debug)]
+pub struct SoftCodeVectors {
+    /// `c̃₀..c̃₃` — soft Golay-23 codewords, MSB at index 0.
+    pub golay: [[i8; 23]; 4],
+    /// `c̃₄..c̃₆` — soft Hamming-15 codewords, MSB at index 0.
+    pub hamming: [[i8; 15]; 3],
+    /// `c̃₇` — 7-bit uncoded, MSB at index 0.
+    pub uncoded: [i8; 7],
+}
+
+impl Default for SoftCodeVectors {
+    fn default() -> Self {
+        Self { golay: [[0i8; 23]; 4], hamming: [[0i8; 15]; 3], uncoded: [0i8; 7] }
+    }
+}
+
+/// XOR a 32-bit hard PN mask into a soft codeword vector, preserving
+/// magnitudes. Each mask bit that is 1 flips the sign of the
+/// corresponding soft bit; 0 leaves it alone.
+///
+/// `mask` is LSB-first (element `k` at bit `k`) to match the hard-
+/// modulation convention in [`modulation_masks`]. `soft` is MSB-first
+/// of width `W`: position 0 of `soft` corresponds to bit `W - 1` of
+/// `mask`.
+pub fn soft_demodulate_vector<const W: usize>(soft: &mut [i8; W], mask: u32) {
+    for (i, s) in soft.iter_mut().enumerate() {
+        let mask_bit = (mask >> (W - 1 - i)) & 1;
+        if mask_bit == 1 {
+            *s = s.saturating_neg();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
