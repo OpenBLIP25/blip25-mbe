@@ -851,7 +851,10 @@ pub fn synthesize_voiced(
 
 /// Bundled cross-frame state for the full §1.10–§1.12 synthesis
 /// pipeline. Owns the unvoiced and voiced sub-states plus the scalar
-/// state from §1.10 / §1.11 (S_E, τ_M, ε_R).
+/// state from §1.10 / §1.11 (S_E, τ_M, ε_R). Also carries the
+/// per-frame [`FrameErrorContext`] and calibration scale `γ_w` so the
+/// codec-generation entry points can hide those knobs from consumers
+/// that don't need to tune them.
 #[derive(Clone, Debug)]
 pub struct SynthState {
     /// §1.10 local-energy state.
@@ -864,6 +867,16 @@ pub struct SynthState {
     pub unvoiced: UnvoicedSynthState,
     /// §1.12.2 voiced sub-state.
     pub voiced: VoicedSynthState,
+    /// Per-frame error context read by the codec-generation entry
+    /// points ([`crate::codecs::ambe::synthesize_frame`] and siblings)
+    /// on each call. Defaults to "error-free" on
+    /// [`SynthState::new`]; consumers with live FEC error counts
+    /// (e.g. from a [`crate::p25_fullrate::frame::Frame::errors`]
+    /// total) should update it before each synth call.
+    pub err: FrameErrorContext,
+    /// §1.12.1 spectral calibration scale. Defaults to [`GAMMA_W`];
+    /// override for calibration studies.
+    pub gamma_w: f64,
     /// Snapshot of the last successfully-synthesized frame's parameters
     /// (for Eq. 99–104 substitution on Repeat/Mute). `None` until the
     /// first valid frame.
@@ -887,6 +900,8 @@ impl SynthState {
             epsilon_r: 0.0,
             unvoiced: UnvoicedSynthState::new(),
             voiced: VoicedSynthState::new(),
+            err: FrameErrorContext::default(),
+            gamma_w: GAMMA_W,
             last_good: None,
         }
     }
