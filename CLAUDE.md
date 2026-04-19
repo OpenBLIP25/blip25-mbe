@@ -12,31 +12,39 @@ test vectors, not any open-source implementation.
   from open-source P25 / MBE implementations (OP25, SDRTrunk, dsdcc, JMBE,
   imbe_vocoder, or any other P25/IMBE/AMBE project).
 - If a spec is ambiguous, incomplete, or missing required detail, **stop and
-  report the gap** — the user will have it added to the spec rather than have
-  you guess or reference P25 third-party code. Strengthening the spec as we go
-  is an explicit project goal: every gap you flag makes the spec more ready
-  for the next implementer.
+  write a gap report** to the spec-author agent rather than guessing or
+  referencing P25 third-party code. Strengthening the spec as we go is an
+  explicit project goal: every gap you flag makes the spec more ready for the
+  next implementer. See "Reporting Spec Gaps" below for the handoff.
 - Do not copy algorithms, constants, or structure from P25 open-source
   implementations. Cross-checking a single numeric constant against a reference
   is acceptable as a last-resort sanity check, but the design and code must
   come from the spec.
 
-### Full-text extracts and PDFs are copyrighted — source from derived works only
-- The TIA-102 PDFs and the `*_Full_Text.md` / `*_Summary.txt` extractions in
-  `~/blip25-specs/` are **copyrighted, internal-only source material**. They
-  are `.gitignored` in the blip25-specs repo for that reason.
-- **Do not base any committed code, constants, or comments on them.** All
-  code-level sourcing must come from the derived implementation specs
-  (`P25_*_Implementation_Spec.md`, `analysis/*.md`, `annex_tables/*.csv`),
-  which are the committable derived works.
-- **Reading the full text for gap detection is OK.** Scanning
-  `*_Full_Text.md` or the PDF to cross-check that a detail is truly missing
-  from the implementation spec, or to locate which section of the standard
-  holds the answer you need to request, is acceptable research. Citing the
-  full text in a gap report so the user can find the source material is
-  fine. But the implementation spec (not the full text) remains the only
-  acceptable code source.
-- Quoting non-trivial passages from the full text into code, comments, or
+### Clean-room boundary — you do NOT read copyrighted source material
+- You are the **implementer** role in a two-agent clean-room setup. A separate
+  **spec-author** agent reads the copyrighted TIA-102 PDFs and full-text
+  extracts; you never do.
+- Allowed reading under `~/blip25-specs/`:
+  - `standards/*/P25_*_Implementation_Spec.md` — the derived implementation specs
+  - `analysis/*.md` — the derived cross-document analysis
+  - `standards/*/annex_tables/*.csv` — derived extraction tables
+  - `specs.toml`, `README.md`, top-level docs
+- **Forbidden** (these are the spec-author's inputs, not yours):
+  - Any `*.pdf` under `~/blip25-specs/` or `~/blip25-mbe/DVSI/`
+  - Any `*_Full_Text.md` or `*_Summary.txt` in `~/blip25-specs/standards/`
+  - Any TIA PDF anywhere on disk
+- Rationale: preserves the clean-room derivation chain so the code and derived
+  specs in this repo remain free of copyrighted content. If you accidentally
+  load one of the forbidden files, stop, discard what you read, and ask the
+  spec-author for a derived-work answer instead.
+
+### Committed code must derive only from derived works
+- All committed code, constants, and comments must trace to the derived
+  implementation specs — never to PDFs, full-text, or summary extracts (you
+  can't read those anyway, but this rule also bars copy-paste via the
+  spec-author agent).
+- Quoting non-trivial passages from any TIA source into code, comments, or
   docs is a copyright issue. Keep such quotes out of the repo.
 
 ### What IS allowed
@@ -83,7 +91,20 @@ When a spec is insufficient, write a clear gap report with:
 1. Which spec file and section
 2. What you need to know (specific question, not vague)
 3. What options exist and why they can't be disambiguated from the spec alone
-4. Why third-party source inspection is not a substitute (e.g., correctness,
-   licensing, or emulation fidelity to DVSI)
+4. Why a chip/test-vector probe is or isn't a substitute (some gaps can be
+   resolved by observing DVSI chip behavior; others need spec language)
+5. Any diagnostic evidence from the current implementation (diverging test
+   vector frames, magnitude of error, conditional stats, etc.)
 
-The user will then get the spec updated.
+### Handoff to the spec-author agent
+1. Write the gap report as a new file under
+   `~/blip25-specs/gap_reports/NNNN_<short_slug>.md` (NNNN = next sequential
+   number; check the directory first).
+2. SendMessage to the `spec-author` teammate pointing them at the file.
+3. Mark the relevant task blocked in the team task list if it can't proceed
+   without a spec answer, and pick up a different task.
+4. The spec-author will draft a spec update. The **user reviews and merges**
+   spec updates before you read them — do not act on an unreviewed draft.
+
+Never answer your own gap by reading copyrighted source material. If the
+spec-author is idle and you're stuck, escalate to the user instead.
