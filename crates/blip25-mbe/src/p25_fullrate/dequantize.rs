@@ -618,6 +618,60 @@ pub fn dequantize(
     Ok(params)
 }
 
+/// Alias for [`DecoderState`] used by consumer-facing APIs that want
+/// the rate-qualified name.
+pub type FullrateDecoderState = DecoderState;
+
+/// Parsed full-rate frame — voice parameters or an erasure marker.
+///
+/// Parallels the [`crate::p25_halfrate::dequantize::Decoded`] shape
+/// (minus the `Tone` variant — full-rate IMBE has no tone-frame
+/// signaling; those cases only exist in half-rate AMBE+2).
+///
+/// An `Erasure` tells the consumer to repeat the previous voice frame
+/// (BABA-A §4.1 "Repeat" disposition). Full-rate's `Mute` / `Silence`
+/// dispositions require error-count hysteresis over multiple frames;
+/// that state machine lives in Gap E (frame-repeat / erasure
+/// convention) and is not covered here.
+#[derive(Clone, Debug)]
+pub enum Decoded {
+    /// Normal voice frame with reconstructed [`MbeParams`]. The
+    /// [`FullrateDecoderState`] has been advanced.
+    Voice(MbeParams),
+    /// Erasure — `b̂₀` was reserved (`[208, 255]`) or amplitude
+    /// reconstruction was invalid. Caller should repeat the previous
+    /// frame; state is **not** advanced.
+    Erasure,
+}
+
+/// Top-level full-rate frame decoder: `(Frame → MbeParams)` with
+/// erasure dispatch.
+///
+/// Consumes a [`Frame`] produced by
+/// [`crate::p25_fullrate::frame::decode_frame`] and the inter-frame
+/// predictor state. On successful decode, the state is advanced per
+/// §1.8. On erasure (reserved `b̂₀` or spectral reconstruction
+/// failure), the state is left unchanged and [`Decoded::Erasure`] is
+/// returned; the consumer should repeat the previous voice frame (or
+/// emit silence on cold start).
+///
+/// This is the consumer-facing entry point paired with
+/// [`crate::p25_halfrate::dequantize::decode_to_params`] — both return
+/// a `Decoded` variant so the consumer can dispatch uniformly.
+///
+/// [`Frame`]: crate::p25_fullrate::frame::Frame
+pub fn decode_to_params(
+    frame: &crate::p25_fullrate::frame::Frame,
+    state: &mut FullrateDecoderState,
+) -> Decoded {
+    match dequantize(&frame.info, state) {
+        Ok(params) => Decoded::Voice(params),
+        // Both `BadPitch` (reserved b̂₀) and `InvalidParams` (non-finite
+        // amplitude from FEC corruption) are §4.1 repeat triggers.
+        Err(_) => Decoded::Erasure,
+    }
+}
+
 // ===========================================================================
 // ENCODE (forward direction) — paired with the decode functions above.
 // All references to spec §1.8 use the same equations rearranged.
@@ -1472,6 +1526,80 @@ mod tests {
         let p2 = dequantize(&u, &mut state).unwrap();
         assert_eq!(p2.harmonic_count(), p1.harmonic_count());
         assert_eq!(state.previous_l(), p2.harmonic_count());
+    }
+
+    // ---- decode_to_params (Gap A) ---------------------------------------
+
+    /// Build a synthetic full-rate [`Frame`] with a given `b̂₀` and
+    /// everything else zero. Returns the frame ready for
+    /// `decode_to_params`.
+    fn frame_with_pitch(b0: u8) -> crate::p25_fullrate::frame::Frame {
+        let mut b = [0u16; 59];
+        b[0] = u16::from(b0);
+        let u = crate::p25_fullrate::priority::prioritize(&b, 9);
+        crate::p25_fullrate::frame::Frame {
+            info: u,
+            errors: [0u8; 8],
+        }
+    }
+
+    #[test]
+    fn decode_to_params_dispatches_voice_on_valid_pitch() {
+        let frame = frame_with_pitch(0);
+        let mut state = FullrateDecoderState::new();
+        match decode_to_params(&frame, &mut state) {
+            Decoded::Voice(p) => {
+                assert_eq!(p.harmonic_count(), 9);
+                assert_eq!(state.previous_l(), 9);
+            }
+            Decoded::Erasure => panic!("expected Voice"),
+        }
+    }
+
+    #[test]
+    fn decode_to_params_dispatches_erasure_on_reserved_pitch() {
+        let frame = frame_with_pitch(220); // reserved range
+        let mut state = FullrateDecoderState::new();
+        // Seed non-trivial state so we can verify it's untouched.
+        state.prev_l = 15;
+        state.prev_sync = true;
+        match decode_to_params(&frame, &mut state) {
+            Decoded::Erasure => {}
+            Decoded::Voice(_) => panic!("expected Erasure"),
+        }
+        // State unchanged on erasure.
+        assert_eq!(state.previous_l(), 15);
+        assert!(state.prev_sync);
+    }
+
+    #[test]
+    fn decode_to_params_voice_advances_state_erasure_does_not() {
+        let voice_frame = frame_with_pitch(0);
+        let erasure_frame = frame_with_pitch(230);
+        let mut state = FullrateDecoderState::new();
+        assert!(matches!(
+            decode_to_params(&voice_frame, &mut state),
+            Decoded::Voice(_)
+        ));
+        let l_after_voice = state.previous_l();
+        let sync_after_voice = state.prev_sync;
+
+        // Erasure must not touch state.
+        assert!(matches!(
+            decode_to_params(&erasure_frame, &mut state),
+            Decoded::Erasure
+        ));
+        assert_eq!(state.previous_l(), l_after_voice);
+        assert_eq!(state.prev_sync, sync_after_voice);
+    }
+
+    #[test]
+    fn fullrate_decoder_state_alias_is_decoder_state() {
+        // Compile-time check that the alias is a true alias, not a
+        // newtype wrapper.
+        fn takes_decoder_state(_: &mut DecoderState) {}
+        let mut s: FullrateDecoderState = FullrateDecoderState::new();
+        takes_decoder_state(&mut s);
     }
 
     // ---- Encoder side ----------------------------------------------------
