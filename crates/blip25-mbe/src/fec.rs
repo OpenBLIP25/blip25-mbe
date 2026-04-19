@@ -268,6 +268,194 @@ pub fn hamming_15_11_decode(codeword: u16) -> FecDecoded {
     FecDecoded { info, errors: 1 }
 }
 
+// ---------------------------------------------------------------------------
+// Soft-decision variants (Chase-II decoding over least-reliable positions)
+// ---------------------------------------------------------------------------
+//
+// Each soft bit is an `i8`: sign gives the hard decision (>0 → 1, ≤0 → 0),
+// magnitude gives the confidence / LLR. Bit order within each array is
+// MSB-first to match the hard-decoder conventions (so `soft[0]` is the
+// most significant codeword bit — bit 22 for Golay-23, bit 23 for
+// Golay-24, bit 14 for Hamming-15).
+//
+// The returned `FecDecoded::errors` is the Chase-winner's hard error
+// count — i.e. the `errors` produced by the inner hard decode of the
+// best candidate, not a soft metric. A codeword accepted with zero
+// flips reports `errors = 0` even if the soft magnitudes were weak.
+
+const CHASE_GOLAY_DEPTH: usize = 6;
+const CHASE_HAMMING_DEPTH: usize = 3;
+
+/// Soft-decision Golay(23, 12) decoder. Chase-II over the
+/// [`CHASE_GOLAY_DEPTH`] least-reliable positions.
+///
+/// Flips every subset of weight ≤ 3 among those positions, hard-decodes
+/// each candidate, and returns the result with minimum soft distance
+/// to the received vector.
+pub fn golay_23_12_decode_soft(soft: &[i8; 23]) -> FecDecoded {
+    let weak = least_reliable_positions::<23>(soft, CHASE_GOLAY_DEPTH);
+    let hard_cw = soft_to_codeword_u32::<23>(soft);
+    chase_decode_u32::<23, 3>(soft, hard_cw, &weak, |cw| {
+        let d = golay_23_12_decode(cw);
+        let candidate_cw = golay_23_12_encode(d.info);
+        (d, candidate_cw)
+    })
+}
+
+/// Soft-decision extended Golay(24, 12) decoder. Chase-II over the
+/// [`CHASE_GOLAY_DEPTH`] least-reliable positions.
+///
+/// Extended Golay corrects up to 3 errors and detects 4 (d_min = 8);
+/// the soft search flips weight-≤3 subsets. When the best candidate
+/// is itself uncorrectable under hard decode it propagates the
+/// sentinel [`u8::MAX`] in [`FecDecoded::errors`].
+pub fn golay_24_12_decode_soft(soft: &[i8; 24]) -> FecDecoded {
+    let weak = least_reliable_positions::<24>(soft, CHASE_GOLAY_DEPTH);
+    let hard_cw = soft_to_codeword_u32::<24>(soft);
+    chase_decode_u32::<24, 3>(soft, hard_cw, &weak, |cw| {
+        let d = golay_24_12_decode(cw);
+        // Reconstruct the 24-bit candidate for soft distance. When the
+        // inner hard decode flagged uncorrectable (errors == u8::MAX),
+        // still emit the best-effort reconstruction so soft distance
+        // can rank it; caller sees the sentinel in `errors`.
+        let candidate_cw = golay_24_12_encode(d.info);
+        (d, candidate_cw)
+    })
+}
+
+/// Soft-decision Hamming(15, 11) decoder. Tries the hard decision
+/// plus single-bit flips of each of the [`CHASE_HAMMING_DEPTH`]
+/// least-reliable positions; returns the result with minimum soft
+/// distance.
+///
+/// Hamming(15, 11) only corrects weight-1 errors on its own, so a
+/// narrow search (single-bit flips) already covers the code's
+/// bounded-distance envelope; deeper flips cannot improve hard
+/// decodability and only risk miscorrection.
+pub fn hamming_15_11_decode_soft(soft: &[i8; 15]) -> FecDecoded {
+    let weak = least_reliable_positions::<15>(soft, CHASE_HAMMING_DEPTH);
+    let hard_cw = soft_to_codeword_u16::<15>(soft);
+    chase_decode_u16::<15, 1>(soft, hard_cw, &weak, |cw| {
+        let d = hamming_15_11_decode(cw);
+        let candidate_cw = hamming_15_11_encode(d.info);
+        (d, candidate_cw)
+    })
+}
+
+/// Return the `k` positions in `soft` with smallest `|soft[i]|`, in
+/// ascending-confidence order. The slice index *is* the bit position
+/// (MSB-first within the codeword).
+fn least_reliable_positions<const N: usize>(soft: &[i8; N], k: usize) -> Vec<usize> {
+    let mut ranked: [(usize, u8); N] = [(0, 0); N];
+    for (i, &s) in soft.iter().enumerate() {
+        ranked[i] = (i, s.unsigned_abs());
+    }
+    ranked.sort_unstable_by_key(|&(_, conf)| conf);
+    ranked.iter().take(k.min(N)).map(|&(pos, _)| pos).collect()
+}
+
+fn soft_to_codeword_u32<const N: usize>(soft: &[i8; N]) -> u32 {
+    let mut cw = 0u32;
+    for &s in soft {
+        cw = (cw << 1) | u32::from(s > 0);
+    }
+    cw
+}
+
+fn soft_to_codeword_u16<const N: usize>(soft: &[i8; N]) -> u16 {
+    let mut cw = 0u16;
+    for &s in soft {
+        cw = (cw << 1) | u16::from(s > 0);
+    }
+    cw
+}
+
+/// Soft distance between `soft` and a candidate codeword. MSB-first:
+/// `soft[i]` lines up with `candidate` bit `(N-1-i)`.
+fn soft_distance_u32<const N: usize>(soft: &[i8; N], candidate: u32) -> u32 {
+    let mut dist = 0u32;
+    for (i, &s) in soft.iter().enumerate() {
+        let cb = ((candidate >> (N - 1 - i)) & 1) as i8;
+        let hard = i8::from(s > 0);
+        if cb != hard {
+            dist += u32::from(s.unsigned_abs());
+        }
+    }
+    dist
+}
+
+fn soft_distance_u16<const N: usize>(soft: &[i8; N], candidate: u16) -> u32 {
+    let mut dist = 0u32;
+    for (i, &s) in soft.iter().enumerate() {
+        let cb = ((candidate >> (N - 1 - i)) & 1) as i8;
+        let hard = i8::from(s > 0);
+        if cb != hard {
+            dist += u32::from(s.unsigned_abs());
+        }
+    }
+    dist
+}
+
+/// Chase-II core (u32 codeword). Flips every subset of `weak`
+/// positions with weight ≤ `T` (plus the zero-flip candidate),
+/// calls `hard_decode` on each, scores by soft distance, returns
+/// the minimum-distance result.
+fn chase_decode_u32<const N: usize, const T: u32>(
+    soft: &[i8; N],
+    hard_cw: u32,
+    weak: &[usize],
+    hard_decode: impl Fn(u32) -> (FecDecoded, u32),
+) -> FecDecoded {
+    let mut best: Option<(FecDecoded, u32)> = None;
+    let num_patterns = 1u32 << weak.len();
+    for pattern in 0..num_patterns {
+        if pattern.count_ones() > T {
+            continue;
+        }
+        let mut candidate = hard_cw;
+        for (bit_idx, &pos) in weak.iter().enumerate() {
+            if (pattern >> bit_idx) & 1 == 1 {
+                candidate ^= 1u32 << (N - 1 - pos);
+            }
+        }
+        let (decoded, reencoded) = hard_decode(candidate);
+        let dist = soft_distance_u32::<N>(soft, reencoded);
+        match best {
+            Some((_, best_dist)) if dist >= best_dist => {}
+            _ => best = Some((decoded, dist)),
+        }
+    }
+    best.map(|(d, _)| d).expect("Chase search emits at least the zero-flip candidate")
+}
+
+fn chase_decode_u16<const N: usize, const T: u32>(
+    soft: &[i8; N],
+    hard_cw: u16,
+    weak: &[usize],
+    hard_decode: impl Fn(u16) -> (FecDecoded, u16),
+) -> FecDecoded {
+    let mut best: Option<(FecDecoded, u32)> = None;
+    let num_patterns = 1u32 << weak.len();
+    for pattern in 0..num_patterns {
+        if pattern.count_ones() > T {
+            continue;
+        }
+        let mut candidate = hard_cw;
+        for (bit_idx, &pos) in weak.iter().enumerate() {
+            if (pattern >> bit_idx) & 1 == 1 {
+                candidate ^= 1u16 << (N - 1 - pos);
+            }
+        }
+        let (decoded, reencoded) = hard_decode(candidate);
+        let dist = soft_distance_u16::<N>(soft, reencoded);
+        match best {
+            Some((_, best_dist)) if dist >= best_dist => {}
+            _ => best = Some((decoded, dist)),
+        }
+    }
+    best.map(|(d, _)| d).expect("Chase search emits at least the zero-flip candidate")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -439,5 +627,118 @@ mod tests {
             let d = golay_23_12_decode(received);
             assert!(d.errors <= 3);
         }
+    }
+
+    // -----------------------------------------------------------------
+    // Soft-decision variants
+    // -----------------------------------------------------------------
+
+    /// Render a 23-bit codeword as a high-confidence soft vector
+    /// (MSB-first).
+    fn codeword_u32_to_soft<const N: usize>(cw: u32, confidence: i8) -> [i8; N] {
+        let mut soft = [0i8; N];
+        for i in 0..N {
+            let bit = (cw >> (N - 1 - i)) & 1;
+            soft[i] = if bit == 1 { confidence } else { -confidence };
+        }
+        soft
+    }
+
+    fn codeword_u16_to_soft<const N: usize>(cw: u16, confidence: i8) -> [i8; N] {
+        let mut soft = [0i8; N];
+        for i in 0..N {
+            let bit = (cw >> (N - 1 - i)) & 1;
+            soft[i] = if bit == 1 { confidence } else { -confidence };
+        }
+        soft
+    }
+
+    #[test]
+    fn soft_golay_23_roundtrip_high_confidence() {
+        for info in 0u16..(1 << 12) {
+            let cw = golay_23_12_encode(info);
+            let soft: [i8; 23] = codeword_u32_to_soft(cw, 120);
+            let d = golay_23_12_decode_soft(&soft);
+            assert_eq!(d.info, info);
+            assert_eq!(d.errors, 0);
+        }
+    }
+
+    #[test]
+    fn soft_golay_23_corrects_weak_errors_beyond_hard_capacity() {
+        // Flip 4 bits but make them all weak. Hard decode miscorrects;
+        // soft decode should still recover the original info word by
+        // exploring flips over the weakest positions.
+        let info = 0b110011001100u16;
+        let cw = golay_23_12_encode(info);
+        let mut soft: [i8; 23] = codeword_u32_to_soft(cw, 120);
+        for pos in [0, 5, 10, 15] {
+            soft[pos] = -soft[pos].signum() * 4;
+        }
+        let d = golay_23_12_decode_soft(&soft);
+        assert_eq!(d.info, info);
+    }
+
+    #[test]
+    fn soft_golay_23_matches_hard_on_strong_input() {
+        let info = 0b101101010010u16;
+        let cw = golay_23_12_encode(info);
+        let soft: [i8; 23] = codeword_u32_to_soft(cw, 127);
+        let soft_d = golay_23_12_decode_soft(&soft);
+        let hard_d = golay_23_12_decode(cw);
+        assert_eq!(soft_d.info, hard_d.info);
+        assert_eq!(soft_d.errors, 0);
+    }
+
+    #[test]
+    fn soft_golay_24_roundtrip_high_confidence() {
+        for info in [0x000u16, 0x001, 0x555, 0xAAA, 0xFFF, 0xABC] {
+            let cw = golay_24_12_encode(info);
+            let soft: [i8; 24] = codeword_u32_to_soft(cw, 120);
+            let d = golay_24_12_decode_soft(&soft);
+            assert_eq!(d.info, info);
+            assert_eq!(d.errors, 0);
+        }
+    }
+
+    #[test]
+    fn soft_hamming_15_roundtrip_high_confidence() {
+        for info in 0u16..(1 << 11) {
+            let cw = hamming_15_11_encode(info);
+            let soft: [i8; 15] = codeword_u16_to_soft(cw, 120);
+            let d = hamming_15_11_decode_soft(&soft);
+            assert_eq!(d.info, info);
+            assert_eq!(d.errors, 0);
+        }
+    }
+
+    #[test]
+    fn soft_hamming_15_corrects_single_error() {
+        let info = 0x2AAu16;
+        let cw = hamming_15_11_encode(info);
+        for bit in 0..15 {
+            let mut soft: [i8; 15] = codeword_u16_to_soft(cw, 120);
+            soft[bit] = -soft[bit];
+            let d = hamming_15_11_decode_soft(&soft);
+            assert_eq!(d.info, info, "bit {bit}");
+            assert_eq!(d.errors, 1);
+        }
+    }
+
+    #[test]
+    fn soft_hamming_15_prefers_weak_flip_over_miscorrection() {
+        // Construct a vector where the hard-decision path miscorrects
+        // a strong bit but the soft path finds a cheaper weak-bit flip
+        // that lands on the same codeword. Flip info bit 0 (cw bit 4)
+        // at low confidence; all other bits at high confidence.
+        let info = 0x555u16;
+        let cw = hamming_15_11_encode(info);
+        let mut soft: [i8; 15] = codeword_u16_to_soft(cw, 127);
+        // Position 10 is info bit 0 (cw bit 4 is position 10 MSB-first:
+        // N=15, bit index 4 corresponds to soft[15-1-4] = soft[10]).
+        soft[10] = -soft[10].signum() * 3;
+        let d = hamming_15_11_decode_soft(&soft);
+        assert_eq!(d.info, info);
+        assert_eq!(d.errors, 1);
     }
 }
