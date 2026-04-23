@@ -38,7 +38,7 @@ use blip25_mbe::codecs::mbe_baseline::{
 };
 use blip25_mbe::codecs::mbe_baseline::analysis::{
     AnalysisError, AnalysisOutput, AnalysisState, VuvResult,
-    band_count_for, band_for_harmonic,
+    band_count_for,
     encode_halfrate as analysis_encode_halfrate,
     encode_with_trace as analysis_encode_with_trace,
 };
@@ -65,7 +65,7 @@ use blip25_mbe::p25_halfrate::priority::{
     deprioritize as deprioritize_half,
 };
 use blip25_mbe::rate_conversion::converter::{
-    ConvertError, FullToHalfConverter, HalfToFullConverter,
+    FullToHalfConverter, HalfToFullConverter,
 };
 use blip25_mbe::mbe_params::MbeParams;
 
@@ -1652,7 +1652,6 @@ fn cmd_xcorr_frame(
     // Interpretation heuristic.
     println!();
     let peak_abs = peak_corr.abs();
-    let zero_abs = zero_lag.abs();
     println!("Diagnostic interpretation:");
     if peak_abs > 0.5 && peak_lag.abs() > 0 {
         let phase_rad = f64::from(omega_0) * f64::from(peak_lag);
@@ -3188,10 +3187,9 @@ impl Default for VuvBandStats {
 }
 
 impl VuvBandStats {
-    fn push(&mut self, chip: &MbeParams, enc: &MbeParams, vuv: &VuvResult) {
+    fn push(&mut self, chip: &MbeParams, _enc: &MbeParams, vuv: &VuvResult) {
         self.frames += 1;
         let l_chip = chip.harmonic_count();
-        let l_enc = enc.harmonic_count();
         let k_enc = vuv.k_hat;
         let k_chip = band_count_for(l_chip);
         let k_min = k_enc.min(k_chip);
