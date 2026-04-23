@@ -813,7 +813,19 @@ pub fn encode_halfrate(
     let sig_win = state.extract_refinement_window();
     let sw = signal_spectrum(&sig_win);
 
-    let refinement = refine_pitch(&sw, basis, p_hat_i);
+    let mut refinement = refine_pitch(&sw, basis, p_hat_i);
+    // Half-rate `L̂` is **Annex L table lookup at b̂₀**, not Eq. 31 on
+    // ω̂₀ (gap 0019 resolution — BABA-A §13.1 + Annex L). Annex L's L
+    // column follows a single-floor rule `L = ⌊0.9254 · π/ω₀⌋` that
+    // diverges from Eq. 31's double-floor-with-+0.25 form on 36/120
+    // rows. Using Eq. 31 here would desync downstream block-size
+    // lookups (Annex N/P/Q/R) from the decoder.
+    {
+        use crate::p25_halfrate::dequantize::{decode_pitch, encode_pitch};
+        let b0 = encode_pitch(refinement.omega_hat as f32)
+            .ok_or(AnalysisError::PitchOutOfRange)?;
+        refinement.l_hat = decode_pitch(b0).ok_or(AnalysisError::PitchOutOfRange)?.l;
+    }
     let vuv_result = determine_vuv(&sw, basis, &refinement, e_p_hat_i, &mut state.vuv);
     let m_hat = estimate_spectral_amplitudes(&sw, basis, &refinement, &vuv_result);
 
