@@ -338,6 +338,13 @@ enum Cmd {
         /// "encoder silence" rather than compared.
         #[arg(long)]
         silence_dispatch: bool,
+        /// If > 0, print per-frame `(enc ω̂_0, chip ω̃_0, Δcents, enc L̂,
+        /// chip L̃, Eq.31(enc), Eq.31(chip))` for the first N
+        /// post-preroll voice-voice frames. Isolates whether an L
+        /// mismatch comes from ω̂_0 ≠ ω̃_0 or from the Annex L table's
+        /// L column diverging from Eq. 31 at the same ω.
+        #[arg(long, default_value_t = 0)]
+        dump_frames: usize,
     },
     RateConvertSmoothness {
         /// Conversion direction — i.e. which target stream's
@@ -534,8 +541,14 @@ fn main() -> Result<()> {
         Cmd::RateConvertSmoothness { direction, name, rc } => {
             cmd_rate_convert_smoothness(&args.vectors, direction, &name, rc)
         }
-        Cmd::HalfrateAnalysisEncode { name, chip_offset, silence_dispatch } => {
-            cmd_halfrate_analysis_encode(&args.vectors, &name, chip_offset, silence_dispatch)
+        Cmd::HalfrateAnalysisEncode { name, chip_offset, silence_dispatch, dump_frames } => {
+            cmd_halfrate_analysis_encode(
+                &args.vectors,
+                &name,
+                chip_offset,
+                silence_dispatch,
+                dump_frames,
+            )
         }
         Cmd::AnalysisEncode { name, rc, dump_frames, chip_offset, silence_dispatch, quantizer_roundtrip, chip_seed_vuv, bitstream } => {
             cmd_analysis_encode(&args.vectors, &name, rc, dump_frames, chip_offset, silence_dispatch, quantizer_roundtrip, chip_seed_vuv, bitstream)
@@ -2879,6 +2892,7 @@ fn cmd_halfrate_analysis_encode(
     name: &str,
     chip_offset: i32,
     silence_dispatch: bool,
+    dump_frames: usize,
 ) -> Result<()> {
     // Half-rate vectors live under tv-rc/r33/ per the existing
     // cmd_decode_pcm_halfrate convention.
@@ -2960,6 +2974,13 @@ fn cmd_halfrate_analysis_encode(
     let mut encoder_silence = 0usize;
     let mut tone_frames = 0usize;
     let mut erasure_frames = 0usize;
+    let mut dumped = 0usize;
+    if dump_frames > 0 {
+        println!(
+            "{:>5} {:>10} {:>10} {:>8} {:>5} {:>5} {:>7} {:>7}",
+            "frame", "enc_ω", "chip_ω", "Δcents", "enc_L", "chip_L", "Eq31_e", "Eq31_c",
+        );
+    }
 
     for f in 0..n_frames {
         let pcm_frame = &pcm[f * FRAME_SAMPLES..(f + 1) * FRAME_SAMPLES];
@@ -2990,6 +3011,24 @@ fn cmd_halfrate_analysis_encode(
                 }
                 if l_match && pitch_close {
                     stats_l_and_pitch.push(ref_params, &enc_params);
+                }
+                if dumped < dump_frames {
+                    let eq31 = |w: f64| {
+                        let inner = (core::f64::consts::PI / w + 0.25).floor();
+                        (0.9254 * inner).floor() as i32
+                    };
+                    println!(
+                        "{:5} {:10.6} {:10.6} {:+8.2} {:5} {:5} {:7} {:7}",
+                        f,
+                        we,
+                        wc,
+                        cents,
+                        le,
+                        lc,
+                        eq31(we),
+                        eq31(wc),
+                    );
+                    dumped += 1;
                 }
             }
             (Ok(AnalysisOutput::Voice(_)), Some(Decoded::Tone { .. })) => {
