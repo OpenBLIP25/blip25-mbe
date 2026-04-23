@@ -47,19 +47,41 @@ test vectors, not any open-source implementation.
 - Quoting non-trivial passages from any TIA source into code, comments, or
   docs is a copyright issue. Keep such quotes out of the repo.
 
-### What IS allowed
-- **General SDR open-source libraries** (DSP primitives, modulation, filter
-  design, generic coding libraries) that are not P25-specific.
-- **LLM knowledge of widely-established, textbook methods** — Golay codes,
-  Hamming codes, Reed-Solomon, CRC polynomials, standard DSP transforms,
-  linear congruential generators, etc. These are mathematical constructs,
-  not project IP. Implementing them from first principles (generator
-  polynomials, parity-check matrices, standard decoding algorithms) is
-  expected and is not considered "guessing."
+### What IS allowed — clean-room scope is P25 IP, not general DSP
 
-The restriction is on the **P25 domain specifically**. General signal
-processing and coding theory are fair game. The stop-on-gap rule applies to
-**any** spec ambiguity — don't scope it narrowly.
+The clean-room rule covers **P25 protocol IP only** — anything whose authority
+is the TIA-102 spec text. Outside that boundary, freely reference open-source
+SDR projects (GNURadio, gr-satellites, gqrx, liquid-dsp, OP25's DSP layer,
+SDRTrunk's DSP layer, etc.) for proven techniques.
+
+**Clean-room rule applies to (P25 IP):**
+- Frame layouts, NID, sync words, NAC values
+- FEC bit allocations, interleavers, code parameters as specified
+- MAC opcodes, TSBK/MBT framing, dispatch tables
+- Vocoder bit ordering, prioritization, FEC mapping (BABA-A)
+- Scrambling LFSR seeds, key derivation
+- Anything literally specified in a TIA-102 document
+
+**Clean-room rule does NOT apply to (general DSP / SDR — reference freely):**
+- DDC, polyphase channelization, decimation filter design
+- PLLs, Costas loops, carrier / phase / frequency recovery
+- Symbol timing recovery (Gardner, M&M, polyphase MF resampler)
+- AGC, DC offset removal, IQ imbalance correction
+- Frame-sync correlator design, sync-pattern search strategy, soft-sync metrics
+- Equalizers, matched filters, eye-diagram analysis
+- Generic coding theory: Golay, Hamming, RS, CRC, BCH, convolutional, Viterbi
+- Standard transforms: FFT, DCT, FIR/IIR, windowing
+
+Litmus test: *"would this code/technique work on a non-P25 signal too?"* If yes,
+it's general DSP — copy from GNURadio and move on. "The spec doesn't describe
+a PLL" is **not** a spec gap; it's a DSP design choice you make from open-source
+references.
+
+- **LLM knowledge of widely-established, textbook methods** is also fine.
+  Implementing them from first principles is expected and not "guessing."
+
+The stop-on-gap rule still applies to **any P25 spec ambiguity** — don't scope
+it narrowly. But it does not apply to DSP design choices the spec leaves open.
 
 ### DVSI emulation target
 - The goal is bit-exact (or as close as the spec allows) equivalence with the
