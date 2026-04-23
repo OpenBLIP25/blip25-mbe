@@ -425,6 +425,17 @@ enum Cmd {
         /// bit match rates.
         #[arg(long)]
         bitstream: bool,
+        /// Override the reference `.bit` path. Default is the shipped
+        /// DVSI test vector next to `<name>.pcm`; supply this to
+        /// compare against a chip-live re-encode of the same PCM (or
+        /// any other authoritative bit stream for that PCM).
+        #[arg(long)]
+        bit_override: Option<PathBuf>,
+        /// Stop after processing this many frames. Use with a partial
+        /// `--bit-override` produced by a shortened chip-live encode
+        /// (`dvsi encode --frames N`) so frame counts match.
+        #[arg(long)]
+        max_frames: Option<usize>,
     },
     /// Run the normative P25 full-rate DVSI test vector sweep driven by
     /// `tv-std/tv/cmpp25.txt` (576 test lines × {alert, clean, cp*,
@@ -550,8 +561,8 @@ fn main() -> Result<()> {
                 dump_frames,
             )
         }
-        Cmd::AnalysisEncode { name, rc, dump_frames, chip_offset, silence_dispatch, quantizer_roundtrip, chip_seed_vuv, bitstream } => {
-            cmd_analysis_encode(&args.vectors, &name, rc, dump_frames, chip_offset, silence_dispatch, quantizer_roundtrip, chip_seed_vuv, bitstream)
+        Cmd::AnalysisEncode { name, rc, dump_frames, chip_offset, silence_dispatch, quantizer_roundtrip, chip_seed_vuv, bitstream, bit_override, max_frames } => {
+            cmd_analysis_encode(&args.vectors, &name, rc, dump_frames, chip_offset, silence_dispatch, quantizer_roundtrip, chip_seed_vuv, bitstream, bit_override.as_deref(), max_frames)
         }
         Cmd::P25Sweep { cmp, filter, op, stop_on_first } => {
             cmd_p25_sweep(&args.vectors, cmp.as_deref(), filter.as_deref(), op.as_deref(), stop_on_first)
@@ -3344,10 +3355,15 @@ fn cmd_analysis_encode(
     quantizer_roundtrip: bool,
     chip_seed_vuv: bool,
     bitstream: bool,
+    bit_override: Option<&Path>,
+    max_frames: Option<usize>,
 ) -> Result<()> {
     let dir = vector_dir(root, rc);
     let pcm_path = dir.join("p25").join(format!("{name}.pcm"));
-    let fec_path = dir.join("p25").join(format!("{name}.bit"));
+    let fec_path = match bit_override {
+        Some(p) => p.to_path_buf(),
+        None => dir.join("p25").join(format!("{name}.bit")),
+    };
 
     let pcm_bytes = fs::read(&pcm_path)
         .with_context(|| format!("read PCM vector {}", pcm_path.display()))?;
@@ -3371,14 +3387,25 @@ fn cmd_analysis_encode(
     }
     let n_pcm_frames = pcm_bytes.len() / (FRAME_SAMPLES * 2);
     let n_fec_frames = fec_bytes.len() / BYTES_PER_FEC_FRAME;
-    if n_pcm_frames != n_fec_frames {
-        return Err(anyhow!(
-            "frame-count mismatch: {} PCM frames vs {} FEC frames",
-            n_pcm_frames,
-            n_fec_frames
-        ));
-    }
-    let n_frames = n_pcm_frames;
+    let n_frames = match max_frames {
+        Some(n) => {
+            let cap = n_pcm_frames.min(n_fec_frames).min(n);
+            if cap == 0 {
+                return Err(anyhow!("--max-frames produced zero comparable frames"));
+            }
+            cap
+        }
+        None => {
+            if n_pcm_frames != n_fec_frames {
+                return Err(anyhow!(
+                    "frame-count mismatch: {} PCM frames vs {} FEC frames (use --max-frames to clip)",
+                    n_pcm_frames,
+                    n_fec_frames
+                ));
+            }
+            n_pcm_frames
+        }
+    };
 
     let pcm: Vec<i16> = pcm_bytes
         .chunks_exact(2)
