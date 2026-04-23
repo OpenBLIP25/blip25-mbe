@@ -37,13 +37,29 @@ For P25 full-rate FEC (144 bits, 18 bytes):
 
     type=0x01 | 0x40 | 0x01 | 0x90 | <18 bytes>
 
-## Speech packet response
+## Speech packet (both directions, same wire shape)
 
-Per manual §6.11.1:
+Decode direction — chip emits:
 
     type=0x02 | 0x40 (CHANNEL0) | 0x00 (SPEECHD field id) | 0xA0 (160 samples) | <320 bytes PCM>
 
-PCM is big-endian i16 per BABA-A convention.
+Encode direction — host sends:
+
+    type=0x02 | 0x40 (CHANNEL0) | 0x00 (SPEECHD field id) | 0xA0 (160 samples) | <320 bytes PCM>
+
+PCM is big-endian i16 per BABA-A convention (confirmed by DVSI's own
+`usb3k_client.c` — `put_word` emits hi byte first).
+
+## Init flags (PKT_INIT data byte)
+
+From DVSI `a3kpacket.h`:
+
+- PKT_INIT_ENCODER = 0x01
+- PKT_INIT_DECODER = 0x02
+- PKT_INIT_ECHO    = 0x04
+
+Decode-only probes use 0x02. Encode probes need 0x01. Roundtrip probes
+(encode-then-decode) need both → 0x03.
 
 ## P25 rate configuration (PKT_RATEP, field id 0x0A)
 
@@ -81,6 +97,11 @@ FIELD_INIT       = 0x0B
 FIELD_PRODID     = 0x30
 FIELD_VERSTRING  = 0x31
 FIELD_CHANNEL0   = 0x40
+
+# PKT_INIT data-byte flags (DVSI a3kpacket.h)
+INIT_ENCODER     = 0x01
+INIT_DECODER     = 0x02
+INIT_ECHO        = 0x04
 
 # WARNING: do not send these
 FIELD_RESET      = 0x33  # hangs chip — never use
@@ -136,6 +157,53 @@ def make_channel_packet(frame_bytes, n_bits=144, channel=0):
     fields = [FIELD_CHANNEL0, FIELD_CHAND, n_bits & 0xFF] + list(frame_bytes)
     return pack_packet(PKT_TYPE_CHANNEL, fields)
 
+def make_speech_packet(samples, channel=0):
+    """Build a speech packet to feed the chip's encoder.
+
+    Format mirrors the decode response (per DVSI usb3k_client.c
+    `encode_speech_packet`):
+        type=PKT_SPEECH | CHANNEL0(0x40) | SPEECHD(0x00) | n_samples | <samples × BE i16>
+
+    `samples` is a list of i16 PCM values in [-32768, 32767]. Length is
+    typically 160 for P25 full-rate (20 ms @ 8 kHz).
+    """
+    if channel != 0:
+        raise NotImplementedError("only channel 0 supported")
+    n = len(samples)
+    if n > 0xFF:
+        raise ValueError(f"sample count {n} exceeds 1-byte field width")
+    fields = [FIELD_CHANNEL0, FIELD_SPEECHD, n & 0xFF]
+    for v in samples:
+        v = int(v)
+        if v < -32768 or v > 32767:
+            raise ValueError(f"PCM sample {v} out of i16 range")
+        if v < 0:
+            v += 0x10000
+        fields.append((v >> 8) & 0xFF)  # big-endian per put_word
+        fields.append(v & 0xFF)
+    return pack_packet(PKT_TYPE_SPEECH, fields)
+
+def extract_channel_bits(channel_body):
+    """Extract `(n_bits, frame_bytes)` from a channel packet body.
+
+    Body layout (per manual §6.9.1, mirror of make_channel_packet):
+        [0x40 (CHANNEL0)] [0x01 (CHAND)] [n_bits_1byte] [ceil(n_bits/8) bytes]
+        OR (when chip omits CHANNEL0 field):
+        [0x01 (CHAND)] [n_bits_1byte] [ceil(n_bits/8) bytes]
+    """
+    if len(channel_body) >= 3 and channel_body[0] == FIELD_CHAND:
+        n_bits = channel_body[1]
+        data = channel_body[2:]
+    elif len(channel_body) >= 4 and channel_body[0] == FIELD_CHANNEL0 and channel_body[1] == FIELD_CHAND:
+        n_bits = channel_body[2]
+        data = channel_body[3:]
+    else:
+        return None
+    n_bytes = (n_bits + 7) // 8
+    if len(data) < n_bytes:
+        return None
+    return (n_bits, bytes(data[:n_bytes]))
+
 def extract_pcm(speech_body):
     """Extract 160 i16 samples from a speech packet body.
 
@@ -174,11 +242,28 @@ def get_version(s):
     pkt_type, body = resp
     return body.decode('ascii', errors='replace').rstrip('\x00')
 
-def init_decoder(s):
-    """PKT_INIT with data=0x02 — initialize decoder. Safe (returns response)."""
-    pkt = pack_packet(PKT_TYPE_CONTROL, [FIELD_INIT, 0x02])
+def init_codec(s, flags=INIT_DECODER):
+    """PKT_INIT — initialize the requested codec halves.
+
+    `flags` is a bitwise OR of INIT_ENCODER / INIT_DECODER / INIT_ECHO.
+    Decode-only: 0x02. Encode-only: 0x01. Roundtrip: 0x03. Safe (returns
+    a response), unlike PKT_RESET (0x33) which permanently hangs the chip.
+    """
+    pkt = pack_packet(PKT_TYPE_CONTROL, [FIELD_INIT, flags & 0xFF])
     s.write(pkt); s.flush()
     return read_response(s)
+
+def init_decoder(s):
+    """Back-compat alias: initialize decoder only."""
+    return init_codec(s, INIT_DECODER)
+
+def init_encoder(s):
+    """Initialize encoder only."""
+    return init_codec(s, INIT_ENCODER)
+
+def init_both(s):
+    """Initialize encoder and decoder for roundtrip probes."""
+    return init_codec(s, INIT_ENCODER | INIT_DECODER)
 
 def set_p25_fullrate(s, with_fec=True):
     """Configure chip for P25 full-rate IMBE decode/encode."""
@@ -204,6 +289,54 @@ def decode_frame(s, frame_18_bytes):
     if pkt_type != PKT_TYPE_SPEECH:
         return None
     return extract_pcm(body)
+
+def encode_frame(s, pcm_160_samples):
+    """Send 160 PCM samples to the chip's encoder, return 18 frame bytes.
+
+    For P25 full-rate FEC the response carries 144 bits / 18 bytes. The
+    chip is in `set_p25_fullrate` mode; the host is responsible for
+    setting the rate before calling this.
+    """
+    if len(pcm_160_samples) != 160:
+        raise ValueError(f"expected 160 samples, got {len(pcm_160_samples)}")
+    pkt = make_speech_packet(pcm_160_samples)
+    s.write(pkt); s.flush()
+    resp = read_response(s, timeout_s=2.0)
+    if resp is None:
+        return None
+    pkt_type, body = resp
+    if pkt_type != PKT_TYPE_CHANNEL:
+        return None
+    parsed = extract_channel_bits(body)
+    if parsed is None:
+        return None
+    n_bits, data = parsed
+    if n_bits != 144 or len(data) != 18:
+        return None
+    return data
+
+def encode_file(s, pcm_path, bit_out, n_frames=None):
+    """Encode a raw PCM file (LE i16, 8 kHz mono) to a P25 full-rate .bit file."""
+    with open(pcm_path, 'rb') as f:
+        pcm = f.read()
+    samples = struct.unpack(f'<{len(pcm)//2}h', pcm[:(len(pcm)//2)*2])
+    total = len(samples) // 160
+    if n_frames is None:
+        n_frames = total
+    n_frames = min(n_frames, total)
+    bit_buf = bytearray()
+    errors = 0
+    for f_idx in range(n_frames):
+        frame_pcm = list(samples[f_idx*160:(f_idx+1)*160])
+        bits = encode_frame(s, frame_pcm)
+        if bits is None:
+            errors += 1
+            bit_buf += bytes(18)
+            continue
+        bit_buf += bits
+    with open(bit_out, 'wb') as f:
+        f.write(bit_buf)
+    return n_frames, errors
 
 def decode_file(s, fec_path, out_path, n_frames=None):
     """Decode an entire .bit file (P25 full-rate FEC) to PCM."""
@@ -252,6 +385,19 @@ def main():
     p_compare.add_argument('--frames', type=int, default=60)
     p_compare.add_argument('--no-fec', action='store_true')
 
+    p_encode = sub.add_parser('encode', help='Encode a raw PCM file (LE i16 8 kHz mono) to a P25 full-rate .bit file')
+    p_encode.add_argument('pcm_path')
+    p_encode.add_argument('bit_out')
+    p_encode.add_argument('--frames', type=int, default=None)
+    p_encode.add_argument('--no-fec', action='store_true')
+
+    p_round = sub.add_parser('roundtrip', help='Encode PCM via chip, then decode the chip bits back to PCM via chip')
+    p_round.add_argument('pcm_in')
+    p_round.add_argument('pcm_out')
+    p_round.add_argument('--frames', type=int, default=None)
+    p_round.add_argument('--no-fec', action='store_true')
+    p_round.add_argument('--bit-out', default=None, help='Optional path to also save the intermediate .bit stream')
+
     args = ap.parse_args()
     with serial.Serial(args.port, args.baud, timeout=2.0) as s:
         s.reset_input_buffer()
@@ -261,8 +407,11 @@ def main():
             print(v if v else "(no response)")
             return
 
-        # All other commands need decoder init + rate set
-        init_decoder(s)
+        # Encode-capable commands need both halves initialized.
+        init_flags = INIT_DECODER
+        if args.cmd in ('encode', 'roundtrip'):
+            init_flags = INIT_ENCODER | INIT_DECODER
+        init_codec(s, init_flags)
         set_p25_fullrate(s, with_fec=not args.no_fec)
         time.sleep(0.1)
 
@@ -271,6 +420,22 @@ def main():
             print(f"decoded {n - errors}/{n} frames to {args.pcm_out}")
             if errors:
                 print(f"errors: {errors}")
+            return
+
+        if args.cmd == 'encode':
+            n, errors = encode_file(s, args.pcm_path, args.bit_out, args.frames)
+            print(f"encoded {n - errors}/{n} frames to {args.bit_out}")
+            if errors:
+                print(f"errors: {errors}")
+            return
+
+        if args.cmd == 'roundtrip':
+            bit_path = args.bit_out if args.bit_out else '/tmp/_chip_round.bit'
+            n_e, err_e = encode_file(s, args.pcm_in, bit_path, args.frames)
+            n_d, err_d = decode_file(s, bit_path, args.pcm_out, n_e)
+            print(f"encoded {n_e - err_e}/{n_e}, decoded {n_d - err_d}/{n_d} → {args.pcm_out}")
+            if err_e or err_d:
+                print(f"encode errors: {err_e}; decode errors: {err_d}")
             return
 
         if args.cmd == 'compare':

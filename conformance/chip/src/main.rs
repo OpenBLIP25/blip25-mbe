@@ -32,6 +32,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
 
+use blip25_mbe::codecs::mbe_baseline::analysis::{
+    encode as analysis_encode, AnalysisOutput, AnalysisState,
+};
 use blip25_mbe::codecs::mbe_baseline::{synthesize_frame, FrameErrorContext, SynthState, GAMMA_W};
 use blip25_mbe::mbe_params::{MbeParams, L_MIN};
 use blip25_mbe::p25_fullrate::dequantize::{
@@ -111,6 +114,37 @@ enum Cmd {
         #[arg(long)]
         dir: PathBuf,
     },
+    /// Compare our analysis encoder against the chip's encoder on the
+    /// same PCM. Decodes both bitstreams via our wire decoder so the
+    /// diff is reported in MbeParams space (L̂, ω̂_0, V/UV mask,
+    /// per-harmonic log₂|M̃_l|). Per gap report 0001 §4.
+    ///
+    /// Inputs:
+    ///   `--pcm`         raw LE i16 8 kHz mono PCM (the source signal)
+    ///   `--chip-bits`   chip-emitted .bit (produced by `dvsi encode <pcm>`)
+    ChipVsOurs {
+        /// Source PCM file (LE i16, 8 kHz mono).
+        #[arg(long)]
+        pcm: PathBuf,
+        /// Chip-emitted bits for the same PCM (18 bytes per frame).
+        #[arg(long = "chip-bits")]
+        chip_bits: PathBuf,
+        /// Number of frames to compare (default: full file).
+        #[arg(long)]
+        frames: Option<usize>,
+        /// Skip this many leading frames before reporting (default: 0).
+        /// Both sides still process every frame so predictor state stays
+        /// consistent — this only suppresses output rows.
+        #[arg(long, default_value_t = 0)]
+        start: usize,
+        /// Frame-alignment offset between chip bits and our encoder
+        /// output. Comparison pair becomes `(ours[i], chip[i + offset])`.
+        /// Use `-2` for tv-rc reference bits to compensate our encoder's
+        /// 3-frame lookahead (it emits the analysis of frame `i-2` when
+        /// fed PCM frame `i`). Default `0` for raw frame-by-frame.
+        #[arg(long = "align-offset", default_value_t = 0, allow_hyphen_values = true)]
+        align_offset: i32,
+    },
 }
 
 fn main() -> Result<()> {
@@ -122,6 +156,13 @@ fn main() -> Result<()> {
         Cmd::ReencodeVector { input, out, frames } => cmd_reencode_vector(&input, &out, frames),
         Cmd::ProbeGenerate { out } => cmd_probe_generate(&out),
         Cmd::ProbeCompare { dir } => cmd_probe_compare(&dir),
+        Cmd::ChipVsOurs {
+            pcm,
+            chip_bits,
+            frames,
+            start,
+            align_offset,
+        } => cmd_chip_vs_ours(&pcm, &chip_bits, frames, start, align_offset),
     }
 }
 
@@ -1075,6 +1116,304 @@ fn frame_metrics(ours: &[i16], chip: &[i16]) -> (f64, f64, i32, f64) {
     let denom = (sum_sq_ours * sum_sq_chip).sqrt();
     let xcorr = if denom > 0.0 { sum_prod / denom } else { 0.0 };
     (snr, rms_err, peak, xcorr)
+}
+
+// ---------------------------------------------------------------------------
+// Chip-encode vs our-encode comparison (MbeParams-level diff).
+//
+// Both bit streams (chip's and ours) are decoded through our own
+// p25_fullrate wire decoder so any mismatch is attributable to the
+// analysis-encoder side, not to a wire-decoder discrepancy. Each side
+// gets its own DecoderState because the predictor evolves with the
+// bits actually emitted on that side.
+// ---------------------------------------------------------------------------
+
+/// Per-frame slot: either a recovered MbeParams or the reason the slot
+/// couldn't produce one.
+enum FrameSlot {
+    Voice(MbeParams),
+    Silence,
+    /// Wire-decoder rejected the bits (chip emitted control / reserved).
+    /// Carries the raw u₀ for diagnostics.
+    Ctrl(u16),
+}
+
+fn cmd_chip_vs_ours(
+    pcm_path: &Path,
+    chip_bits_path: &Path,
+    frames_arg: Option<usize>,
+    start: usize,
+    align_offset: i32,
+) -> Result<()> {
+    let pcm = read_pcm_le_i16(pcm_path)?;
+    let chip_bytes = fs::read(chip_bits_path)
+        .with_context(|| format!("read {}", chip_bits_path.display()))?;
+    if chip_bytes.len() % BYTES_PER_FEC_FRAME != 0 {
+        return Err(anyhow!(
+            "{}: not a whole number of {}-byte frames",
+            chip_bits_path.display(),
+            BYTES_PER_FEC_FRAME
+        ));
+    }
+
+    let n_pcm_frames = pcm.len() / FRAME_SAMPLES;
+    let n_bit_frames = chip_bytes.len() / BYTES_PER_FEC_FRAME;
+    let total = n_pcm_frames.min(n_bit_frames);
+    let n = frames_arg.unwrap_or(total).min(total);
+    if start >= n {
+        return Err(anyhow!(
+            "--start {start} >= comparable frames {n} (pcm={n_pcm_frames}, chip-bits={n_bit_frames})"
+        ));
+    }
+    if n_pcm_frames != n_bit_frames {
+        eprintln!(
+            "warning: pcm has {n_pcm_frames} frames, chip-bits has {n_bit_frames} — comparing the first {total}"
+        );
+    }
+
+    let mut analysis = AnalysisState::new();
+    let mut chip_dec = DecoderState::new();
+    let mut ours_dec = DecoderState::new();
+    let mut ours_enc = DecoderState::new();
+
+    // Process every frame in order so both predictor states evolve
+    // correctly. Comparison happens in a second pass so `--align-offset`
+    // can pair `ours[i]` with `chip[i + offset]`.
+    let mut ours_slots: Vec<FrameSlot> = Vec::with_capacity(n);
+    let mut chip_slots: Vec<FrameSlot> = Vec::with_capacity(n);
+
+    for i in 0..n {
+        let pcm_frame = &pcm[i * FRAME_SAMPLES..(i + 1) * FRAME_SAMPLES];
+        let chip_frame = &chip_bytes[i * BYTES_PER_FEC_FRAME..(i + 1) * BYTES_PER_FEC_FRAME];
+
+        // Chip side. Control frames (b̂_0 ∈ 120..127 erasure / silence /
+        // tone, or reserved 208..255) fail our voice dequantizer; treat
+        // those as a non-comparable slot, not a hard abort.
+        let chip_dibits = unpack_bytes_to_dibits(chip_frame);
+        let chip_imbe = decode_full_frame(&chip_dibits);
+        chip_slots.push(match dequantize_full(&chip_imbe.info, &mut chip_dec) {
+            Ok(p) => FrameSlot::Voice(p),
+            Err(_) => FrameSlot::Ctrl(chip_imbe.info[0]),
+        });
+
+        // Our side. Silence / preroll → no MbeParams to compare.
+        let our_out = analysis_encode(pcm_frame, &mut analysis)
+            .map_err(|e| anyhow!("frame {i}: analysis encode: {e:?}"))?;
+        let our_params = match our_out {
+            AnalysisOutput::Voice(p) => p,
+            AnalysisOutput::Silence => {
+                ours_slots.push(FrameSlot::Silence);
+                continue;
+            }
+        };
+
+        // Round-trip our params through our wire encoder → decoder so
+        // the comparison is apples-to-apples (chip params went through
+        // dequantize too).
+        let b = quantize_full(&our_params, &mut ours_enc)
+            .map_err(|e| anyhow!("frame {i}: our quantize: {e:?}"))?;
+        let u = prioritize_full(&b, our_params.harmonic_count());
+        let our_dibits = encode_full_frame(&u);
+        let our_packed = pack_dibits_to_bytes(&our_dibits);
+        let our_dibits_rt = unpack_bytes_to_dibits(&our_packed);
+        let ours_imbe = decode_full_frame(&our_dibits_rt);
+        let ours_params = dequantize_full(&ours_imbe.info, &mut ours_dec)
+            .map_err(|e| anyhow!("frame {i}: ours dequantize: {e:?}"))?;
+        ours_slots.push(FrameSlot::Voice(ours_params));
+    }
+
+    println!(
+        "{:>5}  {:<8}  {:>3} {:>3} {:>3}  {:>7} {:>7} {:>+7}  {:>4} {:>4} {:>3}  {:>9} {:>9}",
+        "frame", "src",
+        "Lc", "Lo", "dL",
+        "ω0_c", "ω0_o", "dcent",
+        "Vbc", "Vbo", "dV",
+        "rms_dlog2", "pk_dlog2",
+    );
+    println!("{}", "-".repeat(98));
+
+    let mut compared = 0usize;
+    let mut l_match = 0usize;
+    let mut sum_abs_dl = 0u64;
+    let mut sum_abs_dcent = 0.0_f64;
+    let mut omega_within_25c = 0usize;
+    let mut vmask_match = 0usize;
+    let mut sum_rms_dlog2 = 0.0_f64;
+    let mut sum_pk_dlog2 = 0.0_f64;
+
+    for i in start..n {
+        let chip_idx = i as i32 + align_offset;
+        if chip_idx < 0 || (chip_idx as usize) >= n {
+            continue;
+        }
+        let chip_idx = chip_idx as usize;
+        match (&ours_slots[i], &chip_slots[chip_idx]) {
+            (FrameSlot::Silence, _) => println!("{:>5}  {:<8}", i, "silence"),
+            (FrameSlot::Ctrl(_), _) => unreachable!("ours never produces Ctrl"),
+            (_, FrameSlot::Ctrl(u0)) => {
+                println!("{:>5}  {:<8}  chip ctrl  (u₀=0x{:03x})", i, "ctrl", u0)
+            }
+            (_, FrameSlot::Silence) => unreachable!("chip slot is Voice or Ctrl"),
+            (FrameSlot::Voice(ours_p), FrameSlot::Voice(chip_p)) => {
+                let m = mbe_params_diff(chip_p, ours_p);
+                println!(
+                    "{:>5}  {:<8}  {:>3} {:>3} {:>+3}  {:>7.4} {:>7.4} {:>+7.0}  {:>4} {:>4} {:>+3}  {:>9.3} {:>9.3}",
+                    i, "voice",
+                    m.l_chip, m.l_ours, (m.l_ours as i32 - m.l_chip as i32),
+                    m.omega_chip, m.omega_ours, m.dcents,
+                    m.v_bands_chip, m.v_bands_ours,
+                    (m.v_bands_ours as i32 - m.v_bands_chip as i32),
+                    m.rms_dlog2, m.peak_dlog2,
+                );
+                compared += 1;
+                if m.l_chip == m.l_ours {
+                    l_match += 1;
+                }
+                sum_abs_dl += (m.l_ours as i32 - m.l_chip as i32).unsigned_abs() as u64;
+                sum_abs_dcent += m.dcents.abs();
+                if m.dcents.abs() <= 25.0 {
+                    omega_within_25c += 1;
+                }
+                if m.v_bands_chip == m.v_bands_ours && m.vmask_exact {
+                    vmask_match += 1;
+                }
+                sum_rms_dlog2 += m.rms_dlog2;
+                sum_pk_dlog2 += m.peak_dlog2;
+            }
+        }
+    }
+
+    println!("{}", "-".repeat(98));
+    if compared == 0 {
+        println!("no voice frames in window — nothing to aggregate");
+        return Ok(());
+    }
+    let f = compared as f64;
+    println!(
+        "aggregate over {compared} voice frames (start={start}, n={n}, align_offset={align_offset}):\n  \
+         L exact:        {l_match}/{compared} ({:.1}%)   mean |ΔL| = {:.2}\n  \
+         |Δω₀| (cents):  mean = {:.1}     within ±25 ¢: {omega_within_25c}/{compared} ({:.1}%)\n  \
+         V/UV exact:     {vmask_match}/{compared} ({:.1}%)\n  \
+         log₂|M̃_l| diff: mean RMS = {:.3}     mean peak = {:.3}",
+        100.0 * l_match as f64 / f,
+        sum_abs_dl as f64 / f,
+        sum_abs_dcent / f,
+        100.0 * omega_within_25c as f64 / f,
+        100.0 * vmask_match as f64 / f,
+        sum_rms_dlog2 / f,
+        sum_pk_dlog2 / f,
+    );
+    Ok(())
+}
+
+/// Per-frame MbeParams diff between the chip's and our decoded params.
+struct ParamsDiff {
+    l_chip: u8,
+    l_ours: u8,
+    omega_chip: f32,
+    omega_ours: f32,
+    dcents: f64,
+    v_bands_chip: u8,
+    v_bands_ours: u8,
+    /// True iff the per-band V/UV vector is bit-exact across the
+    /// shared band count (min of the two).
+    vmask_exact: bool,
+    rms_dlog2: f64,
+    peak_dlog2: f64,
+}
+
+fn mbe_params_diff(chip: &MbeParams, ours: &MbeParams) -> ParamsDiff {
+    let l_chip = chip.harmonic_count();
+    let l_ours = ours.harmonic_count();
+    let omega_chip = chip.omega_0();
+    let omega_ours = ours.omega_0();
+    let dcents = if omega_chip > 0.0 && omega_ours > 0.0 {
+        1200.0 * ((omega_ours as f64) / (omega_chip as f64)).log2()
+    } else {
+        0.0
+    };
+
+    let k_chip = vuv_band_count(l_chip);
+    let k_ours = vuv_band_count(l_ours);
+    let v_bands_chip = collapse_voiced_bands(chip.voiced_slice(), k_chip);
+    let v_bands_ours = collapse_voiced_bands(ours.voiced_slice(), k_ours);
+
+    let mut vmask_exact = k_chip == k_ours;
+    if vmask_exact {
+        // Both have the same band count; check per-band agreement on
+        // the first harmonic of each band (the wire encoder's
+        // collapse rule).
+        for band in 1..=k_chip {
+            let lh = first_harmonic_of_band(band, k_chip).min(l_chip);
+            if chip.voiced(lh) != ours.voiced(lh) {
+                vmask_exact = false;
+                break;
+            }
+        }
+    }
+
+    // Per-harmonic log₂ amplitude diff over the overlap.
+    let l_overlap = l_chip.min(l_ours);
+    let chip_amps = chip.amplitudes_slice();
+    let ours_amps = ours.amplitudes_slice();
+    let mut sum_sq = 0.0_f64;
+    let mut peak = 0.0_f64;
+    let mut counted = 0u32;
+    for l in 1..=l_overlap {
+        let i = (l - 1) as usize;
+        let mc = chip_amps[i] as f64;
+        let mo = ours_amps[i] as f64;
+        if mc <= 0.0 || mo <= 0.0 {
+            continue;
+        }
+        let d = (mo / mc).log2();
+        sum_sq += d * d;
+        let ad = d.abs();
+        if ad > peak {
+            peak = ad;
+        }
+        counted += 1;
+    }
+    let rms_dlog2 = if counted > 0 {
+        (sum_sq / counted as f64).sqrt()
+    } else {
+        0.0
+    };
+    ParamsDiff {
+        l_chip,
+        l_ours,
+        omega_chip,
+        omega_ours,
+        dcents,
+        v_bands_chip,
+        v_bands_ours,
+        vmask_exact,
+        rms_dlog2,
+        peak_dlog2: peak,
+    }
+}
+
+/// Count voiced bands per the wire encoder's band-collapse rule:
+/// band `k` is voiced iff its first harmonic is voiced.
+fn collapse_voiced_bands(voiced: &[bool], k: u8) -> u8 {
+    let mut n = 0u8;
+    let l_total = voiced.len() as u8;
+    for band in 1..=k {
+        let lh = first_harmonic_of_band(band, k).min(l_total);
+        if lh >= 1 && voiced[(lh - 1) as usize] {
+            n += 1;
+        }
+    }
+    n
+}
+
+/// First harmonic index belonging to the given 1-indexed band, given
+/// the total band count `k`. Bands are 3-harmonic blocks per the
+/// `band_for_harmonic` definition.
+fn first_harmonic_of_band(band: u8, _k: u8) -> u8 {
+    // band_for_harmonic(l, k) = ((l - 1) / 3) + 1, capped at k. So
+    // band b's first harmonic is (b - 1)*3 + 1.
+    (band.saturating_sub(1)) * 3 + 1
 }
 
 #[cfg(test)]
