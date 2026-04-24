@@ -89,6 +89,10 @@ enum Cmd {
         /// --silence-dispatch).
         #[arg(long)]
         pitch_silence_override: bool,
+        /// Enable the experimental Viterbi pitch tracker (replaces
+        /// §0.3.4–§0.3.6 with an online Viterbi over the Eq. 11 grid).
+        #[arg(long)]
+        viterbi_pitch: bool,
     },
 }
 
@@ -103,6 +107,7 @@ fn main() -> Result<()> {
             skip_chip,
             silence_dispatch,
             pitch_silence_override,
+            viterbi_pitch,
         } => cmd_ab_matrix(
             &pcm,
             &out_dir,
@@ -111,6 +116,7 @@ fn main() -> Result<()> {
             skip_chip,
             silence_dispatch,
             pitch_silence_override,
+            viterbi_pitch,
         ),
     }
 }
@@ -123,6 +129,7 @@ fn cmd_ab_matrix(
     skip_chip: bool,
     silence_dispatch: bool,
     pitch_silence_override: bool,
+    viterbi_pitch: bool,
 ) -> Result<()> {
     fs::create_dir_all(out_dir)
         .with_context(|| format!("create out_dir {}", out_dir.display()))?;
@@ -146,7 +153,7 @@ fn cmd_ab_matrix(
 
     // ---- cell 1: our_enc + our_dec (fully local) ----
     let t0 = Instant::now();
-    let our_bits = our_encode(pcm, silence_dispatch, pitch_silence_override)?;
+    let our_bits = our_encode(pcm, silence_dispatch, pitch_silence_override, viterbi_pitch)?;
     let our_enc_secs = t0.elapsed().as_secs_f64();
     eprintln!(
         "our encode: {} frames in {:.2} s ({:.1} ms/frame)",
@@ -295,6 +302,7 @@ fn our_encode(
     pcm: &[i16],
     silence_dispatch: bool,
     pitch_silence_override: bool,
+    viterbi_pitch: bool,
 ) -> Result<Vec<u8>> {
     let n_frames = pcm.len() / FRAME_SAMPLES;
     let mut state = AnalysisState::new();
@@ -303,6 +311,9 @@ fn our_encode(
     }
     if pitch_silence_override {
         state.set_pitch_silence_override(true);
+    }
+    if viterbi_pitch {
+        state.set_viterbi_pitch(true);
     }
     let mut decoder_state_for_quantize = DecoderState::new();
     let mut out = Vec::with_capacity(n_frames * BYTES_PER_FEC_FRAME);

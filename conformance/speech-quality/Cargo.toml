@@ -11,6 +11,10 @@ license.workspace = true
 name = "conformance-speech-quality"
 path = "src/main.rs"
 
+[[example]]
+name = "probe_chip_bit"
+path = "examples/probe_chip_bit.rs"
+
 [dependencies]
 blip25-mbe.workspace = true
 anyhow.workspace = true
