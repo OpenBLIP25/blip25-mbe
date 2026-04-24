@@ -345,6 +345,11 @@ enum Cmd {
         /// L column diverging from Eq. 31 at the same ω.
         #[arg(long, default_value_t = 0)]
         dump_frames: usize,
+        /// Enable the joint-signal silence override (see
+        /// `analysis-encode --pitch-silence-override`). Requires
+        /// `--silence-dispatch`.
+        #[arg(long)]
+        pitch_silence_override: bool,
     },
     RateConvertSmoothness {
         /// Conversion direction — i.e. which target stream's
@@ -436,6 +441,13 @@ enum Cmd {
         /// (`dvsi encode --frames N`) so frame counts match.
         #[arg(long)]
         max_frames: Option<usize>,
+        /// Enable the joint-signal silence override: dispatches frames
+        /// as silence when `E(P̂_I) ≥ 0.4 && frame_energy < 2·η`
+        /// regardless of §0.8.4 hysteresis. Calibrated to catch the
+        /// chip's b̂_0 ≈ 25 default-pitch behavior on isolated
+        /// low-energy / poor-pitch frames. Requires `--silence-dispatch`.
+        #[arg(long)]
+        pitch_silence_override: bool,
     },
     /// Run the normative P25 full-rate DVSI test vector sweep driven by
     /// `tv-std/tv/cmpp25.txt` (576 test lines × {alert, clean, cp*,
@@ -552,17 +564,18 @@ fn main() -> Result<()> {
         Cmd::RateConvertSmoothness { direction, name, rc } => {
             cmd_rate_convert_smoothness(&args.vectors, direction, &name, rc)
         }
-        Cmd::HalfrateAnalysisEncode { name, chip_offset, silence_dispatch, dump_frames } => {
+        Cmd::HalfrateAnalysisEncode { name, chip_offset, silence_dispatch, dump_frames, pitch_silence_override } => {
             cmd_halfrate_analysis_encode(
                 &args.vectors,
                 &name,
                 chip_offset,
                 silence_dispatch,
                 dump_frames,
+                pitch_silence_override,
             )
         }
-        Cmd::AnalysisEncode { name, rc, dump_frames, chip_offset, silence_dispatch, quantizer_roundtrip, chip_seed_vuv, bitstream, bit_override, max_frames } => {
-            cmd_analysis_encode(&args.vectors, &name, rc, dump_frames, chip_offset, silence_dispatch, quantizer_roundtrip, chip_seed_vuv, bitstream, bit_override.as_deref(), max_frames)
+        Cmd::AnalysisEncode { name, rc, dump_frames, chip_offset, silence_dispatch, quantizer_roundtrip, chip_seed_vuv, bitstream, bit_override, max_frames, pitch_silence_override } => {
+            cmd_analysis_encode(&args.vectors, &name, rc, dump_frames, chip_offset, silence_dispatch, quantizer_roundtrip, chip_seed_vuv, bitstream, bit_override.as_deref(), max_frames, pitch_silence_override)
         }
         Cmd::P25Sweep { cmp, filter, op, stop_on_first } => {
             cmd_p25_sweep(&args.vectors, cmp.as_deref(), filter.as_deref(), op.as_deref(), stop_on_first)
@@ -2903,6 +2916,7 @@ fn cmd_halfrate_analysis_encode(
     chip_offset: i32,
     silence_dispatch: bool,
     dump_frames: usize,
+    pitch_silence_override: bool,
 ) -> Result<()> {
     // Half-rate vectors live under tv-rc/r33/ per the existing
     // cmd_decode_pcm_halfrate convention.
@@ -2975,6 +2989,9 @@ fn cmd_halfrate_analysis_encode(
     let mut encoder_state = AnalysisState::new();
     if silence_dispatch {
         encoder_state.set_silence_detection(true);
+    }
+    if pitch_silence_override {
+        encoder_state.set_pitch_silence_override(true);
     }
     let mut stats = ConvertStats::default();
     let mut stats_l_match = ConvertStats::default();
@@ -3357,6 +3374,7 @@ fn cmd_analysis_encode(
     bitstream: bool,
     bit_override: Option<&Path>,
     max_frames: Option<usize>,
+    pitch_silence_override: bool,
 ) -> Result<()> {
     let dir = vector_dir(root, rc);
     let pcm_path = dir.join("p25").join(format!("{name}.pcm"));
@@ -3454,6 +3472,9 @@ fn cmd_analysis_encode(
     if silence_dispatch {
         encoder_state.set_silence_detection(true);
     }
+    if pitch_silence_override {
+        encoder_state.set_pitch_silence_override(true);
+    }
     let mut stats = ConvertStats::default();
     let mut stats_l_match = ConvertStats::default();
     let mut stats_pitch_close = ConvertStats::default();
@@ -3472,10 +3493,12 @@ fn cmd_analysis_encode(
     if dump_frames > 0 {
         println!(
             "{:>5}  {:>9} {:>9} {:>8}   {:>3} {:>3} {:>4}   \
-             {:>6} {:>6} {:>8} {:>8} {:>8} {:>8}   {:<16}  {}",
+             {:>6} {:>6} {:>8} {:>8} {:>8} {:>8}   \
+             {:>10} {:>10} {:>7} {:>3}   {:<16}  {}",
             "frame", "ω̂_0 chip", "ω̂_0 enc", "Δ cents",
             "Lc", "Le", "ΔL",
             "P̂_I", "P_chip", "E(P̂_B)", "E(P̂_F)", "E(P̂_I)", "E(P_ch)",
+            "E_f", "η", "Ef/η", "sil",
             "voicing chip", "voicing enc"
         );
     }
@@ -3505,9 +3528,15 @@ fn cmd_analysis_encode(
                     let e_pb = tr.pitch_search_current.e_of_p(tr.p_hat_b);
                     let e_pf = tr.pitch_search_current.e_of_p(tr.p_hat_f);
                     let e_pchip = tr.pitch_search_current.e_of_p(p_chip);
+                    let ratio = if tr.silence_eta > 0.0 {
+                        tr.frame_energy / tr.silence_eta
+                    } else {
+                        f64::INFINITY
+                    };
                     println!(
                         "{:>5}  {:>9.5} {:>9.5} {:>+8.1}   {:>3} {:>3} {:>+4}   \
-                         {:>6.2} {:>6.2} {:>8.4} {:>8.4} {:>8.4} {:>8.4}   {:<16}  {}",
+                         {:>6.2} {:>6.2} {:>8.4} {:>8.4} {:>8.4} {:>8.4}   \
+                         {:>10.2e} {:>10.2e} {:>7.2} {:>3}   {:<16}  {}",
                         f,
                         wc,
                         we,
@@ -3521,6 +3550,10 @@ fn cmd_analysis_encode(
                         e_pf,
                         tr.e_p_hat_i,
                         e_pchip,
+                        tr.frame_energy,
+                        tr.silence_eta,
+                        ratio,
+                        if tr.silence_decision { "Y" } else { "N" },
                         voicing_sig(ref_params, 16),
                         voicing_sig(&enc_params, 16),
                     );

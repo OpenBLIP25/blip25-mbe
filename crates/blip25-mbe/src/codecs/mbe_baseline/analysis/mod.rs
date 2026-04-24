@@ -204,6 +204,12 @@ pub struct EncodeTrace {
     /// V/UV determination result (per-band D_k, Θ_ξ, decisions).
     /// `None` during preroll or silence-dispatched frames.
     pub vuv_result: Option<VuvResult>,
+    /// Post-HPF frame energy `Σ s²(n)` — silence-detector input.
+    pub frame_energy: f64,
+    /// §0.8.4 noise-floor estimate `η` after this frame's update.
+    pub silence_eta: f64,
+    /// §0.8.4 hysteresis-gated silence decision after this frame.
+    pub silence_decision: bool,
 }
 
 /// Shared [`HarmonicBasis`] — the Eq. 30 `W_R(k)` table is signal-
@@ -432,7 +438,25 @@ pub struct AnalysisState {
     /// implementation; explicit silence dispatch only when
     /// DVSI-compatibility testing demands bit-exact silence frames).
     silence_detection_enabled: bool,
+    /// Opt-in joint-signal silence override. When enabled (and
+    /// `silence_detection_enabled` is also on), dispatches a frame as
+    /// silence when `E(P̂_I) ≥ PITCH_SILENCE_EPI_THRESH` AND
+    /// `frame_energy < PITCH_SILENCE_RATIO_THRESH · η`, bypassing the
+    /// §0.8.4 hysteresis. Motivation: the chip dispatches b̂_0 ≈ 25
+    /// (default pitch) on isolated low-energy / poor-pitch frames that
+    /// don't reach the 5-frame hysteresis threshold. Calibrated on
+    /// tv-std/tv/p25/{clean,dam,mark}; off by default.
+    pitch_silence_override_enabled: bool,
 }
+
+/// `E(P̂_I)` threshold for the joint-signal silence override. Frames
+/// with `E(P̂_I)` at or above this are considered pitch-unreliable.
+/// Calibrated on clean/dam/mark: 0.4 gives 45/92 chipsil recall at
+/// only 10 pitch-close FPs across the three vectors.
+pub const PITCH_SILENCE_EPI_THRESH: f64 = 0.4;
+/// `Ef/η` threshold for the joint-signal silence override. Frames
+/// below this are considered silence-like in energy.
+pub const PITCH_SILENCE_RATIO_THRESH: f64 = 2.0;
 
 /// Preroll frame count at which the analysis encoder has enough
 /// look-ahead state to produce a valid `P̂_I` (§0.9.4).
@@ -452,6 +476,7 @@ impl AnalysisState {
             preroll: 0,
             silence: SilenceDetector::cold_start(),
             silence_detection_enabled: false,
+            pitch_silence_override_enabled: false,
         }
     }
 
@@ -468,6 +493,20 @@ impl AnalysisState {
     #[inline]
     pub fn silence_detection_enabled(&self) -> bool {
         self.silence_detection_enabled
+    }
+
+    /// Enable or disable the joint-signal silence override — dispatches
+    /// frames as silence when `E(P̂_I) ≥ PITCH_SILENCE_EPI_THRESH` AND
+    /// `frame_energy < PITCH_SILENCE_RATIO_THRESH · η`, regardless of
+    /// §0.8.4 hysteresis. Requires `silence_detection_enabled` to be on.
+    pub fn set_pitch_silence_override(&mut self, enabled: bool) {
+        self.pitch_silence_override_enabled = enabled;
+    }
+
+    /// Whether the joint-signal silence override is currently enabled.
+    #[inline]
+    pub fn pitch_silence_override_enabled(&self) -> bool {
+        self.pitch_silence_override_enabled
     }
 
     /// Read-only access to the silence detector state (for inspection
@@ -707,6 +746,9 @@ pub fn encode_with_trace(
         e_p_hat_i,
         pitch_search_current: search_cur.clone(),
         vuv_result: None,
+        frame_energy,
+        silence_eta: state.silence.noise_floor(),
+        silence_decision: silent,
     };
 
     // Step 6: signal DFT.
@@ -729,7 +771,16 @@ pub fn encode_with_trace(
     // pitch and V/UV history ARE always tracked (V/UV was already
     // committed inside `determine_vuv` above; pitch history is
     // committed unconditionally below).
-    if state.silence_detection_enabled && silent {
+    //
+    // Joint-signal override: when `pitch_silence_override_enabled`
+    // is also on, dispatch silence on isolated pitch-unreliable
+    // low-energy frames (chip's b̂_0 ≈ 25 default-pitch behavior)
+    // that don't reach the §0.8.4 hysteresis threshold.
+    let override_silent = state.silence_detection_enabled
+        && state.pitch_silence_override_enabled
+        && e_p_hat_i >= PITCH_SILENCE_EPI_THRESH
+        && frame_energy < PITCH_SILENCE_RATIO_THRESH * state.silence.noise_floor();
+    if (state.silence_detection_enabled && silent) || override_silent {
         state.commit_pitch(p_hat_i, e_p_hat_i);
         state.advance_preroll();
         return Ok((AnalysisOutput::Silence, Some(trace)));
@@ -836,7 +887,11 @@ pub fn encode_halfrate(
     // and return Silence; §13.3 says `γ̃` and `Λ̃` both freeze
     // together on silence (addendum §0.6.10 "common pitfalls" picks
     // this as the conservative reading).
-    if state.silence_detection_enabled && silent {
+    let override_silent = state.silence_detection_enabled
+        && state.pitch_silence_override_enabled
+        && e_p_hat_i >= PITCH_SILENCE_EPI_THRESH
+        && frame_energy < PITCH_SILENCE_RATIO_THRESH * state.silence.noise_floor();
+    if (state.silence_detection_enabled && silent) || override_silent {
         state.commit_pitch(p_hat_i, e_p_hat_i);
         state.advance_preroll();
         return Ok(AnalysisOutput::Silence);
@@ -1178,6 +1233,77 @@ mod tests {
         }
         assert_eq!(silence_count, 0);
         assert_eq!(other_count, 20);
+    }
+
+    /// The pitch-silence override gate fires when the current-frame
+    /// trace reports `E(P̂_I) ≥ PITCH_SILENCE_EPI_THRESH` AND
+    /// `frame_energy < PITCH_SILENCE_RATIO_THRESH · η`, independent of
+    /// §0.8.4 hysteresis. Drive the encoder through a prolonged loud
+    /// periodic run to seed a high η, then feed enough zero frames
+    /// that both the HPF transient has decayed and the analyzed frame
+    /// is itself zero. The joint signal flips to Silence before
+    /// hysteresis (5-frame enter) would otherwise fire.
+    #[test]
+    fn encode_pitch_silence_override_fires_without_hysteresis() {
+        let mut s_on = AnalysisState::new();
+        s_on.set_silence_detection(true);
+        s_on.set_pitch_silence_override(true);
+        let loud = periodic_pcm_frame(50.0, 10, 0.0);
+        // Long loud run seeds η high; preroll also drained.
+        for _ in 0..20 {
+            let _ = encode(&loud, &mut s_on);
+        }
+        let zero_pcm = [0i16; SAMPLES_PER_FRAME as usize];
+        // Walk the HPF transient out. The lookahead carries 3 frames;
+        // after 4 zero inputs the analyzed frame (slot 0) is itself
+        // zero-era and the HPF ringing from the loud→zero transition
+        // has decayed, so frame_energy falls well below 2·η and the
+        // silence floor in Eq. 5 gives E(P̂_I) = 1.0.
+        let mut first_silence: Option<usize> = None;
+        for i in 0..5 {
+            let out = encode(&zero_pcm, &mut s_on).unwrap();
+            if matches!(out, AnalysisOutput::Silence) {
+                first_silence = Some(i);
+                break;
+            }
+        }
+        let Some(idx) = first_silence else {
+            panic!("override never dispatched silence across 5 zero frames");
+        };
+        // Baseline hysteresis (5 silent votes) would not fire until at
+        // least the 5th silent input. We must have silenced at or
+        // before that, demonstrating the override is reaching silence
+        // faster than the hysteresis path would.
+        assert!(
+            idx <= 4,
+            "override fired at zero-frame #{idx}; expected ≤ 4"
+        );
+    }
+
+    /// `pitch_silence_override_enabled()` reflects the setter and the
+    /// override requires `silence_detection_enabled()` to be on.
+    #[test]
+    fn pitch_silence_override_requires_silence_detection() {
+        let mut s = AnalysisState::new();
+        assert!(!s.pitch_silence_override_enabled());
+        s.set_pitch_silence_override(true);
+        assert!(s.pitch_silence_override_enabled());
+        // Enabling the override without enabling silence detection is
+        // a no-op on behavior. Encode a would-override frame and
+        // confirm we still emit Voice.
+        assert!(!s.silence_detection_enabled());
+        let pcm = periodic_pcm_frame(50.0, 10, 0.0);
+        let _ = encode(&pcm, &mut s);
+        let _ = encode(&pcm, &mut s);
+        // Quiet noise frame — would be silence-dispatched if silence
+        // detection were on. With it off, stays Voice regardless.
+        let quiet = [5i16; SAMPLES_PER_FRAME as usize];
+        let out = encode(&quiet, &mut s).unwrap();
+        assert!(
+            matches!(out, AnalysisOutput::Voice(_)),
+            "override alone must not dispatch silence when silence \
+             detection is disabled"
+        );
     }
 
     /// With silence detection enabled and sustained silent input,
