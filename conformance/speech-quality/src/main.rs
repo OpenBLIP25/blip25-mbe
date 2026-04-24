@@ -93,7 +93,25 @@ enum Cmd {
         /// §0.3.4–§0.3.6 with an online Viterbi over the Eq. 11 grid).
         #[arg(long)]
         viterbi_pitch: bool,
+        /// Multiply M̂_l amplitudes by this factor before wire quantize.
+        /// Default 1.0 (no scaling). Probes whether a global amplitude
+        /// calibration error is contributing to the PESQ gap.
+        #[arg(long, default_value_t = 1.0)]
+        amp_scale: f32,
+        /// V/UV override for perceptual probing. `all-voiced` forces
+        /// every band to V, `all-unvoiced` to U, `invert` flips each
+        /// band's decision. `none` leaves §0.7's decision intact.
+        #[arg(long, value_enum, default_value_t = VuvOverride::None)]
+        vuv_override: VuvOverride,
     },
+}
+
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum VuvOverride {
+    None,
+    AllVoiced,
+    AllUnvoiced,
+    Invert,
 }
 
 fn main() -> Result<()> {
@@ -108,6 +126,8 @@ fn main() -> Result<()> {
             silence_dispatch,
             pitch_silence_override,
             viterbi_pitch,
+            amp_scale,
+            vuv_override,
         } => cmd_ab_matrix(
             &pcm,
             &out_dir,
@@ -117,6 +137,8 @@ fn main() -> Result<()> {
             silence_dispatch,
             pitch_silence_override,
             viterbi_pitch,
+            amp_scale,
+            vuv_override,
         ),
     }
 }
@@ -130,6 +152,8 @@ fn cmd_ab_matrix(
     silence_dispatch: bool,
     pitch_silence_override: bool,
     viterbi_pitch: bool,
+    amp_scale: f32,
+    vuv_override: VuvOverride,
 ) -> Result<()> {
     fs::create_dir_all(out_dir)
         .with_context(|| format!("create out_dir {}", out_dir.display()))?;
@@ -153,7 +177,7 @@ fn cmd_ab_matrix(
 
     // ---- cell 1: our_enc + our_dec (fully local) ----
     let t0 = Instant::now();
-    let our_bits = our_encode(pcm, silence_dispatch, pitch_silence_override, viterbi_pitch)?;
+    let our_bits = our_encode(pcm, silence_dispatch, pitch_silence_override, viterbi_pitch, amp_scale, vuv_override)?;
     let our_enc_secs = t0.elapsed().as_secs_f64();
     eprintln!(
         "our encode: {} frames in {:.2} s ({:.1} ms/frame)",
@@ -303,6 +327,8 @@ fn our_encode(
     silence_dispatch: bool,
     pitch_silence_override: bool,
     viterbi_pitch: bool,
+    amp_scale: f32,
+    vuv_override: VuvOverride,
 ) -> Result<Vec<u8>> {
     let n_frames = pcm.len() / FRAME_SAMPLES;
     let mut state = AnalysisState::new();
@@ -324,6 +350,29 @@ fn our_encode(
         let params = match analysis {
             AnalysisOutput::Voice(p) => p,
             AnalysisOutput::Silence => MbeParams::silence(),
+        };
+        // Optional amplitude-scale probe: rebuild MbeParams with
+        // each M̂_l scaled by `amp_scale` before wire quantize.
+        let params = if (amp_scale - 1.0).abs() > 1e-6 || !matches!(vuv_override, VuvOverride::None) {
+            let l = params.harmonic_count();
+            let omega = params.omega_0();
+            let v: Vec<bool> = params.voiced_slice()[..l as usize]
+                .iter()
+                .map(|&v| match vuv_override {
+                    VuvOverride::None => v,
+                    VuvOverride::AllVoiced => true,
+                    VuvOverride::AllUnvoiced => false,
+                    VuvOverride::Invert => !v,
+                })
+                .collect();
+            let amps: Vec<f32> = params.amplitudes_slice()[..l as usize]
+                .iter()
+                .map(|a| a * amp_scale)
+                .collect();
+            MbeParams::new(omega, l, &v, &amps)
+                .map_err(|_| anyhow!("probe-modified MbeParams rejected at frame {f}"))?
+        } else {
+            params
         };
         // Quantize → param-level b[59]; prioritize → 8 info vectors;
         // channel-encode → 72 dibits; pack → 18 bytes. Snapshot the
