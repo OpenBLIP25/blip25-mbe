@@ -18,6 +18,7 @@ license = "MIT"
 blip25-mbe = { path = "crates/blip25-mbe", version = "0.1.0" }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+hound = "3"
 
 [profile.release]
 lto = "thin"

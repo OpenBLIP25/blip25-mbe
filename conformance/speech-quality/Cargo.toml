@@ -1,6 +1,6 @@
 [package]
 name = "blip25-conformance-speech-quality"
-description = "BABG-style PESQ/POLQA perceptual scoring of blip25-mbe output. Not published."
+description = "PESQ/STOI-style perceptual scoring of blip25-mbe output vs the AMBE-3000R chip. 4-cell matrix harness (our_enc|chip_enc) × (our_dec|chip_dec)."
 publish = false
 version.workspace = true
 edition.workspace = true
@@ -15,3 +15,4 @@ path = "src/main.rs"
 blip25-mbe.workspace = true
 anyhow.workspace = true
 clap.workspace = true
+hound.workspace = true
