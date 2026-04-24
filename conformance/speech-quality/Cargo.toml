@@ -19,6 +19,10 @@ path = "examples/probe_chip_bit.rs"
 name = "diff_per_frame"
 path = "examples/diff_per_frame.rs"
 
+[[example]]
+name = "sine_probe"
+path = "examples/sine_probe.rs"
+
 [dependencies]
 blip25-mbe.workspace = true
 anyhow.workspace = true
