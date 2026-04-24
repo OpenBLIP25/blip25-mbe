@@ -88,7 +88,7 @@ pub mod pitch;
 pub use pitch::{
     H_LPF_HALF, LookBackContext, PITCH_COLD_START, PITCH_GRID_LEN, PITCH_GRID_MAX,
     PITCH_GRID_MIN, PITCH_GRID_STEP, PITCH_INPUT_HALF, PITCH_INPUT_LEN, PitchSearch,
-    ViterbiPitchTracker, W_I_HALF, compute_s_lpf, decide_initial_pitch, look_ahead,
+    W_I_HALF, compute_s_lpf, decide_initial_pitch, look_ahead,
     look_back, snap_to_pitch_grid,
 };
 
@@ -447,17 +447,6 @@ pub struct AnalysisState {
     /// don't reach the 5-frame hysteresis threshold. Calibrated on
     /// tv-std/tv/p25/{clean,dam,mark}; off by default.
     pitch_silence_override_enabled: bool,
-    /// Opt-in Viterbi pitch tracker (experimental, off by default).
-    /// Replaces §0.3.4–§0.3.6's look-back/look-ahead/Eq. 21-23 decision
-    /// with a probabilistic online Viterbi over the Eq. 11 grid, using
-    /// `E(P)` as emission and a log-pitch continuity penalty as
-    /// transition. Targets the ~12% of voice frames where the spec
-    /// tracker lands |Δ| > 200¢ off the chip (sticky-lock,
-    /// onset-transition, low-F0 grid-edge classes). Quality gating
-    /// via PESQ/STOI on `our_enc_jmbe_dec` vs 1.26 baseline.
-    viterbi_pitch_enabled: bool,
-    /// Viterbi tracker state (sliding per-candidate accumulated cost).
-    viterbi_pitch: ViterbiPitchTracker,
 }
 
 /// `E(P̂_I)` threshold for the joint-signal silence override. Frames
@@ -488,8 +477,6 @@ impl AnalysisState {
             silence: SilenceDetector::cold_start(),
             silence_detection_enabled: false,
             pitch_silence_override_enabled: false,
-            viterbi_pitch_enabled: false,
-            viterbi_pitch: ViterbiPitchTracker::cold_start(),
         }
     }
 
@@ -520,20 +507,6 @@ impl AnalysisState {
     #[inline]
     pub fn pitch_silence_override_enabled(&self) -> bool {
         self.pitch_silence_override_enabled
-    }
-
-    /// Enable or disable the experimental Viterbi pitch tracker.
-    /// When on, the encoder bypasses §0.3's look-back/look-ahead
-    /// decision and uses the online Viterbi over the Eq. 11 grid
-    /// instead. Default: disabled (strict spec behavior).
-    pub fn set_viterbi_pitch(&mut self, enabled: bool) {
-        self.viterbi_pitch_enabled = enabled;
-    }
-
-    /// Whether the Viterbi pitch tracker is currently enabled.
-    #[inline]
-    pub fn viterbi_pitch_enabled(&self) -> bool {
-        self.viterbi_pitch_enabled
     }
 
     /// Read-only access to the silence detector state (for inspection
@@ -762,12 +735,8 @@ pub fn encode_with_trace(
     let search_f2 = PitchSearch::new(&f2_win);
     let (p_b, ce_b) = look_back(&search_cur, state.pitch_history);
     let (p_f, ce_f) = look_ahead(&search_cur, &search_f1, &search_f2);
-    let (p_hat_i, e_p_hat_i) = if state.viterbi_pitch_enabled {
-        state.viterbi_pitch.step(&search_cur)
-    } else {
-        let p = decide_initial_pitch(p_b, ce_b, p_f, ce_f);
-        (p, search_cur.e_of_p(p))
-    };
+    let p_hat_i = decide_initial_pitch(p_b, ce_b, p_f, ce_f);
+    let e_p_hat_i = search_cur.e_of_p(p_hat_i);
     let mut trace = EncodeTrace {
         p_hat_b: p_b,
         ce_b,
@@ -888,13 +857,8 @@ pub fn encode_halfrate(
     let search_f2 = PitchSearch::new(&f2_win);
     let (p_b, ce_b) = look_back(&search_cur, state.pitch_history);
     let (p_f, ce_f) = look_ahead(&search_cur, &search_f1, &search_f2);
-    let (p_hat_i, e_p_hat_i) = if state.viterbi_pitch_enabled {
-        state.viterbi_pitch.step(&search_cur)
-    } else {
-        let p = decide_initial_pitch(p_b, ce_b, p_f, ce_f);
-        (p, search_cur.e_of_p(p))
-    };
-    let _ = (p_b, ce_b, p_f, ce_f); // kept for future diagnostic trace parity
+    let p_hat_i = decide_initial_pitch(p_b, ce_b, p_f, ce_f);
+    let e_p_hat_i = search_cur.e_of_p(p_hat_i);
 
     let basis = shared_basis();
     let sig_win = state.extract_refinement_window();

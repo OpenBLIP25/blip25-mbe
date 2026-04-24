@@ -89,10 +89,6 @@ enum Cmd {
         /// --silence-dispatch).
         #[arg(long)]
         pitch_silence_override: bool,
-        /// Enable the experimental Viterbi pitch tracker (replaces
-        /// §0.3.4–§0.3.6 with an online Viterbi over the Eq. 11 grid).
-        #[arg(long)]
-        viterbi_pitch: bool,
         /// Multiply M̂_l amplitudes by this factor before wire quantize.
         /// Default 1.0 (no scaling). Probes whether a global amplitude
         /// calibration error is contributing to the PESQ gap.
@@ -103,12 +99,6 @@ enum Cmd {
         /// band's decision. `none` leaves §0.7's decision intact.
         #[arg(long, value_enum, default_value_t = VuvOverride::None)]
         vuv_override: VuvOverride,
-        /// EMA smoothing coefficient on per-harmonic M̂_l. New = α·M̂_l
-        /// + (1−α)·prev. Default 1.0 = no smoothing. Reset on L change
-        /// or silence frame. 0.3-0.7 is typical for perceptual stability
-        /// without destroying transients.
-        #[arg(long, default_value_t = 1.0)]
-        amp_ema: f32,
     },
 }
 
@@ -131,10 +121,8 @@ fn main() -> Result<()> {
             skip_chip,
             silence_dispatch,
             pitch_silence_override,
-            viterbi_pitch,
             amp_scale,
             vuv_override,
-            amp_ema,
         } => cmd_ab_matrix(
             &pcm,
             &out_dir,
@@ -143,10 +131,8 @@ fn main() -> Result<()> {
             skip_chip,
             silence_dispatch,
             pitch_silence_override,
-            viterbi_pitch,
             amp_scale,
             vuv_override,
-            amp_ema,
         ),
     }
 }
@@ -159,10 +145,8 @@ fn cmd_ab_matrix(
     skip_chip: bool,
     silence_dispatch: bool,
     pitch_silence_override: bool,
-    viterbi_pitch: bool,
     amp_scale: f32,
     vuv_override: VuvOverride,
-    amp_ema: f32,
 ) -> Result<()> {
     fs::create_dir_all(out_dir)
         .with_context(|| format!("create out_dir {}", out_dir.display()))?;
@@ -186,7 +170,7 @@ fn cmd_ab_matrix(
 
     // ---- cell 1: our_enc + our_dec (fully local) ----
     let t0 = Instant::now();
-    let our_bits = our_encode(pcm, silence_dispatch, pitch_silence_override, viterbi_pitch, amp_scale, vuv_override, amp_ema)?;
+    let our_bits = our_encode(pcm, silence_dispatch, pitch_silence_override, amp_scale, vuv_override)?;
     let our_enc_secs = t0.elapsed().as_secs_f64();
     eprintln!(
         "our encode: {} frames in {:.2} s ({:.1} ms/frame)",
@@ -335,10 +319,8 @@ fn our_encode(
     pcm: &[i16],
     silence_dispatch: bool,
     pitch_silence_override: bool,
-    viterbi_pitch: bool,
     amp_scale: f32,
     vuv_override: VuvOverride,
-    amp_ema: f32,
 ) -> Result<Vec<u8>> {
     let n_frames = pcm.len() / FRAME_SAMPLES;
     let mut state = AnalysisState::new();
@@ -348,33 +330,19 @@ fn our_encode(
     if pitch_silence_override {
         state.set_pitch_silence_override(true);
     }
-    if viterbi_pitch {
-        state.set_viterbi_pitch(true);
-    }
     let mut decoder_state_for_quantize = DecoderState::new();
     let mut out = Vec::with_capacity(n_frames * BYTES_PER_FEC_FRAME);
-    // Per-harmonic EMA state. Empty = reset (cold start, silence, or
-    // L change). Stored as f32 to match MbeParams amplitudes.
-    let ema_enabled = (amp_ema - 1.0).abs() > 1e-6 && amp_ema > 0.0;
-    let mut ema_prev: Vec<f32> = Vec::new();
     for f in 0..n_frames {
         let frame = &pcm[f * FRAME_SAMPLES..(f + 1) * FRAME_SAMPLES];
         let analysis = analysis_encode(frame, &mut state)
             .map_err(|e| anyhow!("analysis error at frame {f}: {e:?}"))?;
         let params = match analysis {
             AnalysisOutput::Voice(p) => p,
-            AnalysisOutput::Silence => {
-                // Reset EMA so subsequent voice frame re-initializes.
-                if ema_enabled {
-                    ema_prev.clear();
-                }
-                MbeParams::silence()
-            }
+            AnalysisOutput::Silence => MbeParams::silence(),
         };
-        // Probe-modification pass: amp_scale, vuv_override, amp_ema.
+        // Probe-modification pass: amp_scale, vuv_override.
         let needs_rebuild = (amp_scale - 1.0).abs() > 1e-6
-            || !matches!(vuv_override, VuvOverride::None)
-            || ema_enabled;
+            || !matches!(vuv_override, VuvOverride::None);
         let params = if needs_rebuild {
             let l = params.harmonic_count();
             let omega = params.omega_0();
@@ -388,22 +356,10 @@ fn our_encode(
                 })
                 .collect();
             let raw_amps = params.amplitudes_slice();
-            let mut amps: Vec<f32> = raw_amps[..l as usize]
+            let amps: Vec<f32> = raw_amps[..l as usize]
                 .iter()
                 .map(|a| a * amp_scale)
                 .collect();
-            // EMA smoothing in linear amplitude space. Reset when L
-            // changes (per-harmonic state becomes meaningless).
-            if ema_enabled {
-                if ema_prev.len() != amps.len() {
-                    ema_prev = amps.clone();
-                } else {
-                    for (out_a, prev_a) in amps.iter_mut().zip(ema_prev.iter()) {
-                        *out_a = amp_ema * *out_a + (1.0 - amp_ema) * *prev_a;
-                    }
-                    ema_prev = amps.clone();
-                }
-            }
             MbeParams::new(omega, l, &v, &amps)
                 .map_err(|_| anyhow!("probe-modified MbeParams rejected at frame {f}"))?
         } else {
