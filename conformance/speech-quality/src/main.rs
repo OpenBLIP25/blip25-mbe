@@ -28,8 +28,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
 
+use blip25_mbe::codecs::ambe_plus2;
 use blip25_mbe::codecs::mbe_baseline::analysis::{
-    AnalysisOutput, AnalysisState, encode as analysis_encode,
+    AnalysisOutput, AnalysisState, encode as analysis_encode, encode_halfrate as analysis_encode_halfrate,
 };
 use blip25_mbe::codecs::mbe_baseline::{
     FrameErrorContext, GAMMA_W, SynthState, synthesize_frame,
@@ -44,11 +45,21 @@ use blip25_mbe::p25_fullrate::frame::{
 use blip25_mbe::p25_fullrate::priority::{
     deprioritize as deprioritize_full, prioritize as prioritize_full,
 };
+use blip25_mbe::p25_halfrate::dequantize::{
+    DecoderState as HalfDecoderState, Decoded as HalfDecoded,
+    decode_to_params as decode_to_params_half, quantize as quantize_half,
+};
+use blip25_mbe::p25_halfrate::frame::{
+    DIBITS_PER_FRAME as HALF_DIBITS_PER_FRAME,
+    decode_frame as decode_half_frame, encode_frame as encode_half_frame,
+};
 
 const FRAME_SAMPLES: usize = 160;
 const BYTES_PER_FEC_FRAME: usize = 18;
 const DIBITS_PER_FRAME: usize = 72;
 const SAMPLE_RATE: u32 = 8_000;
+/// 36 dibits = 72 bits → 9 bytes per AMBE+2 half-rate FEC frame.
+const HALF_BYTES_PER_FEC_FRAME: usize = 9;
 
 #[derive(Parser, Debug)]
 #[command(version, about)]
@@ -107,6 +118,27 @@ enum Cmd {
         #[arg(long, default_value_t = 0)]
         repeat_reset_after: u32,
     },
+    /// Self-baseline our_enc → our_dec PESQ on the half-rate (AMBE+2)
+    /// path. Slim version of `ab-matrix`: no chip side, just our
+    /// pipeline through `encode_halfrate` + `p25_halfrate::quantize` +
+    /// 9-byte FEC frames + `p25_halfrate::dequantize` + AMBE+2 synth.
+    HalfrateAbMatrix {
+        /// Path to reference PCM (8 kHz mono LE i16, raw, no header).
+        #[arg(long)]
+        pcm: PathBuf,
+        /// Output directory — will be created if missing.
+        #[arg(long)]
+        out_dir: PathBuf,
+        /// Cap frames processed.
+        #[arg(long)]
+        frames: Option<usize>,
+        /// Enable §0.8.4 silence detection in the analysis encoder.
+        #[arg(long)]
+        silence_dispatch: bool,
+        /// Enable the joint-signal silence override.
+        #[arg(long)]
+        pitch_silence_override: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
@@ -142,6 +174,19 @@ fn main() -> Result<()> {
             amp_scale,
             vuv_override,
             repeat_reset_after,
+        ),
+        Cmd::HalfrateAbMatrix {
+            pcm,
+            out_dir,
+            frames,
+            silence_dispatch,
+            pitch_silence_override,
+        } => cmd_halfrate_ab_matrix(
+            &pcm,
+            &out_dir,
+            frames,
+            silence_dispatch,
+            pitch_silence_override,
         ),
     }
 }
@@ -428,6 +473,176 @@ fn our_decode(fec: &[u8], repeat_reset_after: u32) -> Vec<i16> {
         };
         let pcm = synthesize_frame(&params, &err, GAMMA_W, &mut synth_state);
         out.extend_from_slice(&pcm);
+    }
+    out
+}
+
+// ----------------------------------------------------------------------------
+// Half-rate (AMBE+2) self-baseline.
+// ----------------------------------------------------------------------------
+
+fn cmd_halfrate_ab_matrix(
+    pcm_path: &Path,
+    out_dir: &Path,
+    frames: Option<usize>,
+    silence_dispatch: bool,
+    pitch_silence_override: bool,
+) -> Result<()> {
+    fs::create_dir_all(out_dir)
+        .with_context(|| format!("create out_dir {}", out_dir.display()))?;
+    let pcm = read_pcm_i16(pcm_path)?;
+    let n_frames_total = pcm.len() / FRAME_SAMPLES;
+    let n_frames = frames
+        .map(|n| n.min(n_frames_total))
+        .unwrap_or(n_frames_total);
+    let pcm = &pcm[..n_frames * FRAME_SAMPLES];
+    eprintln!(
+        "reference PCM: {} samples = {} frames ({:.1} s)",
+        pcm.len(),
+        n_frames,
+        pcm.len() as f64 / f64::from(SAMPLE_RATE)
+    );
+
+    let ref_wav = out_dir.join("ref.wav");
+    write_wav(&ref_wav, pcm)?;
+
+    let t0 = Instant::now();
+    let our_bits = our_encode_halfrate(pcm, silence_dispatch, pitch_silence_override)?;
+    let enc_secs = t0.elapsed().as_secs_f64();
+    eprintln!(
+        "halfrate encode: {} frames in {:.2} s ({:.1} ms/frame)",
+        our_bits.len() / HALF_BYTES_PER_FEC_FRAME,
+        enc_secs,
+        1000.0 * enc_secs / (our_bits.len() / HALF_BYTES_PER_FEC_FRAME).max(1) as f64
+    );
+
+    let our_bit_path = out_dir.join("our.bit");
+    fs::write(&our_bit_path, &our_bits)
+        .with_context(|| format!("write our.bit {}", our_bit_path.display()))?;
+
+    let t0 = Instant::now();
+    let our_pcm = our_decode_halfrate(&our_bits);
+    let dec_secs = t0.elapsed().as_secs_f64();
+    let wav_path = out_dir.join("our_enc_our_dec.wav");
+    write_wav(&wav_path, &our_pcm)?;
+    eprintln!(
+        "halfrate decode: {} samples in {:.2} s → {}",
+        our_pcm.len(),
+        dec_secs,
+        wav_path.display()
+    );
+    Ok(())
+}
+
+fn our_encode_halfrate(
+    pcm: &[i16],
+    silence_dispatch: bool,
+    pitch_silence_override: bool,
+) -> Result<Vec<u8>> {
+    let n_frames = pcm.len() / FRAME_SAMPLES;
+    let mut state = AnalysisState::new();
+    if silence_dispatch {
+        state.set_silence_detection(true);
+    }
+    if pitch_silence_override {
+        state.set_pitch_silence_override(true);
+    }
+    let mut decoder_state = HalfDecoderState::new();
+    let mut out = Vec::with_capacity(n_frames * HALF_BYTES_PER_FEC_FRAME);
+    for f in 0..n_frames {
+        let frame = &pcm[f * FRAME_SAMPLES..(f + 1) * FRAME_SAMPLES];
+        // Treat any analysis-encoder error (e.g., PitchOutOfRange when
+        // the high-pitched speech exceeds half-rate's tighter ω₀ ceiling
+        // ~0.316 rad/sample) as silence — emits an in-range zero-amp
+        // frame rather than panicking. Same for downstream
+        // quantize_half: out-of-range pitch lands silence.
+        let params = match analysis_encode_halfrate(frame, &mut state) {
+            Ok(AnalysisOutput::Voice(p)) => p,
+            Ok(AnalysisOutput::Silence) | Err(_) => halfrate_silence_params(),
+        };
+        let info = quantize_half(&params, &mut decoder_state)
+            .unwrap_or_else(|_| {
+                // Fall back to an explicit silence frame if quantize
+                // rejects (e.g., synthetic ω₀ stretches the table).
+                let sil = halfrate_silence_params();
+                quantize_half(&sil, &mut decoder_state).expect("silence params encodable")
+            });
+        let dibits = encode_half_frame(&info);
+        out.extend_from_slice(&pack_dibits_half(&dibits));
+    }
+    Ok(out)
+}
+
+fn our_decode_halfrate(fec: &[u8]) -> Vec<i16> {
+    let n_frames = fec.len() / HALF_BYTES_PER_FEC_FRAME;
+    let mut decoder_state = HalfDecoderState::new();
+    let mut synth = SynthState::new();
+    let mut out = Vec::with_capacity(n_frames * FRAME_SAMPLES);
+    let mut last_voice_params: Option<MbeParams> = None;
+    for f in 0..n_frames {
+        let bytes = &fec[f * HALF_BYTES_PER_FEC_FRAME..(f + 1) * HALF_BYTES_PER_FEC_FRAME];
+        let dibits = unpack_dibits_half(bytes);
+        let frame = decode_half_frame(&dibits);
+        let pcm = match decode_to_params_half(&frame.info, &mut decoder_state) {
+            Ok(HalfDecoded::Voice(p)) => {
+                last_voice_params = Some(p.clone());
+                ambe_plus2::synthesize_frame(&p, &mut synth)
+            }
+            Ok(HalfDecoded::Tone { params, .. }) => {
+                last_voice_params = Some(params.clone());
+                ambe_plus2::synthesize_tone(&params, &mut synth)
+            }
+            Ok(HalfDecoded::Erasure) => match &last_voice_params {
+                Some(p) => ambe_plus2::synthesize_frame(p, &mut synth),
+                None => [0i16; FRAME_SAMPLES],
+            },
+            Err(_) => [0i16; FRAME_SAMPLES],
+        };
+        out.extend_from_slice(&pcm);
+    }
+    out
+}
+
+/// Build a silence-equivalent `MbeParams` whose ω₀ falls inside the
+/// half-rate Annex L pitch table range. `MbeParams::silence()`'s
+/// fullrate-friendly ω₀ = 4π/39.5 ≈ 0.318 is just outside half-rate's
+/// max ω₀ ≈ 0.316 (b̂₀=0), so `quantize_half` rejects it as `BadPitch`.
+/// We pick the largest in-range ω₀ (b̂₀=0 entry) and amps=0 — produces
+/// the same silent output without wire-format ambiguity.
+fn halfrate_silence_params() -> MbeParams {
+    use blip25_mbe::p25_halfrate::dequantize::decode_pitch;
+    let pe = decode_pitch(0).expect("b̂₀=0 is a valid half-rate pitch entry");
+    let l = pe.l;
+    let voiced = vec![false; l as usize];
+    let amps = vec![0.0f32; l as usize];
+    MbeParams::new(pe.omega_0, l, &voiced, &amps)
+        .expect("zero-amp silence params for b̂₀=0 are valid")
+}
+
+fn pack_dibits_half(dibits: &[u8; HALF_DIBITS_PER_FRAME]) -> [u8; HALF_BYTES_PER_FEC_FRAME] {
+    let mut out = [0u8; HALF_BYTES_PER_FEC_FRAME];
+    let mut bit = 0usize;
+    for &d in dibits {
+        for pos in (0..2).rev() {
+            let b = (d >> pos) & 1;
+            out[bit / 8] |= b << (7 - (bit % 8));
+            bit += 1;
+        }
+    }
+    out
+}
+
+fn unpack_dibits_half(bytes: &[u8]) -> [u8; HALF_DIBITS_PER_FRAME] {
+    let mut out = [0u8; HALF_DIBITS_PER_FRAME];
+    let mut bit = 0usize;
+    for slot in &mut out {
+        let mut d = 0u8;
+        for _ in 0..2 {
+            let b = (bytes[bit / 8] >> (7 - (bit % 8))) & 1;
+            d = (d << 1) | b;
+            bit += 1;
+        }
+        *slot = d;
     }
     out
 }
