@@ -164,6 +164,17 @@ pub const INIT_TAU_M: f64 = 20480.0;
 /// (Eq. mute condition in §1.11.2).
 pub const MUTE_EPSILON_R_THRESHOLD: f64 = 0.0875;
 
+/// Gain applied to the unvoiced LCG output when synthesizing the mute
+/// frame's comfort-noise output. §1.11.2 calls for "random
+/// small-amplitude noise"; we reuse the unvoiced synth's existing
+/// noise window (centered, zero-mean after subtracting `LCG_MEAN`).
+/// Calibrated so the i16 RMS sits around 100 (≈ 0.003 × 32768) — the
+/// same low level JMBE / SDRTrunk emit on mute.
+const MUTE_NOISE_GAIN: f64 = 0.0065;
+/// Mean of the §1.12.1 LCG output range `[0, 53124]`. Subtracted from
+/// each LCG sample to produce zero-mean noise.
+const LCG_MEAN: f64 = 26562.0;
+
 /// Per-frame error context derived from FEC decoding (§1.5) plus the
 /// pitch-validity check (§1.3.1). Drives the §1.11 smoothing
 /// decisions.
@@ -1079,10 +1090,19 @@ fn synthesize_frame_with_mode(
 
     let mut s = [0f64; FRAME_SAMPLES];
     if disp == FrameDisposition::Mute {
-        // §1.11.2: bypass synthesis output, emit silence (the simpler
-        // of the spec's two suggested options). State above already
-        // advanced normally.
-        // s stays zero.
+        // §1.11.2: bypass synthesis output, emit small-amplitude
+        // noise (the spec's primary recommendation; "true silence" is
+        // the alternative). State above already advanced normally.
+        // Reuse the unvoiced LCG's noise window (already advanced by
+        // `synthesize_unvoiced`) so we don't burn extra entropy or
+        // need a separate RNG. The noise window stores 209 samples
+        // covering n=−104..104; take the central 160 (offsets 24..184
+        // → n=−80..79). Center via LCG_MEAN and scale to a comfort
+        // level matching JMBE / SDRTrunk.
+        for i in 0..FRAME_SAMPLES {
+            let raw = state.unvoiced.noise_window[24 + i];
+            s[i] = (raw - LCG_MEAN) * MUTE_NOISE_GAIN;
+        }
     } else {
         for i in 0..FRAME_SAMPLES {
             s[i] = s_uv[i] + s_v[i];
@@ -1726,8 +1746,10 @@ mod tests {
     }
 
     #[test]
-    fn synthesize_frame_mute_emits_silence_but_advances_state() {
-        // Force a Mute by pre-loading a high ε_R into state.
+    fn synthesize_frame_mute_emits_low_amplitude_noise_but_advances_state() {
+        // Force a Mute by pre-loading a high ε_R into state. §1.11.2's
+        // primary recommendation is "random small-amplitude noise"; we
+        // follow that (silence was the prior alternative).
         let voiced = vec![true; 9];
         let amps = vec![100f32; 9];
         let p = build_params(0.2, &voiced, &amps);
@@ -1736,9 +1758,12 @@ mod tests {
         state.epsilon_r = 0.5; // > MUTE_EPSILON_R_THRESHOLD
         let s_e_init = state.s_e;
         let pcm = synthesize_frame(&p, &err, GAMMA_W, &mut state);
-        for s in pcm.iter() {
-            assert_eq!(*s, 0, "Mute should output silence");
-        }
+        // Output is comfort noise: peak under 1500 i16 (~5% full
+        // scale), and at least some samples non-zero.
+        let peak = pcm.iter().map(|s| s.unsigned_abs()).max().unwrap_or(0);
+        let nonzero = pcm.iter().filter(|&&s| s != 0).count();
+        assert!(peak < 1500, "Mute noise peak too loud: {peak}");
+        assert!(nonzero > FRAME_SAMPLES / 2, "Mute noise too sparse: {nonzero}");
         // State should still have advanced (so re-acquisition works).
         assert_ne!(state.s_e, s_e_init);
     }
