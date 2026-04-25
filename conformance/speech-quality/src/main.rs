@@ -139,6 +139,58 @@ enum Cmd {
         #[arg(long)]
         pitch_silence_override: bool,
     },
+    /// Decode a stream of post-FEC AMBE+2 half-rate info vectors (one
+    /// frame per line, 4 space-separated hex words = û₀ û₁ û₂ û₃,
+    /// each 0..0xFFFF) directly into 8 kHz mono i16 PCM.
+    ///
+    /// Bypasses ALL P25-specific FEC (Annex H interleave, Golay/Hamming
+    /// decode, PN demodulation). Useful for decoding voice frames from
+    /// non-P25 AMBE+2 carriers — DMR, NXDN, D-STAR — once the consumer
+    /// has stripped the wire-specific FEC into the same 4-vector
+    /// post-FEC info shape that `p25_halfrate::dequantize::dequantize`
+    /// consumes. The 49-bit b̂₀..b̂₈ layout is shared across AMBE+2
+    /// standards; the prioritization into 4 info vectors is also
+    /// shared (per BABA-C / DVSI AMBE-3000 protocol). FEC and frame
+    /// envelope differ between standards.
+    ///
+    /// Input format: text file, one frame per line, blank lines and
+    /// `#`-prefixed comments ignored. Lines like:
+    ///   `02af  0c1d  0a91  0014`
+    ///
+    /// Or pipe a `[u16; 4]` binary stream via `--binary`.
+    DecodeRawHalfrate {
+        /// Path to the info-vector input. Use `-` for stdin.
+        #[arg(long)]
+        input: PathBuf,
+        /// Output WAV path.
+        #[arg(long)]
+        out_wav: PathBuf,
+        /// Treat input as packed binary (8 bytes/frame, little-endian
+        /// u16 quadruples) rather than text-hex.
+        #[arg(long)]
+        binary: bool,
+    },
+    /// Decode a stream of raw AMBE+2 half-rate parameter words
+    /// (b̂₀..b̂₈, one frame per line, 9 space-separated decimal
+    /// values) directly into 8 kHz mono i16 PCM.
+    ///
+    /// One step lower than `decode-raw-halfrate`: the consumer
+    /// supplies the 9 b̂ values directly, we run prioritize +
+    /// dequantize + AMBE+2 synth. The b̂₀..b̂₈ shape is shared across
+    /// AMBE+2 standards (P25 Phase 2 / DMR enhanced / NXDN type-2),
+    /// so this is the most-portable entry point for non-P25 carriers
+    /// where wire-FEC and prioritization both differ from P25.
+    ///
+    /// Per-field widths (b̂₀=7, b̂₁=5, b̂₂=5, b̂₃=11, b̂₄=4, b̂₅=4,
+    /// b̂₆=4, b̂₇=4, b̂₈=4) are enforced; out-of-range values error.
+    DecodeRawMbe {
+        /// Path to the b̂-vector input. Use `-` for stdin.
+        #[arg(long)]
+        input: PathBuf,
+        /// Output WAV path.
+        #[arg(long)]
+        out_wav: PathBuf,
+    },
 }
 
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
@@ -188,6 +240,10 @@ fn main() -> Result<()> {
             silence_dispatch,
             pitch_silence_override,
         ),
+        Cmd::DecodeRawHalfrate { input, out_wav, binary } => {
+            cmd_decode_raw_halfrate(&input, &out_wav, binary)
+        }
+        Cmd::DecodeRawMbe { input, out_wav } => cmd_decode_raw_mbe(&input, &out_wav),
     }
 }
 
@@ -601,6 +657,226 @@ fn our_decode_halfrate(fec: &[u8]) -> Vec<i16> {
         out.extend_from_slice(&pcm);
     }
     out
+}
+
+/// Decode a text/binary stream of post-FEC half-rate info vectors
+/// `[û₀, û₁, û₂, û₃]` into PCM via `dequantize_half` + AMBE+2 synth.
+///
+/// Wire-FEC-agnostic entry point for AMBE+2 half-rate. Useful for any
+/// carrier whose voice frames carry the same post-FEC info-vector
+/// layout (P25 Phase 2, DMR enhanced full-rate, NXDN type-2) once the
+/// consumer's wire-extractor has stripped that carrier's FEC.
+fn cmd_decode_raw_halfrate(input: &Path, out_wav: &Path, binary: bool) -> Result<()> {
+    use std::io::Read;
+    let raw: Vec<u8> = if input == Path::new("-") {
+        let mut buf = Vec::new();
+        std::io::stdin().read_to_end(&mut buf)?;
+        buf
+    } else {
+        fs::read(input).with_context(|| format!("read {}", input.display()))?
+    };
+
+    let frames: Vec<[u16; 4]> = if binary {
+        if raw.len() % 8 != 0 {
+            return Err(anyhow!(
+                "binary input must be a whole number of 8-byte frames; got {} bytes",
+                raw.len()
+            ));
+        }
+        raw.chunks_exact(8)
+            .map(|c| {
+                [
+                    u16::from_le_bytes([c[0], c[1]]),
+                    u16::from_le_bytes([c[2], c[3]]),
+                    u16::from_le_bytes([c[4], c[5]]),
+                    u16::from_le_bytes([c[6], c[7]]),
+                ]
+            })
+            .collect()
+    } else {
+        let text = String::from_utf8(raw).context("input is not valid UTF-8 text")?;
+        let mut out = Vec::new();
+        for (lineno, line) in text.lines().enumerate() {
+            let stripped = line.split('#').next().unwrap_or("").trim();
+            if stripped.is_empty() {
+                continue;
+            }
+            let toks: Vec<&str> = stripped.split_whitespace().collect();
+            if toks.len() != 4 {
+                return Err(anyhow!(
+                    "line {}: expected 4 hex words (û₀..û₃), got {} ({})",
+                    lineno + 1,
+                    toks.len(),
+                    stripped
+                ));
+            }
+            let mut info = [0u16; 4];
+            for (i, t) in toks.iter().enumerate() {
+                info[i] = u16::from_str_radix(t.trim_start_matches("0x"), 16)
+                    .with_context(|| format!("line {}: parse {} as hex", lineno + 1, t))?;
+            }
+            out.push(info);
+        }
+        out
+    };
+
+    let mut decoder = HalfDecoderState::new();
+    let mut synth = SynthState::new();
+    let mut pcm: Vec<i16> = Vec::with_capacity(frames.len() * FRAME_SAMPLES);
+    let mut last_voice: Option<MbeParams> = None;
+    let mut decoded = 0usize;
+    let mut tones = 0usize;
+    let mut erasures = 0usize;
+    for (f, info) in frames.iter().enumerate() {
+        let block = match decode_to_params_half(info, &mut decoder) {
+            Ok(HalfDecoded::Voice(p)) => {
+                last_voice = Some(p.clone());
+                decoded += 1;
+                ambe_plus2::synthesize_frame(&p, &mut synth)
+            }
+            Ok(HalfDecoded::Tone { params, .. }) => {
+                last_voice = Some(params.clone());
+                tones += 1;
+                ambe_plus2::synthesize_tone(&params, &mut synth)
+            }
+            Ok(HalfDecoded::Erasure) => {
+                erasures += 1;
+                match &last_voice {
+                    Some(p) => ambe_plus2::synthesize_frame(p, &mut synth),
+                    None => [0i16; FRAME_SAMPLES],
+                }
+            }
+            Err(e) => {
+                erasures += 1;
+                eprintln!("frame {f}: dequantize error {e:?}, emitting silence");
+                [0i16; FRAME_SAMPLES]
+            }
+        };
+        pcm.extend_from_slice(&block);
+    }
+    write_wav(out_wav, &pcm)?;
+    eprintln!(
+        "frames={} voice={} tone={} erasure_or_err={}  → {}",
+        frames.len(),
+        decoded,
+        tones,
+        erasures,
+        out_wav.display()
+    );
+    Ok(())
+}
+
+/// Decode a text stream of raw AMBE+2 half-rate parameter words
+/// (b̂₀..b̂₈, one frame per line, 9 decimal values) directly into PCM.
+///
+/// One step lower than `cmd_decode_raw_halfrate`: the caller supplies
+/// the 9 b̂ values pre-prioritization. We run `p25_halfrate::priority::
+/// prioritize` to produce the 4 info vectors, then `dequantize` +
+/// AMBE+2 synth.
+///
+/// b̂-field widths from BABA-C / AMBE-3000 protocol: b̂₀=7 (pitch),
+/// b̂₁=5 (V/UV), b̂₂=5 (gain), b̂₃=11, b̂₄=4, b̂₅=4, b̂₆=4, b̂₇=4, b̂₈=4.
+/// Total 48 bits + 1 don't-care padding = 49-bit voice payload.
+fn cmd_decode_raw_mbe(input: &Path, out_wav: &Path) -> Result<()> {
+    use blip25_mbe::p25_halfrate::priority::prioritize as prioritize_half;
+    use std::io::Read;
+    let raw: Vec<u8> = if input == Path::new("-") {
+        let mut buf = Vec::new();
+        std::io::stdin().read_to_end(&mut buf)?;
+        buf
+    } else {
+        fs::read(input).with_context(|| format!("read {}", input.display()))?
+    };
+    let text = String::from_utf8(raw).context("input is not valid UTF-8 text")?;
+
+    // Per BABA-C / AMBE-3000 b̂ widths.
+    const WIDTHS: [u8; 9] = [7, 5, 5, 11, 4, 4, 4, 4, 4];
+
+    let mut frames: Vec<[u16; 9]> = Vec::new();
+    for (lineno, line) in text.lines().enumerate() {
+        let stripped = line.split('#').next().unwrap_or("").trim();
+        if stripped.is_empty() {
+            continue;
+        }
+        let toks: Vec<&str> = stripped.split_whitespace().collect();
+        if toks.len() != 9 {
+            return Err(anyhow!(
+                "line {}: expected 9 b̂ values, got {} ({})",
+                lineno + 1,
+                toks.len(),
+                stripped
+            ));
+        }
+        let mut b = [0u16; 9];
+        for (i, t) in toks.iter().enumerate() {
+            // Accept hex (0x...) or decimal.
+            let v = if let Some(h) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+                u16::from_str_radix(h, 16)
+            } else {
+                t.parse::<u16>()
+            };
+            let v = v.with_context(|| format!("line {}: parse {}", lineno + 1, t))?;
+            let max = (1u32 << WIDTHS[i]) - 1;
+            if u32::from(v) > max {
+                return Err(anyhow!(
+                    "line {}: b̂_{} = {} exceeds {}-bit max {}",
+                    lineno + 1,
+                    i,
+                    v,
+                    WIDTHS[i],
+                    max
+                ));
+            }
+            b[i] = v;
+        }
+        frames.push(b);
+    }
+
+    let mut decoder = HalfDecoderState::new();
+    let mut synth = SynthState::new();
+    let mut pcm: Vec<i16> = Vec::with_capacity(frames.len() * FRAME_SAMPLES);
+    let mut last_voice: Option<MbeParams> = None;
+    let mut decoded = 0usize;
+    let mut tones = 0usize;
+    let mut erasures = 0usize;
+    for (f, b) in frames.iter().enumerate() {
+        let info = prioritize_half(b);
+        let block = match decode_to_params_half(&info, &mut decoder) {
+            Ok(HalfDecoded::Voice(p)) => {
+                last_voice = Some(p.clone());
+                decoded += 1;
+                ambe_plus2::synthesize_frame(&p, &mut synth)
+            }
+            Ok(HalfDecoded::Tone { params, .. }) => {
+                last_voice = Some(params.clone());
+                tones += 1;
+                ambe_plus2::synthesize_tone(&params, &mut synth)
+            }
+            Ok(HalfDecoded::Erasure) => {
+                erasures += 1;
+                match &last_voice {
+                    Some(p) => ambe_plus2::synthesize_frame(p, &mut synth),
+                    None => [0i16; FRAME_SAMPLES],
+                }
+            }
+            Err(e) => {
+                erasures += 1;
+                eprintln!("frame {f}: dequantize error {e:?}, emitting silence");
+                [0i16; FRAME_SAMPLES]
+            }
+        };
+        pcm.extend_from_slice(&block);
+    }
+    write_wav(out_wav, &pcm)?;
+    eprintln!(
+        "frames={} voice={} tone={} erasure_or_err={}  → {}",
+        frames.len(),
+        decoded,
+        tones,
+        erasures,
+        out_wav.display()
+    );
+    Ok(())
 }
 
 /// Build a silence-equivalent `MbeParams` whose ω₀ falls inside the
