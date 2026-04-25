@@ -99,6 +99,13 @@ enum Cmd {
         /// band's decision. `none` leaves §0.7's decision intact.
         #[arg(long, value_enum, default_value_t = VuvOverride::None)]
         vuv_override: VuvOverride,
+        /// Beyond-spec: after N consecutive Repeat/Mute frames, fall
+        /// back to a default-fundamental (b̂₀=134) + amps=1.0 frame
+        /// instead of replaying the prior `last_good`. JMBE / SDRTrunk
+        /// use N=3 for chip-stream interop quality. Default 0
+        /// (disabled, spec-faithful per gap 0022).
+        #[arg(long, default_value_t = 0)]
+        repeat_reset_after: u32,
     },
 }
 
@@ -123,6 +130,7 @@ fn main() -> Result<()> {
             pitch_silence_override,
             amp_scale,
             vuv_override,
+            repeat_reset_after,
         } => cmd_ab_matrix(
             &pcm,
             &out_dir,
@@ -133,6 +141,7 @@ fn main() -> Result<()> {
             pitch_silence_override,
             amp_scale,
             vuv_override,
+            repeat_reset_after,
         ),
     }
 }
@@ -147,6 +156,7 @@ fn cmd_ab_matrix(
     pitch_silence_override: bool,
     amp_scale: f32,
     vuv_override: VuvOverride,
+    repeat_reset_after: u32,
 ) -> Result<()> {
     fs::create_dir_all(out_dir)
         .with_context(|| format!("create out_dir {}", out_dir.display()))?;
@@ -180,7 +190,7 @@ fn cmd_ab_matrix(
     );
 
     let t0 = Instant::now();
-    let our_enc_our_dec = our_decode(&our_bits);
+    let our_enc_our_dec = our_decode(&our_bits, repeat_reset_after);
     let our_dec_secs = t0.elapsed().as_secs_f64();
     let wav_path = out_dir.join("our_enc_our_dec.wav");
     write_wav(&wav_path, &our_enc_our_dec)?;
@@ -246,7 +256,7 @@ fn cmd_ab_matrix(
         let chip_bits = fs::read(&local_chip_bit)?;
 
         // ---- cell 3: chip_enc + our_dec ----
-        let chip_enc_our_dec = our_decode(&chip_bits);
+        let chip_enc_our_dec = our_decode(&chip_bits, repeat_reset_after);
         let wav_path = out_dir.join("chip_enc_our_dec.wav");
         write_wav(&wav_path, &chip_enc_our_dec)?;
         eprintln!("chip_enc_our_dec → {}", wav_path.display());
@@ -390,10 +400,13 @@ fn our_encode(
 /// full-rate dequantize + synthesizer. Bad-pitch frames emit a silent
 /// 160-sample block (consistent with the `cmd_decode_pcm` behavior in
 /// the vectors harness).
-fn our_decode(fec: &[u8]) -> Vec<i16> {
+fn our_decode(fec: &[u8], repeat_reset_after: u32) -> Vec<i16> {
     let n_frames = fec.len() / BYTES_PER_FEC_FRAME;
     let mut decoder_state = DecoderState::new();
     let mut synth_state = SynthState::new();
+    if repeat_reset_after > 0 {
+        synth_state.set_repeat_reset_after(Some(repeat_reset_after));
+    }
     let mut out = Vec::with_capacity(n_frames * FRAME_SAMPLES);
     for f in 0..n_frames {
         let bytes = &fec[f * BYTES_PER_FEC_FRAME..(f + 1) * BYTES_PER_FEC_FRAME];

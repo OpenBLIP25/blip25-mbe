@@ -30,10 +30,17 @@ fn write_wav(path: &str, samples: &[i16]) {
 fn main() {
     let path = std::env::args().nth(1).expect("bit file");
     let out = std::env::args().nth(2).expect("out wav");
+    let reset_after: u32 = std::env::args()
+        .nth(3)
+        .map(|s| s.parse().expect("reset_after"))
+        .unwrap_or(0);
     let bytes = fs::read(&path).unwrap();
     let n = bytes.len() / 18;
     let mut dec = DecoderState::new();
     let mut synth = SynthState::new();
+    if reset_after > 0 {
+        synth.set_repeat_reset_after(Some(reset_after));
+    }
     let mut pcm: Vec<i16> = Vec::with_capacity(n*160);
     for f in 0..n {
         let dibits = unpack_msb(&bytes[f*18..(f+1)*18]);

@@ -175,6 +175,14 @@ const MUTE_NOISE_GAIN: f64 = 0.0065;
 /// each LCG sample to produce zero-mean noise.
 const LCG_MEAN: f64 = 26562.0;
 
+/// Default fundamental frequency used as the substitute when the
+/// beyond-spec consecutive-repeat reset (`SynthState::set_repeat_reset_after`)
+/// fires. Matches JMBE / SDRTrunk's `IMBEFundamentalFrequency.DEFAULT`
+/// (b̂₀ = 134, ω₀ ≈ 0.2985·π ≈ 0.937 rad/sample, F0 ≈ 119 Hz). Not a
+/// spec value — gap 0022 resolution confirms BABA-A §7.7 has no
+/// reset behavior.
+const DEFAULT_OMEGA_0: f32 = 0.937_544_4;
+
 /// Per-frame error context derived from FEC decoding (§1.5) plus the
 /// pitch-validity check (§1.3.1). Drives the §1.11 smoothing
 /// decisions.
@@ -892,6 +900,18 @@ pub struct SynthState {
     /// (for Eq. 99–104 substitution on Repeat/Mute). `None` until the
     /// first valid frame.
     last_good: Option<LastGoodFrame>,
+    /// Count of consecutive Repeat/Mute frames since the last `Use`.
+    /// Drives the optional `repeat_reset_after` heuristic.
+    repeat_count: u32,
+    /// Beyond-spec consecutive-repeat reset threshold. When `Some(n)`,
+    /// after `n` consecutive Repeat/Mute frames the substituted
+    /// parameters fall back to a default-fundamental + amps=1.0 frame
+    /// instead of the prior `last_good` snapshot. `None` (default) is
+    /// the spec-faithful path: literal Eq. 99–104 indefinitely (gap
+    /// 0022 resolution — PDF §7.7 prescribes plain assignment with no
+    /// per-repeat attenuation; this knob exists only for chip-stream
+    /// interop quality, not for spec conformance).
+    repeat_reset_after: Option<u32>,
 }
 
 #[derive(Clone, Debug)]
@@ -914,7 +934,29 @@ impl SynthState {
             err: FrameErrorContext::default(),
             gamma_w: GAMMA_W,
             last_good: None,
+            repeat_count: 0,
+            repeat_reset_after: None,
         }
+    }
+
+    /// Enable the beyond-spec consecutive-repeat reset heuristic. After
+    /// `n` consecutive Repeat/Mute frames, fall back to a default
+    /// fundamental + amps=1.0 frame instead of replaying the prior
+    /// snapshot. `None` (default) keeps the literal Eq. 99–104 path —
+    /// the spec-faithful behavior per gap 0022 resolution.
+    ///
+    /// JMBE's `IMBEModelParameters.copy()` uses `n = 3`; SDRTrunk
+    /// matches. Use the same as a pragmatic chip-interop default when
+    /// enabling the knob.
+    pub fn set_repeat_reset_after(&mut self, n: Option<u32>) {
+        self.repeat_reset_after = n;
+    }
+
+    /// Current consecutive-repeat reset threshold (`None` = disabled,
+    /// spec-faithful).
+    #[inline]
+    pub fn repeat_reset_after(&self) -> Option<u32> {
+        self.repeat_reset_after
     }
 }
 
@@ -1020,35 +1062,67 @@ fn synthesize_frame_with_mode(
     let (disp, epsilon_r) = frame_disposition(err, state.epsilon_r);
     state.epsilon_r = epsilon_r;
 
+    // Track consecutive Repeat/Mute frames for the optional reset.
+    let next_repeat_count = match disp {
+        FrameDisposition::Use => 0,
+        FrameDisposition::Repeat | FrameDisposition::Mute => state.repeat_count + 1,
+    };
+
+    // Beyond-spec: when `repeat_reset_after` is set and the threshold
+    // is exceeded, fall back to a default-fundamental + amps=1.0 frame
+    // for substitution (matches JMBE's `MAX_HEADROOM_THRESHOLD = 3`
+    // behavior). Spec-faithful path leaves this `None` and uses
+    // literal Eq. 99–104 indefinitely (gap 0022 resolution).
+    let force_default = matches!(disp, FrameDisposition::Repeat | FrameDisposition::Mute)
+        && state
+            .repeat_reset_after
+            .is_some_and(|n| state.repeat_count >= n);
+
     // Choose which set of parameters drives this frame's synthesis.
     // On Mute we still want to advance every cross-frame piece of
     // state (so re-acquisition works after the mute clears) but we
-    // emit silence — Eq. 99–104 still apply to substitute the last
-    // good frame's values into the synth pipeline so its state
+    // emit comfort noise — Eq. 99–104 still apply to substitute the
+    // last good frame's values into the synth pipeline so its state
     // evolves smoothly.
-    let (omega_0, l, voiced_arr, m_tilde_arr) = match (disp, &state.last_good) {
-        (FrameDisposition::Use, _) => {
-            let l = params.harmonic_count();
-            let mut voiced = [false; L_MAX as usize];
-            let mut m_tilde = [0f32; L_MAX as usize];
-            voiced[..l as usize].copy_from_slice(params.voiced_slice());
-            m_tilde[..l as usize].copy_from_slice(params.amplitudes_slice());
-            (params.omega_0(), l, voiced, m_tilde)
+    let (omega_0, l, voiced_arr, m_tilde_arr) = if force_default {
+        // Default comfort-tone substitute: ω₀ ≈ 0.2985π (≈ 119 Hz F0,
+        // ~3.4 ms period — JMBE / SDRTrunk's IMBEFundamentalFrequency.
+        // DEFAULT, b̂₀ = 134), L = 30, all bands voiced, amps = 1.0.
+        let l = 30u8;
+        let mut voiced = [false; L_MAX as usize];
+        let mut m_tilde = [0f32; L_MAX as usize];
+        for i in 0..l as usize {
+            voiced[i] = true;
+            m_tilde[i] = 1.0;
         }
-        (FrameDisposition::Repeat | FrameDisposition::Mute, Some(prev)) => {
-            (prev.omega_0, prev.l, prev.voiced, prev.m_tilde)
-        }
-        (FrameDisposition::Repeat | FrameDisposition::Mute, None) => {
-            // First-frame edge case: nothing to repeat. Fall back to
-            // current frame's params (treats the disposition as Use).
-            let l = params.harmonic_count();
-            let mut voiced = [false; L_MAX as usize];
-            let mut m_tilde = [0f32; L_MAX as usize];
-            voiced[..l as usize].copy_from_slice(params.voiced_slice());
-            m_tilde[..l as usize].copy_from_slice(params.amplitudes_slice());
-            (params.omega_0(), l, voiced, m_tilde)
+        (DEFAULT_OMEGA_0, l, voiced, m_tilde)
+    } else {
+        match (disp, &state.last_good) {
+            (FrameDisposition::Use, _) => {
+                let l = params.harmonic_count();
+                let mut voiced = [false; L_MAX as usize];
+                let mut m_tilde = [0f32; L_MAX as usize];
+                voiced[..l as usize].copy_from_slice(params.voiced_slice());
+                m_tilde[..l as usize].copy_from_slice(params.amplitudes_slice());
+                (params.omega_0(), l, voiced, m_tilde)
+            }
+            (FrameDisposition::Repeat | FrameDisposition::Mute, Some(prev)) => {
+                (prev.omega_0, prev.l, prev.voiced, prev.m_tilde)
+            }
+            (FrameDisposition::Repeat | FrameDisposition::Mute, None) => {
+                // First-frame edge case: nothing to repeat. Fall back
+                // to current frame's params (treats the disposition
+                // as Use).
+                let l = params.harmonic_count();
+                let mut voiced = [false; L_MAX as usize];
+                let mut m_tilde = [0f32; L_MAX as usize];
+                voiced[..l as usize].copy_from_slice(params.voiced_slice());
+                m_tilde[..l as usize].copy_from_slice(params.amplitudes_slice());
+                (params.omega_0(), l, voiced, m_tilde)
+            }
         }
     };
+    state.repeat_count = next_repeat_count;
 
     // §1.10 enhancement: M̃_l → M̄_l, update S_E.
     let (m_bar_full, s_e_new) = enhance_spectral_amplitudes(
