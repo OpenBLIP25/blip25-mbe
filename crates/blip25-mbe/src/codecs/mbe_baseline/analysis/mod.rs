@@ -871,10 +871,23 @@ pub fn encode_halfrate(
     // diverges from Eq. 31's double-floor-with-+0.25 form on 36/120
     // rows. Using Eq. 31 here would desync downstream block-size
     // lookups (Annex N/P/Q/R) from the decoder.
+    //
+    // If the refined pitch lands outside the Annex L table range
+    // (high-F0 speech can exceed half-rate's max ω₀ ≈ 0.314),
+    // dispatch as Silence rather than erroring — same disposition the
+    // §0.8 silence gate would apply to a frame whose pitch we can't
+    // represent at half-rate. Predictor history isn't committed
+    // (matches the §0.8 silence path below).
     {
         use crate::p25_halfrate::dequantize::{decode_pitch, encode_pitch};
-        let b0 = encode_pitch(refinement.omega_hat as f32)
-            .ok_or(AnalysisError::PitchOutOfRange)?;
+        let b0 = match encode_pitch(refinement.omega_hat as f32) {
+            Some(b0) => b0,
+            None => {
+                state.commit_pitch(p_hat_i, e_p_hat_i);
+                state.advance_preroll();
+                return Ok(AnalysisOutput::Silence);
+            }
+        };
         refinement.l_hat = decode_pitch(b0).ok_or(AnalysisError::PitchOutOfRange)?.l;
     }
     let vuv_result = determine_vuv(&sw, basis, &refinement, e_p_hat_i, &mut state.vuv);

@@ -125,9 +125,44 @@ impl MbeParams {
     /// pairs with `L = L_MIN` under Eq. 47. The exact value is
     /// unobservable in the synthesized output when all amplitudes are
     /// zero.
+    ///
+    /// **Note on rate:** this constructor's ω₀ is full-rate-specific.
+    /// 4π/39.5 ≈ 0.318 sits just above the half-rate Annex L pitch
+    /// table's max (b̂₀=0 → ω₀ ≈ 0.314), so half-rate consumers must
+    /// use [`silence_halfrate`] instead. Mixing them silently fails
+    /// at `p25_halfrate::dequantize::quantize` with
+    /// `DecodeError::BadPitch`.
     pub fn silence() -> Self {
         Self {
             omega_0: 4.0 * PI / 39.5,
+            l: L_MIN,
+            voiced: [false; L_CAP],
+            amplitudes: [0.0; L_CAP],
+        }
+    }
+
+    /// Half-rate-compatible silent frame.
+    ///
+    /// Same shape as [`silence`] (all unvoiced, amplitudes zero) but
+    /// with `ω₀` taken from the largest entry in the AMBE+2 Annex L
+    /// pitch table (b̂₀=0 → ω₀ ≈ 0.314, L = 9). This satisfies
+    /// `p25_halfrate::dequantize::encode_pitch`'s range check, which
+    /// rejects [`silence`]'s 0.318 as out of table.
+    ///
+    /// Use this when the caller is feeding into the half-rate
+    /// quantizer and wants a "no-content" placeholder frame
+    /// (analysis-encoder silence dispatch, erasure substitution,
+    /// preroll output, etc).
+    pub fn silence_halfrate() -> Self {
+        // The b̂₀=0 row of the Annex L table gives the largest
+        // half-rate ω₀ in canonical form. Hardcoded here to avoid a
+        // dependency on `p25_halfrate` from this module; the value
+        // matches `AMBE_PITCH_TABLE[0]` exactly. If Annex L is ever
+        // re-extracted with a corrected entry, update this constant
+        // (and the test below) to match.
+        const HALFRATE_B0_ZERO_OMEGA: f32 = 0.313_977;
+        Self {
+            omega_0: HALFRATE_B0_ZERO_OMEGA,
             l: L_MIN,
             voiced: [false; L_CAP],
             amplitudes: [0.0; L_CAP],
@@ -209,6 +244,26 @@ mod tests {
             assert_eq!(p.amplitude(l), 0.0);
             assert!(!p.voiced(l));
         }
+    }
+
+    #[test]
+    fn silence_halfrate_uses_half_rate_table_max_omega() {
+        let p = MbeParams::silence_halfrate();
+        assert_eq!(p.harmonic_count(), L_MIN);
+        for l in 1..=p.harmonic_count() {
+            assert_eq!(p.amplitude(l), 0.0);
+            assert!(!p.voiced(l));
+        }
+        // ω₀ must round-trip through `p25_halfrate::dequantize::encode_pitch`
+        // back to b̂₀ = 0 (the largest-ω₀ entry); full-rate `silence`
+        // doesn't.
+        let b0 = crate::p25_halfrate::dequantize::encode_pitch(p.omega_0());
+        assert_eq!(b0, Some(0));
+        // Full-rate silence does NOT round-trip through half-rate
+        // encode_pitch — that's the whole reason `silence_halfrate`
+        // exists.
+        let p_full = MbeParams::silence();
+        assert_eq!(crate::p25_halfrate::dequantize::encode_pitch(p_full.omega_0()), None);
     }
 
     #[test]

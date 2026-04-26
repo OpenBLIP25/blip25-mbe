@@ -1,223 +1,214 @@
-# blip25-sdr scope plan
+# blip25-mbe scope plan
 
-**Date:** 2026-04-25.
-**Author:** implementer pass for blip25-mbe ↔ p25-decoder integration.
-**Status:** draft. Replace with a real RFC if the user wants to formalize.
+**Date:** 2026-04-25 (revised 2026-04-26).
+**Status:** draft. This is a working plan — replace with a real RFC if formalized.
 
-This document is from blip25-mbe's point of view. It exists because blip25-mbe
-ships codec primitives (IMBE / AMBE / AMBE+ / AMBE+2 synth and analysis); the
-SDR-side work — RF, DSP, frame sync, FEC, framing, trunking, data — lives
-elsewhere. This is the integration map.
+## Scope rule: codec only, chip-shaped surface, modern Rust API
 
-## TL;DR
+**This repo is just the vocoder.** No air interface, no FEC outside what
+the codec spec itself defines, no trunking, no DSP. Everything off the
+codec proper lives in `~/p25-decoder/` (already split into per-area
+crates by the user) or future sibling crates for NXDN / DMR / D-STAR.
 
-The "SDR" side is `~/p25-decoder/` (workspace named `blip25`). It already
-contains 11 crates and ~32k LOC, with `blip25-mbe = { workspace = true }`
-wired into `blip25-vocoder` and `ambe-client`. The remaining work is
-**filling in the planned crates** the existing CLAUDE.md flags as "(planned)"
-and **closing the codec integration boundary** between blip25-mbe and
-blip25-vocoder.
+Two design constraints orient the work in this repo:
 
-## Where things stand
+1. **Chip-shaped surface.** The DVSI AMBE-3000R is the closest existing
+   reference point for "what a vocoder library should expose." A
+   consumer should be able to use blip25-mbe the way they'd use the
+   chip — stateful per-stream channel handle, runtime rate selection,
+   uniform encode/decode/reset/configure operations across all
+   generations.
 
-### blip25-mbe (this repo)
+2. **Modern Rust API, transport-aware.** The library API is the
+   primary interface (in-process Rust call). Anything that would
+   eventually become a gRPC/protobuf/WS endpoint needs serde-friendly
+   types now so the future shim is mechanical. Keep the core
+   transport-agnostic.
+
+## Where things stand at the codec layer
 
 Solid:
+
 - IMBE Phase 1 full-rate: encoder + decoder + 5-vector PESQ baseline.
 - AMBE+2 half-rate: encoder + decoder + 5-vector PESQ baseline.
-- All four AMBE generations have a `synthesize_frame` entry point.
-- Carrier-agnostic raw entry points (`decode-raw-halfrate`, `decode-raw-mbe`)
-  for non-P25 AMBE+2 carriers.
+- All four AMBE generations (`mbe_baseline`, `ambe`, `ambe_plus`,
+  `ambe_plus2`) expose `synthesize_frame`.
+- Decode mute → comfort noise per BABA-A §1.11.2 (gap 0021).
+- Spec-faithful repeat handling + optional JMBE-style reset
+  (gap 0022).
+- Carrier-agnostic CLI entry points: `decode-raw-halfrate` (4 info
+  vectors), `decode-raw-mbe` (9 b̂ values).
 
-Open at the codec layer (see memory entries dated 2026-04-25):
-- 2-frame onset attack (spec-locked, multi-session if pursued).
-- Tonal-content deficit on alert.pcm (spec-locked).
-- Two half-rate API gotchas — `MbeParams::silence()` not in the half-rate
-  pitch range, `encode_halfrate` errors instead of dispatching silence on
-  out-of-range pitch. Worth small upstream fixes.
+Open:
+
+- Two half-rate gotchas — `MbeParams::silence()` not in half-rate
+  pitch range, `encode_halfrate` errors on out-of-range pitch instead
+  of dispatching silence.
 - AMBE+ (Gen 2) has synth but no dequantize wrapper at the 4-vector
-  interface — small wrapper job if a real test case shows up.
+  interface.
+- 2-frame onset attack on speech onsets (spec-locked, multi-session).
+- Tonal-content deficit on alert.pcm (spec-locked).
 
-### p25-decoder workspace (the SDR side)
+These are the pieces that need addressing in *this* repo.
 
-Crate inventory as of 2026-04-25:
+## What "chip-shaped surface" looks like concretely
 
-| Crate              | Files | LOC    | Status (per CLAUDE.md / inspection)  |
-|--------------------|------:|-------:|--------------------------------------|
-| `blip25-sstp`      |     4 |    682 | Soft-symbol transport protocol — wire format between edges and decoders |
-| `blip25-core`      |    28 | 13 326 | P25 protocol logic core              |
-| `blip25-dsp`       |    12 |  4 601 | DDC, demod, symbol timing, frame sync |
-| `blip25-edge`      |    14 |  8 203 | RF capture + DSP for Pi/Airspy, channelization, NID classification |
-| `blip25-vocoder`   |     6 |  1 769 | Voice decode + call lifecycle (uses blip25-mbe) |
-| `blip25-trunking`  |     4 |  1 489 | TSBK / ISP decode, planned fuller |
-| `blip25-data`      |     3 |    983 | PDU / SNDCP / LRRP / CAD             |
-| `blip25-events`    |     3 |  1 215 | Canonical event envelope (`blip25.v1`) |
-| `blip25-server`    |     1 |    534 | SSTP multiplexer (distributed mode)  |
-| `blip25-scanner`   |     1 |  1 201 | Self-contained binary, watch + follow modes |
-| `ambe-client`      |     3 |    624 | TCP client for DVSI AMBE3000 chip server |
+The chip exposes a single channel handle and a small set of operations:
 
-Per the CLAUDE.md in p25-decoder, the four "(planned)" labels are
-`blip25-trunking`, `blip25-vocoder`, `blip25-data`, and `blip25-scanner`.
-Three of those have non-trivial code already; the fourth (data) has a stub.
-"Planned" reads as "drafted, not finished."
+| Chip operation         | Today's blip25-mbe equivalent      |
+|------------------------|-------------------------------------|
+| Open channel           | `AnalysisState::new()` + `SynthState::new()` (rate-specific imports) |
+| Set rate (`PKT_RATEP`) | Pick the right `encode` vs `encode_halfrate` import |
+| Encode PCM → bits      | Multi-step pipeline: `analysis_encode` → `quantize` → `encode_frame` → pack |
+| Decode bits → PCM      | Multi-step: unpack → `decode_frame` → `dequantize` → `synthesize_frame` |
+| Reset (`PKT_RATEP` re-send) | `AnalysisState::new()` etc — start over |
+| Tone frame             | Half-rate decode-side has `Decoded::Tone`; encoder doesn't emit |
+| Get error stats        | Read `imbe.errors[]` from `decode_frame` output |
+| Set audio mode         | Not modeled                         |
+| Stream multiple channels | Caller manages multiple state objects |
 
-## The integration boundary
+The shape is mostly right but **fragmented across 4-5 imports per
+operation**. A consumer plumbing a P25-Phase-1-or-Phase-2 decoder has
+to know full-rate vs half-rate at the import level, not as a runtime
+parameter.
 
-```
-          ┌──────────────────────────┐    ┌────────────────────────────┐
-RF / IQ   │  blip25-edge / -dsp /     │    │   blip25-mbe (this repo)    │
-──────────► -core (DDC, demod,        │    │                            │
-          │  C4FM/CQPSK/H-CPM,        │    │  - p25_fullrate {decode,    │
-          │  symbol timing, frame     │    │      encode, dequant}        │
-          │  sync, soft symbols)      │    │  - p25_halfrate {decode,    │
-          └─────────┬─────────────────┘    │      encode, dequant}        │
-                    │                       │  - codecs::ambe_plus2,      │
-                    │ NID-classified        │      ambe_plus, ambe,        │
-                    │ frames + soft         │      mbe_baseline (synth)    │
-                    │ payloads               │  - mbe_params::MbeParams    │
-                    ▼                       └────────┬───────────────────┘
-          ┌──────────────────────────┐               │
-          │  blip25-trunking         │               │
-          │  (TSBK / MBT / OSP /     │               │
-          │   ISP / procedures)      │               │
-          └─────────┬────────────────┘               │
-                    │                                │
-                    │ voice burst frames             │
-                    ▼                                ▼
-          ┌──────────────────────────┐    ┌────────────────────────────┐
-          │  blip25-vocoder          │◄───┤ delegates IMBE/AMBE+2       │
-          │  (call lifecycle, LC,    │    │ {decode_frame,              │
-          │   TDMA dispatch, IMBE/   │    │  dequantize,                │
-          │   AMBE+2 wrapping)       │    │  synthesize_frame}          │
-          └─────────┬────────────────┘    └────────────────────────────┘
-                    │
-                    │ PCM + events
-                    ▼
-          ┌──────────────────────────┐
-          │  blip25-server / -scanner│
-          │  (event stream, audio)   │
-          └──────────────────────────┘
+A `Codec`/`Vocoder` handle would consolidate this:
+
+```rust
+let mut vocoder = Vocoder::builder()
+    .rate(Rate::P25Phase1)        // or P25Phase2, NxdnType2, etc
+    .build();
+
+// Encoder side
+let bits = vocoder.encode(pcm_frame)?;
+
+// Decoder side — different vocoder instance for the receive direction
+let mut vocoder = Vocoder::builder().rate(Rate::P25Phase1).build();
+let pcm = vocoder.decode(&bits)?;
+
+// Stats / diagnostics
+let stats = vocoder.last_frame_stats();    // err counts, disposition, MBE params
 ```
 
-The boundary is clean: `blip25-vocoder` consumes 18-byte FEC frames
-(full-rate) or 9-byte FEC frames (half-rate) from upstream and calls
-into blip25-mbe. blip25-mbe knows nothing about the air interface,
-trunking, sync, or RF.
+That's the shape. Rate selection at runtime; state internal; uniform
+operations. Maps cleanly onto a future RPC surface (one streaming
+RPC per direction, one config RPC for rate selection).
 
-## What's left (suggested ordering)
+## Wave 1 — codec-API hardening (small, sequenced)
 
-### Wave 1 — close the codec integration loop (1–2 sessions each)
+### 1.1 Half-rate API gotchas (1 session)
 
-1. **Fix blip25-mbe half-rate gotchas surfaced this session.**
-   - `MbeParams::silence_halfrate()` constructor (or make
-     `MbeParams::silence()` half-rate-compatible).
-   - `encode_halfrate` returns `Ok(Silence)` instead of
-     `Err(PitchOutOfRange)` on out-of-range pitch.
+- `MbeParams::silence_halfrate()` constructor (or make
+  `MbeParams::silence()` carry a half-rate-friendly ω₀ — easiest is
+  to widen its range so half-rate's `encode_pitch` accepts it).
+- `encode_halfrate` returns `Ok(AnalysisOutput::Silence)` instead of
+  `Err(PitchOutOfRange)` when the analysis lands an ω₀ outside the
+  half-rate Annex L pitch table.
 
-   These let `blip25-vocoder` use the analysis path symmetrically
-   between rates.
+These are mechanical fixes surfaced by this session's
+`halfrate-ab-matrix` baseline.
 
-2. **AMBE+ (Gen 2) dequantize wrapper.** If the user's NXDN frames turn out
-   to be Gen-2 AMBE+ (legacy NXDN/DMR), wire a 4-info-vector dequantize
-   that targets the AMBE+ parameter encoding rather than AMBE+2's.
-   Synth side (`codecs::ambe_plus`) already exists.
+### 1.2 AMBE+ (Gen 2) decode wrapper (1 session)
 
-3. **Decoder-side `RawHalfrate` / `RawMbe` entry points in blip25-vocoder.**
-   The CLI form already lives in blip25-mbe's
-   `conformance-speech-quality`; `blip25-vocoder` should expose the
-   same as a library API for `blip25-scanner` consumers who have
-   non-P25 AMBE+2 sources.
+`codecs::ambe_plus::synthesize_frame` exists but consumers of legacy
+NXDN/DMR voice (Gen 2) currently have no path from raw 4-vector
+post-FEC info bits to PCM through the AMBE+ encoder layout. Add a
+`p25_halfrate::dequantize` sibling targeting AMBE+'s parameter
+encoding so `decode-raw-halfrate --gen ambe-plus` works. The synth
+side stays untouched.
 
-### Wave 2 — finish the planned p25-decoder crates (multi-session each)
+### 1.3 Unified `Vocoder` trait + builder (2-3 sessions)
 
-4. **`blip25-trunking` — TSBK and procedures.** The current 1 489 LOC is
-   probably TSBK decode; add the trunking procedures (registration,
-   affiliation, grants, channel assignment) to drive the scanner's
-   `follow` mode from a control channel.
+The user-facing consolidation:
 
-5. **`blip25-data` — PDU / SNDCP / LRRP / CAD.** The 983-LOC stub needs
-   PDU assembly (gap reports 0005–0018 in
-   `~/blip25-specs/gap_reports/` cover most of the wire-side
-   ambiguities the spec-author has worked through). LRRP and CAD-text
-   extraction are specific user-visible payloads that justify the
-   investment.
+```rust
+pub trait Vocoder {
+    fn encode_pcm(&mut self, pcm: &[i16]) -> Result<Vec<u8>>;
+    fn decode_bits(&mut self, bits: &[u8]) -> Result<Vec<i16>>;
+    fn reset(&mut self);
+    fn last_stats(&self) -> FrameStats;
+}
 
-6. **`blip25-scanner` — `follow` mode.** The 1 201-LOC stub looks like
-   the `watch` mode for now; `follow` requires the trunking state
-   machine from #4.
+pub enum Rate {
+    P25Phase1,                    // IMBE full-rate, 18-byte FEC frame
+    P25Phase2,                    // AMBE+2 half-rate, 9-byte FEC frame
+    // Future:
+    // RawAmbePlus2 { width },    // bare 49-bit payload, no carrier FEC
+    // RawAmbePlus { width },     // Gen 2 equivalent
+    // RawImbe,                   // bare 88-bit info, no FEC
+}
 
-### Wave 3 — polish / not-yet-justified
+pub struct VocoderBuilder { /* rate, gen, mute_mode, repeat_reset, etc */ }
+```
 
-7. **Phase 2 H-CPM/H-DQPSK demod.** Memory entry
-   `project_chip_unblock_session_2026-04-23` mentions Phase 2 work but
-   it's unclear whether `blip25-edge` and `blip25-dsp` cover H-CPM
-   demod; if not, a Phase 2 receive path is significant DSP work.
+State internal. Rate selection at runtime. Maps onto every existing
+multi-step pipeline as a thin wrapper. Doesn't replace the low-level
+modules — they stay public for advanced consumers.
 
-8. **Encryption path (TIA-102.AAAD-B).** Block encryption + ESS handling.
-   Spec is in derived form already
-   (`P25_Block_Encryption_Protocol_Implementation_Spec.md`). Useful
-   for monitoring P25 systems that emit encrypted traffic, but the
-   keys are typically not available — value is detection + framing,
-   not actual decrypt.
+### 1.4 `serde`-friendly diagnostic types (1 session)
 
-9. **TIA-102 link-layer authentication (AACE-A).** Specific to user
-   needs; likely deprioritize unless monitoring authenticated systems.
+`FrameStats`, `MbeParams`, `FrameDisposition` should derive
+`Serialize`/`Deserialize` (or have a thin shadow type that does)
+so a future RPC layer can send them over the wire without a
+hand-rolled converter. Keep `serde` an optional feature so the core
+crate stays minimal-dep.
 
-## Open decisions
+### 1.5 Streaming iterator API (1 session, optional)
 
-- **Single repo or split?** Currently p25-decoder is one workspace
-  with blip25-mbe as a path dependency. Works fine. Splitting
-  blip25-mbe out (it already lives in its own repo) lets it serve
-  non-P25 consumers (NXDN, DMR users) independently. **Suggest:**
-  keep current arrangement; blip25-mbe is already independently
-  publishable.
+```rust
+let mut session = vocoder.encode_stream(pcm_iter);   // Iterator<Item = Result<Vec<u8>>>
+let mut session = vocoder.decode_stream(bits_iter);  // Iterator<Item = Result<Vec<i16>>>
+```
 
-- **Clean-room team applies to p25-decoder?** Yes — same blip25-vocoder
-  team pattern (`spec-author` reads PDFs, `implementer` reads only
-  derived works) transfers directly. Memory
-  `project_clean_room_team_2026-04-16` notes this. The user is the
-  merge gate for spec updates.
+Convenient for consumers that already have an iterator/stream of PCM
+or bit chunks. Not strictly necessary; the per-frame API is fine.
 
-- **License consistency?** blip25-mbe is MIT (per `LICENSE`);
-  p25-decoder is GPL-3.0 (per `Cargo.toml`). Different licenses are
-  fine across a workspace boundary but worth flagging for downstream
-  consumers — they take blip25-mbe under MIT and the p25-decoder
-  binaries under GPL. No conflict; just visibility.
+## Wave 2 — boundary cleanup
 
-- **`blip25-edge` Phase 2 readiness.** Need a quick read on whether
-  the existing 8 203 LOC covers H-CPM/H-DQPSK or only Phase 1's C4FM
-  / CQPSK. This determines whether half-rate end-to-end testing on
-  real RF needs DSP work first.
+### 2.1 Document the chip-vs-blip25-mbe correspondence
 
-- **Test data for non-RF testing.** blip25-mbe has DVSI vectors;
-  p25-decoder has 24 IQ captures (`AirSpy_*.wav`) and a stockpile of
-  AMBE dumps (`ambe_dump_ch*_*_ts*.txt`). The dumps look like the raw
-  AMBE+2 voice payloads exactly the kind `decode-raw-mbe` consumes —
-  worth running through to verify cross-pipeline parity.
+A short reference table mapping AMBE-3000R protocol commands to
+blip25-mbe operations, and listing the things our library deliberately
+doesn't model (audio mode, channel framing, RTS/CTS flow control —
+all chip-protocol concerns, not codec concerns). Goes in
+`INTEGRATION.md` next to the existing "Spectral enhancement" section.
 
-## What this plan is NOT
+### 2.2 Pull non-codec content out of conformance tooling
 
-- Not a redesign of either repo's architecture. The architecture is
-  fine; the work is filling in the planned crates and tightening the
-  integration boundary.
-- Not a commit-able artifact for p25-decoder. If the user wants this
-  formalized in p25-decoder, copy it there; this lives in blip25-mbe
-  because that's where the boundary view is.
-- Not a schedule. Sessions are rough sizes ("1–2 sessions each"); the
-  user can sequence as priority demands.
+`conformance-speech-quality` has accumulated diagnostic surface
+across the gap-0021/0022 work. The codec-side stays
+(`probe_chip_dequant`, `chip_bit_disposition`, `decode-raw-*`); the
+JMBE-validation pieces are the gray zone — they're cross-codec
+oracles, not codec primitives. Decide whether to keep
+`JMBEDumpInfo.java` and `score_ab_matrix.py` in this repo or move
+them to a sibling `blip25-mbe-tools` repo when their list grows.
 
-## Recommended first concrete cut
+## Out of scope, listed explicitly so it stays out
 
-If the user wants to start actioning this immediately, the smallest
+- P25 air interface (FDMA C4FM, TDMA H-CPM): `~/p25-decoder/blip25-edge`
+  + `blip25-dsp`.
+- TSBK / MBT / ISP / OSP framing + procedures:
+  `~/p25-decoder/blip25-trunking`.
+- PDU / SNDCP / LRRP / CAD: `~/p25-decoder/blip25-data`.
+- NXDN / DMR / D-STAR wire formats: future sibling crates that
+  consume blip25-mbe as a path/version dep.
+- Encryption (block + ESS), link-layer authentication: belongs in
+  the carrier project, not the codec.
+
+## First concrete cut
+
+If a session opens with "do something on this plan," the smallest
 useful sequence is:
 
-1. **Half-rate gotcha fix in blip25-mbe** (Wave 1 #1) — small commits,
-   immediately useful for the AMBE dump cross-pipeline check.
-2. **Run the existing AMBE dumps through `decode-raw-mbe`** — validates
-   the new entry point against real off-air data.
-3. **Pivot to whichever planned p25-decoder crate has the highest user
-   value** — likely `blip25-data` (LRRP / CAD text) for monitoring
-   value, or `blip25-trunking` procedures if `follow` mode is wanted.
+1. **Wave 1.1 — half-rate gotchas** (today's session). Concrete,
+   self-contained, surfaced by this week's halfrate-ab-matrix run.
+2. **Run the 24 cached AMBE dumps in `~/p25-decoder/ambe_dump_*.txt`
+   through `decode-raw-mbe`** — validates the carrier-agnostic
+   entry point against real captures, surfaces any prioritization
+   mismatches before NXDN frames arrive.
+3. **Wave 1.3 — unified `Vocoder` trait** if quality/PESQ is
+   feeling tapped out. Pure ergonomics work; doesn't move PESQ
+   numbers but makes the integration boundary cleaner.
 
-Wave 1 #1 + a real-data run yields a concrete deliverable in one
-session and tees up Wave 2 cleanly.
+Wave 1.1 + the dump-replay yields a one-session deliverable that
+also exercises the new NXDN-readiness work end-to-end.

@@ -191,6 +191,28 @@ enum Cmd {
         #[arg(long)]
         out_wav: PathBuf,
     },
+    /// Decode a stream of P25 Phase 2 / AMBE+2 half-rate FEC frames
+    /// (9 bytes per frame = 36 dibits) into 8 kHz mono i16 PCM. Runs
+    /// the full p25_halfrate decode chain: unpack dibits →
+    /// `decode_frame` (Annex H deinterleave + Golay/Hamming) →
+    /// `dequantize` → AMBE+2 synth.
+    ///
+    /// Two input formats:
+    /// - Text: one 18-hex-char line per frame (lines like
+    ///   `E9C1F6445F718B761D`, `#`-comments and blank lines OK).
+    /// - Binary: raw 9-byte frames concatenated (`--binary`).
+    DecodeFecHalfrate {
+        /// Path to FEC-frame input. Use `-` for stdin.
+        #[arg(long)]
+        input: PathBuf,
+        /// Output WAV path.
+        #[arg(long)]
+        out_wav: PathBuf,
+        /// Treat input as packed binary (9 bytes per frame) rather
+        /// than text-hex.
+        #[arg(long)]
+        binary: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
@@ -244,6 +266,9 @@ fn main() -> Result<()> {
             cmd_decode_raw_halfrate(&input, &out_wav, binary)
         }
         Cmd::DecodeRawMbe { input, out_wav } => cmd_decode_raw_mbe(&input, &out_wav),
+        Cmd::DecodeFecHalfrate { input, out_wav, binary } => {
+            cmd_decode_fec_halfrate(&input, &out_wav, binary)
+        }
     }
 }
 
@@ -607,22 +632,17 @@ fn our_encode_halfrate(
     let mut out = Vec::with_capacity(n_frames * HALF_BYTES_PER_FEC_FRAME);
     for f in 0..n_frames {
         let frame = &pcm[f * FRAME_SAMPLES..(f + 1) * FRAME_SAMPLES];
-        // Treat any analysis-encoder error (e.g., PitchOutOfRange when
-        // the high-pitched speech exceeds half-rate's tighter ω₀ ceiling
-        // ~0.316 rad/sample) as silence — emits an in-range zero-amp
-        // frame rather than panicking. Same for downstream
-        // quantize_half: out-of-range pitch lands silence.
+        // `encode_halfrate` now dispatches PitchOutOfRange as Silence
+        // internally (blip25-mbe Wave 1.1 fix). `MbeParams::silence_halfrate`
+        // gives a half-rate-table-compatible placeholder. Only treat
+        // remaining analysis errors as fatal.
         let params = match analysis_encode_halfrate(frame, &mut state) {
             Ok(AnalysisOutput::Voice(p)) => p,
-            Ok(AnalysisOutput::Silence) | Err(_) => halfrate_silence_params(),
+            Ok(AnalysisOutput::Silence) => MbeParams::silence_halfrate(),
+            Err(e) => return Err(anyhow!("analysis-halfrate error at frame {f}: {e:?}")),
         };
         let info = quantize_half(&params, &mut decoder_state)
-            .unwrap_or_else(|_| {
-                // Fall back to an explicit silence frame if quantize
-                // rejects (e.g., synthetic ω₀ stretches the table).
-                let sil = halfrate_silence_params();
-                quantize_half(&sil, &mut decoder_state).expect("silence params encodable")
-            });
+            .map_err(|e| anyhow!("halfrate quantize error at frame {f}: {e:?}"))?;
         let dibits = encode_half_frame(&info);
         out.extend_from_slice(&pack_dibits_half(&dibits));
     }
@@ -879,20 +899,90 @@ fn cmd_decode_raw_mbe(input: &Path, out_wav: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Build a silence-equivalent `MbeParams` whose ω₀ falls inside the
-/// half-rate Annex L pitch table range. `MbeParams::silence()`'s
-/// fullrate-friendly ω₀ = 4π/39.5 ≈ 0.318 is just outside half-rate's
-/// max ω₀ ≈ 0.316 (b̂₀=0), so `quantize_half` rejects it as `BadPitch`.
-/// We pick the largest in-range ω₀ (b̂₀=0 entry) and amps=0 — produces
-/// the same silent output without wire-format ambiguity.
-fn halfrate_silence_params() -> MbeParams {
-    use blip25_mbe::p25_halfrate::dequantize::decode_pitch;
-    let pe = decode_pitch(0).expect("b̂₀=0 is a valid half-rate pitch entry");
-    let l = pe.l;
-    let voiced = vec![false; l as usize];
-    let amps = vec![0.0f32; l as usize];
-    MbeParams::new(pe.omega_0, l, &voiced, &amps)
-        .expect("zero-amp silence params for b̂₀=0 are valid")
+/// Decode FEC-level half-rate frames (9 bytes / 36 dibits each) into
+/// PCM via our P25 Phase 2 wire decode + AMBE+2 synth.
+///
+/// Wire-FEC-aware entry point. Useful for raw chip dumps, off-air
+/// captures, and any consumer that has 9-byte AMBE+2 FEC frames in
+/// hand. Mirrors `decode-raw-halfrate` but one layer up — input is
+/// pre-FEC-decode bytes, output is PCM after the full wire chain.
+fn cmd_decode_fec_halfrate(input: &Path, out_wav: &Path, binary: bool) -> Result<()> {
+    use std::io::Read;
+    let raw: Vec<u8> = if input == Path::new("-") {
+        let mut buf = Vec::new();
+        std::io::stdin().read_to_end(&mut buf)?;
+        buf
+    } else {
+        fs::read(input).with_context(|| format!("read {}", input.display()))?
+    };
+
+    let frames: Vec<[u8; HALF_BYTES_PER_FEC_FRAME]> = if binary {
+        if raw.len() % HALF_BYTES_PER_FEC_FRAME != 0 {
+            return Err(anyhow!(
+                "binary input must be a whole number of 9-byte frames; got {} bytes",
+                raw.len()
+            ));
+        }
+        raw.chunks_exact(HALF_BYTES_PER_FEC_FRAME)
+            .map(|c| {
+                let mut a = [0u8; HALF_BYTES_PER_FEC_FRAME];
+                a.copy_from_slice(c);
+                a
+            })
+            .collect()
+    } else {
+        let text = String::from_utf8(raw).context("input is not valid UTF-8 text")?;
+        let mut out = Vec::new();
+        for (lineno, line) in text.lines().enumerate() {
+            let stripped = line.split('#').next().unwrap_or("").trim();
+            if stripped.is_empty() {
+                continue;
+            }
+            // Strip whitespace/punctuation, accept e.g. "E9C1F6445F718B761D"
+            // or "e9 c1 f6 44 5f 71 8b 76 1d".
+            let hex: String = stripped
+                .chars()
+                .filter(|c| !c.is_whitespace() && *c != ':' && *c != '-')
+                .collect();
+            if hex.len() != 2 * HALF_BYTES_PER_FEC_FRAME {
+                return Err(anyhow!(
+                    "line {}: expected {} hex chars (= {} bytes), got {} ({})",
+                    lineno + 1,
+                    2 * HALF_BYTES_PER_FEC_FRAME,
+                    HALF_BYTES_PER_FEC_FRAME,
+                    hex.len(),
+                    stripped
+                ));
+            }
+            let mut bytes = [0u8; HALF_BYTES_PER_FEC_FRAME];
+            for (i, b) in bytes.iter_mut().enumerate() {
+                *b = u8::from_str_radix(&hex[2 * i..2 * i + 2], 16)
+                    .with_context(|| format!("line {}: parse hex byte at {}", lineno + 1, i))?;
+            }
+            out.push(bytes);
+        }
+        out
+    };
+
+    let pcm = our_decode_halfrate(
+        &frames
+            .iter()
+            .flat_map(|f| f.iter().copied())
+            .collect::<Vec<u8>>(),
+    );
+    write_wav(out_wav, &pcm)?;
+    eprintln!(
+        "frames={}  samples={}  rms={:.0}  → {}",
+        frames.len(),
+        pcm.len(),
+        if pcm.is_empty() {
+            0.0
+        } else {
+            (pcm.iter().map(|&s| (s as f64) * (s as f64)).sum::<f64>() / pcm.len() as f64).sqrt()
+        },
+        out_wav.display()
+    );
+    Ok(())
 }
 
 fn pack_dibits_half(dibits: &[u8; HALF_DIBITS_PER_FRAME]) -> [u8; HALF_BYTES_PER_FEC_FRAME] {
