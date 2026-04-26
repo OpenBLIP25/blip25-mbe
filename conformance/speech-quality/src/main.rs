@@ -964,12 +964,18 @@ fn cmd_decode_fec_halfrate(input: &Path, out_wav: &Path, binary: bool) -> Result
         out
     };
 
-    let pcm = our_decode_halfrate(
-        &frames
-            .iter()
-            .flat_map(|f| f.iter().copied())
-            .collect::<Vec<u8>>(),
-    );
+    // Drive the chip-shaped Vocoder API rather than `our_decode_halfrate`'s
+    // probe-flag-aware path -- this is a clean carrier-agnostic decode and
+    // wants the carrier-agnostic surface.
+    use blip25_mbe::vocoder::{Rate, Vocoder};
+    let mut vocoder = Vocoder::new(Rate::P25Phase2);
+    let mut pcm: Vec<i16> = Vec::with_capacity(frames.len() * FRAME_SAMPLES);
+    for (f, bytes) in frames.iter().enumerate() {
+        let frame = vocoder
+            .decode_bits(bytes)
+            .with_context(|| format!("decode frame {f}"))?;
+        pcm.extend_from_slice(&frame);
+    }
     write_wav(out_wav, &pcm)?;
     eprintln!(
         "frames={}  samples={}  rms={:.0}  → {}",
