@@ -99,6 +99,43 @@ impl Rate {
     }
 }
 
+/// Half-rate synthesis generation. Picks how reconstructed `MbeParams`
+/// are turned back into PCM on the half-rate decode path.
+///
+/// Full-rate (P25 Phase 1 IMBE) ignores this — it always uses the
+/// BABA-A §1.12 baseline phase, the only synth the IMBE spec
+/// describes.
+///
+/// The original Wave 1.2 of `SCOPE_PLAN.md` framed this as an
+/// "AMBE+ Gen-2 dequantize wrapper" — that turned out to be the
+/// wrong axis. The half-rate WIRE format and parameter recovery are
+/// AMBE+2 across the board (per
+/// `~/blip25-specs/analysis/oss_implementations_lessons_learned.md`);
+/// the actual Gen-2 vs Gen-3 split for legacy NXDN / DMR is here, on
+/// the synth side. mbelib's half-rate decoder uses [`Self::Baseline`]
+/// (1993-vintage IMBE phase, no Hilbert phase regen). JMBE / SDRTrunk
+/// use [`Self::AmbePlus`] (US5701390 phase regen, modern AMBE+ /
+/// AMBE+2 sound).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[non_exhaustive]
+pub enum HalfrateSynth {
+    /// US5701390 phase regen — modern AMBE+ / AMBE+2 sound. Default
+    /// and recommended for P25 Phase 2 / NXDN type-2 / DMR enhanced.
+    AmbePlus,
+    /// BABA-A §1.12 baseline IMBE phase — no Hilbert regen. Matches
+    /// mbelib's half-rate output. Use for legacy NXDN type-1 / older
+    /// DMR captures where the consumer wants mbelib-equivalent
+    /// audible behavior.
+    Baseline,
+}
+
+impl Default for HalfrateSynth {
+    fn default() -> Self {
+        Self::AmbePlus
+    }
+}
+
 /// Per-frame statistics recorded by the most recent [`Vocoder::encode_pcm`]
 /// or [`Vocoder::decode_bits`] call. `None` until at least one frame
 /// has been processed.
@@ -225,6 +262,7 @@ pub struct Vocoder {
     synth: SynthState,
     last_stats: FrameStats,
     tone_detection: bool,
+    halfrate_synth: HalfrateSynth,
 }
 
 impl Vocoder {
@@ -238,7 +276,22 @@ impl Vocoder {
             synth: SynthState::new(),
             last_stats: FrameStats::default(),
             tone_detection: false,
+            halfrate_synth: HalfrateSynth::AmbePlus,
         }
+    }
+
+    /// Configure which half-rate synth flavor [`Self::decode_bits`] +
+    /// [`Self::synthesize_params`] use on Phase 2 / AMBE+2 input.
+    /// No-op for full-rate (which always uses the BABA-A §1.12
+    /// baseline IMBE synth). Default [`HalfrateSynth::AmbePlus`].
+    pub fn set_halfrate_synth(&mut self, gen: HalfrateSynth) {
+        self.halfrate_synth = gen;
+    }
+
+    /// Currently configured half-rate synth flavor.
+    #[inline]
+    pub fn halfrate_synth(&self) -> HalfrateSynth {
+        self.halfrate_synth
     }
 
     /// Enable encode-side Annex T tone detection. When on (and rate
@@ -496,13 +549,14 @@ impl Vocoder {
         // disposition is `Use` unless smoothed ε_R is already high.
         let prev_err = self.synth.err;
         self.synth.err = FrameErrorContext::default();
+        let err = self.synth.err;
+        let gamma_w = self.synth.gamma_w;
         let pcm: [i16; FRAME_SAMPLES] = match self.rate {
-            Rate::P25Phase1 => {
-                let err = self.synth.err;
-                let gamma_w = self.synth.gamma_w;
-                synthesize_frame(params, &err, gamma_w, &mut self.synth)
-            }
-            Rate::P25Phase2 => ambe_plus2::synthesize_frame(params, &mut self.synth),
+            Rate::P25Phase1 => synthesize_frame(params, &err, gamma_w, &mut self.synth),
+            Rate::P25Phase2 => match self.halfrate_synth {
+                HalfrateSynth::AmbePlus => ambe_plus2::synthesize_frame(params, &mut self.synth),
+                HalfrateSynth::Baseline => synthesize_frame(params, &err, gamma_w, &mut self.synth),
+            },
         };
         self.synth.err = prev_err;
         pcm.to_vec()
@@ -940,6 +994,7 @@ pub struct VocoderBuilder {
     repeat_reset_after: Option<u32>,
     silence_dispatch: bool,
     pitch_silence_override: bool,
+    halfrate_synth: HalfrateSynth,
 }
 
 impl VocoderBuilder {
@@ -952,6 +1007,7 @@ impl VocoderBuilder {
             repeat_reset_after: None,
             silence_dispatch: false,
             pitch_silence_override: false,
+            halfrate_synth: HalfrateSynth::AmbePlus,
         }
     }
 
@@ -988,6 +1044,14 @@ impl VocoderBuilder {
         self
     }
 
+    /// Configure the half-rate synth flavor (no-op for full-rate).
+    /// See [`Vocoder::set_halfrate_synth`].
+    #[inline]
+    pub fn halfrate_synth(mut self, gen: HalfrateSynth) -> Self {
+        self.halfrate_synth = gen;
+        self
+    }
+
     /// Materialize the [`Vocoder`].
     pub fn build(self) -> Vocoder {
         let mut v = Vocoder::new(self.rate);
@@ -995,6 +1059,7 @@ impl VocoderBuilder {
         v.set_repeat_reset_after(self.repeat_reset_after);
         v.set_silence_dispatch(self.silence_dispatch);
         v.set_pitch_silence_override(self.pitch_silence_override);
+        v.set_halfrate_synth(self.halfrate_synth);
         v
     }
 }
@@ -1156,11 +1221,27 @@ mod halfrate {
         let frame = decode_frame(&dibits);
         let stats_eps0 = frame.errors[0];
         let stats_epst = frame.errors.iter().map(|&e| u16::from(e)).sum::<u16>().min(255) as u8;
+        let err = FrameErrorContext {
+            epsilon_0: stats_eps0,
+            epsilon_4: frame.errors[3], // half-rate has 4 codewords; index 3 = û₃
+            epsilon_t: stats_epst,
+            bad_pitch: false,
+        };
         let pcm: [i16; FRAME_SAMPLES] = match decode_to_params(&frame.info, &mut vocoder.halfrate_dec) {
-            Ok(Decoded::Voice(p)) => ambe_plus2::synthesize_frame(&p, &mut vocoder.synth),
-            Ok(Decoded::Tone { params, .. }) => {
-                ambe_plus2::synthesize_tone(&params, &mut vocoder.synth)
-            }
+            Ok(Decoded::Voice(p)) => match vocoder.halfrate_synth {
+                HalfrateSynth::AmbePlus => ambe_plus2::synthesize_frame(&p, &mut vocoder.synth),
+                HalfrateSynth::Baseline => {
+                    let gamma_w = vocoder.synth.gamma_w;
+                    synthesize_frame(&p, &err, gamma_w, &mut vocoder.synth)
+                }
+            },
+            Ok(Decoded::Tone { params, .. }) => match vocoder.halfrate_synth {
+                HalfrateSynth::AmbePlus => ambe_plus2::synthesize_tone(&params, &mut vocoder.synth),
+                HalfrateSynth::Baseline => {
+                    let gamma_w = vocoder.synth.gamma_w;
+                    synthesize_frame(&params, &err, gamma_w, &mut vocoder.synth)
+                }
+            },
             Ok(Decoded::Erasure) | Err(_) => [0i16; FRAME_SAMPLES],
         };
         let disposition = vocoder.synth.last_disposition();
@@ -1690,7 +1771,7 @@ mod tests {
         assert_eq!(v.last_disposition(), Some(FrameDisposition::Use));
     }
 
-    /// Builder applies all four config knobs in one expression.
+    /// Builder applies all five config knobs in one expression.
     #[test]
     fn builder_configures_all_knobs() {
         let v = Vocoder::builder(Rate::P25Phase2)
@@ -1698,12 +1779,43 @@ mod tests {
             .repeat_reset_after(Some(3))
             .silence_dispatch(true)
             .pitch_silence_override(true)
+            .halfrate_synth(HalfrateSynth::Baseline)
             .build();
         assert_eq!(v.rate(), Rate::P25Phase2);
         assert!(v.tone_detection());
         assert_eq!(v.repeat_reset_after(), Some(3));
         assert!(v.silence_dispatch());
         assert!(v.pitch_silence_override());
+        assert_eq!(v.halfrate_synth(), HalfrateSynth::Baseline);
+    }
+
+    /// Half-rate synth choice routes to the right backend. Both
+    /// modes produce non-trivial audio. They MAY converge to
+    /// identical PCM on simple/periodic inputs (the AMBE+ phase
+    /// regen is a no-op when all bands voiced cleanly), so the
+    /// assertion is non-silent + correct rate, not bit-difference.
+    #[test]
+    fn halfrate_synth_modes_both_decode_cleanly() {
+        let mut tx = Vocoder::new(Rate::P25Phase2);
+        let pcm = periodic_pcm(40, 6000);
+        let mut bits_buf: Vec<u8> = Vec::new();
+        for _ in 0..5 {
+            bits_buf.extend(tx.encode_pcm(&pcm).unwrap());
+        }
+
+        for gen in [HalfrateSynth::AmbePlus, HalfrateSynth::Baseline] {
+            let mut rx = Vocoder::builder(Rate::P25Phase2)
+                .halfrate_synth(gen)
+                .build();
+            assert_eq!(rx.halfrate_synth(), gen);
+            let mut out_pcm: Vec<i16> = Vec::new();
+            for chunk in bits_buf.chunks_exact(9) {
+                out_pcm.extend(rx.decode_bits(chunk).unwrap());
+            }
+            let rms = (out_pcm.iter().map(|&s| (s as f64) * (s as f64)).sum::<f64>()
+                / out_pcm.len() as f64).sqrt();
+            assert!(rms > 50.0, "{gen:?} output too quiet: rms={rms}");
+        }
     }
 
     /// Default builder = spec-faithful (no beyond-spec or opt-in knobs).
@@ -1716,10 +1828,12 @@ mod tests {
         assert_eq!(a.repeat_reset_after(), b.repeat_reset_after());
         assert_eq!(a.silence_dispatch(), b.silence_dispatch());
         assert_eq!(a.pitch_silence_override(), b.pitch_silence_override());
+        assert_eq!(a.halfrate_synth(), b.halfrate_synth());
         assert!(!a.tone_detection());
         assert!(a.repeat_reset_after().is_none());
         assert!(!a.silence_dispatch());
         assert!(!a.pitch_silence_override());
+        assert_eq!(a.halfrate_synth(), HalfrateSynth::AmbePlus);
     }
 
     /// `flush` zero-pads residue and emits one final frame; on an
