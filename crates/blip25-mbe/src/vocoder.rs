@@ -420,6 +420,45 @@ impl Vocoder {
         EncodeStream { vocoder: self, pcm, pos: 0 }
     }
 
+    /// Run the analysis encoder on one PCM frame and return the
+    /// resulting [`MbeParams`] without quantizing or FEC-encoding.
+    /// Advances the analysis state (look-ahead history, predictor,
+    /// V/UV state, silence detector) so subsequent calls see
+    /// continuous context.
+    ///
+    /// `pcm` must be exactly [`Self::frame_samples`] samples (160).
+    ///
+    /// On `AnalysisOutput::Silence` (preroll, silence dispatch,
+    /// half-rate `PitchOutOfRange`), returns the rate-appropriate
+    /// silence params ([`MbeParams::silence`] or
+    /// [`MbeParams::silence_halfrate`]).
+    ///
+    /// Counterpart of [`Self::synthesize_params`]. Together these
+    /// expose the parameter layer without going through wire FEC,
+    /// enabling rate-conversion / analysis / playback pipelines that
+    /// don't need the full encode/decode round-trip.
+    pub fn extract_params(&mut self, pcm: &[i16]) -> Result<MbeParams, VocoderError> {
+        if pcm.len() != self.frame_samples() {
+            return Err(VocoderError::WrongPcmLength {
+                expected: self.frame_samples(),
+                got: pcm.len(),
+            });
+        }
+        let frame = pcm.try_into().expect("length already validated");
+        let analysis_out = match self.rate {
+            Rate::P25Phase1 => analysis_encode(frame, &mut self.analysis),
+            Rate::P25Phase2 => analysis_encode_halfrate(frame, &mut self.analysis),
+        }
+        .map_err(VocoderError::Analysis)?;
+        Ok(match analysis_out {
+            AnalysisOutput::Voice(p) => p,
+            AnalysisOutput::Silence => match self.rate {
+                Rate::P25Phase1 => MbeParams::silence(),
+                Rate::P25Phase2 => MbeParams::silence_halfrate(),
+            },
+        })
+    }
+
     /// Synthesize one PCM frame directly from [`MbeParams`], skipping
     /// the FEC + dequantize chain. Advances the channel's synth state
     /// (so re-acquisition after silence and across-frame phase
@@ -1382,6 +1421,45 @@ mod tests {
         assert_eq!(live.pending_samples(), 80);
         live.discard_pending();
         assert_eq!(live.pending_samples(), 0);
+    }
+
+    /// `extract_params` runs the analysis encoder on PCM and returns
+    /// MbeParams. Multiple calls advance state correctly (preroll
+    /// → voice transition).
+    #[test]
+    fn extract_params_returns_params_per_frame() {
+        let mut v = Vocoder::new(Rate::P25Phase1);
+        // First few frames are preroll; analysis should still return
+        // silence params, not error.
+        let pcm = periodic_pcm(40, 6000);
+        let p1 = v.extract_params(&pcm).unwrap();
+        let p2 = v.extract_params(&pcm).unwrap();
+        let p3 = v.extract_params(&pcm).unwrap();
+        // Preroll dispatches silence; by frame 3+ we should see voice
+        // params (non-silence ω₀ or non-zero amplitudes).
+        let any_voice = [&p1, &p2, &p3].iter().any(|p| {
+            let amps = p.amplitudes_slice();
+            amps.iter().any(|&a| a > 0.0)
+        });
+        assert!(any_voice, "no voice params after 3 frames of periodic PCM");
+    }
+
+    /// extract_params + synthesize_params chain together — extract
+    /// params from PCM, immediately synthesize them back to PCM, get
+    /// non-trivial output. (Not the same as the input — that would
+    /// require the wire FEC chain to advance the synth predictor in
+    /// step with the analysis predictor — but the synth output is
+    /// well-defined.)
+    #[test]
+    fn extract_then_synthesize_roundtrips_through_params() {
+        let mut a = Vocoder::new(Rate::P25Phase1);
+        let mut b = Vocoder::new(Rate::P25Phase1);
+        let pcm = periodic_pcm(40, 6000);
+        for _ in 0..5 {
+            let params = a.extract_params(&pcm).unwrap();
+            let resynth = b.synthesize_params(&params);
+            assert_eq!(resynth.len(), FRAME_SAMPLES);
+        }
     }
 
     /// `synthesize_params` accepts arbitrary MbeParams and produces a
