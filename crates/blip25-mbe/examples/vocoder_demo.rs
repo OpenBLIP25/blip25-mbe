@@ -8,7 +8,7 @@
 //! streaming, the parameter-layer (extract_params / synthesize_params),
 //! the builder, and stats / disposition inspection.
 
-use blip25_mbe::vocoder::{LiveEncoder, Rate, Vocoder};
+use blip25_mbe::vocoder::{LiveEncoder, Rate, TranscodeDirection, Transcoder, Vocoder};
 
 const FRAMES: usize = 50; // 1.0 second of audio at 8 kHz / 20 ms/frame.
 
@@ -29,6 +29,9 @@ fn main() {
 
     println!("\n=== Builder + opt-in knobs ===");
     builder_demo(&pcm);
+
+    println!("\n=== Transcoder: P25 Phase 1 → Phase 2 ===");
+    transcode_demo(&pcm);
 }
 
 fn one_shot(pcm: &[i16]) {
@@ -141,6 +144,30 @@ fn builder_demo(pcm: &[i16]) {
         frame_buf.extend(tx.encode_pcm(chunk).expect("encode"));
     }
     println!("Encoded {} bytes via builder-configured channel", frame_buf.len());
+}
+
+fn transcode_demo(pcm: &[i16]) {
+    // Encode at Phase 1 (full-rate, 18-byte FEC frames) and transcode
+    // each frame to Phase 2 (half-rate, 9-byte). The bridge runs in
+    // the parameter domain — no PCM round-trip — so quality stays at
+    // the parameter-extraction floor instead of the lossy
+    // analysis-encode → synthesis → analysis-encode chain.
+    let mut enc = Vocoder::new(Rate::P25Phase1);
+    let mut tx = Transcoder::new(TranscodeDirection::P25Phase1ToPhase2);
+    let mut p1_total = 0usize;
+    let mut p2_total = 0usize;
+    for chunk in pcm.chunks_exact(enc.frame_samples()) {
+        let p1 = enc.encode_pcm(chunk).expect("encode phase1");
+        let p2 = tx.transcode(&p1).expect("transcode phase1 → phase2");
+        p1_total += p1.len();
+        p2_total += p2.len();
+    }
+    println!(
+        "Transcoder: {} P1 bytes → {} P2 bytes ({}× compression)",
+        p1_total,
+        p2_total,
+        p1_total as f32 / p2_total as f32,
+    );
 }
 
 // Synthesize a 1-second test signal: a 312.5 Hz tone for the first

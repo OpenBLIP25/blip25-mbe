@@ -941,7 +941,10 @@ pub enum Decoded {
     /// parameters produced by Eq. 206–209. The params feed directly
     /// into the §1.12 synthesizer.
     Tone {
+        /// Annex T `(I_D, A_D)` extracted from the tone-frame layout.
         fields: ToneFrameFields,
+        /// MBE parameters built from `fields` via Eq. 206–209;
+        /// suitable for direct dispatch into the synthesizer.
         params: MbeParams,
     },
     /// Erasure — caller should repeat the previous frame.

@@ -575,6 +575,9 @@ pub fn reconstruct_amplitudes_from_bits(
     out
 }
 
+/// Decode a full-rate IMBE info-vector bundle (`û₀..û₇`) into
+/// [`MbeParams`], using and updating the receiver-side `state` per
+/// §1.7–§1.10.
 pub fn dequantize(
     u: &[u16; 8],
     state: &mut DecoderState,

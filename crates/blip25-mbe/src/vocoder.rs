@@ -170,9 +170,19 @@ pub struct DecodeStats {
 #[derive(Debug)]
 pub enum VocoderError {
     /// Input PCM slice was the wrong length. Always `frame_samples()`.
-    WrongPcmLength { expected: usize, got: usize },
+    WrongPcmLength {
+        /// Number of samples the channel expected.
+        expected: usize,
+        /// Number of samples the caller passed.
+        got: usize,
+    },
     /// Input bit slice was the wrong length. Always `fec_frame_bytes()`.
-    WrongBitsLength { expected: usize, got: usize },
+    WrongBitsLength {
+        /// Number of bytes the channel expected.
+        expected: usize,
+        /// Number of bytes the caller passed.
+        got: usize,
+    },
     /// Analysis encoder failure (HPF / pitch / refinement).
     Analysis(AnalysisError),
     /// Wire-quantize failure (e.g. predictor returned a non-finite value).

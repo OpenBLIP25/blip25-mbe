@@ -162,6 +162,7 @@ fn gen_annex_e(out_dir: &PathBuf) {
     let mut out = String::new();
     out.push_str("// Auto-generated from spec_tables/annex_e_gain_quantizer.csv\n");
     out.push_str("// Do not edit — regenerated each build.\n");
+    out.push_str("/// IMBE full-rate `b̂₂` gain levels (Annex E).\n");
     out.push_str("pub const IMBE_GAIN_LEVELS: [f32; 64] = [\n");
     for (i, level) in levels.iter().enumerate() {
         out.push_str(&format!("    {level:.6}, // b̂₂ = {i}\n"));
@@ -389,9 +390,11 @@ fn gen_annex_b(out_dir: &PathBuf) {
     out.push_str("// Auto-generated from spec_tables/annex_b_analysis_window.csv\n");
     out.push_str("// Do not edit — regenerated each build.\n");
     out.push_str("/// Length of the initial pitch-estimation window (n = −150..=150).\n");
+    out.push_str("/// Annex B analysis-window length (samples).\n");
     out.push_str("pub const ANALYSIS_WINDOW_LEN: usize = 301;\n\n");
     out.push_str("/// Analysis window wI(n) per BABA-A Annex B.\n");
     out.push_str("/// Indexed `[n + 150]` so `IMBE_ANALYSIS_WINDOW[0] = wI(−150)`.\n");
+    out.push_str("/// IMBE Annex B analysis window `wA(n)` for n ∈ [-150, 150].\n");
     out.push_str("pub const IMBE_ANALYSIS_WINDOW: [f32; ANALYSIS_WINDOW_LEN] = [\n");
     for (n, w) in &samples {
         out.push_str(&format!("    {w:.8}, // n = {n}\n"));
@@ -463,9 +466,11 @@ fn gen_annex_c(out_dir: &PathBuf) {
     out.push_str("// Auto-generated from spec_tables/annex_c_pitch_refinement_window.csv\n");
     out.push_str("// Do not edit — regenerated each build.\n");
     out.push_str("/// Length of the pitch refinement window (n = −110..=110).\n");
+    out.push_str("/// Annex C pitch-refinement window length (samples).\n");
     out.push_str("pub const REFINEMENT_WINDOW_LEN: usize = 221;\n\n");
     out.push_str("/// Pitch refinement window wR(n) per BABA-A Annex C.\n");
     out.push_str("/// Indexed `[n + 110]` so `IMBE_REFINEMENT_WINDOW[0] = wR(−110)`.\n");
+    out.push_str("/// IMBE Annex C pitch-refinement window `wR(n)` for n ∈ [-110, 110].\n");
     out.push_str("pub const IMBE_REFINEMENT_WINDOW: [f32; REFINEMENT_WINDOW_LEN] = [\n");
     for (n, w) in &samples {
         out.push_str(&format!("    {w:.8}, // n = {n}\n"));
@@ -523,9 +528,11 @@ fn gen_annex_d(out_dir: &PathBuf) {
     out.push_str("// Auto-generated from BABA-A Annex D via the implementation spec.\n");
     out.push_str("// Do not edit — regenerated each build.\n");
     out.push_str("/// Length of the Annex D FIR low-pass filter (n = −10..=10).\n");
+    out.push_str("/// Annex D pitch-tracker LPF length (taps).\n");
     out.push_str("pub const ANNEX_D_LPF_LEN: usize = 21;\n\n");
     out.push_str("/// Annex D FIR low-pass filter h_LPF(n) used in initial pitch\n");
     out.push_str("/// autocorrelation. Indexed `[n + 10]`.\n");
+    out.push_str("/// IMBE Annex D pitch-tracker LPF taps `h_LPF(j)` for j ∈ [-10, 10].\n");
     out.push_str("pub const IMBE_ANNEX_D_LPF: [f32; ANNEX_D_LPF_LEN] = [\n");
     for (n, h) in &taps {
         out.push_str(&format!("    {h:.6}, // n = {n}\n"));
@@ -592,9 +599,11 @@ fn gen_annex_i(out_dir: &PathBuf) {
     out.push_str("// Auto-generated from spec_tables/annex_i_synthesis_window.csv\n");
     out.push_str("// Do not edit — regenerated each build.\n");
     out.push_str("/// Length of the speech synthesis window (n = −105..=105).\n");
+    out.push_str("/// Annex I synthesis-window length (samples).\n");
     out.push_str("pub const SYNTH_WINDOW_LEN: usize = 211;\n\n");
     out.push_str("/// Speech synthesis window wS(n) per BABA-A Annex I.\n");
     out.push_str("/// Indexed `[n + 105]` so `IMBE_SYNTH_WINDOW[0] = wS(−105)`.\n");
+    out.push_str("/// IMBE Annex I synthesis window `wS(n)` for n ∈ [-105, 105].\n");
     out.push_str("pub const IMBE_SYNTH_WINDOW: [f32; SYNTH_WINDOW_LEN] = [\n");
     for (n, w) in &samples {
         out.push_str(&format!("    {w:.6}, // n = {n}\n"));
@@ -822,6 +831,7 @@ fn gen_annex_l(out_dir: &PathBuf) {
     let mut out = String::new();
     out.push_str("// Auto-generated from spec_tables/annex_l_pitch_table.csv\n");
     out.push_str("// CSV stores cycles/sample; values converted to rad/sample at load.\n");
+    out.push_str("/// AMBE+2 half-rate Annex L pitch quantization table (120 entries indexed by `b̂₀`).\n");
     out.push_str("pub const AMBE_PITCH_TABLE: [PitchEntry; 120] = [\n");
     for (_, l, w) in &entries {
         out.push_str(&format!("    PitchEntry {{ l: {l}, omega_0: {w:.6} }},\n"));
@@ -852,6 +862,7 @@ fn gen_annex_m(out_dir: &PathBuf) {
 
     let mut out = String::new();
     out.push_str("// Auto-generated from spec_tables/annex_m_vuv_codebook.csv\n");
+    out.push_str("/// AMBE+2 half-rate Annex M V/UV codebook (32 codewords × 8 bands).\n");
     out.push_str("pub const AMBE_VUV_CODEBOOK: [[bool; 8]; 32] = [\n");
     for row in &rows {
         out.push_str(&format!(
@@ -886,6 +897,7 @@ fn gen_annex_n(out_dir: &PathBuf) {
 
     let mut out = String::new();
     out.push_str("// Auto-generated from spec_tables/annex_n_block_lengths.csv\n");
+    out.push_str("/// AMBE+2 half-rate Annex N block-length table (48 L-values × 4 blocks).\n");
     out.push_str("pub const AMBE_BLOCK_LENGTHS: [[u8; 4]; 48] = [\n");
     for (l_idx, r) in rows.iter().enumerate() {
         out.push_str(&format!(
@@ -917,6 +929,7 @@ fn gen_annex_o(out_dir: &PathBuf) {
 
     let mut out = String::new();
     out.push_str("// Auto-generated from spec_tables/annex_o_gain_quantizer.csv\n");
+    out.push_str("/// AMBE+2 half-rate Annex O differential-gain levels (32 entries indexed by `b̂₂`).\n");
     out.push_str("pub const AMBE_GAIN_LEVELS: [f32; 32] = [\n");
     for (i, lvl) in levels.iter().enumerate() {
         out.push_str(&format!("    {lvl:.6}, // b̂₂ = {i}\n"));
@@ -945,6 +958,7 @@ fn gen_annex_p(out_dir: &PathBuf) {
 
     let mut out = String::new();
     out.push_str("// Auto-generated from spec_tables/annex_p_prba24_codebook.csv\n");
+    out.push_str("/// AMBE+2 half-rate Annex P PRBA[2..4] codebook (512 entries × 3 components).\n");
     out.push_str("pub const AMBE_PRBA24: [[f32; 3]; 512] = [\n");
     for r in &rows {
         out.push_str(&format!("    [{:.6}, {:.6}, {:.6}],\n", r[0], r[1], r[2]));
@@ -974,6 +988,7 @@ fn gen_annex_q(out_dir: &PathBuf) {
 
     let mut out = String::new();
     out.push_str("// Auto-generated from spec_tables/annex_q_prba58_codebook.csv\n");
+    out.push_str("/// AMBE+2 half-rate Annex Q PRBA[5..8] codebook (128 entries × 4 components).\n");
     out.push_str("pub const AMBE_PRBA58: [[f32; 4]; 128] = [\n");
     for r in &rows {
         out.push_str(&format!(
@@ -1012,6 +1027,10 @@ fn gen_annex_r(out_dir: &PathBuf) {
         });
         assert_eq!(rows.len(), expected_count, "{path}: row count");
 
+        out.push_str(&format!(
+            "/// AMBE+2 half-rate Annex R higher-order-coefficient codebook \
+             {const_name} (`b̂` = {col_label}).\n"
+        ));
         out.push_str(&format!(
             "pub const {const_name}: [[f32; 4]; {expected_count}] = [\n"
         ));
@@ -1060,6 +1079,7 @@ fn gen_annex_t(out_dir: &PathBuf) {
 
     let mut out = String::new();
     out.push_str("// Auto-generated from spec_tables/annex_t_tone_params.csv\n");
+    out.push_str("/// AMBE+2 half-rate Annex T tone-frame parameter table indexed by `I_D` (256 entries; `None` for reserved IDs).\n");
     out.push_str("pub const ANNEX_T: [Option<ToneParams>; 256] = [\n");
     for entry in &table {
         match entry {
