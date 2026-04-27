@@ -254,6 +254,30 @@ impl Vocoder {
         self.tone_detection
     }
 
+    /// Configure the beyond-spec consecutive-repeat reset threshold
+    /// on the synth side. After `n` consecutive Repeat/Mute frames,
+    /// substitution falls back to a default-fundamental + amps=1.0
+    /// frame instead of replaying the prior `last_good`. `None`
+    /// (default) is the spec-faithful path per gap 0022 resolution.
+    /// JMBE / SDRTrunk use `Some(3)` for chip-stream interop quality.
+    pub fn set_repeat_reset_after(&mut self, n: Option<u32>) {
+        self.synth.set_repeat_reset_after(n);
+    }
+
+    /// Current consecutive-repeat reset threshold (`None` = disabled,
+    /// spec-faithful).
+    #[inline]
+    pub fn repeat_reset_after(&self) -> Option<u32> {
+        self.synth.repeat_reset_after()
+    }
+
+    /// Start a fluent builder for this rate. Equivalent to
+    /// `VocoderBuilder::new(rate)`.
+    #[inline]
+    pub fn builder(rate: Rate) -> VocoderBuilder {
+        VocoderBuilder::new(rate)
+    }
+
     /// The rate this channel was constructed at. Cannot change for
     /// the lifetime of the channel; build a new [`Vocoder`] to switch
     /// rates (mirrors a chip's PKT_RATEP cycle).
@@ -629,6 +653,57 @@ impl LiveDecoder {
     #[inline]
     pub fn rate(&self) -> Rate {
         self.vocoder.rate()
+    }
+}
+
+/// Fluent builder for [`Vocoder`]. Lets callers configure rate +
+/// optional knobs in one expression instead of `new` + a sequence of
+/// setters. Mirrors the chip's "open channel + PKT_RATEP +
+/// configuration" sequence, but in one call.
+///
+/// ```no_run
+/// use blip25_mbe::vocoder::{Rate, Vocoder};
+///
+/// let mut tx = Vocoder::builder(Rate::P25Phase2)
+///     .tone_detection(true)
+///     .build();
+/// ```
+#[derive(Clone, Debug)]
+pub struct VocoderBuilder {
+    rate: Rate,
+    tone_detection: bool,
+    repeat_reset_after: Option<u32>,
+}
+
+impl VocoderBuilder {
+    /// New builder defaulting to spec-faithful behavior at `rate`.
+    #[inline]
+    pub fn new(rate: Rate) -> Self {
+        Self { rate, tone_detection: false, repeat_reset_after: None }
+    }
+
+    /// Enable encode-side Annex T tone detection (half-rate only).
+    /// See [`Vocoder::set_tone_detection`].
+    #[inline]
+    pub fn tone_detection(mut self, on: bool) -> Self {
+        self.tone_detection = on;
+        self
+    }
+
+    /// Configure the beyond-spec consecutive-repeat reset threshold.
+    /// See [`Vocoder::set_repeat_reset_after`].
+    #[inline]
+    pub fn repeat_reset_after(mut self, n: Option<u32>) -> Self {
+        self.repeat_reset_after = n;
+        self
+    }
+
+    /// Materialize the [`Vocoder`].
+    pub fn build(self) -> Vocoder {
+        let mut v = Vocoder::new(self.rate);
+        v.set_tone_detection(self.tone_detection);
+        v.set_repeat_reset_after(self.repeat_reset_after);
+        v
     }
 }
 
@@ -1212,6 +1287,31 @@ mod tests {
         assert_eq!(live.pending_samples(), 80);
         live.discard_pending();
         assert_eq!(live.pending_samples(), 0);
+    }
+
+    /// Builder applies tone-detection + repeat-reset config in one
+    /// expression and produces an equivalent Vocoder.
+    #[test]
+    fn builder_configures_tone_detection_and_repeat_reset() {
+        let v = Vocoder::builder(Rate::P25Phase2)
+            .tone_detection(true)
+            .repeat_reset_after(Some(3))
+            .build();
+        assert_eq!(v.rate(), Rate::P25Phase2);
+        assert!(v.tone_detection());
+        assert_eq!(v.repeat_reset_after(), Some(3));
+    }
+
+    /// Default builder = spec-faithful (no beyond-spec knobs).
+    #[test]
+    fn builder_defaults_match_vocoder_new() {
+        let a = Vocoder::builder(Rate::P25Phase1).build();
+        let b = Vocoder::new(Rate::P25Phase1);
+        assert_eq!(a.rate(), b.rate());
+        assert_eq!(a.tone_detection(), b.tone_detection());
+        assert_eq!(a.repeat_reset_after(), b.repeat_reset_after());
+        assert!(!a.tone_detection());
+        assert!(a.repeat_reset_after().is_none());
     }
 
     /// `flush` zero-pads residue and emits one final frame; on an
