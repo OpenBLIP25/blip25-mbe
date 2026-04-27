@@ -865,35 +865,49 @@ pub fn encode_halfrate(
     }
 
     // Steps 1–9: identical to `encode` (rate-agnostic frontend).
+    // Profile-stage instrumentation mirrors `encode_with_trace`'s layout
+    // so `profile_encode` shows side-by-side breakdowns for both rates.
     let mut hpf_out = [0.0f64; SAMPLES_PER_FRAME as usize];
-    state.hpf.run_pcm(pcm, &mut hpf_out);
+    profile::time(profile::Stage::Hpf, || state.hpf.run_pcm(pcm, &mut hpf_out));
 
-    let frame_energy: f64 = hpf_out.iter().map(|s| s * s).sum();
-    let silent = state.silence.update(frame_energy);
+    let (frame_energy, silent) = profile::time(profile::Stage::SilenceDetect, || {
+        let e: f64 = hpf_out.iter().map(|s| s * s).sum();
+        let s = state.silence.update(e);
+        (e, s)
+    });
 
-    state.ingest_frame(&hpf_out);
+    profile::time(profile::Stage::Ingest, || state.ingest_frame(&hpf_out));
 
     if state.in_preroll() {
         state.advance_preroll();
         return Ok(AnalysisOutput::Silence);
     }
 
-    let cur_win = state.extract_pitch_window(0);
-    let f1_win = state.extract_pitch_window(1);
-    let f2_win = state.extract_pitch_window(2);
-    let search_cur = PitchSearch::new(&cur_win);
-    let search_f1 = PitchSearch::new(&f1_win);
-    let search_f2 = PitchSearch::new(&f2_win);
-    let (p_b, ce_b) = look_back(&search_cur, state.pitch_history);
-    let (p_f, ce_f) = look_ahead(&search_cur, &search_f1, &search_f2);
-    let p_hat_i = decide_initial_pitch(p_b, ce_b, p_f, ce_f);
-    let e_p_hat_i = search_cur.e_of_p(p_hat_i);
+    let (search_cur, search_f1, search_f2) =
+        profile::time(profile::Stage::PitchSearch, || {
+            let cur_win = state.extract_pitch_window(0);
+            let f1_win = state.extract_pitch_window(1);
+            let f2_win = state.extract_pitch_window(2);
+            (
+                PitchSearch::new(&cur_win),
+                PitchSearch::new(&f1_win),
+                PitchSearch::new(&f2_win),
+            )
+        });
+    let (p_hat_i, e_p_hat_i) = profile::time(profile::Stage::PitchTrack, || {
+        let (p_b, ce_b) = look_back(&search_cur, state.pitch_history);
+        let (p_f, ce_f) = look_ahead(&search_cur, &search_f1, &search_f2);
+        let p_hat_i = decide_initial_pitch(p_b, ce_b, p_f, ce_f);
+        let e_p_hat_i = search_cur.e_of_p(p_hat_i);
+        (p_hat_i, e_p_hat_i)
+    });
 
     let basis = shared_basis();
-    let sig_win = state.extract_refinement_window();
-    let sw = signal_spectrum(&sig_win);
+    let sw = profile::time(profile::Stage::SignalSpectrum, || {
+        let sig_win = state.extract_refinement_window();
+        signal_spectrum(&sig_win)
+    });
 
-    let mut refinement = refine_pitch(&sw, basis, p_hat_i);
     // Half-rate `L̂` is **Annex L table lookup at b̂₀**, not Eq. 31 on
     // ω̂₀ (gap 0019 resolution — BABA-A §13.1 + Annex L). Annex L's L
     // column follows a single-floor rule `L = ⌊0.9254 · π/ω₀⌋` that
@@ -907,20 +921,30 @@ pub fn encode_halfrate(
     // §0.8 silence gate would apply to a frame whose pitch we can't
     // represent at half-rate. Predictor history isn't committed
     // (matches the §0.8 silence path below).
-    {
-        use crate::p25_halfrate::dequantize::{decode_pitch, encode_pitch};
-        let b0 = match encode_pitch(refinement.omega_hat as f32) {
-            Some(b0) => b0,
-            None => {
-                state.commit_pitch(p_hat_i, e_p_hat_i);
-                state.advance_preroll();
-                return Ok(AnalysisOutput::Silence);
-            }
-        };
-        refinement.l_hat = decode_pitch(b0).ok_or(AnalysisError::PitchOutOfRange)?.l;
-    }
-    let vuv_result = determine_vuv(&sw, basis, &refinement, e_p_hat_i, &mut state.vuv);
-    let m_hat = estimate_spectral_amplitudes(&sw, basis, &refinement, &vuv_result);
+    let refinement_result =
+        profile::time(profile::Stage::RefinePitch, || -> Result<Option<refine::PitchRefinement>, AnalysisError> {
+            let mut refinement = refine_pitch(&sw, basis, p_hat_i);
+            use crate::p25_halfrate::dequantize::{decode_pitch, encode_pitch};
+            let Some(b0) = encode_pitch(refinement.omega_hat as f32) else {
+                return Ok(None);
+            };
+            refinement.l_hat = decode_pitch(b0).ok_or(AnalysisError::PitchOutOfRange)?.l;
+            Ok(Some(refinement))
+        });
+    let refinement = match refinement_result? {
+        Some(r) => r,
+        None => {
+            state.commit_pitch(p_hat_i, e_p_hat_i);
+            state.advance_preroll();
+            return Ok(AnalysisOutput::Silence);
+        }
+    };
+    let vuv_result = profile::time(profile::Stage::Vuv, || {
+        determine_vuv(&sw, basis, &refinement, e_p_hat_i, &mut state.vuv)
+    });
+    let m_hat = profile::time(profile::Stage::Amplitude, || {
+        estimate_spectral_amplitudes(&sw, basis, &refinement, &vuv_result)
+    });
 
     // §0.8 silence gate — half-rate silence dispatch would emit
     // `b̂_0 ∈ [124, 125]` per §13.1 Table 14, but the addendum §0.8
@@ -942,40 +966,41 @@ pub fn encode_halfrate(
     // Step 10: half-rate matched-decoder roundtrip. Runs the halfrate
     // wire encoder + decoder on the analysis output to recover the
     // `Λ̃_l(0)` / `L̃(0)` / `γ̃(0)` state the receiver will see.
-    let rt = matched_decoder_roundtrip_halfrate(
-        &m_hat,
-        &refinement,
-        &vuv_result,
-        &state.predictor_halfrate,
-    )?;
+    let rt = profile::time(profile::Stage::MatchedDecoder, || {
+        matched_decoder_roundtrip_halfrate(
+            &m_hat,
+            &refinement,
+            &vuv_result,
+            &state.predictor_halfrate,
+        )
+    })?;
 
-    // Step 11: commit state for the next frame. All three predictor
-    // fields advance together per §0.6.10 — Λ̃, L̃, γ̃ are not
-    // independent.
-    state.predictor_halfrate.commit(
-        &rt.lambda_tilde_zero,
-        rt.l_tilde_zero,
-        rt.gamma_tilde_zero,
-    );
-    state.commit_pitch(p_hat_i, e_p_hat_i);
+    // Step 11–12: commit predictor + pitch state, build the rate-agnostic
+    // MbeParams. All three half-rate predictor fields advance together
+    // per §0.6.10 — Λ̃, L̃, γ̃ are not independent.
+    let params = profile::time(profile::Stage::Tail, || -> Result<MbeParams, AnalysisError> {
+        state.predictor_halfrate.commit(
+            &rt.lambda_tilde_zero,
+            rt.l_tilde_zero,
+            rt.gamma_tilde_zero,
+        );
+        state.commit_pitch(p_hat_i, e_p_hat_i);
 
-    // Step 12: emit voice. The returned `MbeParams` carries the
-    // rate-agnostic `M̂_l` (linear); `p25_halfrate::quantize` applies
-    // Eq. 150 internally.
-    let mut amplitudes = Vec::with_capacity(refinement.l_hat as usize);
-    let mut voiced = Vec::with_capacity(refinement.l_hat as usize);
-    for l in 1..=u32::from(refinement.l_hat) {
-        amplitudes.push(m_hat[l as usize] as f32);
-        let k = band_for_harmonic(l, vuv_result.k_hat);
-        voiced.push(k >= 1 && vuv_result.vuv[k as usize] == 1);
-    }
-    let params = MbeParams::new(
-        refinement.omega_hat as f32,
-        refinement.l_hat,
-        &voiced,
-        &amplitudes,
-    )
-    .map_err(|_| AnalysisError::PitchOutOfRange)?;
+        let mut amplitudes = Vec::with_capacity(refinement.l_hat as usize);
+        let mut voiced = Vec::with_capacity(refinement.l_hat as usize);
+        for l in 1..=u32::from(refinement.l_hat) {
+            amplitudes.push(m_hat[l as usize] as f32);
+            let k = band_for_harmonic(l, vuv_result.k_hat);
+            voiced.push(k >= 1 && vuv_result.vuv[k as usize] == 1);
+        }
+        MbeParams::new(
+            refinement.omega_hat as f32,
+            refinement.l_hat,
+            &voiced,
+            &amplitudes,
+        )
+        .map_err(|_| AnalysisError::PitchOutOfRange)
+    })?;
     state.advance_preroll();
     Ok(AnalysisOutput::Voice(params))
 }
