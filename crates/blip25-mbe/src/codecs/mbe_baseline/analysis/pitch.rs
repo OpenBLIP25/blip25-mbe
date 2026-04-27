@@ -13,12 +13,34 @@
 //!   (d) Decision: CE_B ≤ 0.48 ⇒ P̂_B, else CE_B ≤ CE_F ⇒ P̂_B, else P̂_F.
 
 use super::{analysis_window, lpf_tap};
+use crate::mbe_params::SAMPLES_PER_FRAME;
 
 /// Half-support of Annex B window `w_I(n)`: `n ∈ [−W_I_HALF, W_I_HALF]`.
 pub const W_I_HALF: i32 = 150;
 
 /// Half-support of Annex D LPF `h_LPF(n)`: `n ∈ [−H_LPF_HALF, H_LPF_HALF]`.
 pub const H_LPF_HALF: i32 = 10;
+
+/// Lookahead buffer length the encoder maintains. Mirrors
+/// `super::LOOKAHEAD_LEN` but kept here as a `pub const` so the shared
+/// LPF helper doesn't need a circular import.
+pub const LOOKAHEAD_LEN: usize = 3 * SAMPLES_PER_FRAME as usize;
+
+/// Per-frame "tail extension" each pitch slot's LPF reaches past the
+/// frame center: from frame center, the slot's LPF output covers
+/// `n ∈ [−W_I_HALF, W_I_HALF]`. Frame centers sit at `slot·160 + 80`,
+/// so the union of all slot LPF outputs covers buffer indices
+/// `[slot0_center − W_I_HALF, slot2_center + W_I_HALF]` =
+/// `[80 − 150, 2·160 + 80 + 150]` = `[−70, 550]` (inclusive both
+/// ends → 621 entries).
+const SHARED_LPF_TAIL: usize = (W_I_HALF as usize) - (SAMPLES_PER_FRAME as usize / 2);
+
+/// Length of the shared LPF output covering all 3 pitch-slot windows
+/// at once. Buf range is `[−70, 550]` inclusive both ends, so 621
+/// entries: `(slot2_right − slot0_left) + 1` =
+/// `(2·SAMPLES_PER_FRAME + 2·W_I_HALF) + 1`.
+pub const SHARED_LPF_LEN: usize =
+    2 * SAMPLES_PER_FRAME as usize + 2 * W_I_HALF as usize + 1;
 
 /// Half-support of the input buffer that `PitchSearch::new` consumes.
 /// The LPF needs `±H_LPF_HALF` samples beyond the `w_I` support, so the
@@ -90,6 +112,65 @@ pub fn compute_s_lpf(s_input: &[f64; PITCH_INPUT_LEN]) -> [f64; (2 * W_I_HALF + 
         *slot = acc;
     }
     out
+}
+
+/// LPF the entire 480-sample lookahead buffer in one pass, producing
+/// 621 outputs covering buffer indices `[−70, 550]`. Each pitch slot's
+/// 301-entry local `s_LPF` array (centered at `slot·160 + 80`) is then
+/// just a 301-entry slice of the shared output:
+///   - slot 0 → `[0..301]`     (buf `[−70, 230]`)
+///   - slot 1 → `[160..461]`   (buf `[90, 390]`)
+///   - slot 2 → `[320..621]`   (buf `[250, 550]`)
+///
+/// Replaces 3 separate `compute_s_lpf` passes (each 301 outputs × 21
+/// taps) with one wider pass (621 × 21) — 30% fewer FIR mults per
+/// frame. The arithmetic identity that makes this work: the slot's
+/// per-window zero-extension boundaries (slot 0 at slot-local i=80,
+/// slot 2 at slot-local i=240+1) coincide with the lookahead buffer's
+/// natural `[0, LOOKAHEAD_LEN)` boundary, so a single shared
+/// zero-extension produces the same FIR outputs as per-slot windowing.
+pub fn compute_s_lpf_shared(lookahead: &[f64; LOOKAHEAD_LEN]) -> [f64; SHARED_LPF_LEN] {
+    const TAPS: usize = (2 * H_LPF_HALF + 1) as usize;
+    let mut h = [0.0f64; TAPS];
+    for j in -H_LPF_HALF..=H_LPF_HALF {
+        h[(j + H_LPF_HALF) as usize] = f64::from(lpf_tap(j));
+    }
+
+    // Padded input covering buf logical positions `[−80, 560]`
+    // (length 641 = SHARED_LPF_LEN + 2·H_LPF_HALF): zero outside
+    // `[0, LOOKAHEAD_LEN)`, lookahead inside.  The padding width on
+    // each side is `SHARED_LPF_TAIL + H_LPF_HALF = 80`.
+    const PAD_LEFT: usize = SHARED_LPF_TAIL + H_LPF_HALF as usize;
+    const PAD_LEN: usize = SHARED_LPF_LEN + 2 * H_LPF_HALF as usize;
+    let mut padded = [0.0f64; PAD_LEN];
+    padded[PAD_LEFT..PAD_LEFT + LOOKAHEAD_LEN].copy_from_slice(lookahead);
+
+    // Output index `i` ∈ [0, SHARED_LPF_LEN) is at buffer logical
+    // position `B = i − SHARED_LPF_TAIL`. The FIR reads padded at buf
+    // `[B − H_LPF_HALF, B + H_LPF_HALF]`, which in padded indices is
+    // `[B + PAD_LEFT − H_LPF_HALF, B + PAD_LEFT + H_LPF_HALF]` =
+    // `[i, i + 2·H_LPF_HALF]` since `PAD_LEFT − SHARED_LPF_TAIL =
+    // H_LPF_HALF`. So `src_base = i + 2·H_LPF_HALF`, decrement by k.
+    let two_h = 2 * H_LPF_HALF as usize;
+    let mut out = [0.0f64; SHARED_LPF_LEN];
+    for (i, slot) in out.iter_mut().enumerate() {
+        let src_base = i + two_h;
+        let mut acc = 0.0;
+        for k in 0..TAPS {
+            acc += padded[src_base - k] * h[k];
+        }
+        *slot = acc;
+    }
+    out
+}
+
+/// Slice the shared LPF output for the given pitch slot. Returns a
+/// 301-entry slice covering that slot's local `s_LPF` array indexed
+/// by `n + W_I_HALF` for `n ∈ [−W_I_HALF, W_I_HALF]`.
+#[inline]
+pub fn slot_s_lpf(shared: &[f64; SHARED_LPF_LEN], slot: usize) -> &[f64] {
+    let start = slot * SAMPLES_PER_FRAME as usize;
+    &shared[start..start + (2 * W_I_HALF + 1) as usize]
 }
 
 /// Quantizer state for one frame of pitch analysis.
@@ -222,6 +303,18 @@ impl PitchSearch {
     pub fn new(s_input: &[f64; PITCH_INPUT_LEN]) -> Self {
         let s_lpf = compute_s_lpf(s_input);
         Self::from_lpf(&s_lpf)
+    }
+
+    /// Build from a slice of an already-LPF'd buffer. Used by the
+    /// shared-LPF fast path: `compute_s_lpf_shared` produces 621
+    /// outputs once per frame, then `slot_s_lpf` returns 301-entry
+    /// slices that feed three calls to `from_lpf_slice`. Panics if
+    /// the slice isn't exactly `2·W_I_HALF + 1` entries long.
+    pub fn from_lpf_slice(s_lpf: &[f64]) -> Self {
+        let arr: &[f64; (2 * W_I_HALF + 1) as usize] = s_lpf
+            .try_into()
+            .expect("from_lpf_slice expects exactly 2·W_I_HALF + 1 entries");
+        Self::from_lpf(arr)
     }
 
     /// Build from an already-LPF'd buffer. Useful for tests that want

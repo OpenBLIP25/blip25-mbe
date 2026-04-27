@@ -88,8 +88,8 @@ pub mod pitch;
 pub use pitch::{
     H_LPF_HALF, LookBackContext, PITCH_COLD_START, PITCH_GRID_LEN, PITCH_GRID_MAX,
     PITCH_GRID_MIN, PITCH_GRID_STEP, PITCH_INPUT_HALF, PITCH_INPUT_LEN, PitchSearch,
-    W_I_HALF, compute_s_lpf, decide_initial_pitch, look_ahead,
-    look_back, snap_to_pitch_grid,
+    SHARED_LPF_LEN, W_I_HALF, compute_s_lpf, compute_s_lpf_shared, decide_initial_pitch,
+    look_ahead, look_back, slot_s_lpf, snap_to_pitch_grid,
 };
 
 // ---------------------------------------------------------------------------
@@ -614,6 +614,14 @@ impl AnalysisState {
     /// slot (`0 = current`, `1 = future_1`, `2 = future_2`) for
     /// §0.3 `PitchSearch` construction. Positions outside
     /// `[0, LOOKAHEAD_LEN)` are zero-extended per §0.1.3.
+    /// Borrow the lookahead PCM buffer. Used by the shared-LPF
+    /// pitch-search fast path to feed all three slots from a single
+    /// FIR pass instead of 3 separate `compute_s_lpf` calls.
+    #[inline]
+    fn lookahead_buf(&self) -> &[f64; LOOKAHEAD_LEN] {
+        &self.lookahead
+    }
+
     fn extract_pitch_window(&self, frame_slot: usize) -> [f64; PITCH_INPUT_LEN] {
         let center = frame_slot * SAMPLES_PER_FRAME as usize
             + (SAMPLES_PER_FRAME as usize) / 2;
@@ -805,16 +813,23 @@ pub fn encode_with_trace(
     // is queried once by `look_back` (linear scan is fine) and is also
     // cloned into the EncodeTrace, so skipping the table here keeps the
     // trace's clone cost low.
+    //
+    // LPF the lookahead once and slice the shared output into each
+    // slot's local s_LPF — replaces 3 separate FIR passes with one
+    // wider pass (30% fewer mults; same outputs by zero-extension
+    // identity, see `compute_s_lpf_shared` doc).
     let (search_cur, search_f1, search_f2) =
         profile::time(profile::Stage::PitchSearch, || {
-            let cur_win = state.extract_pitch_window(0);
-            let f1_win = state.extract_pitch_window(1);
-            let f2_win = state.extract_pitch_window(2);
-            let mut search_f1 = PitchSearch::new(&f1_win);
-            let mut search_f2 = PitchSearch::new(&f2_win);
+            let shared = compute_s_lpf_shared(state.lookahead_buf());
+            let mut search_f1 = PitchSearch::from_lpf_slice(slot_s_lpf(&shared, 1));
+            let mut search_f2 = PitchSearch::from_lpf_slice(slot_s_lpf(&shared, 2));
             search_f1.enable_argmin_fast();
             search_f2.enable_argmin_fast();
-            (PitchSearch::new(&cur_win), search_f1, search_f2)
+            (
+                PitchSearch::from_lpf_slice(slot_s_lpf(&shared, 0)),
+                search_f1,
+                search_f2,
+            )
         });
     let (p_b, ce_b, p_f, ce_f, p_hat_i, e_p_hat_i) =
         profile::time(profile::Stage::PitchTrack, || {
@@ -983,14 +998,17 @@ pub fn encode_halfrate(
 
     let (search_cur, search_f1, search_f2) =
         profile::time(profile::Stage::PitchSearch, || {
-            let cur_win = state.extract_pitch_window(0);
-            let f1_win = state.extract_pitch_window(1);
-            let f2_win = state.extract_pitch_window(2);
-            let mut search_f1 = PitchSearch::new(&f1_win);
-            let mut search_f2 = PitchSearch::new(&f2_win);
+            // Shared-LPF fast path — see encode_with_trace for context.
+            let shared = compute_s_lpf_shared(state.lookahead_buf());
+            let mut search_f1 = PitchSearch::from_lpf_slice(slot_s_lpf(&shared, 1));
+            let mut search_f2 = PitchSearch::from_lpf_slice(slot_s_lpf(&shared, 2));
             search_f1.enable_argmin_fast();
             search_f2.enable_argmin_fast();
-            (PitchSearch::new(&cur_win), search_f1, search_f2)
+            (
+                PitchSearch::from_lpf_slice(slot_s_lpf(&shared, 0)),
+                search_f1,
+                search_f2,
+            )
         });
     let (p_hat_i, e_p_hat_i) = profile::time(profile::Stage::PitchTrack, || {
         let (p_b, ce_b) = look_back(&search_cur, state.pitch_history);
