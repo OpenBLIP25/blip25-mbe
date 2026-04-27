@@ -13,10 +13,13 @@
 
 #![allow(dead_code)]
 
-/// Named stages of the analysis encode pipeline. Order matches the
-/// flow in [`super::encode_with_trace`].
+/// Named stages of the analysis-encode and decode pipelines. Encode
+/// stages match the flow in [`super::encode_with_trace`]; decode
+/// stages match `synthesize_frame_with_mode` plus the wire layer
+/// in [`crate::vocoder`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum Stage {
+    // ---- analysis-encode pipeline ----
     /// `HpfState::run_pcm` — high-pass filter applied to the input frame.
     Hpf,
     /// Frame energy + silence detector update.
@@ -24,8 +27,6 @@ pub enum Stage {
     /// `state.ingest_frame` — append post-HPF frame to lookahead buffer.
     Ingest,
     /// `state.extract_pitch_window` × 3 + `PitchSearch::new` × 3.
-    /// Builds `s_LPF` over each of the three lookahead frames and
-    /// computes the per-pitch-grid `E(P)` table.
     PitchSearch,
     /// `look_back` + `look_ahead` + `decide_initial_pitch` + `e_of_p`
     /// for the chosen `P̂_I`.
@@ -42,11 +43,30 @@ pub enum Stage {
     MatchedDecoder,
     /// `predictor.commit` + `commit_pitch` + `MbeParams::new` + return.
     Tail,
+    // ---- decode pipeline ----
+    /// `unpack_dibits` — FEC byte stream → dibit array.
+    DibitUnpack,
+    /// `decode_frame` — Annex H deinterleave + Golay/Hamming decode.
+    DecodeFrame,
+    /// `dequantize` (rate-specific) — info vectors → MbeParams.
+    Dequantize,
+    /// `enhance_spectral_amplitudes` (§1.10 enhancement filter).
+    Enhance,
+    /// `apply_smoothing` (§1.11.3 V/UV + amplitude smoothing).
+    Smoothing,
+    /// `synthesize_unvoiced` (§1.12.1 noise + DFT + IDFT).
+    SynthUnvoiced,
+    /// `synthesize_voiced` (§1.12.2 sum of sinusoids per harmonic).
+    SynthVoiced,
+    /// Final mix + last_good snapshot + i16 quantization.
+    SynthMix,
 }
 
 impl Stage {
     /// All stages, in pipeline order. Useful for `for s in Stage::ALL`
-    /// loops in the consumer.
+    /// loops in the consumer. Encode stages first, decode stages
+    /// second; only one half is non-zero in any given timings snapshot
+    /// (encoders and decoders are separate Vocoders typically).
     pub const ALL: &'static [Stage] = &[
         Stage::Hpf,
         Stage::SilenceDetect,
@@ -59,6 +79,14 @@ impl Stage {
         Stage::Amplitude,
         Stage::MatchedDecoder,
         Stage::Tail,
+        Stage::DibitUnpack,
+        Stage::DecodeFrame,
+        Stage::Dequantize,
+        Stage::Enhance,
+        Stage::Smoothing,
+        Stage::SynthUnvoiced,
+        Stage::SynthVoiced,
+        Stage::SynthMix,
     ];
 
     /// Short snake_case label.
@@ -75,6 +103,14 @@ impl Stage {
             Stage::Amplitude => "amplitude",
             Stage::MatchedDecoder => "matched_decoder",
             Stage::Tail => "tail",
+            Stage::DibitUnpack => "dibit_unpack",
+            Stage::DecodeFrame => "decode_frame",
+            Stage::Dequantize => "dequantize",
+            Stage::Enhance => "enhance",
+            Stage::Smoothing => "smoothing",
+            Stage::SynthUnvoiced => "synth_unvoiced",
+            Stage::SynthVoiced => "synth_voiced",
+            Stage::SynthMix => "synth_mix",
         }
     }
 }
@@ -82,11 +118,14 @@ impl Stage {
 /// Snapshot of the cumulative per-stage timings on the calling thread.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Timings {
-    /// Cumulative wall-clock per stage, in nanoseconds.
-    pub total_ns: [u64; 11],
-    /// Number of frames observed (each stage tick increments this once,
-    /// at `Stage::Hpf`).
+    /// Cumulative wall-clock per stage, in nanoseconds. Indexed by
+    /// the [`Stage`] enum's discriminant — keep in sync with
+    /// [`Stage::ALL`].
+    pub total_ns: [u64; 19],
+    /// Number of encode frames observed (incremented at `Stage::Hpf`).
     pub frames: u64,
+    /// Number of decode frames observed (incremented at `Stage::DibitUnpack`).
+    pub decode_frames: u64,
 }
 
 impl Timings {
@@ -113,8 +152,8 @@ mod inner {
     }
 
     /// Time a closure, accumulating into the named stage. Increments
-    /// the frame counter when called with `Stage::Hpf` (the first
-    /// stage of every encode call).
+    /// the encode frame counter when called with `Stage::Hpf` and
+    /// the decode frame counter when called with `Stage::DibitUnpack`.
     pub fn time<R>(stage: Stage, f: impl FnOnce() -> R) -> R {
         let t0 = Instant::now();
         let r = f();
@@ -124,6 +163,8 @@ mod inner {
             t.total_ns[stage as usize] = t.total_ns[stage as usize].saturating_add(dt);
             if matches!(stage, Stage::Hpf) {
                 t.frames = t.frames.saturating_add(1);
+            } else if matches!(stage, Stage::DibitUnpack) {
+                t.decode_frames = t.decode_frames.saturating_add(1);
             }
         });
         r

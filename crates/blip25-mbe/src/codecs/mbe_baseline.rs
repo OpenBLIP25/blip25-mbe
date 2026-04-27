@@ -401,38 +401,80 @@ impl Default for UnvoicedSynthState {
 /// 256-point complex DFT of a windowed real input over `n = −104..=104`.
 /// Returns `(re, im)` arrays of length 256 indexed `[m + 128]` for
 /// `m = −128..127`.
+///
+/// Backed by [`rustfft`] — `O(N log N)` per frame. Input is mapped
+/// from logical n ∈ [−104, 104] into DFT-natural index n_nat = n mod
+/// 256; output is mapped from DFT-natural k into the centered m_idx
+/// = m + 128 layout via the same 128-entry rotate. FFT is general
+/// DSP (not P25 IP), so the swap is allowed under the clean-room rule
+/// — same justification as the encode-side `signal_spectrum`.
 fn dft_256_windowed(input: &[f64; 209]) -> ([f64; 256], [f64; 256]) {
+    use num_complex::Complex;
+    use rustfft::{Fft, FftPlanner};
+    use std::sync::OnceLock;
+
+    static FFT: OnceLock<std::sync::Arc<dyn Fft<f64>>> = OnceLock::new();
+    let fft = FFT.get_or_init(|| {
+        let mut planner = FftPlanner::<f64>::new();
+        planner.plan_fft_forward(256)
+    });
+
+    // input[i] = signal at logical n = i - 104. Pack into natural
+    // index n_nat = n.rem_euclid(256). For n ∈ [0, 104], n_nat = n;
+    // for n ∈ [−104, −1], n_nat = n + 256 ∈ [152, 255].
+    let mut buf = [Complex::<f64>::new(0.0, 0.0); 256];
+    for (i, &x) in input.iter().enumerate() {
+        let n = i as i32 - 104;
+        let n_nat = n.rem_euclid(256) as usize;
+        buf[n_nat].re = x;
+    }
+    fft.process(&mut buf);
+
+    // Output rotation: re[m_idx] = buf[(m_idx + 128) % 256] places
+    // m = 0 at m_idx = 128 and m = −128 at m_idx = 0.
     let mut re = [0f64; 256];
     let mut im = [0f64; 256];
     for m_idx in 0..256 {
-        let m = m_idx as i32 - 128;
-        let mut acc_re = 0f64;
-        let mut acc_im = 0f64;
-        for n_idx in 0..209 {
-            let n = n_idx as i32 - 104;
-            let arg = -2.0 * PI64 * f64::from(m) * f64::from(n) / 256.0;
-            acc_re += input[n_idx] * arg.cos();
-            acc_im += input[n_idx] * arg.sin();
-        }
-        re[m_idx] = acc_re;
-        im[m_idx] = acc_im;
+        let k = (m_idx + 128) & 255;
+        re[m_idx] = buf[k].re;
+        im[m_idx] = buf[k].im;
     }
     (re, im)
 }
 
 /// 256-point inverse DFT producing real-valued output (Eq. 125).
 /// The 1/256 normalization is included.
+///
+/// Backed by [`rustfft`]. Input is the centered (re, im) packing
+/// produced by [`dft_256_windowed`] / [`shape_spectrum`]; output is
+/// indexed by `n_idx = n + 128` for `n ∈ [−128, 127]`. The IDFT of
+/// a hermitian-symmetric spectrum is real; we take the real part to
+/// drop the round-off-only imaginary residue.
 fn idft_256(re: &[f64; 256], im: &[f64; 256]) -> [f64; 256] {
+    use num_complex::Complex;
+    use rustfft::{Fft, FftPlanner};
+    use std::sync::OnceLock;
+
+    static IFFT: OnceLock<std::sync::Arc<dyn Fft<f64>>> = OnceLock::new();
+    let fft = IFFT.get_or_init(|| {
+        let mut planner = FftPlanner::<f64>::new();
+        planner.plan_fft_inverse(256)
+    });
+
+    // Undo the centered (m + 128) rotation: freq[k] = packed[(k + 128) mod 256].
+    let mut buf = [Complex::<f64>::new(0.0, 0.0); 256];
+    for k in 0..256 {
+        let m_idx = (k + 128) & 255;
+        buf[k] = Complex::new(re[m_idx], im[m_idx]);
+    }
+    fft.process(&mut buf);
+
+    // rustfft's inverse is unnormalized — divide by N. Output index
+    // mirrors the input rotation: out[n_idx] = ifft_buf[(n_idx + 128) % 256].
     let mut out = [0f64; 256];
     for n_idx in 0..256 {
-        let n = n_idx as i32 - 128;
-        let mut acc = 0f64;
-        for m_idx in 0..256 {
-            let m = m_idx as i32 - 128;
-            let arg = 2.0 * PI64 * f64::from(m) * f64::from(n) / 256.0;
-            acc += re[m_idx] * arg.cos() - im[m_idx] * arg.sin();
-        }
-        out[n_idx] = acc / 256.0;
+        let k = (n_idx + 128) & 255;
+        out[n_idx] = buf[k].re / 256.0;
     }
     out
 }
@@ -1143,80 +1185,87 @@ fn synthesize_frame_with_mode(
     state.repeat_count = next_repeat_count;
 
     // §1.10 enhancement: M̃_l → M̄_l, update S_E.
-    let (m_bar_full, s_e_new) = enhance_spectral_amplitudes(
-        &m_tilde_arr[..l as usize],
-        omega_0,
-        state.s_e,
+    let (m_bar_full, s_e_new) = analysis::profile::time(
+        analysis::profile::Stage::Enhance,
+        || enhance_spectral_amplitudes(&m_tilde_arr[..l as usize], omega_0, state.s_e),
     );
     state.s_e = s_e_new;
 
     // §1.11.3 V/UV-and-amplitude smoothing.
-    let smoothed = apply_smoothing(
-        &m_bar_full[..l as usize],
-        &voiced_arr[..l as usize],
-        state.s_e,
-        state.epsilon_r,
-        err.epsilon_t,
-        err.epsilon_4,
-        state.tau_m,
-    );
+    let smoothed = analysis::profile::time(analysis::profile::Stage::Smoothing, || {
+        apply_smoothing(
+            &m_bar_full[..l as usize],
+            &voiced_arr[..l as usize],
+            state.s_e,
+            state.epsilon_r,
+            err.epsilon_t,
+            err.epsilon_4,
+            state.tau_m,
+        )
+    });
     state.tau_m = smoothed.tau_m;
 
     // §1.12.1 unvoiced + §1.12.2 voiced + Eq. 142 sum.
-    let s_uv = synthesize_unvoiced(
-        omega_0,
-        &smoothed.m_bar[..l as usize],
-        &smoothed.v_bar[..l as usize],
-        gamma_w,
-        &mut state.unvoiced,
-    );
+    let s_uv = analysis::profile::time(analysis::profile::Stage::SynthUnvoiced, || {
+        synthesize_unvoiced(
+            omega_0,
+            &smoothed.m_bar[..l as usize],
+            &smoothed.v_bar[..l as usize],
+            gamma_w,
+            &mut state.unvoiced,
+        )
+    });
     let noise_samples = voiced_noise_samples(&state.unvoiced);
-    let s_v = synthesize_voiced(
-        omega_0,
-        &smoothed.m_bar[..l as usize],
-        &smoothed.v_bar[..l as usize],
-        &noise_samples,
-        phase_mode,
-        &mut state.voiced,
-    );
-
-    let mut s = [0f64; FRAME_SAMPLES];
-    if disp == FrameDisposition::Mute {
-        // §1.11.2: bypass synthesis output, emit small-amplitude
-        // noise (the spec's primary recommendation; "true silence" is
-        // the alternative). State above already advanced normally.
-        // Reuse the unvoiced LCG's noise window (already advanced by
-        // `synthesize_unvoiced`) so we don't burn extra entropy or
-        // need a separate RNG. The noise window stores 209 samples
-        // covering n=−104..104; take the central 160 (offsets 24..184
-        // → n=−80..79). Center via LCG_MEAN and scale to a comfort
-        // level matching JMBE / SDRTrunk.
-        for i in 0..FRAME_SAMPLES {
-            let raw = state.unvoiced.noise_window[24 + i];
-            s[i] = (raw - LCG_MEAN) * MUTE_NOISE_GAIN;
-        }
-    } else {
-        for i in 0..FRAME_SAMPLES {
-            s[i] = s_uv[i] + s_v[i];
-        }
-    }
-
-    // Snapshot for next-frame substitution. Storing (ω₀, L, voiced,
-    // M̃) is enough — rerunning §1.10 enhancement on M̃ with the
-    // current S_E reproduces M̄ exactly, so no separate M̄ snapshot
-    // is needed.
-    let mut snap_voiced = [false; L_MAX as usize];
-    let mut snap_m_tilde = [0f32; L_MAX as usize];
-    snap_voiced[..l as usize].copy_from_slice(&voiced_arr[..l as usize]);
-    snap_m_tilde[..l as usize].copy_from_slice(&m_tilde_arr[..l as usize]);
-    state.last_good = Some(LastGoodFrame {
-        omega_0,
-        l,
-        voiced: snap_voiced,
-        m_tilde: snap_m_tilde,
+    let s_v = analysis::profile::time(analysis::profile::Stage::SynthVoiced, || {
+        synthesize_voiced(
+            omega_0,
+            &smoothed.m_bar[..l as usize],
+            &smoothed.v_bar[..l as usize],
+            &noise_samples,
+            phase_mode,
+            &mut state.voiced,
+        )
     });
 
-    pcm_from_f64(&s)
+    analysis::profile::time(analysis::profile::Stage::SynthMix, || {
+        let mut s = [0f64; FRAME_SAMPLES];
+        if disp == FrameDisposition::Mute {
+            // §1.11.2: bypass synthesis output, emit small-amplitude
+            // noise (the spec's primary recommendation; "true silence" is
+            // the alternative). State above already advanced normally.
+            // Reuse the unvoiced LCG's noise window (already advanced by
+            // `synthesize_unvoiced`) so we don't burn extra entropy or
+            // need a separate RNG. The noise window stores 209 samples
+            // covering n=−104..104; take the central 160 (offsets 24..184
+            // → n=−80..79). Center via LCG_MEAN and scale to a comfort
+            // level matching JMBE / SDRTrunk.
+            for i in 0..FRAME_SAMPLES {
+                let raw = state.unvoiced.noise_window[24 + i];
+                s[i] = (raw - LCG_MEAN) * MUTE_NOISE_GAIN;
+            }
+        } else {
+            for i in 0..FRAME_SAMPLES {
+                s[i] = s_uv[i] + s_v[i];
+            }
+        }
+
+        // Snapshot for next-frame substitution. Storing (ω₀, L, voiced,
+        // M̃) is enough — rerunning §1.10 enhancement on M̃ with the
+        // current S_E reproduces M̄ exactly, so no separate M̄ snapshot
+        // is needed.
+        let mut snap_voiced = [false; L_MAX as usize];
+        let mut snap_m_tilde = [0f32; L_MAX as usize];
+        snap_voiced[..l as usize].copy_from_slice(&voiced_arr[..l as usize]);
+        snap_m_tilde[..l as usize].copy_from_slice(&m_tilde_arr[..l as usize]);
+        state.last_good = Some(LastGoodFrame {
+            omega_0,
+            l,
+            voiced: snap_voiced,
+            m_tilde: snap_m_tilde,
+        });
+
+        pcm_from_f64(&s)
+    })
 }
 
 #[cfg(test)]

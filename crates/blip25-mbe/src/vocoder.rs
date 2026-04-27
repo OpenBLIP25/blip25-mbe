@@ -50,6 +50,7 @@ use crate::codecs::mbe_baseline::analysis::{
     AnalysisError, AnalysisOutput, AnalysisState, ToneDetection,
     detect_tone, encode as analysis_encode,
     encode_halfrate as analysis_encode_halfrate,
+    profile as analysis_profile,
 };
 use crate::codecs::mbe_baseline::{
     FrameDisposition, FrameErrorContext, GAMMA_W, SynthState, synthesize_frame,
@@ -1108,11 +1109,18 @@ mod fullrate {
     }
 
     pub(super) fn decode(bits: &[u8], vocoder: &mut Vocoder) -> (Vec<i16>, DecodeStats) {
-        let dibits = unpack_dibits_full(bits);
-        let imbe = decode_frame(&dibits);
+        let dibits = analysis_profile::time(analysis_profile::Stage::DibitUnpack, || {
+            unpack_dibits_full(bits)
+        });
+        let imbe = analysis_profile::time(analysis_profile::Stage::DecodeFrame, || {
+            decode_frame(&dibits)
+        });
         let stats_eps0 = imbe.errors[0];
         let stats_epst = imbe.error_total().min(255) as u8;
-        let pcm: [i16; FRAME_SAMPLES] = match dequantize(&imbe.info, &mut vocoder.fullrate_dec) {
+        let dq = analysis_profile::time(analysis_profile::Stage::Dequantize, || {
+            dequantize(&imbe.info, &mut vocoder.fullrate_dec)
+        });
+        let pcm: [i16; FRAME_SAMPLES] = match dq {
             Ok(params) => {
                 let err = FrameErrorContext {
                     epsilon_0: stats_eps0,
@@ -1122,11 +1130,7 @@ mod fullrate {
                 };
                 synthesize_frame(&params, &err, GAMMA_W, &mut vocoder.synth)
             }
-            Err(_) => {
-                // Bad-pitch / decode error → emit silence, advance no
-                // synth state (preserves the existing harness behavior).
-                [0i16; FRAME_SAMPLES]
-            }
+            Err(_) => [0i16; FRAME_SAMPLES],
         };
         let disposition = vocoder.synth.last_disposition();
         (
@@ -1217,8 +1221,12 @@ mod halfrate {
     }
 
     pub(super) fn decode(bits: &[u8], vocoder: &mut Vocoder) -> (Vec<i16>, DecodeStats) {
-        let dibits = unpack_dibits_half(bits);
-        let frame = decode_frame(&dibits);
+        let dibits = analysis_profile::time(analysis_profile::Stage::DibitUnpack, || {
+            unpack_dibits_half(bits)
+        });
+        let frame = analysis_profile::time(analysis_profile::Stage::DecodeFrame, || {
+            decode_frame(&dibits)
+        });
         let stats_eps0 = frame.errors[0];
         let stats_epst = frame.errors.iter().map(|&e| u16::from(e)).sum::<u16>().min(255) as u8;
         let err = FrameErrorContext {
@@ -1227,7 +1235,10 @@ mod halfrate {
             epsilon_t: stats_epst,
             bad_pitch: false,
         };
-        let pcm: [i16; FRAME_SAMPLES] = match decode_to_params(&frame.info, &mut vocoder.halfrate_dec) {
+        let dq = analysis_profile::time(analysis_profile::Stage::Dequantize, || {
+            decode_to_params(&frame.info, &mut vocoder.halfrate_dec)
+        });
+        let pcm: [i16; FRAME_SAMPLES] = match dq {
             Ok(Decoded::Voice(p)) => match vocoder.halfrate_synth {
                 HalfrateSynth::AmbePlus => ambe_plus2::synthesize_frame(&p, &mut vocoder.synth),
                 HalfrateSynth::Baseline => {
