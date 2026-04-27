@@ -807,6 +807,27 @@ pub fn synthesize_voiced(
     }
 
     // Per-harmonic synthesis + accumulate.
+    //
+    // The three constant-frequency branches (VUv, UvV, VVSum) each
+    // need cos(ω·l·n + φ) sampled over n = 0..N. We replace those
+    // with a complex-phasor recursion: starting from z₀ = exp(jφ₀)
+    // and stepping by w = exp(jω·l) per sample, z_{n+1} = z_n · w
+    // and Re(z_n) gives the cosine. This costs 2 cos + 2 sin per
+    // harmonic (init + step rotation) plus 4 mults + 2 adds per
+    // sample, vs. one transcendental per sample in the direct form
+    // — a ~30× math reduction in the inner loop. Magnitude drift
+    // over 160 steps is ≪ 1e−13, well below audible.
+    //
+    // VVRamp's quadratic phase term (Eq. 134) doesn't reduce to a
+    // constant rotation; keep it on `cos()`. It only fires for
+    // low-l harmonics with small |Δω·l/ω| and is the rarer branch.
+    enum Branch {
+        UvUv,
+        VUv,
+        UvV,
+        VVSum,
+        VVRamp,
+    }
     let mut s_v = [0f64; FRAME_SAMPLES];
     for l in 1..=max_l {
         let l_f = l as f64;
@@ -815,15 +836,6 @@ pub fn synthesize_voiced(
         let v_curr = l <= l_curr as usize && v_bar[l - 1];
         let v_prev = l <= l_prev as usize && state.prev_v_bar[l];
 
-        // Decide which branch this harmonic uses for the entire frame.
-        // (It's a function of l, prev/curr V/UV, and the |Δω·l/ω| ratio.)
-        enum Branch {
-            UvUv,
-            VUv,
-            UvV,
-            VVSum,
-            VVRamp,
-        }
         let branch = match (v_prev, v_curr) {
             (false, false) => Branch::UvUv,
             (true, false) => Branch::VUv,
@@ -842,48 +854,81 @@ pub fn synthesize_voiced(
             }
         };
 
-        // Pre-compute Eq. 134 ramp constants once per harmonic.
-        let (delta_omega_l, theta0, omega_curr_minus_prev_over_2n) = if matches!(branch, Branch::VVRamp) {
-            let delta_phi = phi_curr[l] - state.phi[l]
-                - (omega_prev + omega_curr) * l_f * n_f / 2.0;
-            let wrapped = wrap_phase(delta_phi);
-            let dω_l = wrapped / n_f;
-            let coef_n2 = (omega_curr * l_f - omega_prev * l_f) / (2.0 * n_f);
-            (dω_l, state.phi[l], coef_n2)
-        } else {
-            (0.0, 0.0, 0.0)
-        };
-
-        for n in 0..FRAME_SAMPLES {
-            let n_int = n as i32;
-            let nf = f64::from(n_int);
-            let n_minus_n_f = nf - n_f;
-            let s_vl: f64 = match branch {
-                Branch::UvUv => 0.0,
-                Branch::VUv => {
-                    ws_n[n] * m_prev_l
-                        * (omega_prev * nf * l_f + state.phi[l]).cos()
+        match branch {
+            Branch::UvUv => {}
+            Branch::VUv => {
+                // Phase is omega_prev * n * l + state.phi[l], n = 0..N.
+                let phi0 = state.phi[l];
+                let (mut pre, mut pim) = (phi0.cos(), phi0.sin());
+                let step = omega_prev * l_f;
+                let (dc, ds) = (step.cos(), step.sin());
+                let scale = 2.0 * m_prev_l;
+                for n in 0..FRAME_SAMPLES {
+                    s_v[n] += scale * ws_n[n] * pre;
+                    let npre = pre * dc - pim * ds;
+                    let npim = pre * ds + pim * dc;
+                    pre = npre;
+                    pim = npim;
                 }
-                Branch::UvV => {
-                    ws_nm[n] * m_curr_l
-                        * (omega_curr * n_minus_n_f * l_f + phi_curr[l]).cos()
+            }
+            Branch::UvV => {
+                // Phase is omega_curr * (n - N) * l + phi_curr[l].
+                // Start phase at n = 0: omega_curr * (-N) * l + phi_curr[l].
+                let phi0 = phi_curr[l] - omega_curr * n_f * l_f;
+                let (mut cre, mut cim) = (phi0.cos(), phi0.sin());
+                let step = omega_curr * l_f;
+                let (dc, ds) = (step.cos(), step.sin());
+                let scale = 2.0 * m_curr_l;
+                for n in 0..FRAME_SAMPLES {
+                    s_v[n] += scale * ws_nm[n] * cre;
+                    let ncre = cre * dc - cim * ds;
+                    let ncim = cre * ds + cim * dc;
+                    cre = ncre;
+                    cim = ncim;
                 }
-                Branch::VVSum => {
-                    let t1 = ws_n[n] * m_prev_l
-                        * (omega_prev * nf * l_f + state.phi[l]).cos();
-                    let t2 = ws_nm[n] * m_curr_l
-                        * (omega_curr * n_minus_n_f * l_f + phi_curr[l]).cos();
-                    t1 + t2
+            }
+            Branch::VVSum => {
+                // Two phasors: prev frame (omega_prev) and current
+                // frame (omega_curr) overlap-added with the cross
+                // window pair.
+                let (mut pre, mut pim) = (state.phi[l].cos(), state.phi[l].sin());
+                let pstep = omega_prev * l_f;
+                let (pdc, pds) = (pstep.cos(), pstep.sin());
+                let phi_c0 = phi_curr[l] - omega_curr * n_f * l_f;
+                let (mut cre, mut cim) = (phi_c0.cos(), phi_c0.sin());
+                let cstep = omega_curr * l_f;
+                let (cdc, cds) = (cstep.cos(), cstep.sin());
+                let scale_p = 2.0 * m_prev_l;
+                let scale_c = 2.0 * m_curr_l;
+                for n in 0..FRAME_SAMPLES {
+                    s_v[n] += scale_p * ws_n[n] * pre + scale_c * ws_nm[n] * cre;
+                    let npre = pre * pdc - pim * pds;
+                    let npim = pre * pds + pim * pdc;
+                    pre = npre;
+                    pim = npim;
+                    let ncre = cre * cdc - cim * cds;
+                    let ncim = cre * cds + cim * cdc;
+                    cre = ncre;
+                    cim = ncim;
                 }
-                Branch::VVRamp => {
+            }
+            Branch::VVRamp => {
+                // Quadratic phase — keep direct cos().
+                let delta_phi = phi_curr[l] - state.phi[l]
+                    - (omega_prev + omega_curr) * l_f * n_f / 2.0;
+                let wrapped = wrap_phase(delta_phi);
+                let delta_omega_l = wrapped / n_f;
+                let theta0 = state.phi[l];
+                let coef_n2 = (omega_curr * l_f - omega_prev * l_f) / (2.0 * n_f);
+                for n in 0..FRAME_SAMPLES {
+                    let nf = n as f64;
                     let a_l = m_prev_l + (nf / n_f) * (m_curr_l - m_prev_l);
-                    let theta_l =
-                        theta0 + (omega_prev * l_f + delta_omega_l) * nf
-                            + omega_curr_minus_prev_over_2n * nf * nf;
-                    a_l * theta_l.cos()
+                    let theta_l = theta0
+                        + (omega_prev * l_f + delta_omega_l) * nf
+                        + coef_n2 * nf * nf;
+                    s_v[n] += 2.0 * a_l * theta_l.cos();
                 }
-            };
-            s_v[n] += 2.0 * s_vl;
+            }
         }
     }
 
