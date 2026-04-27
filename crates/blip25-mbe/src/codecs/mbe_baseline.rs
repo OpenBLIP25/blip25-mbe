@@ -913,6 +913,13 @@ pub struct SynthState {
     /// per-repeat attenuation; this knob exists only for chip-stream
     /// interop quality, not for spec conformance).
     repeat_reset_after: Option<u32>,
+    /// The disposition (`Use` / `Repeat` / `Mute`) selected by the
+    /// most recent [`synthesize_frame`] / [`synthesize_frame_ambe_plus`]
+    /// call. `None` until at least one frame has been synthesized.
+    /// Updated **inside** the synth before any state advancement so
+    /// callers reading it after the synth returns get the current
+    /// frame's decision, not the prior one.
+    last_disposition: Option<FrameDisposition>,
 }
 
 #[derive(Clone, Debug)]
@@ -937,7 +944,16 @@ impl SynthState {
             last_good: None,
             repeat_count: 0,
             repeat_reset_after: None,
+            last_disposition: None,
         }
+    }
+
+    /// The disposition (`Use` / `Repeat` / `Mute`) selected by the
+    /// most recent synth call. `None` until at least one frame has
+    /// been synthesized; reset by [`Self::new`].
+    #[inline]
+    pub fn last_disposition(&self) -> Option<FrameDisposition> {
+        self.last_disposition
     }
 
     /// Enable the beyond-spec consecutive-repeat reset heuristic. After
@@ -1062,6 +1078,7 @@ fn synthesize_frame_with_mode(
 ) -> [i16; FRAME_SAMPLES] {
     let (disp, epsilon_r) = frame_disposition(err, state.epsilon_r);
     state.epsilon_r = epsilon_r;
+    state.last_disposition = Some(disp);
 
     // Track consecutive Repeat/Mute frames for the optional reset.
     let next_repeat_count = match disp {

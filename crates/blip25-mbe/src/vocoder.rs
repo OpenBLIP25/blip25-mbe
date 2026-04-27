@@ -147,7 +147,10 @@ pub struct DecodeStats {
     /// Total FEC error count across all coded vectors of the frame.
     pub epsilon_t: u8,
     /// Synth-side disposition for this frame (Use / Repeat / Mute).
-    /// Full-rate populates this; half-rate currently leaves it `None`.
+    /// Populated for both rates after the synth runs. `None` only on
+    /// frames where dequantize errored before synth was reached
+    /// (e.g. invalid pitch index in full-rate; the field then carries
+    /// over the prior frame's value via `Vocoder::synth.last_disposition`).
     pub disposition: Option<FrameDisposition>,
 }
 
@@ -241,6 +244,17 @@ impl Vocoder {
     #[inline]
     pub fn last_stats(&self) -> &FrameStats {
         &self.last_stats
+    }
+
+    /// Disposition (`Use` / `Repeat` / `Mute`) of the most recent
+    /// [`Self::decode_bits`] call's synthesizer pass. `None` until at
+    /// least one frame has been decoded. Reset by [`Self::reset`].
+    ///
+    /// Decode-side only; encode-side has no synth and always returns
+    /// `None`.
+    #[inline]
+    pub fn last_disposition(&self) -> Option<FrameDisposition> {
+        self.synth.last_disposition()
     }
 
     /// Reset all channel state. Equivalent to the chip's PKT_RATEP
@@ -455,12 +469,13 @@ mod fullrate {
                 [0i16; FRAME_SAMPLES]
             }
         };
+        let disposition = vocoder.synth.last_disposition();
         (
             pcm.to_vec(),
             DecodeStats {
                 epsilon_0: stats_eps0,
                 epsilon_t: stats_epst,
-                disposition: None, // synth's `last_disposition` isn't surfaced yet
+                disposition,
             },
         )
     }
@@ -529,12 +544,13 @@ mod halfrate {
             }
             Ok(Decoded::Erasure) | Err(_) => [0i16; FRAME_SAMPLES],
         };
+        let disposition = vocoder.synth.last_disposition();
         (
             pcm.to_vec(),
             DecodeStats {
                 epsilon_0: stats_eps0,
                 epsilon_t: stats_epst,
-                disposition: None,
+                disposition,
             },
         )
     }
@@ -745,6 +761,31 @@ mod tests {
         for f in &frames {
             assert_eq!(f.len(), FRAME_SAMPLES);
         }
+    }
+
+    /// `DecodeStats::disposition` populates after a decode call.
+    /// On clean own-encoded bits the disposition is `Use`; on bits
+    /// crafted to cross the mute threshold (high ε_t injected by
+    /// pre-loading `state.epsilon_r`) it should be `Mute`.
+    #[test]
+    fn decode_stats_carry_disposition() {
+        let mut tx = Vocoder::new(Rate::P25Phase1);
+        let mut rx = Vocoder::new(Rate::P25Phase1);
+        for _ in 0..5 {
+            let pcm = periodic_pcm(40, 8000);
+            let bits = tx.encode_pcm(&pcm).unwrap();
+            let _ = rx.decode_bits(&bits).unwrap();
+        }
+        let disp = rx
+            .last_stats()
+            .decode
+            .as_ref()
+            .expect("decode stats populated after decode call")
+            .disposition
+            .expect("disposition surfaced");
+        // Clean own-encoded bits: 0 errors per frame, so Use.
+        assert_eq!(disp, FrameDisposition::Use);
+        assert_eq!(rx.last_disposition(), Some(FrameDisposition::Use));
     }
 
     /// Streaming and per-frame paths produce identical output —
