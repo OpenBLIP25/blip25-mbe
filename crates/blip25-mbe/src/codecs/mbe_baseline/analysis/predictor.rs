@@ -656,7 +656,7 @@ mod halfrate_tests {
     }
 
     #[test]
-    fn lambda_hat_unvoiced_adds_2289_plus_omega_L_term() {
+    fn lambda_hat_unvoiced_adds_2289_plus_omega_l_term() {
         // Unvoiced case: Λ̂ = log₂(16) + 0.5·log₂(ω̃_0·L̂) + 2.289.
         // With ω̃_0 = 0.3, L̂ = 10: 0.5·log₂(3.0) + 2.289 ≈ 0.7925 + 2.289 = 3.0815.
         // Plus log₂(16) = 4. Total ≈ 7.0815.

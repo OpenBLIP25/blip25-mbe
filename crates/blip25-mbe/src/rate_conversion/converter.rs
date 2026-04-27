@@ -678,7 +678,7 @@ mod tests {
             "predictor ω_prev should have advanced from cold-start init"
         );
         let omega_after_f1 = conv.predictor_state().omega_0_prev();
-        let l_after_f1 = conv.predictor_state().l_prev();
+        let _l_after_f1 = conv.predictor_state().l_prev();
 
         // Frame 2: different pitch — forces slow path and further advance.
         let p2 = sample_params(0.25);

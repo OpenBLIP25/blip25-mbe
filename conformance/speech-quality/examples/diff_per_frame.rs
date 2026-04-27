@@ -32,6 +32,10 @@ struct FrameInfo {
     l: u8,
     voiced_count: u8,
     amp_rms_db: f64,
+    /// True on a dequantize-side error. Set for diagnostic
+    /// visibility under a debugger; not read in the current code
+    /// path but preserved so the struct's role stays self-documenting.
+    #[allow(dead_code)]
     err: bool,
 }
 

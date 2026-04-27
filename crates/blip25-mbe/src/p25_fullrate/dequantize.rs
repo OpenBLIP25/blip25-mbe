@@ -1459,7 +1459,6 @@ mod tests {
 
     #[test]
     fn extract_pitch_index_round_trip_via_priority_table() {
-        use crate::p25_fullrate::priority::prioritize;
         // Build a known b array, prioritize at any L (any L works for
         // pitch since positions are L-invariant per §1.3.1 robustness),
         // and verify extraction recovers the exact b̂₀.
@@ -1476,7 +1475,6 @@ mod tests {
 
     #[test]
     fn dequantize_rejects_reserved_pitch() {
-        use crate::p25_fullrate::priority::prioritize;
         let mut b = [0u16; 59];
         b[0] = 220; // reserved
         let u = crate::p25_fullrate::priority::prioritize(&b, 9);
@@ -1489,7 +1487,6 @@ mod tests {
 
     #[test]
     fn dequantize_produces_sane_silence_for_zero_b() {
-        use crate::p25_fullrate::priority::prioritize;
         // b̂₀ = 0 → ω₀ = 4π/39.5, L = 9, K = 3
         // All other bits zero → quantizer indices at midtread base
         //   (which represents −2^{B−1} + 0.5 step → small negative
@@ -1516,7 +1513,6 @@ mod tests {
 
     #[test]
     fn dequantize_advances_decoder_state() {
-        use crate::p25_fullrate::priority::prioritize;
         let b = [0u16; 59];
         let u = crate::p25_fullrate::priority::prioritize(&b, 9);
         let mut state = DecoderState::new();
@@ -1747,7 +1743,6 @@ mod tests {
         // lossy (see `analysis/vocoder_decode_disambiguations.md` §9)
         // so we don't expect b̂₂..b̂_{L+1} to roundtrip exactly. This
         // test pins down the bit-exact pieces.
-        use crate::p25_fullrate::priority::prioritize;
         // Pick a pitch index whose decoded L lets us reuse the same L
         // in prioritize. b̂₀ = 0 → L = 9.
         let l = 9u8;

@@ -8,7 +8,6 @@
 use blip25_mbe::codecs::mbe_baseline::analysis::{
     AnalysisOutput, AnalysisState, encode as analysis_encode,
 };
-use blip25_mbe::mbe_params::MbeParams;
 use std::env;
 use std::fs;
 

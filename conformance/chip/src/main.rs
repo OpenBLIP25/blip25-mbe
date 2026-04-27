@@ -701,11 +701,9 @@ enum ProbeExpect {
     Peak { harmonic_l: u8, amplitude: f32, l_total: u8 },
 }
 
-/// Frames to skip at the start of each probe block to bypass chip
-/// warmup (startup attenuation + any cold-start predictor transient).
-const PROBE_WARMUP_FRAMES: usize = 10;
-/// Probe block length. Measurement window is `[PROBE_WARMUP_FRAMES,
-/// PROBE_BLOCK_FRAMES)`.
+/// Probe block length. Each block runs the chip on a sustained
+/// signal long enough that the trailing measurement is past startup
+/// transients.
 const PROBE_BLOCK_FRAMES: usize = 20;
 
 /// Build a voiced MbeParams with flat amplitude across harmonics but a
