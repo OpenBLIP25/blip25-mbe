@@ -763,9 +763,16 @@ pub struct Transcoder {
 impl Transcoder {
     /// Open a new transcoder for the `(from, to)` rate pair.
     ///
-    /// Currently supported pairs:
+    /// Cross-codec pairs (run the parameter-domain converter):
     /// - `(Rate::Imbe7200x4400, Rate::AmbePlus2_3600x2450)`
     /// - `(Rate::AmbePlus2_3600x2450, Rate::Imbe7200x4400)`
+    ///
+    /// Same-codec FEC ↔ no-FEC pairs (pure wire-layer bit shuffling,
+    /// no codec or predictor state):
+    /// - `(Rate::Imbe7200x4400, Rate::Imbe4400x4400)` — strip Annex H FEC
+    /// - `(Rate::Imbe4400x4400, Rate::Imbe7200x4400)` — add Annex H FEC
+    /// - `(Rate::AmbePlus2_3600x2450, Rate::AmbePlus2_2450x2450)` — strip half-rate FEC
+    /// - `(Rate::AmbePlus2_2450x2450, Rate::AmbePlus2_3600x2450)` — add half-rate FEC
     ///
     /// Any other combination returns
     /// [`VocoderError::UnsupportedTranscode`].
@@ -781,6 +788,16 @@ impl Transcoder {
                 direction,
                 full_to_half: None,
                 half_to_full: Some(crate::rate_conversion::HalfToFullConverter::new()),
+            }),
+            // Same-codec FEC ↔ no-FEC pairs are stateless wire transforms;
+            // both converters stay None.
+            (Rate::Imbe7200x4400, Rate::Imbe4400x4400)
+            | (Rate::Imbe4400x4400, Rate::Imbe7200x4400)
+            | (Rate::AmbePlus2_3600x2450, Rate::AmbePlus2_2450x2450)
+            | (Rate::AmbePlus2_2450x2450, Rate::AmbePlus2_3600x2450) => Ok(Self {
+                direction,
+                full_to_half: None,
+                half_to_full: None,
             }),
             _ => Err(VocoderError::UnsupportedTranscode { from, to }),
         }
@@ -825,6 +842,18 @@ impl Transcoder {
                     .convert(&dibits_in)
                     .map_err(|e| VocoderError::Quantize(format!("{e:?}")))?;
                 Ok(pack_dibits_n::<72, 18>(&dibits_out).to_vec())
+            }
+            (Rate::Imbe7200x4400, Rate::Imbe4400x4400) => {
+                Ok(fullrate::fec_to_info_bytes(bits).to_vec())
+            }
+            (Rate::Imbe4400x4400, Rate::Imbe7200x4400) => {
+                Ok(fullrate::info_to_fec_bytes(bits).to_vec())
+            }
+            (Rate::AmbePlus2_3600x2450, Rate::AmbePlus2_2450x2450) => {
+                Ok(halfrate::fec_to_info_bytes(bits).to_vec())
+            }
+            (Rate::AmbePlus2_2450x2450, Rate::AmbePlus2_3600x2450) => {
+                Ok(halfrate::info_to_fec_bytes(bits).to_vec())
             }
             (from, to) => Err(VocoderError::UnsupportedTranscode { from, to }),
         }
@@ -1257,6 +1286,22 @@ mod fullrate {
         out
     }
 
+    /// Wire-layer transcode: 18-byte FEC frame → 11-byte info-only
+    /// frame. Pure bit-shuffling — no codec or predictor state.
+    pub(super) fn fec_to_info_bytes(fec_bytes: &[u8]) -> [u8; 11] {
+        let dibits = unpack_dibits_full(fec_bytes);
+        let frame = decode_frame(&dibits);
+        pack_info_full(&frame.info)
+    }
+
+    /// Wire-layer transcode: 11-byte info-only frame → 18-byte FEC
+    /// frame. Pure bit-shuffling — re-applies Golay/Hamming/PN.
+    pub(super) fn info_to_fec_bytes(info_bytes: &[u8]) -> [u8; 18] {
+        let info = unpack_info_full(info_bytes);
+        let dibits = encode_frame(&info);
+        pack_dibits_full(&dibits)
+    }
+
     fn pack_dibits_full(dibits: &[u8; 72]) -> [u8; 18] {
         let mut out = [0u8; 18];
         let mut bit = 0usize;
@@ -1438,6 +1483,22 @@ mod halfrate {
         let mut out = [0u16; 4];
         super::unpack_info_bits(bytes, &INFO_WIDTHS, &mut out);
         out
+    }
+
+    /// Wire-layer transcode: 9-byte FEC frame → 7-byte info-only
+    /// frame. Pure bit-shuffling — no codec or predictor state.
+    pub(super) fn fec_to_info_bytes(fec_bytes: &[u8]) -> [u8; 7] {
+        let dibits = unpack_dibits_half(fec_bytes);
+        let frame = decode_frame(&dibits);
+        pack_info_half(&frame.info)
+    }
+
+    /// Wire-layer transcode: 7-byte info-only frame → 9-byte FEC
+    /// frame. Pure bit-shuffling — re-applies Golay/Hamming/PN.
+    pub(super) fn info_to_fec_bytes(info_bytes: &[u8]) -> [u8; 9] {
+        let info = unpack_info_half(info_bytes);
+        let dibits = encode_frame(&info);
+        pack_dibits_half(&dibits)
     }
 }
 
@@ -1982,6 +2043,44 @@ mod tests {
                 to: Rate::Imbe7200x4400,
             })
         ));
+    }
+
+    /// Same-codec FEC ↔ no-FEC transcode is lossless: strip then add
+    /// (or add then strip) reproduces the original bytes exactly.
+    #[test]
+    fn transcoder_full_fec_to_info_roundtrip_is_lossless() {
+        let mut enc = Vocoder::new(Rate::Imbe7200x4400);
+        let mut strip =
+            Transcoder::new(Rate::Imbe7200x4400, Rate::Imbe4400x4400).unwrap();
+        let mut add =
+            Transcoder::new(Rate::Imbe4400x4400, Rate::Imbe7200x4400).unwrap();
+        for k in 0..4 {
+            let pcm = periodic_pcm(40 + k, 7000);
+            let fec = enc.encode_pcm(&pcm).unwrap();
+            assert_eq!(fec.len(), 18);
+            let info = strip.transcode(&fec).unwrap();
+            assert_eq!(info.len(), 11);
+            let fec2 = add.transcode(&info).unwrap();
+            assert_eq!(fec2, fec, "FEC strip + add round-trips byte-for-byte");
+        }
+    }
+
+    #[test]
+    fn transcoder_half_fec_to_info_roundtrip_is_lossless() {
+        let mut enc = Vocoder::new(Rate::AmbePlus2_3600x2450);
+        let mut strip =
+            Transcoder::new(Rate::AmbePlus2_3600x2450, Rate::AmbePlus2_2450x2450).unwrap();
+        let mut add =
+            Transcoder::new(Rate::AmbePlus2_2450x2450, Rate::AmbePlus2_3600x2450).unwrap();
+        for k in 0..4 {
+            let pcm = periodic_pcm(40 + k, 6000);
+            let fec = enc.encode_pcm(&pcm).unwrap();
+            assert_eq!(fec.len(), 9);
+            let info = strip.transcode(&fec).unwrap();
+            assert_eq!(info.len(), 7);
+            let fec2 = add.transcode(&info).unwrap();
+            assert_eq!(fec2, fec, "FEC strip + add round-trips byte-for-byte");
+        }
     }
 
     /// `extract_params` runs the analysis encoder on PCM and returns
