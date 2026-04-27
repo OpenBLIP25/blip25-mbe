@@ -60,6 +60,93 @@ Wire `Frame::decode` is authoritative for its wire. Consumers should not
 re-implement interleave patterns, FEC polynomial application, or priority
 bit ordering — those are the chip's job.
 
+## Chip-shaped façade: `Vocoder`
+
+The recommended entry point for in-process Rust callers is the
+`Vocoder` handle in `blip25_mbe::vocoder`. It owns all per-rate state
+(analysis, decoder, synth) internally and presents a uniform
+encode/decode/reset surface across rates selected at runtime via
+`Rate`. Builds on top of the wire + codec + parameter layers above —
+no functionality the low-level modules don't have, just consolidation
+behind a single handle the way the chip presents a single channel.
+
+```rust
+use blip25_mbe::vocoder::{Rate, Vocoder};
+
+// One channel direction = one Vocoder. Two channels for full-duplex.
+let mut tx = Vocoder::new(Rate::P25Phase1);    // or Rate::P25Phase2
+let bits = tx.encode_pcm(&pcm_frame)?;          // 18-byte FEC frame (or 9 for Phase 2)
+
+let mut rx = Vocoder::new(Rate::P25Phase1);
+let pcm = rx.decode_bits(&bits)?;               // 160 samples i16
+
+// Streaming variants for whole-buffer encode/decode:
+let bits: Vec<Vec<u8>> = tx.encode_stream(&pcm).collect::<Result<_, _>>()?;
+let frames: Vec<Vec<i16>> = rx.decode_stream(&all_bits).collect::<Result<_, _>>()?;
+
+// Diagnostics (chip status-register equivalent):
+let stats = tx.last_stats();   // FrameStats { analysis: Some(...), decode: None }
+println!("emitted {:?}, params = {:?}", stats.analysis.as_ref().unwrap().output, stats.analysis.as_ref().unwrap().params);
+
+// Reset (chip PKT_RATEP re-send equivalent):
+tx.reset();
+```
+
+### AMBE-3000R protocol → `Vocoder` correspondence
+
+| Chip operation                    | `Vocoder` equivalent              | Notes                                                          |
+|-----------------------------------|------------------------------------|----------------------------------------------------------------|
+| Open channel                      | `Vocoder::new(rate)`               |                                                                |
+| Set rate (`PKT_RATEP`)            | `Rate` argument at construction    | Rate fixed for handle lifetime; build a new handle to switch.  |
+| Reset (re-send `PKT_RATEP`)       | `Vocoder::reset()`                 | Clears all state, keeps rate.                                  |
+| Encode 160-sample PCM → bits      | `encode_pcm(&[i16; 160])`          | Returns `Vec<u8>` of `fec_frame_bytes()`.                      |
+| Decode bits → 160-sample PCM      | `decode_bits(&[u8])`               | Returns `Vec<i16>` of length `frame_samples()`.                |
+| Bulk encode a buffer              | `encode_stream(&[i16])`            | `ExactSizeIterator<Item = Result<Vec<u8>>>`. Drops trailing partial frame. |
+| Bulk decode a buffer              | `decode_stream(&[u8])`             | Mirrors `encode_stream`.                                       |
+| Read last-frame status registers  | `last_stats()` → `&FrameStats`     | `analysis` (encode-side) and `decode` (decode-side) sub-structs. |
+| Frame size info                   | `frame_samples()`, `fec_frame_bytes()` | Const per-rate.                                            |
+
+`Vocoder` is enum-dispatched (no `dyn` overhead) and exhaustively
+covers each `Rate` variant. Adding a new rate means adding a variant
+to `Rate` plus a `match` arm in the enum dispatch — mechanical.
+
+### What `Vocoder` deliberately does NOT model
+
+These are chip-protocol concerns that don't exist at the codec layer:
+
+- **Audio mode** (sample rate, format, gain). The chip's `PKT_AMODE`
+  configures these; `Vocoder` only consumes/produces 8 kHz mono i16.
+  Resampling and gain control are radio-side.
+- **Channel framing / RTS-CTS / flow control.** The chip's serial
+  protocol has framing for transport reliability; in-process Rust
+  doesn't need it.
+- **Multi-channel multiplex.** The chip can multiplex multiple
+  channels over one serial port; `Vocoder` is one channel. Caller
+  allocates as many handles as they need.
+- **Tone-frame emission** (encode side). Half-rate decode handles
+  `Decoded::Tone` already; encode-side tone dispatch (analyzing PCM
+  and emitting an Annex T tone frame instead of voice) is not
+  implemented. A real chip would.
+- **Beyond-spec heuristics** (max-headroom-reset, error-rate-freeze
+  on repeat). Available as opt-in flags on the lower-level paths
+  (`SynthState::set_repeat_reset_after`); not on `Vocoder` because
+  the chip-shaped API stays spec-faithful by default. See gap 0021 /
+  0022 for the spec-vs-chip divergence story.
+
+### Wire-format support matrix
+
+| Rate           | FEC bytes | Codec        | End-to-end | Carriers                                      |
+|----------------|----------:|--------------|:---------:|------------------------------------------------|
+| `P25Phase1`    |        18 | IMBE Gen 1   | ✅        | P25 Phase 1 FDMA voice                         |
+| `P25Phase2`    |         9 | AMBE+2 Gen 3 | ✅        | P25 Phase 2 TDMA voice; carrier-agnostic for any AMBE+2 sink that lays its post-FEC info as 4 vectors of widths {12,12,12,12} (NXDN type-2 typical, DMR enhanced) |
+
+For carriers whose post-FEC info layout differs (older DMR, AMBE+
+Gen 2 NXDN, D-STAR's specific bit layout), drop down a layer to
+`decode-raw-mbe` (raw 9-value `b̂₀..b̂₈`) or `decode-raw-halfrate`
+(post-FEC 4-vector info) — both are available as CLI subcommands of
+`conformance-speech-quality` and as direct library calls into
+`p25_halfrate::dequantize` + `codecs::ambe_plus2`.
+
 ## What Stays in the Consumer (p25-decoder example)
 
 These responsibilities are radio-side, not chip-side. They never migrate.
