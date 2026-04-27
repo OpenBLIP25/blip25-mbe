@@ -100,6 +100,13 @@ enum Cmd {
         /// --silence-dispatch).
         #[arg(long)]
         pitch_silence_override: bool,
+        /// Enable the onset-attack mitigation: on near-silent frames,
+        /// commit a short default pitch (period 25 ≈ chip's b̂₀ ≈ 25)
+        /// to pitch_history instead of the phantom long-period
+        /// autocorrelation peak. Independent of --silence-dispatch.
+        /// See `project_onset_attack_flag_landed_2026-04-27.md`.
+        #[arg(long)]
+        default_pitch_on_silence: bool,
         /// Multiply M̂_l amplitudes by this factor before wire quantize.
         /// Default 1.0 (no scaling). Probes whether a global amplitude
         /// calibration error is contributing to the PESQ gap.
@@ -138,6 +145,9 @@ enum Cmd {
         /// Enable the joint-signal silence override.
         #[arg(long)]
         pitch_silence_override: bool,
+        /// Enable the onset-attack mitigation. See AbMatrix doc.
+        #[arg(long)]
+        default_pitch_on_silence: bool,
     },
     /// Decode a stream of post-FEC AMBE+2 half-rate info vectors (one
     /// frame per line, 4 space-separated hex words = û₀ û₁ û₂ û₃,
@@ -253,6 +263,7 @@ fn main() -> Result<()> {
             skip_chip,
             silence_dispatch,
             pitch_silence_override,
+            default_pitch_on_silence,
             amp_scale,
             vuv_override,
             repeat_reset_after,
@@ -264,6 +275,7 @@ fn main() -> Result<()> {
             skip_chip,
             silence_dispatch,
             pitch_silence_override,
+            default_pitch_on_silence,
             amp_scale,
             vuv_override,
             repeat_reset_after,
@@ -274,12 +286,14 @@ fn main() -> Result<()> {
             frames,
             silence_dispatch,
             pitch_silence_override,
+            default_pitch_on_silence,
         } => cmd_halfrate_ab_matrix(
             &pcm,
             &out_dir,
             frames,
             silence_dispatch,
             pitch_silence_override,
+            default_pitch_on_silence,
         ),
         Cmd::DecodeRawHalfrate { input, out_wav, binary } => {
             cmd_decode_raw_halfrate(&input, &out_wav, binary)
@@ -302,6 +316,7 @@ fn cmd_ab_matrix(
     skip_chip: bool,
     silence_dispatch: bool,
     pitch_silence_override: bool,
+    default_pitch_on_silence: bool,
     amp_scale: f32,
     vuv_override: VuvOverride,
     repeat_reset_after: u32,
@@ -328,7 +343,14 @@ fn cmd_ab_matrix(
 
     // ---- cell 1: our_enc + our_dec (fully local) ----
     let t0 = Instant::now();
-    let our_bits = our_encode(pcm, silence_dispatch, pitch_silence_override, amp_scale, vuv_override)?;
+    let our_bits = our_encode(
+        pcm,
+        silence_dispatch,
+        pitch_silence_override,
+        default_pitch_on_silence,
+        amp_scale,
+        vuv_override,
+    )?;
     let our_enc_secs = t0.elapsed().as_secs_f64();
     eprintln!(
         "our encode: {} frames in {:.2} s ({:.1} ms/frame)",
@@ -477,6 +499,7 @@ fn our_encode(
     pcm: &[i16],
     silence_dispatch: bool,
     pitch_silence_override: bool,
+    default_pitch_on_silence: bool,
     amp_scale: f32,
     vuv_override: VuvOverride,
 ) -> Result<Vec<u8>> {
@@ -487,6 +510,9 @@ fn our_encode(
     }
     if pitch_silence_override {
         state.set_pitch_silence_override(true);
+    }
+    if default_pitch_on_silence {
+        state.set_default_pitch_on_silence(true);
     }
     let mut decoder_state_for_quantize = DecoderState::new();
     let mut out = Vec::with_capacity(n_frames * BYTES_PER_FEC_FRAME);
@@ -590,6 +616,7 @@ fn cmd_halfrate_ab_matrix(
     frames: Option<usize>,
     silence_dispatch: bool,
     pitch_silence_override: bool,
+    default_pitch_on_silence: bool,
 ) -> Result<()> {
     fs::create_dir_all(out_dir)
         .with_context(|| format!("create out_dir {}", out_dir.display()))?;
@@ -610,7 +637,12 @@ fn cmd_halfrate_ab_matrix(
     write_wav(&ref_wav, pcm)?;
 
     let t0 = Instant::now();
-    let our_bits = our_encode_halfrate(pcm, silence_dispatch, pitch_silence_override)?;
+    let our_bits = our_encode_halfrate(
+        pcm,
+        silence_dispatch,
+        pitch_silence_override,
+        default_pitch_on_silence,
+    )?;
     let enc_secs = t0.elapsed().as_secs_f64();
     eprintln!(
         "halfrate encode: {} frames in {:.2} s ({:.1} ms/frame)",
@@ -641,6 +673,7 @@ fn our_encode_halfrate(
     pcm: &[i16],
     silence_dispatch: bool,
     pitch_silence_override: bool,
+    default_pitch_on_silence: bool,
 ) -> Result<Vec<u8>> {
     let n_frames = pcm.len() / FRAME_SAMPLES;
     let mut state = AnalysisState::new();
@@ -649,6 +682,9 @@ fn our_encode_halfrate(
     }
     if pitch_silence_override {
         state.set_pitch_silence_override(true);
+    }
+    if default_pitch_on_silence {
+        state.set_default_pitch_on_silence(true);
     }
     let mut decoder_state = HalfDecoderState::new();
     let mut out = Vec::with_capacity(n_frames * HALF_BYTES_PER_FEC_FRAME);

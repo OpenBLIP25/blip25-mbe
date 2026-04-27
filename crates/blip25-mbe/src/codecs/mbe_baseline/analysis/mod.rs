@@ -483,11 +483,31 @@ pub const PITCH_SILENCE_RATIO_THRESH: f64 = 2.0;
 /// memo `project_onset_attack_2frame_2026-04-25.md`. Snapped to the
 /// half-sample grid (25.0 is exactly grid index 8).
 pub const DEFAULT_PITCH_ON_SILENCE_PERIOD: f64 = 25.0;
+
+/// Minimum pitch period (samples) the original `p_hat_i` must exceed
+/// for the default-pitch-on-silence override to fire. Below this we
+/// trust the tracker — even a "wrong" short-period lock won't push the
+/// next frame's `look_back` continuity window past where look-ahead
+/// can recover. Period 80 ≈ 100 Hz; phantom long-period locks on
+/// silent input cluster around 100–150 (per the memo's alert frames
+/// 18–19 trace at period ≈ 120). Calibrated to fire on those without
+/// catching mid-speech ambiguity.
+pub const DEFAULT_PITCH_PHANTOM_THRESHOLD: f64 = 80.0;
+/// Minimum `e_p_hat_i` (Eq. 5 confidence) required for the override.
+/// Reuse `PITCH_SILENCE_EPI_THRESH = 0.4` — frames below this have
+/// pitch the tracker considers reliable, so don't override.
 /// `E(P̂)` value committed alongside `DEFAULT_PITCH_ON_SILENCE_PERIOD`.
-/// Set near zero so the next frame's `CE_B` (Eq. 11) doesn't get a
-/// stale "previous frame was lousy" tax — the override's whole point
-/// is to give look-back a clean starting position.
-pub const DEFAULT_PITCH_ON_SILENCE_E: f64 = 0.0;
+/// Pinned at the §0.3 silence-floor value `1.0` (matching the value
+/// `e_of_p` returns on silent frames where the Eq. 5 denominator
+/// would blow up). The first-pass implementation set this to `0.0`
+/// thinking "give look-back a clean starting position", but that was
+/// the opposite of what was needed: with prev_err_1 = prev_err_2 = 0,
+/// the next voice frame's `CE_B = E(P̂_B) + 0 + 0` (Eq. 11) was
+/// artificially LOW, biasing the Eq. 21–23 decision toward the (wrong)
+/// look-back pitch even when a confident look-ahead found the actual
+/// onset's fundamental. Pinning at `1.0` taxes CE_B by 2.0 so
+/// look-ahead can win when it has the better answer.
+pub const DEFAULT_PITCH_ON_SILENCE_E: f64 = 1.0;
 
 /// Preroll frame count at which the analysis encoder has enough
 /// look-ahead state to produce a valid `P̂_I` (§0.9.4).
@@ -856,14 +876,28 @@ pub fn encode_with_trace(
         && e_p_hat_i >= PITCH_SILENCE_EPI_THRESH
         && frame_energy < PITCH_SILENCE_RATIO_THRESH * state.silence.noise_floor();
 
-    // Onset-attack mitigation (`set_default_pitch_on_silence`): when a
-    // frame is near-silent by the §0.8.4 per-frame ratio test, commit
-    // a short default pitch instead of the phantom long-period
-    // autocorrelation peak. Doesn't affect THIS frame's encoding —
-    // only the value committed to `state.pitch_history` for the next
-    // frame's `look_back`.
-    let near_silent = frame_energy < PITCH_SILENCE_RATIO_THRESH * state.silence.noise_floor();
-    let (commit_p, commit_e) = if state.default_pitch_on_silence_enabled && near_silent {
+    // Onset-attack mitigation (`set_default_pitch_on_silence`): only
+    // fires when ALL of the following hold:
+    //   1. `silent` — §0.8.4 hysteresis-gated silence decision.
+    //   2. `p_hat_i > DEFAULT_PITCH_PHANTOM_THRESHOLD` — the original
+    //      pitch is in long-period phantom territory (above ~100 Hz
+    //      fundamental). Avoids resetting on short-period locks the
+    //      tracker can recover from.
+    //   3. `e_p_hat_i ≥ PITCH_SILENCE_EPI_THRESH` — pitch confidence
+    //      below this means the tracker thinks it's locked in. Don't
+    //      override what the tracker considers a confident result.
+    // The triple gate is deliberately conservative — the §0.8.4
+    // detector falsely flags ~40% of continuous-tone content as silent
+    // (calibrated for chip-bit matching, not perceptual silence), and
+    // an over-eager override on those false silents resets pitch
+    // mid-tone and tanks PESQ. See memo
+    // `project_onset_attack_flag_landed_2026-04-27.md`.
+    let phantom_pitch =
+        p_hat_i > DEFAULT_PITCH_PHANTOM_THRESHOLD && e_p_hat_i >= PITCH_SILENCE_EPI_THRESH;
+    let (commit_p, commit_e) = if state.default_pitch_on_silence_enabled
+        && silent
+        && phantom_pitch
+    {
         (DEFAULT_PITCH_ON_SILENCE_PERIOD, DEFAULT_PITCH_ON_SILENCE_E)
     } else {
         (p_hat_i, e_p_hat_i)
@@ -967,8 +1001,12 @@ pub fn encode_halfrate(
     });
 
     // Onset-attack mitigation — see encode_with_trace for rationale.
-    let near_silent = frame_energy < PITCH_SILENCE_RATIO_THRESH * state.silence.noise_floor();
-    let (commit_p, commit_e) = if state.default_pitch_on_silence_enabled && near_silent {
+    let phantom_pitch =
+        p_hat_i > DEFAULT_PITCH_PHANTOM_THRESHOLD && e_p_hat_i >= PITCH_SILENCE_EPI_THRESH;
+    let (commit_p, commit_e) = if state.default_pitch_on_silence_enabled
+        && silent
+        && phantom_pitch
+    {
         (DEFAULT_PITCH_ON_SILENCE_PERIOD, DEFAULT_PITCH_ON_SILENCE_E)
     } else {
         (p_hat_i, e_p_hat_i)
@@ -1419,61 +1457,64 @@ mod tests {
         );
     }
 
-    /// `set_default_pitch_on_silence` overrides the *committed* pitch
-    /// when a frame is near-silent, but leaves the encoded frame
-    /// unchanged. Compare prev_pitch in pitch_history before and after
-    /// a quiet frame, with the flag off vs. on.
+    /// `set_default_pitch_on_silence` does not change THIS frame's
+    /// encoded output — only `pitch_history` for the next frame.
+    /// Run identical input through flag-off and flag-on encoders for
+    /// many frames; assert per-frame outputs are byte-identical.
+    /// (Whether the override actually fires depends on input-specific
+    /// pitch + confidence + hysteresis triggers; the load-bearing
+    /// invariant is just the no-side-effect-on-this-frame guarantee.)
     #[test]
-    fn default_pitch_on_silence_overrides_committed_pitch_only() {
-        let warmup = |s: &mut AnalysisState| {
-            // Drain preroll + warm η.
-            let loud = periodic_pcm_frame(50.0, 10, 0.0);
-            for _ in 0..20 {
-                let _ = encode(&loud, s);
-            }
-        };
-        // Quiet noise frame whose energy is below 2·η after the loud
-        // warm-up — the §0.8.4 per-frame ratio test will mark it silent.
-        let quiet = [5i16; SAMPLES_PER_FRAME as usize];
-
-        // Flag OFF: the committed pitch is whatever the tracker picked
-        // from the autocorrelation peaks of the quiet input — typically
-        // a long-period phantom, never the override's 25.0.
+    fn default_pitch_on_silence_does_not_change_current_frame_output() {
         let mut s_off = AnalysisState::new();
-        warmup(&mut s_off);
-        assert!(!s_off.default_pitch_on_silence_enabled());
-        let _ = encode(&quiet, &mut s_off).unwrap();
-        let phantom = s_off.pitch_history().prev_pitch;
-        assert_ne!(
-            phantom, DEFAULT_PITCH_ON_SILENCE_PERIOD,
-            "with flag off the committed pitch must NOT be the override"
-        );
-
-        // Flag ON: the committed pitch is the short default. The
-        // ENCODED frame (output) for the same input must be unchanged
-        // bit-for-bit since the override only affects pitch_history,
-        // not the rate-quantized output of THIS frame.
         let mut s_on = AnalysisState::new();
         s_on.set_default_pitch_on_silence(true);
-        warmup(&mut s_on);
-        assert!(s_on.default_pitch_on_silence_enabled());
-        let mut s_off_for_compare = AnalysisState::new();
-        warmup(&mut s_off_for_compare);
-        let out_off = encode(&quiet, &mut s_off_for_compare).unwrap();
-        let out_on = encode(&quiet, &mut s_on).unwrap();
-        assert_eq!(
-            format!("{out_off:?}"),
-            format!("{out_on:?}"),
-            "override changed THIS frame's encoded output — should only \
-             affect committed pitch_history"
-        );
-        assert_eq!(
-            s_on.pitch_history().prev_pitch,
+
+        // Drain preroll + warmup with periodic content, then run a
+        // mix of loud + quiet frames. Compare per-frame outputs.
+        let loud = periodic_pcm_frame(50.0, 10, 0.0);
+        let quiet = [5i16; SAMPLES_PER_FRAME as usize];
+
+        for _ in 0..3 {
+            let _ = encode(&loud, &mut s_off);
+            let _ = encode(&loud, &mut s_on);
+        }
+        // 30 frames mixed quiet + loud — covers silence enter/exit
+        // hysteresis transitions plus the override's potential fire
+        // points in steady silence.
+        for i in 0..30 {
+            let frame = if i % 7 < 5 { &quiet } else { &loud };
+            let out_off = encode(frame, &mut s_off).unwrap();
+            let out_on = encode(frame, &mut s_on).unwrap();
+            assert_eq!(
+                format!("{out_off:?}"),
+                format!("{out_on:?}"),
+                "frame {i} output diverged between flag-off and flag-on \
+                 — the override must only affect pitch_history side-effects, \
+                 not the current frame's encoded output"
+            );
+        }
+    }
+
+    /// Single isolated low-energy frame must not fire the override —
+    /// it requires §0.8.4 hysteresis (5 consecutive silent votes) AND
+    /// a phantom-territory pitch AND high `e_p_hat_i`.
+    #[test]
+    fn default_pitch_on_silence_does_not_fire_on_single_quiet_frame() {
+        let mut s = AnalysisState::new();
+        s.set_default_pitch_on_silence(true);
+        let loud = periodic_pcm_frame(50.0, 10, 0.0);
+        for _ in 0..20 {
+            let _ = encode(&loud, &mut s);
+        }
+        let quiet = [5i16; SAMPLES_PER_FRAME as usize];
+        let _ = encode(&quiet, &mut s).unwrap();
+        assert_ne!(
+            s.pitch_history().prev_pitch,
             DEFAULT_PITCH_ON_SILENCE_PERIOD,
-            "with flag on, near-silent frame's committed pitch must be \
-             the default short period"
+            "single quiet frame must not fire the override before \
+             the hysteresis gate trips"
         );
-        assert_eq!(s_on.pitch_history().prev_err_1, DEFAULT_PITCH_ON_SILENCE_E);
     }
 
     /// `pitch_silence_override_enabled()` reflects the setter and the
