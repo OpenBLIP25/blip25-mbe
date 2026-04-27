@@ -292,7 +292,104 @@ impl Vocoder {
         self.last_stats.decode = Some(stats);
         Ok(pcm)
     }
+
+    /// Encode an arbitrary-length PCM slice as a stream of frames.
+    ///
+    /// Returns an iterator that yields one `Result<Vec<u8>>` per
+    /// frame consumed (160 samples per frame). Trailing partial
+    /// frames are silently dropped — the caller is responsible for
+    /// padding to a multiple of [`Self::frame_samples`] if all
+    /// samples must be encoded.
+    ///
+    /// State (predictor, look-ahead history, ε_R) advances across
+    /// frames just as it would with manual per-frame
+    /// [`Self::encode_pcm`] calls.
+    ///
+    /// ```no_run
+    /// # use blip25_mbe::vocoder::{Rate, Vocoder};
+    /// # let pcm: Vec<i16> = vec![0; 160 * 50];
+    /// let mut tx = Vocoder::new(Rate::P25Phase1);
+    /// let bits: Result<Vec<Vec<u8>>, _> = tx.encode_stream(&pcm).collect();
+    /// ```
+    pub fn encode_stream<'a>(&'a mut self, pcm: &'a [i16]) -> EncodeStream<'a> {
+        EncodeStream { vocoder: self, pcm, pos: 0 }
+    }
+
+    /// Decode an arbitrary-length FEC byte slice as a stream of PCM
+    /// frames.
+    ///
+    /// Returns an iterator that yields one `Result<Vec<i16>>` per
+    /// frame consumed ([`Self::fec_frame_bytes`] per frame). Trailing
+    /// partial frames are silently dropped.
+    ///
+    /// ```no_run
+    /// # use blip25_mbe::vocoder::{Rate, Vocoder};
+    /// # let bits: Vec<u8> = vec![0; 18 * 50];
+    /// let mut rx = Vocoder::new(Rate::P25Phase1);
+    /// let pcm_frames: Result<Vec<Vec<i16>>, _> = rx.decode_stream(&bits).collect();
+    /// ```
+    pub fn decode_stream<'a>(&'a mut self, bits: &'a [u8]) -> DecodeStream<'a> {
+        DecodeStream { vocoder: self, bits, pos: 0 }
+    }
 }
+
+/// Streaming-encode iterator returned by [`Vocoder::encode_stream`].
+/// Yields one `Result<Vec<u8>>` per 160-sample input frame; trailing
+/// partial frames are silently dropped.
+pub struct EncodeStream<'a> {
+    vocoder: &'a mut Vocoder,
+    pcm: &'a [i16],
+    pos: usize,
+}
+
+impl Iterator for EncodeStream<'_> {
+    type Item = Result<Vec<u8>, VocoderError>;
+    fn next(&mut self) -> Option<Self::Item> {
+        let n = self.vocoder.frame_samples();
+        if self.pos + n > self.pcm.len() {
+            return None;
+        }
+        let frame = &self.pcm[self.pos..self.pos + n];
+        self.pos += n;
+        Some(self.vocoder.encode_pcm(frame))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = (self.pcm.len() - self.pos) / self.vocoder.frame_samples();
+        (remaining, Some(remaining))
+    }
+}
+
+impl ExactSizeIterator for EncodeStream<'_> {}
+
+/// Streaming-decode iterator returned by [`Vocoder::decode_stream`].
+/// Yields one `Result<Vec<i16>>` per FEC frame; trailing partial
+/// frames are silently dropped.
+pub struct DecodeStream<'a> {
+    vocoder: &'a mut Vocoder,
+    bits: &'a [u8],
+    pos: usize,
+}
+
+impl Iterator for DecodeStream<'_> {
+    type Item = Result<Vec<i16>, VocoderError>;
+    fn next(&mut self) -> Option<Self::Item> {
+        let n = self.vocoder.fec_frame_bytes();
+        if self.pos + n > self.bits.len() {
+            return None;
+        }
+        let frame = &self.bits[self.pos..self.pos + n];
+        self.pos += n;
+        Some(self.vocoder.decode_bits(frame))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = (self.bits.len() - self.pos) / self.vocoder.fec_frame_bytes();
+        (remaining, Some(remaining))
+    }
+}
+
+impl ExactSizeIterator for DecodeStream<'_> {}
 
 impl core::fmt::Debug for Vocoder {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -597,5 +694,81 @@ mod tests {
         assert_eq!(s, "\"P25Phase1\"");
         let back: Rate = serde_json::from_str(&s).unwrap();
         assert_eq!(back, Rate::P25Phase1);
+    }
+
+    /// Streaming encode iterator yields exactly `pcm.len() /
+    /// frame_samples()` items and drops a trailing partial frame.
+    #[test]
+    fn encode_stream_yields_one_per_frame_drops_partial() {
+        let mut v = Vocoder::new(Rate::P25Phase1);
+        // 5 full frames + 50 trailing samples (partial — should drop).
+        let mut pcm: Vec<i16> = Vec::with_capacity(5 * FRAME_SAMPLES + 50);
+        for f in 0..5 {
+            pcm.extend_from_slice(&periodic_pcm(40, (1000 + f * 100) as i16));
+        }
+        pcm.extend(std::iter::repeat(0i16).take(50));
+        let stream = v.encode_stream(&pcm);
+        assert_eq!(stream.len(), 5);
+        let bits: Vec<Vec<u8>> = stream.collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(bits.len(), 5);
+        for b in &bits {
+            assert_eq!(b.len(), 18); // P25Phase1 FEC frame size
+        }
+    }
+
+    /// Streaming decode parallels encode: one item per FEC frame,
+    /// trailing partial bytes dropped, output 160 samples each.
+    #[test]
+    fn decode_stream_yields_one_per_frame_drops_partial() {
+        let mut tx = Vocoder::new(Rate::P25Phase2);
+        let mut pcm: Vec<i16> = Vec::with_capacity(7 * FRAME_SAMPLES);
+        for _ in 0..7 {
+            pcm.extend_from_slice(&periodic_pcm(40, 5000));
+        }
+        let bits: Vec<u8> = tx
+            .encode_stream(&pcm)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .into_iter()
+            .flatten()
+            .collect();
+        // Append 4 stray bytes that should be dropped.
+        let mut padded = bits.clone();
+        padded.extend_from_slice(&[0; 4]);
+
+        let mut rx = Vocoder::new(Rate::P25Phase2);
+        let frames: Vec<Vec<i16>> = rx
+            .decode_stream(&padded)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(frames.len(), 7);
+        for f in &frames {
+            assert_eq!(f.len(), FRAME_SAMPLES);
+        }
+    }
+
+    /// Streaming and per-frame paths produce identical output —
+    /// the iterator is a thin chunking wrapper around `encode_pcm`,
+    /// state advances the same way.
+    #[test]
+    fn encode_stream_matches_per_frame_calls_byte_for_byte() {
+        let mut a = Vocoder::new(Rate::P25Phase1);
+        let mut b = Vocoder::new(Rate::P25Phase1);
+        let mut pcm: Vec<i16> = Vec::with_capacity(4 * FRAME_SAMPLES);
+        for _ in 0..4 {
+            pcm.extend_from_slice(&periodic_pcm(40, 6000));
+        }
+        let by_stream: Vec<u8> = a
+            .encode_stream(&pcm)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .into_iter()
+            .flatten()
+            .collect();
+        let mut by_call: Vec<u8> = Vec::new();
+        for chunk in pcm.chunks_exact(FRAME_SAMPLES) {
+            by_call.extend(b.encode_pcm(chunk).unwrap());
+        }
+        assert_eq!(by_stream, by_call);
     }
 }
