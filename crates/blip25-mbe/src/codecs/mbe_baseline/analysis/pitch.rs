@@ -152,17 +152,22 @@ impl PitchSearch {
             w4 += w2 * w2;
         }
         // Eq. 7 via hoisted envelope — r(t) = Σ sw2[j]·sw2[j+t].
+        // Express as a slice-aligned dot product so LLVM can autovectorize
+        // the inner sum (the bounds-arithmetic version masked the access
+        // pattern from the optimizer). For t ≥ 0 the valid range is
+        // j ∈ [−W_I_HALF, W_I_HALF − t]; in array-index form `i = j +
+        // W_I_HALF` runs over [0, 2·W_I_HALF − t], the `a` read is
+        // sw2[i] and the `b` read is sw2[i + t].
         let mut r = [0.0f64; R_MAX_LAG + 1];
-        for t in 0..=R_MAX_LAG as i32 {
+        let n = sw2.len();
+        for t in 0..=R_MAX_LAG {
+            let a = &sw2[..n - t];
+            let b = &sw2[t..];
             let mut acc = 0.0;
-            let j_lo = (-W_I_HALF).max(-W_I_HALF - t);
-            let j_hi = W_I_HALF.min(W_I_HALF - t);
-            for j in j_lo..=j_hi {
-                let a = sw2[(j + W_I_HALF) as usize];
-                let b = sw2[(j + t + W_I_HALF) as usize];
-                acc += a * b;
+            for i in 0..a.len() {
+                acc += a[i] * b[i];
             }
-            r[t as usize] = acc;
+            r[t] = acc;
         }
         // Precompute E(P) at every half-sample grid point so the
         // hot loops in look_back / look_ahead become slice scans
