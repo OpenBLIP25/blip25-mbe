@@ -20,6 +20,8 @@ default = []
 serde = ["dep:serde"]
 
 [dependencies]
+rustfft = { workspace = true }
+num-complex = { workspace = true }
 serde = { workspace = true, optional = true }
 
 [dev-dependencies]

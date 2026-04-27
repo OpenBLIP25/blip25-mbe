@@ -186,30 +186,42 @@ impl Default for HarmonicBasis {
 /// `m = i` if `i ≤ 128`, else `m = i − 256`). Use [`packed_index`] to
 /// translate a two-sided `m` into its array slot.
 ///
-/// Direct-form DFT; O(N·W) = 256·221 ≈ 56 k multiplies per frame.
-/// Fast enough for correctness-first development and leaves the door
-/// open for a future FFT-based reimplementation without changing the
-/// signature.
+/// Backed by [`rustfft`] — `O(N log N)` per frame. The previous
+/// direct-form `O(N · W)` version (~56 k multiplies / frame) is
+/// preserved as the spec-correctness reference in the test below.
+/// FFT is general DSP, not P25 IP, so the swap is allowed under the
+/// clean-room rule.
 pub fn signal_spectrum(signal_centered: &[f64; (2 * W_R_HALF + 1) as usize]) -> [Complex64; DFT_SIZE] {
-    let mut out = [Complex64::ZERO; DFT_SIZE];
-    let two_pi = 2.0 * core::f64::consts::PI;
-    let dft_size = DFT_SIZE as f64;
-    for (idx, slot) in out.iter_mut().enumerate() {
-        let m = unpacked_m(idx);
-        let m_f = f64::from(m);
-        let mut re = 0.0;
-        let mut im = 0.0;
-        for n in -W_R_HALF..=W_R_HALF {
-            let w = f64::from(refinement_window(n));
-            if w == 0.0 {
-                continue;
-            }
-            let s = signal_centered[(n + W_R_HALF) as usize];
-            let angle = -two_pi * m_f * f64::from(n) / dft_size;
-            re += s * w * angle.cos();
-            im += s * w * angle.sin();
+    use std::sync::OnceLock;
+    use num_complex::Complex;
+    use rustfft::{Fft, FftPlanner};
+
+    static FFT: OnceLock<std::sync::Arc<dyn Fft<f64>>> = OnceLock::new();
+    let fft = FFT.get_or_init(|| {
+        let mut planner = FftPlanner::<f64>::new();
+        planner.plan_fft_forward(DFT_SIZE)
+    });
+
+    // Build the windowed signal in DFT-natural ordering: x[n] for
+    // n ∈ [0, N) where x[(n + N) % N] = signal(n) · w_R(n) and the
+    // logical n ∈ [-W_R_HALF, W_R_HALF] of the input. Outside that
+    // range the window is zero, so the corresponding x[k] are zero.
+    let mut buf = [Complex::<f64>::new(0.0, 0.0); DFT_SIZE];
+    for n in -W_R_HALF..=W_R_HALF {
+        let w = f64::from(refinement_window(n));
+        if w == 0.0 {
+            continue;
         }
-        *slot = Complex64::new(re, im);
+        let s = signal_centered[(n + W_R_HALF) as usize];
+        let idx = ((n.rem_euclid(DFT_SIZE as i32)) as usize) % DFT_SIZE;
+        buf[idx] = Complex::new(s * w, 0.0);
+    }
+
+    fft.process(&mut buf);
+
+    let mut out = [Complex64::ZERO; DFT_SIZE];
+    for (slot, c) in out.iter_mut().zip(buf.iter()) {
+        *slot = Complex64::new(c.re, c.im);
     }
     out
 }
@@ -228,8 +240,12 @@ pub fn packed_index(m: i32) -> usize {
 /// Inverse of [`packed_index`] for `idx ∈ [0, 256)`: returns `m`
 /// in the two-sided range. Slots `0..=128` map to positive `m`;
 /// slots `129..=255` map to `m − 256`.
+///
+/// Public for diagnostic / probe use; the FFT-backed
+/// [`signal_spectrum`] doesn't need it but the direct-form reference
+/// in the tests does.
 #[inline]
-fn unpacked_m(idx: usize) -> i32 {
+pub fn unpacked_m(idx: usize) -> i32 {
     if idx <= DFT_SIZE / 2 {
         idx as i32
     } else {
@@ -317,6 +333,65 @@ mod tests {
             let idx = packed_index(m);
             assert!(idx < DFT_SIZE, "packed_index({m}) out of bounds");
             assert_eq!(unpacked_m(idx), m, "roundtrip failed for m = {m}");
+        }
+    }
+
+    /// Direct-form reference DFT for the FFT-backed
+    /// [`signal_spectrum`] to be asserted against. O(N·W) per Eq. 29
+    /// — the formulation the spec describes literally. Kept in the
+    /// test module to verify the FFT path produces the same output
+    /// to floating-point tolerance.
+    fn signal_spectrum_direct_reference(
+        signal_centered: &[f64; (2 * W_R_HALF + 1) as usize],
+    ) -> [Complex64; DFT_SIZE] {
+        let mut out = [Complex64::ZERO; DFT_SIZE];
+        let two_pi = 2.0 * core::f64::consts::PI;
+        let dft_size = DFT_SIZE as f64;
+        for (idx, slot) in out.iter_mut().enumerate() {
+            let m = unpacked_m(idx);
+            let m_f = f64::from(m);
+            let mut re = 0.0;
+            let mut im = 0.0;
+            for n in -W_R_HALF..=W_R_HALF {
+                let w = f64::from(refinement_window(n));
+                if w == 0.0 {
+                    continue;
+                }
+                let s = signal_centered[(n + W_R_HALF) as usize];
+                let angle = -two_pi * m_f * f64::from(n) / dft_size;
+                re += s * w * angle.cos();
+                im += s * w * angle.sin();
+            }
+            *slot = Complex64::new(re, im);
+        }
+        out
+    }
+
+    /// FFT-backed `signal_spectrum` matches the direct-form reference
+    /// for a non-trivial input to within float-summation tolerance.
+    #[test]
+    fn signal_spectrum_fft_matches_direct_reference() {
+        let mut signal = [0.0f64; (2 * W_R_HALF + 1) as usize];
+        // A mix of two slow-changing tones and a small DC offset —
+        // exercises both real and imaginary spectrum components.
+        let two_pi = 2.0 * core::f64::consts::PI;
+        for (i, slot) in signal.iter_mut().enumerate() {
+            let n = i as f64 - W_R_HALF as f64;
+            *slot = 100.0 + 1000.0 * (two_pi * n / 50.0).sin()
+                + 500.0 * (two_pi * n / 23.5).cos();
+        }
+        let fft = signal_spectrum(&signal);
+        let dir = signal_spectrum_direct_reference(&signal);
+        // Per-bin tolerance: 1e-6 absolute / relative (FFT and the
+        // direct sum differ only by float rounding order).
+        for (k, (a, b)) in fft.iter().zip(dir.iter()).enumerate() {
+            let de = (a.re - b.re).abs();
+            let di = (a.im - b.im).abs();
+            let scale = a.re.abs().max(b.re.abs()).max(1.0);
+            assert!(
+                de / scale < 1e-9 && di / scale < 1e-9,
+                "bin {k} mismatch: FFT={a:?}, direct={b:?}, |Δre|={de}, |Δim|={di}"
+            );
         }
     }
 
