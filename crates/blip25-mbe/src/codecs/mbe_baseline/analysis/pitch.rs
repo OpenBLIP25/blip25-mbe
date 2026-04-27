@@ -56,19 +56,38 @@ pub const PITCH_COLD_START: f64 = 100.0;
 ///
 /// `s_input` covers `n ∈ [−PITCH_INPUT_HALF, PITCH_INPUT_HALF]`. The
 /// returned buffer covers the `w_I` support `n ∈ [−W_I_HALF, W_I_HALF]`.
-/// Samples outside `s_input` are treated as zero (addendum §0.3.1).
+/// Samples outside `s_input` are treated as zero (addendum §0.3.1) —
+/// but `PITCH_INPUT_HALF = W_I_HALF + H_LPF_HALF`, so for every output
+/// `n` and every tap `j` the source index `n - j + PITCH_INPUT_HALF`
+/// stays inside `[0, PITCH_INPUT_LEN)`. The bounds check is provable
+/// dead and the inner loop runs without one.
 pub fn compute_s_lpf(s_input: &[f64; PITCH_INPUT_LEN]) -> [f64; (2 * W_I_HALF + 1) as usize] {
+    // Pre-load LPF taps as f64 in a stack array so the inner loop is
+    // a tight FIR convolution (21 mul-adds per output sample).
+    const TAPS: usize = (2 * H_LPF_HALF + 1) as usize;
+    let mut h = [0.0f64; TAPS];
+    for j in -H_LPF_HALF..=H_LPF_HALF {
+        h[(j + H_LPF_HALF) as usize] = f64::from(lpf_tap(j));
+    }
+
     let mut out = [0.0f64; (2 * W_I_HALF + 1) as usize];
-    for n in -W_I_HALF..=W_I_HALF {
+    // Output index `i = n + W_I_HALF`; source index for tap `k` (=
+    // `j + H_LPF_HALF`) is `n - j + PITCH_INPUT_HALF`
+    //   = (i - W_I_HALF) - (k - H_LPF_HALF) + PITCH_INPUT_HALF
+    //   = i + (PITCH_INPUT_HALF - W_I_HALF + H_LPF_HALF) - k
+    //   = i + 2·H_LPF_HALF - k          (since PITCH_INPUT_HALF = W_I_HALF + H_LPF_HALF)
+    // → starting `src` for tap k=0 at output i is `i + 2·H_LPF_HALF`,
+    // and decrements by 1 for each tap. Bounds: i ∈ [0, 2·W_I_HALF],
+    // k ∈ [0, 2·H_LPF_HALF], so src ∈ [0, 2·(W_I_HALF + H_LPF_HALF)]
+    // = [0, PITCH_INPUT_LEN − 1]. Safe without per-iteration check.
+    let two_h = 2 * H_LPF_HALF as usize;
+    for (i, slot) in out.iter_mut().enumerate() {
+        let src_base = i + two_h;
         let mut acc = 0.0;
-        for j in -H_LPF_HALF..=H_LPF_HALF {
-            let src = n - j + PITCH_INPUT_HALF;
-            if !(0..PITCH_INPUT_LEN as i32).contains(&src) {
-                continue;
-            }
-            acc += s_input[src as usize] * f64::from(lpf_tap(j));
+        for k in 0..TAPS {
+            acc += s_input[src_base - k] * h[k];
         }
-        out[(n + W_I_HALF) as usize] = acc;
+        *slot = acc;
     }
     out
 }
