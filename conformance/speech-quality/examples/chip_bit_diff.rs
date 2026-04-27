@@ -2,8 +2,8 @@
 //! against the original dibits. Print where bits differ by codeword
 //! slot (c0..c7) to localize the FEC-count-mismatch bug.
 
-use blip25_mbe::p25_fullrate::fec::deinterleave;
-use blip25_mbe::p25_fullrate::frame::{decode_frame, encode_frame};
+use blip25_mbe::imbe_wire::fec::deinterleave;
+use blip25_mbe::imbe_wire::frame::{decode_frame, encode_frame};
 use std::fs;
 
 fn unpack_dibits_msb(bytes: &[u8]) -> [u8; 72] {

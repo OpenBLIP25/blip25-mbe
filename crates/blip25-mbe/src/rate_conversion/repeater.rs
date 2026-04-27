@@ -15,13 +15,13 @@
 //! Corresponds to the AMBE-3000 `PKT_RPT_MODE = 0x01` configuration
 //! with identical decoder and encoder rate parameters.
 
-use crate::p25_fullrate::dequantize::{DecoderState, dequantize, quantize};
-use crate::p25_fullrate::frame::{decode_frame as decode_full, encode_frame as encode_full};
-use crate::p25_fullrate::priority::prioritize as prioritize_full;
-use crate::p25_halfrate::dequantize::{
+use crate::imbe_wire::dequantize::{DecoderState, dequantize, quantize};
+use crate::imbe_wire::frame::{decode_frame as decode_full, encode_frame as encode_full};
+use crate::imbe_wire::priority::prioritize as prioritize_full;
+use crate::ambe_plus2_wire::dequantize::{
     DecoderState as HalfDecoderState, dequantize as dequantize_half, quantize as quantize_half,
 };
-use crate::p25_halfrate::frame::{
+use crate::ambe_plus2_wire::frame::{
     DIBITS_PER_FRAME, decode_frame as decode_half, encode_frame as encode_half,
 };
 
@@ -82,7 +82,7 @@ mod tests {
     use super::*;
     use crate::mbe_params::MbeParams;
 
-    fn fullrate_voice_params() -> MbeParams {
+    fn imbe_voice_params() -> MbeParams {
         let omega_0 = 0.20f32;
         let l = MbeParams::harmonic_count_for(omega_0);
         let voiced: Vec<bool> = (1..=l).map(|h| h <= l / 2).collect();
@@ -95,7 +95,7 @@ mod tests {
     #[test]
     fn full_rate_repeater_produces_valid_dibits() {
         let mut src = DecoderState::new();
-        let params = fullrate_voice_params();
+        let params = imbe_voice_params();
         let l = params.harmonic_count();
         let b = quantize(&params, &mut src).unwrap();
         let u = prioritize_full(&b, l);
@@ -129,7 +129,7 @@ mod tests {
     #[test]
     fn full_rate_repeater_eventually_idempotent() {
         let mut src = DecoderState::new();
-        let params = fullrate_voice_params();
+        let params = imbe_voice_params();
         let l = params.harmonic_count();
 
         let mut frames: Vec<[u8; 72]> = Vec::new();

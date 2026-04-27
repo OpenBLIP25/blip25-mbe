@@ -69,43 +69,43 @@
 use core::f32::consts::PI;
 
 use crate::mbe_params::MbeParams;
-use crate::p25_fullrate::dequantize::{
+use crate::imbe_wire::dequantize::{
     DecodeError, DecoderState, EncodeError, PITCH_INDEX_MAX, dequantize, encode_pitch as full_encode_pitch,
     pitch_decode as full_pitch_decode, quantize,
 };
-use crate::p25_fullrate::frame::{decode_frame as decode_full, encode_frame as encode_full};
-use crate::p25_fullrate::priority::{
+use crate::imbe_wire::frame::{decode_frame as decode_full, encode_frame as encode_full};
+use crate::imbe_wire::priority::{
     IMBE_B_MAX, L_MIN as FULL_L_MIN, prioritize as prioritize_full,
 };
-use crate::p25_halfrate::dequantize::{
+use crate::ambe_plus2_wire::dequantize::{
     Decoded, DecoderState as HalfDecoderState, decode_to_params, encode_pitch as half_encode_pitch,
     quantize as quantize_half,
 };
-use crate::p25_halfrate::frame::{
+use crate::ambe_plus2_wire::frame::{
     AMBE_PITCH_TABLE, DIBITS_PER_FRAME, decode_frame as decode_half, encode_frame as encode_half,
 };
-use crate::p25_halfrate::priority::{AMBE_B_COUNT, prioritize as prioritize_half};
+use crate::ambe_plus2_wire::priority::{AMBE_B_COUNT, prioritize as prioritize_half};
 use crate::rate_conversion::predictor::{CrossRatePredictorState, blend as cross_rate_blend};
 
 /// Lowest ω̃₀ in the half-rate Annex L table (entry 119, L = 56).
 /// Used to clamp source parameters to the half-rate grid's range
 /// before handing them to the half-rate quantizer.
-fn halfrate_omega_min() -> f32 {
+fn ambe_plus2_omega_min() -> f32 {
     AMBE_PITCH_TABLE[AMBE_PITCH_TABLE.len() - 1].omega_0
 }
 
 /// Highest ω̃₀ in the half-rate Annex L table (entry 0, L = 9).
-fn halfrate_omega_max() -> f32 {
+fn ambe_plus2_omega_max() -> f32 {
     AMBE_PITCH_TABLE[0].omega_0
 }
 
 /// Lowest ω̃₀ emittable by the full-rate encoder (b̂₀ = 207): `4π/246.5`.
-fn fullrate_omega_min() -> f32 {
+fn imbe_omega_min() -> f32 {
     4.0 * PI / (f32::from(PITCH_INDEX_MAX) + 39.5)
 }
 
 /// Highest ω̃₀ emittable by the full-rate encoder (b̂₀ = 0): `4π/39.5`.
-fn fullrate_omega_max() -> f32 {
+fn imbe_omega_max() -> f32 {
     4.0 * PI / 39.5
 }
 
@@ -141,9 +141,9 @@ const FULLRATE_ERASURE_B0: u16 = PITCH_INDEX_MAX as u16 + 1;
 
 /// Emit a half-rate erasure frame: 36 dibits whose deprioritized
 /// `b̂₀ = 120` (other parameters zero). After the channel codec pass
-/// these will round-trip through `classify_halfrate_frame` as
-/// [`crate::p25_halfrate::dequantize::FrameKind::Erasure`].
-fn halfrate_erasure_dibits() -> [u8; DIBITS_PER_FRAME] {
+/// these will round-trip through `classify_ambe_plus2_frame` as
+/// [`crate::ambe_plus2_wire::dequantize::FrameKind::Erasure`].
+fn ambe_plus2_erasure_dibits() -> [u8; DIBITS_PER_FRAME] {
     let mut b = [0u16; AMBE_B_COUNT];
     b[0] = HALFRATE_ERASURE_B0;
     let u = prioritize_half(&b);
@@ -153,7 +153,7 @@ fn halfrate_erasure_dibits() -> [u8; DIBITS_PER_FRAME] {
 /// Emit a full-rate erasure frame: 72 dibits whose deprioritized
 /// `b̂₀ = 208` (just past `PITCH_INDEX_MAX`). The full-rate decoder's
 /// §1.11 repeat logic will substitute the previous voice frame.
-fn fullrate_erasure_dibits() -> [u8; 72] {
+fn imbe_erasure_dibits() -> [u8; 72] {
     let mut b = [0u16; IMBE_B_MAX];
     b[0] = FULLRATE_ERASURE_B0;
     // Prioritize uses the L-indexed map; at L=L_MIN only the fixed
@@ -234,10 +234,10 @@ impl FullToHalfConverter {
         let frame = decode_full(dibits);
         let params = match dequantize(&frame.info, &mut self.decoder) {
             Ok(p) => p,
-            Err(DecodeError::BadPitch) => return Ok(halfrate_erasure_dibits()),
+            Err(DecodeError::BadPitch) => return Ok(ambe_plus2_erasure_dibits()),
             Err(other) => return Err(ConvertError::Decode(other)),
         };
-        let clamped = clamp_omega_to(&params, halfrate_omega_min(), halfrate_omega_max());
+        let clamped = clamp_omega_to(&params, ambe_plus2_omega_min(), ambe_plus2_omega_max());
         // Pre-compute the target-committed (ω̂₀, L) so the predictor
         // sees what the half-rate encoder will actually emit — the
         // encoder snaps ω̂₀ to the Annex L grid, and L derives from
@@ -335,10 +335,10 @@ impl HalfToFullConverter {
         let params = match decode_to_params(&frame.info, &mut self.decoder) {
             Ok(Decoded::Voice(p)) => p,
             Ok(Decoded::Tone { params, .. }) => params,
-            Ok(Decoded::Erasure) => return Ok(fullrate_erasure_dibits()),
-            Err(_) => return Ok(fullrate_erasure_dibits()),
+            Ok(Decoded::Erasure) => return Ok(imbe_erasure_dibits()),
+            Err(_) => return Ok(imbe_erasure_dibits()),
         };
-        let clamped = clamp_omega_to(&params, fullrate_omega_min(), fullrate_omega_max());
+        let clamped = clamp_omega_to(&params, imbe_omega_min(), imbe_omega_max());
         // Pre-compute the target-committed (ω̂₀, L) so the predictor
         // sees what the full-rate encoder will actually emit. The
         // full-rate encoder snaps ω̂₀ onto the Eq. 47 grid, where
@@ -396,18 +396,18 @@ mod tests {
         MbeParams::new(omega_0, l, &voiced, &amps).unwrap()
     }
 
-    fn fullrate_dibits_from(params: &MbeParams, state: &mut DecoderState) -> [u8; 72] {
+    fn imbe_dibits_from(params: &MbeParams, state: &mut DecoderState) -> [u8; 72] {
         let l = params.harmonic_count();
-        let b = quantize(params, state).expect("quantize fullrate");
+        let b = quantize(params, state).expect("quantize imbe");
         let u = prioritize_full(&b, l);
         encode_full(&u)
     }
 
-    fn halfrate_dibits_from(
+    fn ambe_plus2_dibits_from(
         params: &MbeParams,
         state: &mut HalfDecoderState,
     ) -> [u8; DIBITS_PER_FRAME] {
-        let u = quantize_half(params, state).expect("quantize halfrate");
+        let u = quantize_half(params, state).expect("quantize ambe_plus2");
         encode_half(&u)
     }
 
@@ -428,7 +428,7 @@ mod tests {
         let mut src_state = DecoderState::new();
         let mut conv = FullToHalfConverter::new();
         let params = sample_params(0.20);
-        let input = fullrate_dibits_from(&params, &mut src_state);
+        let input = imbe_dibits_from(&params, &mut src_state);
         let out = conv.convert(&input).expect("convert");
         assert_valid_dibits(&out);
     }
@@ -438,7 +438,7 @@ mod tests {
         let mut src_state = HalfDecoderState::new();
         let mut conv = HalfToFullConverter::new();
         let params = sample_params(0.18);
-        let input = halfrate_dibits_from(&params, &mut src_state);
+        let input = ambe_plus2_dibits_from(&params, &mut src_state);
         let out = conv.convert(&input).expect("convert");
         assert_valid_dibits(&out);
     }
@@ -454,7 +454,7 @@ mod tests {
 
         let mut last_omega = 0f32;
         for _ in 0..6 {
-            let a = fullrate_dibits_from(&params, &mut src_state);
+            let a = imbe_dibits_from(&params, &mut src_state);
             let b = a_to_b.convert(&a).expect("A→B");
             let a2 = b_to_a.convert(&b).expect("B→A");
 
@@ -483,12 +483,12 @@ mod tests {
             .map(|h| 100.0 * (-(h as f32) * 0.05).exp())
             .collect();
         let params =
-            MbeParams::new(halfrate_omega_min(), l, &voiced, &amps).unwrap();
+            MbeParams::new(ambe_plus2_omega_min(), l, &voiced, &amps).unwrap();
 
         let mut a_to_b = HalfToFullConverter::new();
         let mut b_to_a = FullToHalfConverter::new();
         for _ in 0..4 {
-            let a = halfrate_dibits_from(&params, &mut src_state);
+            let a = ambe_plus2_dibits_from(&params, &mut src_state);
             let b = a_to_b.convert(&a).expect("half → full");
             let _ = b_to_a.convert(&b).expect("full → half (was failing)");
         }
@@ -503,7 +503,7 @@ mod tests {
         let params = MbeParams::silence(); // ω₀ = 4π/39.5 = full-rate max
         let mut conv = FullToHalfConverter::new();
         for _ in 0..4 {
-            let a = fullrate_dibits_from(&params, &mut src_state);
+            let a = imbe_dibits_from(&params, &mut src_state);
             let _ = conv.convert(&a).expect("full → half at grid top");
         }
     }
@@ -530,13 +530,13 @@ mod tests {
 
     // ---- Tone / silence / erasure handling -----------------------------
 
-    use crate::p25_halfrate::dequantize::{FrameKind, classify_halfrate_frame};
+    use crate::ambe_plus2_wire::dequantize::{FrameKind, classify_ambe_plus2_frame};
 
     /// Build a half-rate erasure frame's 36 dibits by deliberately
     /// prioritizing `b̂₀ = 120` with everything else zero — same path
     /// the converter uses to emit erasure on its output side.
-    fn halfrate_erasure_input() -> [u8; DIBITS_PER_FRAME] {
-        halfrate_erasure_dibits()
+    fn ambe_plus2_erasure_input() -> [u8; DIBITS_PER_FRAME] {
+        ambe_plus2_erasure_dibits()
     }
 
     /// Build a half-rate tone frame's 36 dibits for tone ID 5 (first
@@ -544,7 +544,7 @@ mod tests {
     /// a different bit layout from voice (§2.10.1 Table 20), so we
     /// set the signature bits directly rather than going through the
     /// voice-path prioritizer.
-    fn halfrate_tone_input() -> [u8; DIBITS_PER_FRAME] {
+    fn ambe_plus2_tone_input() -> [u8; DIBITS_PER_FRAME] {
         // Signature: û₀(11..6) = 0x3F, û₃(3..0) = 0.
         // Tone ID copy 4 in û₃(12..5) = 5 (the primary ID the
         // parser reads).
@@ -558,26 +558,26 @@ mod tests {
     /// into û and encoding. The decoder will reject with
     /// `DecodeError::BadPitch`, which the converter maps to a
     /// half-rate erasure on its output.
-    fn fullrate_erasure_input() -> [u8; 72] {
-        fullrate_erasure_dibits()
+    fn imbe_erasure_input() -> [u8; 72] {
+        imbe_erasure_dibits()
     }
 
     #[test]
-    fn halfrate_erasure_dibits_round_trip_as_erasure() {
+    fn ambe_plus2_erasure_dibits_round_trip_as_erasure() {
         // Self-check: the dibits we emit must classify as Erasure
         // after the channel codec pass (otherwise receivers would
         // interpret the converter's output as voice).
-        let dibits = halfrate_erasure_dibits();
+        let dibits = ambe_plus2_erasure_dibits();
         let frame = decode_half(&dibits);
-        assert_eq!(classify_halfrate_frame(&frame.info), FrameKind::Erasure);
+        assert_eq!(classify_ambe_plus2_frame(&frame.info), FrameKind::Erasure);
     }
 
     #[test]
-    fn fullrate_erasure_dibits_round_trip_as_bad_pitch() {
+    fn imbe_erasure_dibits_round_trip_as_bad_pitch() {
         // Self-check: the dibits we emit must decode to a reserved
         // `b̂₀`, which the full-rate dequantizer rejects as BadPitch —
         // the §1.11 frame-repeat trigger at the receiver.
-        let dibits = fullrate_erasure_dibits();
+        let dibits = imbe_erasure_dibits();
         let frame = decode_full(&dibits);
         let mut state = DecoderState::new();
         match dequantize(&frame.info, &mut state) {
@@ -592,10 +592,10 @@ mod tests {
         // classify as Erasure at the receiver (not Voice, which would
         // play garbage, or Tone, which would mis-interpret the frame).
         let mut conv = FullToHalfConverter::new();
-        let input = fullrate_erasure_input();
+        let input = imbe_erasure_input();
         let out = conv.convert(&input).expect("convert");
         let frame = decode_half(&out);
-        assert_eq!(classify_halfrate_frame(&frame.info), FrameKind::Erasure);
+        assert_eq!(classify_ambe_plus2_frame(&frame.info), FrameKind::Erasure);
     }
 
     #[test]
@@ -603,7 +603,7 @@ mod tests {
         // Half-rate erasure input → full-rate erasure output that
         // triggers frame repeat at the receiver.
         let mut conv = HalfToFullConverter::new();
-        let input = halfrate_erasure_input();
+        let input = ambe_plus2_erasure_input();
         let out = conv.convert(&input).expect("convert");
         let frame = decode_full(&out);
         let mut sink = DecoderState::new();
@@ -620,7 +620,7 @@ mod tests {
         // exact to DVSI's tone generator, but audible and continuous
         // rather than a dropout).
         let mut conv = HalfToFullConverter::new();
-        let input = halfrate_tone_input();
+        let input = ambe_plus2_tone_input();
         let out = conv.convert(&input).expect("convert tone");
         let frame = decode_full(&out);
         let mut sink = DecoderState::new();
@@ -636,16 +636,16 @@ mod tests {
         // advance would produce different predictor residuals even
         // with identical inputs.
         let mut conv = HalfToFullConverter::new();
-        let a = conv.convert(&halfrate_erasure_input()).unwrap();
-        let b = conv.convert(&halfrate_erasure_input()).unwrap();
+        let a = conv.convert(&ambe_plus2_erasure_input()).unwrap();
+        let b = conv.convert(&ambe_plus2_erasure_input()).unwrap();
         assert_eq!(a, b, "erasure output should be deterministic");
     }
 
     #[test]
     fn full_to_half_erasure_is_idempotent() {
         let mut conv = FullToHalfConverter::new();
-        let a = conv.convert(&fullrate_erasure_input()).unwrap();
-        let b = conv.convert(&fullrate_erasure_input()).unwrap();
+        let a = conv.convert(&imbe_erasure_input()).unwrap();
+        let b = conv.convert(&imbe_erasure_input()).unwrap();
         assert_eq!(a, b, "erasure output should be deterministic");
     }
 
@@ -654,7 +654,7 @@ mod tests {
     #[test]
     fn cross_rate_predictor_state_tracks_target_across_frames() {
         // Analogue of quantize_multi_frame_predictor_state_tracks_decoder
-        // in p25_fullrate::dequantize::tests, but for the rate-converter
+        // in imbe_wire::dequantize::tests, but for the rate-converter
         // predictor. After each frame, the converter's predictor state
         // should hold exactly the post-§4.5 magnitudes and the
         // target-committed (ω̂₀_B, L̂_B). Feeding a varying-pitch voice
@@ -668,7 +668,7 @@ mod tests {
 
         // Frame 1: a voice frame. Predictor should advance.
         let p1 = sample_params(0.20);
-        let a1 = fullrate_dibits_from(&p1, &mut src_state);
+        let a1 = imbe_dibits_from(&p1, &mut src_state);
         let _ = conv.convert(&a1).unwrap();
         // After frame 1, state's ω_prev / l_prev match the half-rate
         // encoder's committed values (not the input's ω₀).
@@ -682,7 +682,7 @@ mod tests {
 
         // Frame 2: different pitch — forces slow path and further advance.
         let p2 = sample_params(0.25);
-        let a2 = fullrate_dibits_from(&p2, &mut src_state);
+        let a2 = imbe_dibits_from(&p2, &mut src_state);
         let _ = conv.convert(&a2).unwrap();
         let omega_after_f2 = conv.predictor_state().omega_0_prev();
         assert!(
@@ -705,7 +705,7 @@ mod tests {
         );
 
         // Erasure frame: should not advance predictor state (§6.3).
-        let e = fullrate_erasure_input();
+        let e = imbe_erasure_input();
         let before_omega = conv.predictor_state().omega_0_prev();
         let before_l = conv.predictor_state().l_prev();
         let _ = conv.convert(&e).unwrap();
@@ -734,7 +734,7 @@ mod tests {
         let initial_l = conv.predictor_state().l_prev();
 
         let p = sample_params(0.18);
-        let a = fullrate_dibits_from(&p, &mut src_state);
+        let a = imbe_dibits_from(&p, &mut src_state);
         let _ = conv.convert(&a).unwrap();
 
         assert_eq!(

@@ -3,8 +3,8 @@
 //! The forward direction of the vocoder: 8 kHz 16-bit PCM in, one
 //! [`MbeParams`] out per 20 ms (160-sample) frame. The result is
 //! consumed by any of the wire-side `quantize` pipelines
-//! ([`crate::p25_fullrate::quantize`],
-//! [`crate::p25_halfrate::quantize`],
+//! ([`crate::imbe_wire::quantize`],
+//! [`crate::ambe_plus2_wire::quantize`],
 //! [`crate::dvsi_3000::quantize`]) and is independent of wire format.
 //!
 //! # Status
@@ -125,7 +125,7 @@ pub mod predictor;
 pub use predictor::{
     HalfratePredictorState, L_TILDE_COLD_START, L_TILDE_COLD_START_HALFRATE,
     LAMBDA_HAT_UNVOICED_BIAS, PredictionResidual, PredictorState, RHO_HALFRATE,
-    compute_prediction_residual, compute_prediction_residual_halfrate, fullrate_rho_f64,
+    compute_prediction_residual, compute_prediction_residual_ambe_plus2, imbe_rho_f64,
     lambda_hat_from_m_hat,
 };
 
@@ -173,8 +173,8 @@ pub enum AnalysisOutput {
     /// decides the current frame is silent.
     Silence,
     /// Voice frame with reconstructed MBE parameters. The wire-side
-    /// encoder ([`crate::p25_fullrate::dequantize::quantize`] or
-    /// [`crate::p25_halfrate::dequantize::quantize`]) consumes this
+    /// encoder ([`crate::imbe_wire::dequantize::quantize`] or
+    /// [`crate::ambe_plus2_wire::dequantize::quantize`]) consumes this
     /// to produce the transmitted bitstream.
     Voice(MbeParams),
 }
@@ -239,8 +239,8 @@ fn matched_decoder_roundtrip(
     vuv: &VuvResult,
     predictor: &PredictorState,
 ) -> Result<[f64; L_HAT_MAX as usize + 1], AnalysisError> {
-    use crate::p25_fullrate::dequantize::{
-        quantize as fullrate_quantize, reconstruct_amplitudes_from_bits, DecoderState,
+    use crate::imbe_wire::dequantize::{
+        quantize as imbe_quantize, reconstruct_amplitudes_from_bits, DecoderState,
     };
     let l_hat = refinement.l_hat;
     let omega_0_f32 = refinement.omega_hat as f32;
@@ -260,7 +260,7 @@ fn matched_decoder_roundtrip(
         .map_err(|_| AnalysisError::PitchOutOfRange)?;
 
     // Seed a DecoderState from the analysis predictor. Both the
-    // forward prediction (inside `fullrate_quantize`) and the
+    // forward prediction (inside `imbe_quantize`) and the
     // inverse reconstruction must see the same `M̃_l(−1)` / `L̃(−1)`,
     // so we snapshot before calling quantize (which mutates its
     // state argument open-loop).
@@ -268,7 +268,7 @@ fn matched_decoder_roundtrip(
     let ds_snapshot = DecoderState::from_amplitudes(&prev_slice, predictor.l_tilde_prev());
 
     let mut ds_for_quantize = ds_snapshot.clone();
-    let bits = fullrate_quantize(&params, &mut ds_for_quantize)
+    let bits = imbe_quantize(&params, &mut ds_for_quantize)
         .map_err(|_| AnalysisError::PitchOutOfRange)?;
 
     // Reconstruct `M̃_l(0)` using the unmutated snapshot — matches
@@ -283,7 +283,7 @@ fn matched_decoder_roundtrip(
     Ok(m_tilde)
 }
 
-/// Output of [`matched_decoder_roundtrip_halfrate`]: the reconstructed
+/// Output of [`matched_decoder_roundtrip_ambe_plus2`]: the reconstructed
 /// `Λ̃_l(0)` log-domain vector, harmonic count `L̃(0) = L̂(0)`, and the
 /// reconstructed `γ̃(0)` differential-gain scalar. All three commit
 /// together into a [`HalfratePredictorState`] via
@@ -310,14 +310,14 @@ struct HalfrateRoundtrip {
 /// before `quantize` and seed a fresh clone into `dequantize` to
 /// avoid double-advancing the wire-decoder's state within one
 /// encoder frame.
-fn matched_decoder_roundtrip_halfrate(
+fn matched_decoder_roundtrip_ambe_plus2(
     m_hat: &SpectralAmplitudes,
     refinement: &PitchRefinement,
     vuv: &VuvResult,
     predictor: &HalfratePredictorState,
 ) -> Result<HalfrateRoundtrip, AnalysisError> {
-    use crate::p25_halfrate::dequantize::{
-        dequantize as halfrate_dequantize, quantize as halfrate_quantize,
+    use crate::ambe_plus2_wire::dequantize::{
+        dequantize as ambe_plus2_dequantize, quantize as ambe_plus2_quantize,
         DecoderState as HalfrateDecoderState,
     };
 
@@ -342,8 +342,8 @@ fn matched_decoder_roundtrip_halfrate(
 
     // Seed a `HalfrateDecoderState` from the analysis predictor's
     // log-domain state. Both the forward log-mag prediction inside
-    // `halfrate_quantize` and the inverse reconstruction in
-    // `halfrate_dequantize` must see the same `Λ̃(−1)` / `L̃(−1)` /
+    // `ambe_plus2_quantize` and the inverse reconstruction in
+    // `ambe_plus2_dequantize` must see the same `Λ̃(−1)` / `L̃(−1)` /
     // `γ̃(−1)` — snapshot before quantize (which mutates state
     // open-loop to its own target lambda) and seed a fresh clone into
     // dequantize.
@@ -364,14 +364,14 @@ fn matched_decoder_roundtrip_halfrate(
     );
 
     let mut ds_for_quantize = ds_snapshot.clone();
-    let u = halfrate_quantize(&params, &mut ds_for_quantize)
+    let u = ambe_plus2_quantize(&params, &mut ds_for_quantize)
         .map_err(|_| AnalysisError::PitchOutOfRange)?;
 
     // Run dequantize on the emitted bits using a fresh clone of the
     // pre-quantize snapshot — this gives us the exact state the wire
     // decoder would see at this frame.
     let mut ds_for_dequantize = ds_snapshot;
-    let _ = halfrate_dequantize(&u, &mut ds_for_dequantize)
+    let _ = ambe_plus2_dequantize(&u, &mut ds_for_dequantize)
         .map_err(|_| AnalysisError::PitchOutOfRange)?;
 
     // Extract the reconstructed state. The wire decoder's `prev_l`
@@ -429,7 +429,7 @@ pub struct AnalysisState {
     /// `γ̃(−1)` differential-gain scalar. Kept separate from
     /// `predictor` per §0.6.10's "split state per rate" guidance —
     /// cross-rate contamination would break both encoders.
-    predictor_halfrate: HalfratePredictorState,
+    predictor_ambe_plus2: HalfratePredictorState,
     /// Preroll counter per §0.9.4: saturates at `PREROLL_FRAMES`.
     /// Below that, the encoder is still filling its two-frame
     /// look-ahead and emits silence instead of voice.
@@ -523,7 +523,7 @@ impl AnalysisState {
             pitch_history: LookBackContext::cold_start(),
             vuv: VuvState::cold_start(),
             predictor: PredictorState::cold_start(),
-            predictor_halfrate: HalfratePredictorState::cold_start(),
+            predictor_ambe_plus2: HalfratePredictorState::cold_start(),
             preroll: 0,
             silence: SilenceDetector::cold_start(),
             silence_detection_enabled: false,
@@ -956,20 +956,20 @@ pub fn encode_with_trace(
 }
 
 /// Half-rate analysis encoder: PCM → `MbeParams` destined for
-/// `p25_halfrate::quantize`.
+/// `ambe_plus2_wire::quantize`.
 ///
 /// Shares §0.1–§0.7 (HPF, pitch, V/UV, spectral amplitudes) with the
 /// full-rate [`encode`] path — these are rate-agnostic. Diverges at
 /// step 10 (matched-decoder roundtrip) where it calls the half-rate
 /// wire encoder + decoder and commits `(Λ̃_l(0), L̃(0), γ̃(0))` into
-/// `state.predictor_halfrate` per addendum §0.6.10.
+/// `state.predictor_ambe_plus2` per addendum §0.6.10.
 ///
 /// The returned `MbeParams` carries the rate-agnostic `M̂_l` in linear
-/// form; the caller feeds it to `p25_halfrate::quantize` which applies
+/// form; the caller feeds it to `ambe_plus2_wire::quantize` which applies
 /// Eq. 150 internally. This matches the shape of `encode` — both
 /// paths return analysis-side `M̂_l`, and the wire quantizer handles
 /// any rate-specific pre-processing.
-pub fn encode_halfrate(
+pub fn encode_ambe_plus2(
     pcm: &[i16],
     state: &mut AnalysisState,
 ) -> Result<AnalysisOutput, AnalysisError> {
@@ -1052,7 +1052,7 @@ pub fn encode_halfrate(
     let refinement_result =
         profile::time(profile::Stage::RefinePitch, || -> Result<Option<refine::PitchRefinement>, AnalysisError> {
             let mut refinement = refine_pitch(&sw, basis, p_hat_i);
-            use crate::p25_halfrate::dequantize::{decode_pitch, encode_pitch};
+            use crate::ambe_plus2_wire::dequantize::{decode_pitch, encode_pitch};
             let Some(b0) = encode_pitch(refinement.omega_hat as f32) else {
                 return Ok(None);
             };
@@ -1091,15 +1091,15 @@ pub fn encode_halfrate(
         return Ok(AnalysisOutput::Silence);
     }
 
-    // Step 10: half-rate matched-decoder roundtrip. Runs the halfrate
+    // Step 10: half-rate matched-decoder roundtrip. Runs the ambe_plus2
     // wire encoder + decoder on the analysis output to recover the
     // `Λ̃_l(0)` / `L̃(0)` / `γ̃(0)` state the receiver will see.
     let rt = profile::time(profile::Stage::MatchedDecoder, || {
-        matched_decoder_roundtrip_halfrate(
+        matched_decoder_roundtrip_ambe_plus2(
             &m_hat,
             &refinement,
             &vuv_result,
-            &state.predictor_halfrate,
+            &state.predictor_ambe_plus2,
         )
     })?;
 
@@ -1107,7 +1107,7 @@ pub fn encode_halfrate(
     // MbeParams. All three half-rate predictor fields advance together
     // per §0.6.10 — Λ̃, L̃, γ̃ are not independent.
     let params = profile::time(profile::Stage::Tail, || -> Result<MbeParams, AnalysisError> {
-        state.predictor_halfrate.commit(
+        state.predictor_ambe_plus2.commit(
             &rt.lambda_tilde_zero,
             rt.l_tilde_zero,
             rt.gamma_tilde_zero,
@@ -1256,18 +1256,18 @@ mod tests {
     }
 
     /// Half-rate analog of the above — periodic input drives
-    /// `encode_halfrate` through preroll to voice. Exercises the
+    /// `encode_ambe_plus2` through preroll to voice. Exercises the
     /// rate-agnostic frontend, half-rate predictor commit, and
     /// matched-decoder roundtrip end-to-end.
     #[test]
-    fn encode_halfrate_third_frame_emits_voice_on_periodic_input() {
+    fn encode_ambe_plus2_third_frame_emits_voice_on_periodic_input() {
         let mut s = AnalysisState::new();
         let p0 = periodic_pcm_frame(50.0, 10, 0.0);
         let p1 = periodic_pcm_frame(50.0, 10, 160.0);
         let p2 = periodic_pcm_frame(50.0, 10, 320.0);
-        assert_eq!(encode_halfrate(&p0, &mut s), Ok(AnalysisOutput::Silence));
-        assert_eq!(encode_halfrate(&p1, &mut s), Ok(AnalysisOutput::Silence));
-        match encode_halfrate(&p2, &mut s).unwrap() {
+        assert_eq!(encode_ambe_plus2(&p0, &mut s), Ok(AnalysisOutput::Silence));
+        assert_eq!(encode_ambe_plus2(&p1, &mut s), Ok(AnalysisOutput::Silence));
+        match encode_ambe_plus2(&p2, &mut s).unwrap() {
             AnalysisOutput::Voice(params) => {
                 let omega = params.omega_0();
                 assert!(omega.is_finite() && omega > 0.0);
@@ -1283,24 +1283,24 @@ mod tests {
 
     /// Verify the half-rate predictor advances across frames.
     #[test]
-    fn encode_halfrate_predictor_advances_across_frames() {
+    fn encode_ambe_plus2_predictor_advances_across_frames() {
         let mut s = AnalysisState::new();
         // Initial state: cold-start (L̃ = 15, γ̃ = 0, all Λ̃ = 1.0).
-        assert_eq!(s.predictor_halfrate.l_tilde_prev(), 15);
-        assert_eq!(s.predictor_halfrate.gamma_tilde_prev(), 0.0);
+        assert_eq!(s.predictor_ambe_plus2.l_tilde_prev(), 15);
+        assert_eq!(s.predictor_ambe_plus2.gamma_tilde_prev(), 0.0);
 
         for i in 0..5 {
             let pcm = periodic_pcm_frame(50.0, 10, 160.0 * i as f64);
-            let _ = encode_halfrate(&pcm, &mut s).unwrap();
+            let _ = encode_ambe_plus2(&pcm, &mut s).unwrap();
         }
 
         // After multiple voice frames the state must have evolved
         // away from cold-start on at least one of (L̃, γ̃, Λ̃). This
         // is a weak assertion — we only need to prove the predictor
         // loop is live, not anything specific about its values.
-        let advanced = s.predictor_halfrate.l_tilde_prev() != 15
-            || s.predictor_halfrate.gamma_tilde_prev() != 0.0
-            || s.predictor_halfrate.lambda_tilde_prev()[1] != 1.0;
+        let advanced = s.predictor_ambe_plus2.l_tilde_prev() != 15
+            || s.predictor_ambe_plus2.gamma_tilde_prev() != 0.0
+            || s.predictor_ambe_plus2.lambda_tilde_prev()[1] != 1.0;
         assert!(advanced, "half-rate predictor did not advance past cold-start");
     }
 
@@ -1308,7 +1308,7 @@ mod tests {
     /// both should emit the same pitch / L̂ / voicing on the same PCM.
     /// Only the predictor state evolves differently.
     #[test]
-    fn encode_halfrate_matches_encode_on_frontend_outputs() {
+    fn encode_ambe_plus2_matches_encode_on_frontend_outputs() {
         let mut s_full = AnalysisState::new();
         let mut s_half = AnalysisState::new();
         // Run through preroll + one voice frame; compare the MbeParams
@@ -1317,11 +1317,11 @@ mod tests {
         for i in 0..2 {
             let pcm = periodic_pcm_frame(50.0, 10, 160.0 * i as f64);
             let _ = encode(&pcm, &mut s_full).unwrap();
-            let _ = encode_halfrate(&pcm, &mut s_half).unwrap();
+            let _ = encode_ambe_plus2(&pcm, &mut s_half).unwrap();
         }
         let p2 = periodic_pcm_frame(50.0, 10, 320.0);
         let out_full = encode(&p2, &mut s_full).unwrap();
-        let out_half = encode_halfrate(&p2, &mut s_half).unwrap();
+        let out_half = encode_ambe_plus2(&p2, &mut s_half).unwrap();
         let (pf, ph) = match (&out_full, &out_half) {
             (AnalysisOutput::Voice(pf), AnalysisOutput::Voice(ph)) => (pf, ph),
             _ => panic!("expected Voice from both, got full={out_full:?} half={out_half:?}"),

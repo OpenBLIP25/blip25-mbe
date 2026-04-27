@@ -14,7 +14,7 @@
 //! * **`p25/<name>.bit`** (full-FEC) — 18 bytes per 20 ms frame = 144
 //!   bits packed MSB-first. The 144 bits are 72 dibits in transmission
 //!   order, each dibit's high bit transmitted first. Feeds directly
-//!   into [`blip25_mbe::p25_fullrate::frame::decode_frame`].
+//!   into [`blip25_mbe::imbe_wire::frame::decode_frame`].
 //!
 //! * **`p25_nofec/<name>.bit`** (info-only) — 11 bytes per 20 ms frame
 //!   = 88 bits packed MSB-first. The 88 bits are the eight info
@@ -39,29 +39,29 @@ use blip25_mbe::codecs::mbe_baseline::{
 use blip25_mbe::codecs::mbe_baseline::analysis::{
     AnalysisError, AnalysisOutput, AnalysisState, VuvResult,
     band_count_for,
-    encode_halfrate as analysis_encode_halfrate,
+    encode_ambe_plus2 as analysis_encode_ambe_plus2,
     encode_with_trace as analysis_encode_with_trace,
 };
 use blip25_mbe::fec::{golay_23_12_encode, hamming_15_11_encode};
-use blip25_mbe::p25_fullrate::dequantize::{
+use blip25_mbe::imbe_wire::dequantize::{
     DecodeError, DecoderState, dequantize as dequantize_full, quantize as quantize_full,
 };
-use blip25_mbe::p25_fullrate::fec::{deinterleave as deinterleave_full, modulation_masks};
-use blip25_mbe::p25_fullrate::frame::{
+use blip25_mbe::imbe_wire::fec::{deinterleave as deinterleave_full, modulation_masks};
+use blip25_mbe::imbe_wire::frame::{
     Frame as FullFrame, INFO_WIDTHS,
     decode_frame as decode_full_frame, encode_frame as encode_full_frame,
 };
-use blip25_mbe::p25_fullrate::priority::{
+use blip25_mbe::imbe_wire::priority::{
     deprioritize as deprioritize_full, prioritize as prioritize_full,
 };
-use blip25_mbe::p25_halfrate::dequantize::{
+use blip25_mbe::ambe_plus2_wire::dequantize::{
     Decoded, DecoderState as HalfDecoderState, decode_to_params,
     dequantize as dequantize_half, quantize as quantize_half,
 };
-use blip25_mbe::p25_halfrate::frame::{
+use blip25_mbe::ambe_plus2_wire::frame::{
     decode_frame as decode_half_frame, deinterleave as deinterleave_half,
 };
-use blip25_mbe::p25_halfrate::priority::{
+use blip25_mbe::ambe_plus2_wire::priority::{
     deprioritize as deprioritize_half,
 };
 use blip25_mbe::rate_conversion::converter::{
@@ -318,9 +318,9 @@ enum Cmd {
     /// direct A/B comparison.
     /// Half-rate PCM → MbeParams analysis encoder conformance. Drives
     /// `DVSI/Vectors/.../r33/<name>.pcm` through
-    /// `codecs::mbe_baseline::analysis::encode_halfrate` in 20 ms frames,
+    /// `codecs::mbe_baseline::analysis::encode_ambe_plus2` in 20 ms frames,
     /// dequantizes the parallel `<name>.bit` chip bitstream via
-    /// `p25_halfrate::dequantize` for the reference `MbeParams`, and
+    /// `ambe_plus2_wire::dequantize` for the reference `MbeParams`, and
     /// reports parameter-level distortion (pitch cents, L mismatch %,
     /// voicing %, amplitude dB RMSE). Analogous to `analysis-encode`
     /// but for the half-rate wire format. Preroll frames (first two)
@@ -366,7 +366,7 @@ enum Cmd {
     /// `DVSI/Vectors/.../p25/<name>.pcm` through
     /// [`blip25_mbe::codecs::mbe_baseline::analysis::encode`] in 20 ms
     /// frames, dequantizes the parallel `<name>.bit` chip bitstream
-    /// via `p25_fullrate::dequantize` to get the reference per-frame
+    /// via `imbe_wire::dequantize` to get the reference per-frame
     /// `MbeParams`, and reports parameter-level distortion
     /// (pitch cents, L mismatch %, voicing %, amplitude dB RMSE).
     /// Preroll frames (first two) are tallied as non-comparable.
@@ -525,7 +525,7 @@ fn main() -> Result<()> {
             write_pcm.as_deref(),
         ),
         Cmd::DecodePcmHalfrate { name, gamma_w, write_pcm, phase_mode } => {
-            cmd_decode_pcm_halfrate(
+            cmd_decode_pcm_ambe_plus2(
                 &args.vectors,
                 &name,
                 gamma_w.unwrap_or(GAMMA_W),
@@ -534,15 +534,15 @@ fn main() -> Result<()> {
             )
         }
         Cmd::HalfrateInspect { name, frames } => {
-            cmd_halfrate_inspect(&args.vectors, &name, frames)
+            cmd_ambe_plus2_inspect(&args.vectors, &name, frames)
         }
-        Cmd::HalfrateEncoderSanity => cmd_halfrate_encoder_sanity(),
+        Cmd::HalfrateEncoderSanity => cmd_ambe_plus2_encoder_sanity(),
         Cmd::HalfrateSeamDump { name, frame } => {
-            cmd_halfrate_seam_dump(&args.vectors, &name, frame)
+            cmd_ambe_plus2_seam_dump(&args.vectors, &name, frame)
         }
-        Cmd::HalfrateRoundtrip { name } => cmd_halfrate_roundtrip(&args.vectors, &name),
+        Cmd::HalfrateRoundtrip { name } => cmd_ambe_plus2_roundtrip(&args.vectors, &name),
         Cmd::HalfrateFecHistogram { name, rate, rc } => {
-            cmd_halfrate_fec_histogram(&args.vectors, &name, &rate, rc)
+            cmd_ambe_plus2_fec_histogram(&args.vectors, &name, &rate, rc)
         }
         Cmd::ScanTransitions { name, min_transition_ratio, limit } => {
             cmd_scan_transitions(&args.vectors, &name, min_transition_ratio, limit)
@@ -565,7 +565,7 @@ fn main() -> Result<()> {
             cmd_rate_convert_smoothness(&args.vectors, direction, &name, rc)
         }
         Cmd::HalfrateAnalysisEncode { name, chip_offset, silence_dispatch, dump_frames, pitch_silence_override } => {
-            cmd_halfrate_analysis_encode(
+            cmd_ambe_plus2_analysis_encode(
                 &args.vectors,
                 &name,
                 chip_offset,
@@ -885,7 +885,7 @@ fn cmd_pn_diag(root: &Path, name: &str, rc: bool, frame: usize) -> Result<()> {
 const BYTES_PER_HALFRATE_FRAME: usize = 9;
 const DIBITS_PER_HALFRATE_FRAME: usize = 36;
 
-fn unpack_dibits_halfrate(bytes: &[u8]) -> [u8; DIBITS_PER_HALFRATE_FRAME] {
+fn unpack_dibits_ambe_plus2(bytes: &[u8]) -> [u8; DIBITS_PER_HALFRATE_FRAME] {
     debug_assert_eq!(bytes.len(), BYTES_PER_HALFRATE_FRAME);
     let mut r = BitReader::new(bytes);
     let mut out = [0u8; DIBITS_PER_HALFRATE_FRAME];
@@ -897,7 +897,7 @@ fn unpack_dibits_halfrate(bytes: &[u8]) -> [u8; DIBITS_PER_HALFRATE_FRAME] {
     out
 }
 
-fn cmd_decode_pcm_halfrate(
+fn cmd_decode_pcm_ambe_plus2(
     root: &Path,
     name: &str,
     gamma_w: f64,
@@ -952,7 +952,7 @@ fn cmd_decode_pcm_halfrate(
 
     for f in 0..n_frames {
         let frame = &bit_bytes[f * BYTES_PER_HALFRATE_FRAME..(f + 1) * BYTES_PER_HALFRATE_FRAME];
-        let dibits = unpack_dibits_halfrate(frame);
+        let dibits = unpack_dibits_ambe_plus2(frame);
         let ambe = decode_half_frame(&dibits);
         let err = FrameErrorContext {
             epsilon_0: ambe.errors[0],
@@ -1042,7 +1042,7 @@ fn cmd_decode_pcm_halfrate(
     Ok(())
 }
 
-fn cmd_halfrate_seam_dump(root: &Path, name: &str, frame_idx: usize) -> Result<()> {
+fn cmd_ambe_plus2_seam_dump(root: &Path, name: &str, frame_idx: usize) -> Result<()> {
     use blip25_mbe::fec::golay_24_12_decode;
 
     let dir = root.join("tv-std").join("tv").join("r33");
@@ -1053,7 +1053,7 @@ fn cmd_halfrate_seam_dump(root: &Path, name: &str, frame_idx: usize) -> Result<(
     }
 
     let frame = &bit_bytes[frame_idx * BYTES_PER_HALFRATE_FRAME..(frame_idx + 1) * BYTES_PER_HALFRATE_FRAME];
-    let dibits = unpack_dibits_halfrate(frame);
+    let dibits = unpack_dibits_ambe_plus2(frame);
 
     println!("=== Frame {frame_idx} of r33/{name}.bit ===\n");
 
@@ -1134,7 +1134,7 @@ fn cmd_halfrate_seam_dump(root: &Path, name: &str, frame_idx: usize) -> Result<(
     Ok(())
 }
 
-fn cmd_halfrate_encoder_sanity() -> Result<()> {
+fn cmd_ambe_plus2_encoder_sanity() -> Result<()> {
     // Speech-scale voiced frame: pitch ≈ 150 Hz, L = 27, all voiced,
     // M_l following a -6 dB/octave-ish roll-off typical for voiced
     // speech. Peak M_l = 2000 (ln₂ ≈ 11), mean ≈ 500 (ln₂ ≈ 9).
@@ -1175,7 +1175,7 @@ fn cmd_halfrate_encoder_sanity() -> Result<()> {
     Ok(())
 }
 
-fn cmd_halfrate_inspect(root: &Path, name: &str, frames_to_dump: usize) -> Result<()> {
+fn cmd_ambe_plus2_inspect(root: &Path, name: &str, frames_to_dump: usize) -> Result<()> {
     let dir = root.join("tv-std").join("tv").join("r33");
     let bit_path = dir.join(format!("{name}.bit"));
     let bit_bytes = fs::read(&bit_path)
@@ -1193,7 +1193,7 @@ fn cmd_halfrate_inspect(root: &Path, name: &str, frames_to_dump: usize) -> Resul
             break;
         }
         let frame = &bit_bytes[f * BYTES_PER_HALFRATE_FRAME..(f + 1) * BYTES_PER_HALFRATE_FRAME];
-        let dibits = unpack_dibits_halfrate(frame);
+        let dibits = unpack_dibits_ambe_plus2(frame);
         let ambe = decode_half_frame(&dibits);
         let err = FrameErrorContext {
             epsilon_0: ambe.errors[0],
@@ -1739,7 +1739,7 @@ fn xcorr_normalized(a: &[i16], b: &[i16], lag: i32) -> f64 {
     acc / (n * rms_a * rms_b)
 }
 
-fn cmd_halfrate_roundtrip(root: &Path, name: &str) -> Result<()> {
+fn cmd_ambe_plus2_roundtrip(root: &Path, name: &str) -> Result<()> {
     let dir = root.join("tv-std").join("tv").join("r33");
     let bit_path = dir.join(format!("{name}.bit"));
     let bit_bytes = fs::read(&bit_path)
@@ -1763,7 +1763,7 @@ fn cmd_halfrate_roundtrip(root: &Path, name: &str) -> Result<()> {
 
     for f in 0..n_frames {
         let frame = &bit_bytes[f * BYTES_PER_HALFRATE_FRAME..(f + 1) * BYTES_PER_HALFRATE_FRAME];
-        let dibits = unpack_dibits_halfrate(frame);
+        let dibits = unpack_dibits_ambe_plus2(frame);
         let ambe = decode_half_frame(&dibits);
         match decode_to_params(&ambe.info, &mut state_dec) {
             Ok(Decoded::Voice(params)) => {
@@ -1803,7 +1803,7 @@ fn cmd_halfrate_roundtrip(root: &Path, name: &str) -> Result<()> {
     Ok(())
 }
 
-fn cmd_halfrate_fec_histogram(root: &Path, name: &str, rate: &str, rc: bool) -> Result<()> {
+fn cmd_ambe_plus2_fec_histogram(root: &Path, name: &str, rate: &str, rc: bool) -> Result<()> {
     let base = if rc { root.join("tv-rc") } else { root.join("tv-std").join("tv") };
     let bit_path = base.join(rate).join(format!("{name}.bit"));
     let bit_bytes = fs::read(&bit_path)
@@ -1823,7 +1823,7 @@ fn cmd_halfrate_fec_histogram(root: &Path, name: &str, rate: &str, rc: bool) -> 
     let mut hist = [0usize; 5]; // 0, 1, 2, 3, uncorrectable
     for f in 0..n_frames {
         let frame = &bit_bytes[f * BYTES_PER_HALFRATE_FRAME..(f + 1) * BYTES_PER_HALFRATE_FRAME];
-        let dibits = unpack_dibits_halfrate(frame);
+        let dibits = unpack_dibits_ambe_plus2(frame);
         let ambe = decode_half_frame(&dibits);
         let e = ambe.errors[0];
         let bucket = if e == u8::MAX { 4 } else { usize::from(e).min(3) };
@@ -2322,8 +2322,8 @@ fn cmd_rate_convert_full_to_half(root: &Path, name: &str, rc: bool) -> Result<()
                 // Full-rate reserved pitch — converter should emit a
                 // half-rate erasure signal.
                 let dst_frame = decode_half_frame(&dst_dibits);
-                use blip25_mbe::p25_halfrate::dequantize::{FrameKind, classify_halfrate_frame};
-                match classify_halfrate_frame(&dst_frame.info) {
+                use blip25_mbe::ambe_plus2_wire::dequantize::{FrameKind, classify_ambe_plus2_frame};
+                match classify_ambe_plus2_frame(&dst_frame.info) {
                     FrameKind::Erasure => skips.erasure_passthrough += 1,
                     _ => skips.erasure_mismatch += 1,
                 }
@@ -2365,7 +2365,7 @@ fn cmd_rate_convert_half_to_full(root: &Path, name: &str, rc: bool) -> Result<()
 
     for f in 0..n_frames {
         let frame = &bit_bytes[f * BYTES_PER_HALFRATE_FRAME..(f + 1) * BYTES_PER_HALFRATE_FRAME];
-        let dibits = unpack_dibits_halfrate(frame);
+        let dibits = unpack_dibits_ambe_plus2(frame);
 
         // Classify the source kind via the tone-aware dispatch, then
         // exercise the converter on ALL kinds — tone/erasure frames
@@ -2531,7 +2531,7 @@ fn cmd_rate_convert_roundtrip_half(root: &Path, name: &str, rc: bool) -> Result<
 
     for f in 0..n_frames {
         let frame = &bit_bytes[f * BYTES_PER_HALFRATE_FRAME..(f + 1) * BYTES_PER_HALFRATE_FRAME];
-        let dibits = unpack_dibits_halfrate(frame);
+        let dibits = unpack_dibits_ambe_plus2(frame);
 
         let ambe = decode_half_frame(&dibits);
         let src_params = match decode_to_params(&ambe.info, &mut src_state) {
@@ -2814,7 +2814,7 @@ fn measure_smoothness_half_to_full(
 
     for f in 0..n_frames {
         let frame = &bit_bytes[f * BYTES_PER_HALFRATE_FRAME..(f + 1) * BYTES_PER_HALFRATE_FRAME];
-        let dibits = unpack_dibits_halfrate(frame);
+        let dibits = unpack_dibits_ambe_plus2(frame);
         let dst_dibits = match conv.convert(&dibits) {
             Ok(b) => b,
             Err(_) => {
@@ -2902,15 +2902,15 @@ fn print_smoothness_delta(off: &SmoothnessStats, on: &SmoothnessStats) {
 }
 
 // ---------------------------------------------------------------------------
-// Half-rate analysis-encoder harness (cmd: halfrate-analysis-encode)
+// Half-rate analysis-encoder harness (cmd: ambe-plus2-analysis-encode)
 //
-// Parallels `cmd_analysis_encode` but drives `encode_halfrate` against
+// Parallels `cmd_analysis_encode` but drives `encode_ambe_plus2` against
 // tv-rc/r33 PCM + bits. Compares per-frame MbeParams between the
 // analysis encoder and the chip's dequantize of the r33 reference
 // bitstream. Same chip_offset = −2 convention as full-rate.
 // ---------------------------------------------------------------------------
 
-fn cmd_halfrate_analysis_encode(
+fn cmd_ambe_plus2_analysis_encode(
     root: &Path,
     name: &str,
     chip_offset: i32,
@@ -2919,7 +2919,7 @@ fn cmd_halfrate_analysis_encode(
     pitch_silence_override: bool,
 ) -> Result<()> {
     // Half-rate vectors live under tv-rc/r33/ per the existing
-    // cmd_decode_pcm_halfrate convention.
+    // cmd_decode_pcm_ambe_plus2 convention.
     let dir = root.join("tv-rc").join("r33");
     let pcm_path = dir.join(format!("{name}.pcm"));
     let bit_path = dir.join(format!("{name}.bit"));
@@ -2980,7 +2980,7 @@ fn cmd_halfrate_analysis_encode(
     let chip_frames: Vec<Decoded> = (0..n_frames)
         .map(|f| {
             let fec = &bit_bytes[f * BYTES_PER_HALFRATE_FRAME..(f + 1) * BYTES_PER_HALFRATE_FRAME];
-            let dibits = unpack_dibits_halfrate(fec);
+            let dibits = unpack_dibits_ambe_plus2(fec);
             let ambe = decode_half_frame(&dibits);
             decode_to_params(&ambe.info, &mut chip_state).unwrap_or(Decoded::Erasure)
         })
@@ -3011,7 +3011,7 @@ fn cmd_halfrate_analysis_encode(
 
     for f in 0..n_frames {
         let pcm_frame = &pcm[f * FRAME_SAMPLES..(f + 1) * FRAME_SAMPLES];
-        let encoded = analysis_encode_halfrate(pcm_frame, &mut encoder_state);
+        let encoded = analysis_encode_ambe_plus2(pcm_frame, &mut encoder_state);
 
         let chip_idx = f as i32 + chip_offset;
         let chip_ref: Option<&Decoded> = if chip_idx >= 0 && (chip_idx as usize) < n_frames {

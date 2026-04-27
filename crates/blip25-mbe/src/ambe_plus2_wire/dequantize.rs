@@ -33,13 +33,13 @@
 
 use core::f64::consts::{LN_2, PI as PI64, SQRT_2};
 
-use crate::p25_fullrate::dequantize::DecodeError;
-use crate::p25_halfrate::frame::{
+use crate::imbe_wire::dequantize::DecodeError;
+use crate::ambe_plus2_wire::frame::{
     AMBE_BLOCK_LENGTHS, AMBE_GAIN_LEVELS, AMBE_HOC_B5, AMBE_HOC_B6, AMBE_HOC_B7,
     AMBE_HOC_B8, AMBE_PITCH_TABLE, AMBE_PRBA24, AMBE_PRBA58, AMBE_VUV_CODEBOOK,
     ANNEX_T, PitchEntry, ToneParams,
 };
-use crate::p25_halfrate::priority::{deprioritize, prioritize};
+use crate::ambe_plus2_wire::priority::{deprioritize, prioritize};
 use crate::mbe_params::{L_MAX, MbeParams};
 
 /// Maximum per-block length observed in Annex N (`L̃ = 56` row has
@@ -91,7 +91,7 @@ pub const HALFRATE_TONE_FIRST: u8 = 120;
 
 /// Cross-frame state for the half-rate decoder.
 ///
-/// Two key differences from [`crate::p25_fullrate::dequantize::DecoderState`]:
+/// Two key differences from [`crate::imbe_wire::dequantize::DecoderState`]:
 /// - `prev_lambda` is stored in **log₂** domain (Λ̃_l(−1)), not linear.
 /// - `prev_l` initializes to 15, not 30.
 /// - `prev_gamma` carries the Eq. 168 differential-gain state, updated
@@ -996,7 +996,7 @@ pub enum Decoded {
 /// path `b̂₀` value. A legitimate voice frame cannot produce this
 /// signature because voice-path `b̂₀(6..3) = 1111` would require
 /// `b̂₀ ≥ 120`, which is outside Annex L's valid pitch range.
-pub fn classify_halfrate_frame(u: &[u16; 4]) -> FrameKind {
+pub fn classify_ambe_plus2_frame(u: &[u16; 4]) -> FrameKind {
     // Signature + trailer check first — tone frames use their own
     // bit layout (Table 20), so voice deprioritization is irrelevant
     // until we've ruled out tone.
@@ -1037,7 +1037,7 @@ pub fn parse_tone_frame(u: &[u16; 4]) -> Option<ToneFrameFields> {
 }
 
 /// Encode a tone-frame's `(I_D, A_D)` into the prioritized 4-info-vector
-/// shape that goes into [`crate::p25_halfrate::frame::encode_frame`].
+/// shape that goes into [`crate::ambe_plus2_wire::frame::encode_frame`].
 ///
 /// Inverse of [`parse_tone_frame`] — produces û₀..û₃ with the §2.10.1
 /// signature (`û₀(11..6) = 0x3F`) and Table 20 layout (4 redundant
@@ -1120,7 +1120,7 @@ pub fn decode_to_params(
     u: &[u16; 4],
     state: &mut DecoderState,
 ) -> Result<Decoded, DecodeError> {
-    match classify_halfrate_frame(u) {
+    match classify_ambe_plus2_frame(u) {
         FrameKind::Voice => {
             let params = dequantize(u, state)?;
             Ok(Decoded::Voice(params))
@@ -1385,7 +1385,7 @@ mod tests {
 
     #[test]
     fn dequantize_rejects_tone_frame() {
-        use crate::p25_halfrate::priority::prioritize;
+        use crate::ambe_plus2_wire::priority::prioritize;
         let mut b = [0u16; 9];
         b[0] = 120; // tone frame
         let u = prioritize(&b);
@@ -1398,7 +1398,7 @@ mod tests {
 
     #[test]
     fn dequantize_produces_finite_amplitudes_for_zero_b() {
-        use crate::p25_halfrate::priority::prioritize;
+        use crate::ambe_plus2_wire::priority::prioritize;
         // b̂₀ = 0 → valid pitch; other params zero.
         let b = [0u16; 9];
         let u = prioritize(&b);
@@ -1442,15 +1442,15 @@ mod tests {
 
     #[test]
     fn classify_voice_frame_when_b0_valid() {
-        use crate::p25_halfrate::priority::prioritize;
+        use crate::ambe_plus2_wire::priority::prioritize;
         let b = [0u16; 9];
         let u = prioritize(&b);
-        assert_eq!(classify_halfrate_frame(&u), FrameKind::Voice);
+        assert_eq!(classify_ambe_plus2_frame(&u), FrameKind::Voice);
     }
 
     #[test]
     fn classify_erasure_for_b0_range_120_125() {
-        use crate::p25_halfrate::priority::prioritize;
+        use crate::ambe_plus2_wire::priority::prioritize;
         for b0 in 120..=125u16 {
             let mut b = [0u16; 9];
             b[0] = b0;
@@ -1458,7 +1458,7 @@ mod tests {
             // Without the tone signature in û₀, this classifies as Erasure
             // (the 120–125 range is specifically erasure per §13.1 Table 14).
             assert_eq!(
-                classify_halfrate_frame(&u),
+                classify_ambe_plus2_frame(&u),
                 FrameKind::Erasure,
                 "b̂₀ = {b0}"
             );
@@ -1468,18 +1468,18 @@ mod tests {
     #[test]
     fn classify_tone_for_b0_126_and_127_with_signature() {
         let u = build_tone_frame_u(128, 0); // DTMF tone 0 (ID 128)
-        assert_eq!(classify_halfrate_frame(&u), FrameKind::Tone);
+        assert_eq!(classify_ambe_plus2_frame(&u), FrameKind::Tone);
     }
 
     #[test]
     fn classify_erasure_when_tone_range_but_signature_missing() {
-        use crate::p25_halfrate::priority::prioritize;
+        use crate::ambe_plus2_wire::priority::prioritize;
         let mut b = [0u16; 9];
         b[0] = 126; // tone-range b̂₀ but no signature
         let u = prioritize(&b);
         // With this synthetic frame, û₀ doesn't have the 0x3F
         // signature — caller should fall back to Erasure.
-        assert_eq!(classify_halfrate_frame(&u), FrameKind::Erasure);
+        assert_eq!(classify_ambe_plus2_frame(&u), FrameKind::Erasure);
     }
 
     #[test]
@@ -1576,8 +1576,8 @@ mod tests {
     // ---- Top-level dispatch ---------------------------------------------
 
     #[test]
-    fn decode_halfrate_dispatches_voice() {
-        use crate::p25_halfrate::priority::prioritize;
+    fn decode_ambe_plus2_dispatches_voice() {
+        use crate::ambe_plus2_wire::priority::prioritize;
         let b = [0u16; 9];
         let u = prioritize(&b);
         let mut state = DecoderState::new();
@@ -1588,7 +1588,7 @@ mod tests {
     }
 
     #[test]
-    fn decode_halfrate_dispatches_tone() {
+    fn decode_ambe_plus2_dispatches_tone() {
         let u = build_tone_frame_u(5, 100); // 156.25 Hz tone
         let mut state = DecoderState::new();
         match decode_to_params(&u, &mut state).unwrap() {
@@ -1604,8 +1604,8 @@ mod tests {
     }
 
     #[test]
-    fn decode_halfrate_dispatches_erasure() {
-        use crate::p25_halfrate::priority::prioritize;
+    fn decode_ambe_plus2_dispatches_erasure() {
+        use crate::ambe_plus2_wire::priority::prioritize;
         let mut b = [0u16; 9];
         b[0] = 120; // erasure
         let u = prioritize(&b);
@@ -1763,7 +1763,7 @@ mod tests {
         // all-voiced (row 0) and all-unvoiced (row 16) rows are
         // stable endpoints — any per-harmonic pattern derived from
         // those unambiguously maps back to the same row.
-        use crate::p25_halfrate::priority::{deprioritize, prioritize};
+        use crate::ambe_plus2_wire::priority::{deprioritize, prioritize};
 
         // Only b̂₁ = 0 (all voiced) is guaranteed to be the lowest
         // codebook index matching any all-voiced active-slot pattern.
@@ -1801,7 +1801,7 @@ mod tests {
         // Gain (b̂₂) uses a differential quantizer, so the first
         // roundtrip may produce drift as the encoder recomputes γ̃
         // from decoded M̃_l. Iterating a few times should stabilize.
-        use crate::p25_halfrate::priority::{deprioritize, prioritize};
+        use crate::ambe_plus2_wire::priority::{deprioritize, prioritize};
         let mut b = [0u16; 9];
         b[0] = 0;
         b[1] = 0;
@@ -1834,7 +1834,7 @@ mod tests {
 
     #[test]
     fn dequantize_advances_state_between_frames() {
-        use crate::p25_halfrate::priority::prioritize;
+        use crate::ambe_plus2_wire::priority::prioritize;
         let b = [0u16; 9];
         let u = prioritize(&b);
         let mut state = DecoderState::new();

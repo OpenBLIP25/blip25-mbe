@@ -8,7 +8,7 @@
 //! decoder, synth) and dispatches uniformly across rates selected at
 //! runtime via the [`Rate`] enum.
 //!
-//! The low-level modules ([`crate::p25_fullrate`], [`crate::p25_halfrate`],
+//! The low-level modules ([`crate::imbe_wire`], [`crate::ambe_plus2_wire`],
 //! [`crate::codecs::mbe_baseline`]) stay public for advanced consumers
 //! that need to drive the pipeline frame-by-frame at the parameter
 //! layer; this module is the recommended entry point for everything else.
@@ -49,15 +49,15 @@ use crate::codecs::ambe_plus2;
 use crate::codecs::mbe_baseline::analysis::{
     AnalysisError, AnalysisOutput, AnalysisState, ToneDetection,
     detect_tone, encode as analysis_encode,
-    encode_halfrate as analysis_encode_halfrate,
+    encode_ambe_plus2 as analysis_encode_ambe_plus2,
     profile as analysis_profile,
 };
 use crate::codecs::mbe_baseline::{
     FrameDisposition, FrameErrorContext, GAMMA_W, SynthState, synthesize_frame,
 };
 use crate::mbe_params::MbeParams;
-use crate::p25_fullrate;
-use crate::p25_halfrate;
+use crate::imbe_wire;
+use crate::ambe_plus2_wire;
 
 /// Number of i16 PCM samples per 20 ms frame at 8 kHz. Constant across
 /// every supported rate.
@@ -137,7 +137,7 @@ impl Rate {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[non_exhaustive]
-pub enum HalfrateSynth {
+pub enum AmbePlus2Synth {
     /// US5701390 phase regen — modern AMBE+ / AMBE+2 sound. Default
     /// and recommended for P25 Phase 2 / NXDN type-2 / DMR enhanced.
     AmbePlus,
@@ -148,7 +148,7 @@ pub enum HalfrateSynth {
     Baseline,
 }
 
-impl Default for HalfrateSynth {
+impl Default for AmbePlus2Synth {
     fn default() -> Self {
         Self::AmbePlus
     }
@@ -286,12 +286,12 @@ impl std::error::Error for VocoderError {}
 pub struct Vocoder {
     rate: Rate,
     analysis: AnalysisState,
-    fullrate_dec: p25_fullrate::dequantize::DecoderState,
-    halfrate_dec: p25_halfrate::dequantize::DecoderState,
+    imbe_dec: imbe_wire::dequantize::DecoderState,
+    ambe_plus2_dec: ambe_plus2_wire::dequantize::DecoderState,
     synth: SynthState,
     last_stats: FrameStats,
     tone_detection: bool,
-    halfrate_synth: HalfrateSynth,
+    ambe_plus2_synth: AmbePlus2Synth,
 }
 
 impl Vocoder {
@@ -300,27 +300,27 @@ impl Vocoder {
         Self {
             rate,
             analysis: AnalysisState::new(),
-            fullrate_dec: p25_fullrate::dequantize::DecoderState::new(),
-            halfrate_dec: p25_halfrate::dequantize::DecoderState::new(),
+            imbe_dec: imbe_wire::dequantize::DecoderState::new(),
+            ambe_plus2_dec: ambe_plus2_wire::dequantize::DecoderState::new(),
             synth: SynthState::new(),
             last_stats: FrameStats::default(),
             tone_detection: false,
-            halfrate_synth: HalfrateSynth::AmbePlus,
+            ambe_plus2_synth: AmbePlus2Synth::AmbePlus,
         }
     }
 
     /// Configure which half-rate synth flavor [`Self::decode_bits`] +
     /// [`Self::synthesize_params`] use on Phase 2 / AMBE+2 input.
     /// No-op for full-rate (which always uses the BABA-A §1.12
-    /// baseline IMBE synth). Default [`HalfrateSynth::AmbePlus`].
-    pub fn set_halfrate_synth(&mut self, gen: HalfrateSynth) {
-        self.halfrate_synth = gen;
+    /// baseline IMBE synth). Default [`AmbePlus2Synth::AmbePlus`].
+    pub fn set_ambe_plus2_synth(&mut self, gen: AmbePlus2Synth) {
+        self.ambe_plus2_synth = gen;
     }
 
     /// Currently configured half-rate synth flavor.
     #[inline]
-    pub fn halfrate_synth(&self) -> HalfrateSynth {
-        self.halfrate_synth
+    pub fn ambe_plus2_synth(&self) -> AmbePlus2Synth {
+        self.ambe_plus2_synth
     }
 
     /// Enable encode-side Annex T tone detection. When on (and rate
@@ -465,8 +465,8 @@ impl Vocoder {
     /// configuration knobs (tone detection) stay the same.
     pub fn reset(&mut self) {
         self.analysis = AnalysisState::new();
-        self.fullrate_dec = p25_fullrate::dequantize::DecoderState::new();
-        self.halfrate_dec = p25_halfrate::dequantize::DecoderState::new();
+        self.imbe_dec = imbe_wire::dequantize::DecoderState::new();
+        self.ambe_plus2_dec = ambe_plus2_wire::dequantize::DecoderState::new();
         self.synth = SynthState::new();
         self.last_stats = FrameStats::default();
         // tone_detection: preserved (config, not state)
@@ -484,10 +484,10 @@ impl Vocoder {
             });
         }
         let (bytes, stats) = match self.rate {
-            Rate::Imbe7200x4400 => fullrate::encode(pcm, self, true)?,
-            Rate::Imbe4400x4400 => fullrate::encode(pcm, self, false)?,
-            Rate::AmbePlus2_3600x2450 => halfrate::encode(pcm, self, true)?,
-            Rate::AmbePlus2_2450x2450 => halfrate::encode(pcm, self, false)?,
+            Rate::Imbe7200x4400 => imbe_pipeline::encode(pcm, self, true)?,
+            Rate::Imbe4400x4400 => imbe_pipeline::encode(pcm, self, false)?,
+            Rate::AmbePlus2_3600x2450 => ambe_plus2_pipeline::encode(pcm, self, true)?,
+            Rate::AmbePlus2_2450x2450 => ambe_plus2_pipeline::encode(pcm, self, false)?,
         };
         self.last_stats.analysis = Some(stats);
         Ok(bytes)
@@ -505,10 +505,10 @@ impl Vocoder {
             });
         }
         let (pcm, stats) = match self.rate {
-            Rate::Imbe7200x4400 => fullrate::decode(bits, self, true),
-            Rate::Imbe4400x4400 => fullrate::decode(bits, self, false),
-            Rate::AmbePlus2_3600x2450 => halfrate::decode(bits, self, true),
-            Rate::AmbePlus2_2450x2450 => halfrate::decode(bits, self, false),
+            Rate::Imbe7200x4400 => imbe_pipeline::decode(bits, self, true),
+            Rate::Imbe4400x4400 => imbe_pipeline::decode(bits, self, false),
+            Rate::AmbePlus2_3600x2450 => ambe_plus2_pipeline::decode(bits, self, true),
+            Rate::AmbePlus2_2450x2450 => ambe_plus2_pipeline::decode(bits, self, false),
         };
         self.last_stats.decode = Some(stats);
         Ok(pcm)
@@ -548,7 +548,7 @@ impl Vocoder {
     /// On `AnalysisOutput::Silence` (preroll, silence dispatch,
     /// half-rate `PitchOutOfRange`), returns the rate-appropriate
     /// silence params ([`MbeParams::silence`] or
-    /// [`MbeParams::silence_halfrate`]).
+    /// [`MbeParams::silence_ambe_plus2`]).
     ///
     /// Counterpart of [`Self::synthesize_params`]. Together these
     /// expose the parameter layer without going through wire FEC,
@@ -567,7 +567,7 @@ impl Vocoder {
                 analysis_encode(frame, &mut self.analysis)
             }
             Rate::AmbePlus2_3600x2450 | Rate::AmbePlus2_2450x2450 => {
-                analysis_encode_halfrate(frame, &mut self.analysis)
+                analysis_encode_ambe_plus2(frame, &mut self.analysis)
             }
         }
         .map_err(VocoderError::Analysis)?;
@@ -576,7 +576,7 @@ impl Vocoder {
             AnalysisOutput::Silence => match self.rate {
                 Rate::Imbe7200x4400 | Rate::Imbe4400x4400 => MbeParams::silence(),
                 Rate::AmbePlus2_3600x2450 | Rate::AmbePlus2_2450x2450 => {
-                    MbeParams::silence_halfrate()
+                    MbeParams::silence_ambe_plus2()
                 }
             },
         })
@@ -589,7 +589,7 @@ impl Vocoder {
     /// [`Self::decode_bits`] call).
     ///
     /// Useful for playing back tone-frame params from
-    /// [`crate::p25_halfrate::dequantize::tone_to_mbe_params`], replaying
+    /// [`crate::ambe_plus2_wire::dequantize::tone_to_mbe_params`], replaying
     /// captured params in test harnesses, or driving synth from any
     /// upstream that produces `MbeParams` without going through wire
     /// bits.
@@ -614,9 +614,9 @@ impl Vocoder {
             Rate::Imbe7200x4400 | Rate::Imbe4400x4400 => {
                 synthesize_frame(params, &err, gamma_w, &mut self.synth)
             }
-            Rate::AmbePlus2_3600x2450 | Rate::AmbePlus2_2450x2450 => match self.halfrate_synth {
-                HalfrateSynth::AmbePlus => ambe_plus2::synthesize_frame(params, &mut self.synth),
-                HalfrateSynth::Baseline => synthesize_frame(params, &err, gamma_w, &mut self.synth),
+            Rate::AmbePlus2_3600x2450 | Rate::AmbePlus2_2450x2450 => match self.ambe_plus2_synth {
+                AmbePlus2Synth::AmbePlus => ambe_plus2::synthesize_frame(params, &mut self.synth),
+                AmbePlus2Synth::Baseline => synthesize_frame(params, &err, gamma_w, &mut self.synth),
             },
         };
         self.synth.err = prev_err;
@@ -844,16 +844,16 @@ impl Transcoder {
                 Ok(pack_dibits_n::<72, 18>(&dibits_out).to_vec())
             }
             (Rate::Imbe7200x4400, Rate::Imbe4400x4400) => {
-                Ok(fullrate::fec_to_info_bytes(bits).to_vec())
+                Ok(imbe_pipeline::fec_to_info_bytes(bits).to_vec())
             }
             (Rate::Imbe4400x4400, Rate::Imbe7200x4400) => {
-                Ok(fullrate::info_to_fec_bytes(bits).to_vec())
+                Ok(imbe_pipeline::info_to_fec_bytes(bits).to_vec())
             }
             (Rate::AmbePlus2_3600x2450, Rate::AmbePlus2_2450x2450) => {
-                Ok(halfrate::fec_to_info_bytes(bits).to_vec())
+                Ok(ambe_plus2_pipeline::fec_to_info_bytes(bits).to_vec())
             }
             (Rate::AmbePlus2_2450x2450, Rate::AmbePlus2_3600x2450) => {
-                Ok(halfrate::info_to_fec_bytes(bits).to_vec())
+                Ok(ambe_plus2_pipeline::info_to_fec_bytes(bits).to_vec())
             }
             (from, to) => Err(VocoderError::UnsupportedTranscode { from, to }),
         }
@@ -1098,7 +1098,7 @@ pub struct VocoderBuilder {
     silence_dispatch: bool,
     pitch_silence_override: bool,
     default_pitch_on_silence: bool,
-    halfrate_synth: HalfrateSynth,
+    ambe_plus2_synth: AmbePlus2Synth,
 }
 
 impl VocoderBuilder {
@@ -1112,7 +1112,7 @@ impl VocoderBuilder {
             silence_dispatch: false,
             pitch_silence_override: false,
             default_pitch_on_silence: false,
-            halfrate_synth: HalfrateSynth::AmbePlus,
+            ambe_plus2_synth: AmbePlus2Synth::AmbePlus,
         }
     }
 
@@ -1159,10 +1159,10 @@ impl VocoderBuilder {
     }
 
     /// Configure the half-rate synth flavor (no-op for full-rate).
-    /// See [`Vocoder::set_halfrate_synth`].
+    /// See [`Vocoder::set_ambe_plus2_synth`].
     #[inline]
-    pub fn halfrate_synth(mut self, gen: HalfrateSynth) -> Self {
-        self.halfrate_synth = gen;
+    pub fn ambe_plus2_synth(mut self, gen: AmbePlus2Synth) -> Self {
+        self.ambe_plus2_synth = gen;
         self
     }
 
@@ -1174,7 +1174,7 @@ impl VocoderBuilder {
         v.set_silence_dispatch(self.silence_dispatch);
         v.set_pitch_silence_override(self.pitch_silence_override);
         v.set_default_pitch_on_silence(self.default_pitch_on_silence);
-        v.set_halfrate_synth(self.halfrate_synth);
+        v.set_ambe_plus2_synth(self.ambe_plus2_synth);
         v
     }
 }
@@ -1189,11 +1189,11 @@ impl core::fmt::Debug for Vocoder {
     }
 }
 
-mod fullrate {
+mod imbe_pipeline {
     use super::*;
-    use crate::p25_fullrate::dequantize::{dequantize, quantize};
-    use crate::p25_fullrate::frame::{INFO_WIDTHS, decode_frame, encode_frame};
-    use crate::p25_fullrate::priority::{deprioritize, prioritize};
+    use crate::imbe_wire::dequantize::{dequantize, quantize};
+    use crate::imbe_wire::frame::{INFO_WIDTHS, decode_frame, encode_frame};
+    use crate::imbe_wire::priority::{deprioritize, prioritize};
 
     pub(super) fn encode(
         pcm: &[i16],
@@ -1207,8 +1207,8 @@ mod fullrate {
             AnalysisOutput::Voice(p) => (AnalysisOutputKind::Voice, p),
             AnalysisOutput::Silence => (AnalysisOutputKind::Silence, MbeParams::silence()),
         };
-        let mut snapshot = vocoder.fullrate_dec.clone();
-        let b = quantize(&params, &mut vocoder.fullrate_dec)
+        let mut snapshot = vocoder.imbe_dec.clone();
+        let b = quantize(&params, &mut vocoder.imbe_dec)
             .map_err(|e| VocoderError::Quantize(format!("{e:?}")))?;
         // Step the decoder snapshot via dequantize so the predictor
         // state matches what a downstream receiver would observe (the
@@ -1217,7 +1217,7 @@ mod fullrate {
         let info = prioritize(&b, l);
         let _ = deprioritize; // reserved for future per-priority diagnostics
         let _ = dequantize(&info, &mut snapshot);
-        vocoder.fullrate_dec = snapshot;
+        vocoder.imbe_dec = snapshot;
         let bytes: Vec<u8> = if apply_fec {
             let dibits = encode_frame(&info);
             pack_dibits_full(&dibits).to_vec()
@@ -1249,7 +1249,7 @@ mod fullrate {
             (info, 0u8, 0u8, 0u8)
         };
         let dq = analysis_profile::time(analysis_profile::Stage::Dequantize, || {
-            dequantize(&info, &mut vocoder.fullrate_dec)
+            dequantize(&info, &mut vocoder.imbe_dec)
         });
         let pcm: [i16; FRAME_SAMPLES] = match dq {
             Ok(params) => {
@@ -1331,12 +1331,12 @@ mod fullrate {
     }
 }
 
-mod halfrate {
+mod ambe_plus2_pipeline {
     use super::*;
-    use crate::p25_halfrate::dequantize::{
+    use crate::ambe_plus2_wire::dequantize::{
         Decoded, decode_to_params, encode_tone_frame_info, quantize, tone_to_mbe_params,
     };
-    use crate::p25_halfrate::frame::{INFO_WIDTHS, decode_frame, encode_frame};
+    use crate::ambe_plus2_wire::frame::{INFO_WIDTHS, decode_frame, encode_frame};
 
     pub(super) fn encode(
         pcm: &[i16],
@@ -1357,7 +1357,7 @@ mod halfrate {
                 // row; for the unlikely None case (reserved id), fall
                 // back to a half-rate-friendly silence placeholder.
                 let params = tone_to_mbe_params(id, amplitude)
-                    .unwrap_or_else(MbeParams::silence_halfrate);
+                    .unwrap_or_else(MbeParams::silence_ambe_plus2);
                 return Ok((
                     bytes,
                     AnalysisStats { output: AnalysisOutputKind::Tone { id, amplitude }, params },
@@ -1366,13 +1366,13 @@ mod halfrate {
         }
 
         let frame = pcm.try_into().expect("length already validated");
-        let (kind, params) = match analysis_encode_halfrate(frame, &mut vocoder.analysis)
+        let (kind, params) = match analysis_encode_ambe_plus2(frame, &mut vocoder.analysis)
             .map_err(VocoderError::Analysis)?
         {
             AnalysisOutput::Voice(p) => (AnalysisOutputKind::Voice, p),
-            AnalysisOutput::Silence => (AnalysisOutputKind::Silence, MbeParams::silence_halfrate()),
+            AnalysisOutput::Silence => (AnalysisOutputKind::Silence, MbeParams::silence_ambe_plus2()),
         };
-        let info = quantize(&params, &mut vocoder.halfrate_dec)
+        let info = quantize(&params, &mut vocoder.ambe_plus2_dec)
             .map_err(|e| VocoderError::Quantize(format!("{e:?}")))?;
         let bytes = pack_info_or_fec(&info, apply_fec);
         Ok((bytes, AnalysisStats { output: kind, params }))
@@ -1415,19 +1415,19 @@ mod halfrate {
             bad_pitch: false,
         };
         let dq = analysis_profile::time(analysis_profile::Stage::Dequantize, || {
-            decode_to_params(&info, &mut vocoder.halfrate_dec)
+            decode_to_params(&info, &mut vocoder.ambe_plus2_dec)
         });
         let pcm: [i16; FRAME_SAMPLES] = match dq {
-            Ok(Decoded::Voice(p)) => match vocoder.halfrate_synth {
-                HalfrateSynth::AmbePlus => ambe_plus2::synthesize_frame(&p, &mut vocoder.synth),
-                HalfrateSynth::Baseline => {
+            Ok(Decoded::Voice(p)) => match vocoder.ambe_plus2_synth {
+                AmbePlus2Synth::AmbePlus => ambe_plus2::synthesize_frame(&p, &mut vocoder.synth),
+                AmbePlus2Synth::Baseline => {
                     let gamma_w = vocoder.synth.gamma_w;
                     synthesize_frame(&p, &err, gamma_w, &mut vocoder.synth)
                 }
             },
-            Ok(Decoded::Tone { params, .. }) => match vocoder.halfrate_synth {
-                HalfrateSynth::AmbePlus => ambe_plus2::synthesize_tone(&params, &mut vocoder.synth),
-                HalfrateSynth::Baseline => {
+            Ok(Decoded::Tone { params, .. }) => match vocoder.ambe_plus2_synth {
+                AmbePlus2Synth::AmbePlus => ambe_plus2::synthesize_tone(&params, &mut vocoder.synth),
+                AmbePlus2Synth::Baseline => {
                     let gamma_w = vocoder.synth.gamma_w;
                     synthesize_frame(&params, &err, gamma_w, &mut vocoder.synth)
                 }
@@ -1633,7 +1633,7 @@ mod tests {
     }
 
     #[test]
-    fn fullrate_roundtrip_smoke() {
+    fn imbe_roundtrip_smoke() {
         let mut tx = Vocoder::new(Rate::Imbe7200x4400);
         let mut rx = Vocoder::new(Rate::Imbe7200x4400);
         // Three frames — first two are preroll on the analysis side
@@ -1650,7 +1650,7 @@ mod tests {
     }
 
     #[test]
-    fn halfrate_roundtrip_smoke() {
+    fn ambe_plus2_roundtrip_smoke() {
         let mut tx = Vocoder::new(Rate::AmbePlus2_3600x2450);
         let mut rx = Vocoder::new(Rate::AmbePlus2_3600x2450);
         for _ in 0..5 {
@@ -1844,8 +1844,8 @@ mod tests {
         // Decoder side: parse the bits and confirm it classifies as
         // a tone frame (FrameKind::Tone via the §2.10.1 signature
         // dispatch).
-        use crate::p25_halfrate::dequantize::{FrameKind, classify_halfrate_frame};
-        use crate::p25_halfrate::frame::decode_frame;
+        use crate::ambe_plus2_wire::dequantize::{FrameKind, classify_ambe_plus2_frame};
+        use crate::ambe_plus2_wire::frame::decode_frame;
         let mut dibits = [0u8; 36];
         let mut bit = 0;
         for slot in &mut dibits {
@@ -1858,7 +1858,7 @@ mod tests {
             *slot = d;
         }
         let frame = decode_frame(&dibits);
-        assert_eq!(classify_halfrate_frame(&frame.info), FrameKind::Tone);
+        assert_eq!(classify_ambe_plus2_frame(&frame.info), FrameKind::Tone);
 
         // Decoding through the Vocoder yields PCM (synthesize_tone
         // path); we don't assert frequency parity because tone-synth
@@ -2124,7 +2124,7 @@ mod tests {
 
     /// `synthesize_params` accepts arbitrary MbeParams and produces a
     /// 160-sample PCM frame. Round-trips cleanly with `MbeParams::silence`
-    /// (full-rate) and `MbeParams::silence_halfrate` (half-rate) —
+    /// (full-rate) and `MbeParams::silence_ambe_plus2` (half-rate) —
     /// silence params synthesize to (near-)silent output.
     #[test]
     fn synthesize_params_emits_one_frame_per_call() {
@@ -2136,7 +2136,7 @@ mod tests {
         assert!(peak < 5000, "silence params produced peak={peak}");
 
         let mut rx = Vocoder::new(Rate::AmbePlus2_3600x2450);
-        let pcm = rx.synthesize_params(&MbeParams::silence_halfrate());
+        let pcm = rx.synthesize_params(&MbeParams::silence_ambe_plus2());
         assert_eq!(pcm.len(), FRAME_SAMPLES);
         let peak = pcm.iter().map(|&s| s.unsigned_abs()).max().unwrap_or(0);
         assert!(peak < 5000);
@@ -2161,14 +2161,14 @@ mod tests {
             .repeat_reset_after(Some(3))
             .silence_dispatch(true)
             .pitch_silence_override(true)
-            .halfrate_synth(HalfrateSynth::Baseline)
+            .ambe_plus2_synth(AmbePlus2Synth::Baseline)
             .build();
         assert_eq!(v.rate(), Rate::AmbePlus2_3600x2450);
         assert!(v.tone_detection());
         assert_eq!(v.repeat_reset_after(), Some(3));
         assert!(v.silence_dispatch());
         assert!(v.pitch_silence_override());
-        assert_eq!(v.halfrate_synth(), HalfrateSynth::Baseline);
+        assert_eq!(v.ambe_plus2_synth(), AmbePlus2Synth::Baseline);
     }
 
     /// Half-rate synth choice routes to the right backend. Both
@@ -2177,7 +2177,7 @@ mod tests {
     /// regen is a no-op when all bands voiced cleanly), so the
     /// assertion is non-silent + correct rate, not bit-difference.
     #[test]
-    fn halfrate_synth_modes_both_decode_cleanly() {
+    fn ambe_plus2_synth_modes_both_decode_cleanly() {
         let mut tx = Vocoder::new(Rate::AmbePlus2_3600x2450);
         let pcm = periodic_pcm(40, 6000);
         let mut bits_buf: Vec<u8> = Vec::new();
@@ -2185,11 +2185,11 @@ mod tests {
             bits_buf.extend(tx.encode_pcm(&pcm).unwrap());
         }
 
-        for gen in [HalfrateSynth::AmbePlus, HalfrateSynth::Baseline] {
+        for gen in [AmbePlus2Synth::AmbePlus, AmbePlus2Synth::Baseline] {
             let mut rx = Vocoder::builder(Rate::AmbePlus2_3600x2450)
-                .halfrate_synth(gen)
+                .ambe_plus2_synth(gen)
                 .build();
-            assert_eq!(rx.halfrate_synth(), gen);
+            assert_eq!(rx.ambe_plus2_synth(), gen);
             let mut out_pcm: Vec<i16> = Vec::new();
             for chunk in bits_buf.chunks_exact(9) {
                 out_pcm.extend(rx.decode_bits(chunk).unwrap());
@@ -2210,12 +2210,12 @@ mod tests {
         assert_eq!(a.repeat_reset_after(), b.repeat_reset_after());
         assert_eq!(a.silence_dispatch(), b.silence_dispatch());
         assert_eq!(a.pitch_silence_override(), b.pitch_silence_override());
-        assert_eq!(a.halfrate_synth(), b.halfrate_synth());
+        assert_eq!(a.ambe_plus2_synth(), b.ambe_plus2_synth());
         assert!(!a.tone_detection());
         assert!(a.repeat_reset_after().is_none());
         assert!(!a.silence_dispatch());
         assert!(!a.pitch_silence_override());
-        assert_eq!(a.halfrate_synth(), HalfrateSynth::AmbePlus);
+        assert_eq!(a.ambe_plus2_synth(), AmbePlus2Synth::AmbePlus);
     }
 
     /// `flush` zero-pads residue and emits one final frame; on an

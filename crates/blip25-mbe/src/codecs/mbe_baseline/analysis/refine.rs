@@ -238,7 +238,7 @@ mod tests {
         assert_eq!(quantize_pitch_index(omega_too_lo), None);
     }
 
-    /// `quantize_pitch_index` and the fullrate decoder's pitch_decode
+    /// `quantize_pitch_index` and the imbe decoder's pitch_decode
     /// must round-trip within one quantization step — the encoder's
     /// `−39` floor pairs with the decoder's `+39.5` offset to
     /// implement midtread quantization per addendum §0.4.4.

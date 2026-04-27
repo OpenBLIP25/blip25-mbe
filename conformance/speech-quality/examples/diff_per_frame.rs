@@ -6,8 +6,8 @@
 //! Labels default to filenames. Useful for spotting where our encoder
 //! diverges from a reference encoder at silence→speech boundaries.
 
-use blip25_mbe::p25_fullrate::dequantize::{DecoderState, dequantize};
-use blip25_mbe::p25_fullrate::frame::decode_frame;
+use blip25_mbe::imbe_wire::dequantize::{DecoderState, dequantize};
+use blip25_mbe::imbe_wire::frame::decode_frame;
 use std::env;
 use std::fs;
 

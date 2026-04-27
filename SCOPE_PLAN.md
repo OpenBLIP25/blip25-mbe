@@ -36,13 +36,13 @@ Solid:
 - Decode mute → comfort noise per BABA-A §1.11.2 (gap 0021).
 - Spec-faithful repeat handling + optional JMBE-style reset
   (gap 0022).
-- Carrier-agnostic CLI entry points: `decode-raw-halfrate` (4 info
+- Carrier-agnostic CLI entry points: `decode-raw-ambe-plus2` (4 info
   vectors), `decode-raw-mbe` (9 b̂ values).
 
 Open:
 
 - Two half-rate gotchas — `MbeParams::silence()` not in half-rate
-  pitch range, `encode_halfrate` errors on out-of-range pitch instead
+  pitch range, `encode_ambe_plus2` errors on out-of-range pitch instead
   of dispatching silence.
 - AMBE+ (Gen 2) has synth but no dequantize wrapper at the 4-vector
   interface.
@@ -58,7 +58,7 @@ The chip exposes a single channel handle and a small set of operations:
 | Chip operation         | Today's blip25-mbe equivalent      |
 |------------------------|-------------------------------------|
 | Open channel           | `AnalysisState::new()` + `SynthState::new()` (rate-specific imports) |
-| Set rate (`PKT_RATEP`) | Pick the right `encode` vs `encode_halfrate` import |
+| Set rate (`PKT_RATEP`) | Pick the right `encode` vs `encode_ambe_plus2` import |
 | Encode PCM → bits      | Multi-step pipeline: `analysis_encode` → `quantize` → `encode_frame` → pack |
 | Decode bits → PCM      | Multi-step: unpack → `decode_frame` → `dequantize` → `synthesize_frame` |
 | Reset (`PKT_RATEP` re-send) | `AnalysisState::new()` etc — start over |
@@ -132,23 +132,23 @@ plan at 364.
 
 ### 1.1 Half-rate API gotchas (1 session)
 
-- `MbeParams::silence_halfrate()` constructor (or make
+- `MbeParams::silence_ambe_plus2()` constructor (or make
   `MbeParams::silence()` carry a half-rate-friendly ω₀ — easiest is
   to widen its range so half-rate's `encode_pitch` accepts it).
-- `encode_halfrate` returns `Ok(AnalysisOutput::Silence)` instead of
+- `encode_ambe_plus2` returns `Ok(AnalysisOutput::Silence)` instead of
   `Err(PitchOutOfRange)` when the analysis lands an ω₀ outside the
   half-rate Annex L pitch table.
 
 These are mechanical fixes surfaced by this session's
-`halfrate-ab-matrix` baseline.
+`ambe-plus2-ab-matrix` baseline.
 
 ### 1.2 AMBE+ (Gen 2) decode wrapper (1 session)
 
 `codecs::ambe_plus::synthesize_frame` exists but consumers of legacy
 NXDN/DMR voice (Gen 2) currently have no path from raw 4-vector
 post-FEC info bits to PCM through the AMBE+ encoder layout. Add a
-`p25_halfrate::dequantize` sibling targeting AMBE+'s parameter
-encoding so `decode-raw-halfrate --gen ambe-plus` works. The synth
+`ambe_plus2_wire::dequantize` sibling targeting AMBE+'s parameter
+encoding so `decode-raw-ambe-plus2 --gen ambe-plus` works. The synth
 side stays untouched.
 
 ### 1.3 Unified `Vocoder` trait + builder (2-3 sessions)
@@ -235,7 +235,7 @@ If a session opens with "do something on this plan," the smallest
 useful sequence is:
 
 1. **Wave 1.1 — half-rate gotchas** (today's session). Concrete,
-   self-contained, surfaced by this week's halfrate-ab-matrix run.
+   self-contained, surfaced by this week's ambe-plus2-ab-matrix run.
 2. **Run the 24 cached AMBE dumps in `~/p25-decoder/ambe_dump_*.txt`
    through `decode-raw-mbe`** — validates the carrier-agnostic
    entry point against real captures, surfaces any prioritization

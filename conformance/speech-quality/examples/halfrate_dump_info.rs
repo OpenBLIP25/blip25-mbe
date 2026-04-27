@@ -1,4 +1,4 @@
-use blip25_mbe::p25_halfrate::frame::{DIBITS_PER_FRAME, decode_frame};
+use blip25_mbe::ambe_plus2_wire::frame::{DIBITS_PER_FRAME, decode_frame};
 use std::fs;
 
 fn unpack(bytes: &[u8]) -> [u8; DIBITS_PER_FRAME] {

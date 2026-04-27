@@ -1,6 +1,6 @@
 //! MBE baseline codec — TIA-102.BABA-A §1.10–§1.13 (synthesis pipeline)
 //! and §1.8 (dequantize-side analysis is shared with the upstream pipeline in
-//! [`crate::p25_fullrate::dequantize`]).
+//! [`crate::imbe_wire::dequantize`]).
 //!
 //! This module hosts the synthesizer that turns [`MbeParams`] into
 //! 8 kHz 16-bit PCM, plus a (currently unimplemented) forward analysis
@@ -978,7 +978,7 @@ pub struct SynthState {
     /// points ([`crate::codecs::ambe::synthesize_frame`] and siblings)
     /// on each call. Defaults to "error-free" on
     /// [`SynthState::new`]; consumers with live FEC error counts
-    /// (e.g. from a [`crate::p25_fullrate::frame::Frame::errors`]
+    /// (e.g. from a [`crate::imbe_wire::frame::Frame::errors`]
     /// total) should update it before each synth call.
     pub err: FrameErrorContext,
     /// §1.12.1 spectral calibration scale. Defaults to [`GAMMA_W`];
@@ -1118,8 +1118,8 @@ pub fn synthesize_frame_ambe_plus(
 /// silence.
 ///
 /// This is the decode-side counterpart to the
-/// [`crate::p25_halfrate::dequantize::Decoded::Erasure`] /
-/// [`crate::p25_fullrate::dequantize::Decoded::Erasure`] variants —
+/// [`crate::ambe_plus2_wire::dequantize::Decoded::Erasure`] /
+/// [`crate::imbe_wire::dequantize::Decoded::Erasure`] variants —
 /// consumers call it when the wire layer signals an erasure without
 /// constructing any `MbeParams` of their own. `phase_mode` selects
 /// baseline vs. AMBE+ phase handling; the codec-generation modules

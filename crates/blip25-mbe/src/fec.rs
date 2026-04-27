@@ -7,7 +7,7 @@
 //!
 //! Wire-format-specific FEC layout (which bits are covered by which code,
 //! how they are interleaved, how PN demodulation fits in) lives in the
-//! wire module — for IMBE, see [`crate::p25_fullrate::fec`].
+//! wire module — for IMBE, see [`crate::imbe_wire::fec`].
 //!
 //! Both codes are perfect (every 11-bit syndrome for Golay, every 4-bit
 //! syndrome for Hamming maps to a unique minimum-weight error pattern),

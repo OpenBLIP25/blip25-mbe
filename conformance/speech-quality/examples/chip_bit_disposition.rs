@@ -3,8 +3,8 @@
 //! `decode_frame`, mirroring the smoothed ε_R update the synth applies.
 
 use blip25_mbe::codecs::mbe_baseline::{FrameDisposition, FrameErrorContext, frame_disposition};
-use blip25_mbe::p25_fullrate::dequantize::{DecodeError, DecoderState, dequantize};
-use blip25_mbe::p25_fullrate::frame::decode_frame;
+use blip25_mbe::imbe_wire::dequantize::{DecodeError, DecoderState, dequantize};
+use blip25_mbe::imbe_wire::frame::decode_frame;
 use std::fs;
 
 const FRAME_BYTES: usize = 18;

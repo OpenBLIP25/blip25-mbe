@@ -431,7 +431,7 @@ mod tests {
     }
 
     #[test]
-    fn pn_seed_halfrate_matches_formula() {
+    fn pn_seed_ambe_plus2_matches_formula() {
         for u0 in [0u16, 1, 42, 4095] {
             assert_eq!(pn_sequence(u0)[0], u0.wrapping_mul(16));
         }

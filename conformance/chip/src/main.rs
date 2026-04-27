@@ -37,14 +37,14 @@ use blip25_mbe::codecs::mbe_baseline::analysis::{
 };
 use blip25_mbe::codecs::mbe_baseline::{synthesize_frame, FrameErrorContext, SynthState, GAMMA_W};
 use blip25_mbe::mbe_params::{MbeParams, L_MIN};
-use blip25_mbe::p25_fullrate::dequantize::{
+use blip25_mbe::imbe_wire::dequantize::{
     band_for_harmonic, dequantize as dequantize_full, quantize as quantize_full, vuv_band_count,
     DecoderState,
 };
-use blip25_mbe::p25_fullrate::frame::{
+use blip25_mbe::imbe_wire::frame::{
     decode_frame as decode_full_frame, encode_frame as encode_full_frame,
 };
-use blip25_mbe::p25_fullrate::priority::prioritize as prioritize_full;
+use blip25_mbe::imbe_wire::priority::prioritize as prioritize_full;
 
 const FRAME_SAMPLES: usize = 160;
 const BYTES_PER_FEC_FRAME: usize = 18;
@@ -1120,7 +1120,7 @@ fn frame_metrics(ours: &[i16], chip: &[i16]) -> (f64, f64, i32, f64) {
 // Chip-encode vs our-encode comparison (MbeParams-level diff).
 //
 // Both bit streams (chip's and ours) are decoded through our own
-// p25_fullrate wire decoder so any mismatch is attributable to the
+// imbe_wire wire decoder so any mismatch is attributable to the
 // analysis-encoder side, not to a wire-decoder discrepancy. Each side
 // gets its own DecoderState because the predictor evolves with the
 // bits actually emitted on that side.

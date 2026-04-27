@@ -67,7 +67,7 @@ impl PredictorState {
     /// 0-indexed slice of the past-frame amplitudes for `l = 1..=l_tilde_prev`.
     /// Entry `i` is `M̃_{i+1}(−1)`. Length equals `l_tilde_prev`.
     /// Used by the §0.10 matched-decoder roundtrip to seed a
-    /// `DecoderState` via [`crate::p25_fullrate::dequantize::DecoderState::from_amplitudes`].
+    /// `DecoderState` via [`crate::imbe_wire::dequantize::DecoderState::from_amplitudes`].
     pub fn m_tilde_prev_slice(&self) -> Vec<f32> {
         let n = self.l_tilde_prev as usize;
         (1..=n).map(|i| self.m_tilde_prev[i] as f32).collect()
@@ -106,12 +106,12 @@ impl Default for PredictorState {
 
 /// Full-rate prediction coefficient `ρ` per BABA-A Eq. 55.
 ///
-/// Promoted from [`crate::p25_fullrate::dequantize::fullrate_rho`]'s
+/// Promoted from [`crate::imbe_wire::dequantize::imbe_rho`]'s
 /// `f32` helper into `f64` for the analysis pipeline. Values are
 /// identical; the `as f64` cast is lossless for these schedule points.
 #[inline]
-pub fn fullrate_rho_f64(l_hat: u8) -> f64 {
-    f64::from(crate::p25_fullrate::dequantize::fullrate_rho(l_hat))
+pub fn imbe_rho_f64(l_hat: u8) -> f64 {
+    f64::from(crate::imbe_wire::dequantize::imbe_rho(l_hat))
 }
 
 /// Compute the log₂-domain prediction residual `T̂_l` per Eq. 54 in
@@ -143,7 +143,7 @@ pub fn compute_prediction_residual(
     let l_hat_u32 = u32::from(l_hat);
     let l_prev_u32 = u32::from(state.l_tilde_prev.max(1));
     let ratio = f64::from(state.l_tilde_prev) / f64::from(l_hat);
-    let rho = fullrate_rho_f64(l_hat);
+    let rho = imbe_rho_f64(l_hat);
 
     // Eq. 52/53 + Eq. 56/57: build P_l for all l = 1..=L̂.
     let mut p = [0.0f64; L_HAT_MAX as usize + 1];
@@ -187,7 +187,7 @@ pub fn compute_prediction_residual(
 }
 
 #[cfg(test)]
-mod fullrate_tests {
+mod imbe_tests {
     use super::*;
 
     #[test]
@@ -294,7 +294,7 @@ mod fullrate_tests {
             .map(|l| m_same[l as usize].log2())
             .sum::<f64>()
             / 16.0;
-        let rho = fullrate_rho_f64(16);
+        let rho = imbe_rho_f64(16);
         for l in 1..=16u32 {
             let log_m = m_same[l as usize].log2();
             let expected = (1.0 - rho) * log_m + rho * log_mean;
@@ -339,21 +339,21 @@ mod fullrate_tests {
         }
     }
 
-    /// `fullrate_rho_f64` matches the Eq. 55 schedule (within the
+    /// `imbe_rho_f64` matches the Eq. 55 schedule (within the
     /// f32→f64 cast precision of the underlying helper).
     #[test]
-    fn fullrate_rho_matches_eq55_schedule_points() {
+    fn imbe_rho_matches_eq55_schedule_points() {
         let tol = 1e-5;
         // L̂ ≤ 15 → 0.40.
-        assert!((fullrate_rho_f64(9) - 0.40).abs() < tol);
-        assert!((fullrate_rho_f64(15) - 0.40).abs() < tol);
+        assert!((imbe_rho_f64(9) - 0.40).abs() < tol);
+        assert!((imbe_rho_f64(15) - 0.40).abs() < tol);
         // 15 < L̂ ≤ 24 → 0.03·L − 0.05.
-        assert!((fullrate_rho_f64(16) - 0.43).abs() < tol);
-        assert!((fullrate_rho_f64(20) - 0.55).abs() < tol);
-        assert!((fullrate_rho_f64(24) - 0.67).abs() < tol);
+        assert!((imbe_rho_f64(16) - 0.43).abs() < tol);
+        assert!((imbe_rho_f64(20) - 0.55).abs() < tol);
+        assert!((imbe_rho_f64(24) - 0.67).abs() < tol);
         // L̂ > 24 → 0.70.
-        assert!((fullrate_rho_f64(25) - 0.70).abs() < tol);
-        assert!((fullrate_rho_f64(56) - 0.70).abs() < tol);
+        assert!((imbe_rho_f64(25) - 0.70).abs() < tol);
+        assert!((imbe_rho_f64(56) - 0.70).abs() < tol);
     }
 }
 
@@ -437,7 +437,7 @@ impl HalfratePredictorState {
     /// Commit `Λ̃_l(0)`, `L̃(0)`, `γ̃(0)` from the matched-decoder
     /// roundtrip as next frame's state. Called by the §0.10
     /// half-rate pipeline after
-    /// [`crate::p25_halfrate::dequantize::dequantize`] advances the
+    /// [`crate::ambe_plus2_wire::dequantize::dequantize`] advances the
     /// wire decoder's own `DecoderState`.
     ///
     /// `lambda_tilde_curr` is 1-indexed with `[0]` ignored; the
@@ -519,7 +519,7 @@ pub fn lambda_hat_from_m_hat(
 ///
 /// The mean-removal matches full-rate — `+ (ρ/L̂)·Σ Λ̃` inside the
 /// bracket, not `-`. The sign is per Eq. 155 direct reading.
-pub fn compute_prediction_residual_halfrate(
+pub fn compute_prediction_residual_ambe_plus2(
     lambda_hat: &[f64; L_HAT_MAX as usize + 1],
     l_hat: u8,
     state: &HalfratePredictorState,
@@ -573,7 +573,7 @@ pub fn compute_prediction_residual_halfrate(
 }
 
 #[cfg(test)]
-mod halfrate_tests {
+mod ambe_plus2_tests {
     use super::*;
 
     fn zero_vuv(k_hat: u8) -> VuvResult {
@@ -605,7 +605,7 @@ mod halfrate_tests {
     }
 
     #[test]
-    fn halfrate_predictor_cold_start_values() {
+    fn ambe_plus2_predictor_cold_start_values() {
         let st = HalfratePredictorState::cold_start();
         assert_eq!(st.l_tilde_prev(), 15);
         assert_eq!(st.gamma_tilde_prev(), 0.0);
@@ -615,7 +615,7 @@ mod halfrate_tests {
     }
 
     #[test]
-    fn halfrate_predictor_read_applies_eq156_eq157() {
+    fn ambe_plus2_predictor_read_applies_eq156_eq157() {
         let mut st = HalfratePredictorState::cold_start();
         // Seed distinct values into lambda_tilde_prev[1..=5]; rest is
         // cold-start 1.0 but we'll lower L̃ to 5 so Eq. 157 fires
@@ -695,7 +695,7 @@ mod halfrate_tests {
     }
 
     #[test]
-    fn prediction_residual_halfrate_cold_start_equals_lambda_hat_minus_rho_residual() {
+    fn prediction_residual_ambe_plus2_cold_start_equals_lambda_hat_minus_rho_residual() {
         // Cold-start state: all Λ̃ = 1.0, L̃(−1) = 15. Feed a flat Λ̂
         // = 3.0 for L̂ = 12 harmonics. Predictor term P_l is flat at
         // 1.0 (k̂_l varies 1..1.25, but reads all land on cold-start
@@ -707,7 +707,7 @@ mod halfrate_tests {
             lambda_hat[l] = 3.0;
         }
         let st = HalfratePredictorState::cold_start();
-        let t_hat = compute_prediction_residual_halfrate(&lambda_hat, l_hat, &st);
+        let t_hat = compute_prediction_residual_ambe_plus2(&lambda_hat, l_hat, &st);
         for l in 1..=l_hat as usize {
             assert!(
                 (t_hat[l] - 3.0).abs() < 1e-12,
@@ -718,7 +718,7 @@ mod halfrate_tests {
     }
 
     #[test]
-    fn prediction_residual_halfrate_perfect_prediction_gives_zero_mean() {
+    fn prediction_residual_ambe_plus2_perfect_prediction_gives_zero_mean() {
         // Perfect-prediction check: Λ̂_l matches a rescaled Λ̃_l
         // exactly. After interpolation and mean-removal the residual
         // should be mean-zero (Σ T̂_l = 0) because Eq. 155's structure
@@ -733,7 +733,7 @@ mod halfrate_tests {
         for l in 1..=20 {
             st.lambda_tilde_prev[l] = (l as f64) * 0.1;
         }
-        let t_hat = compute_prediction_residual_halfrate(&lambda_hat, l_hat, &st);
+        let t_hat = compute_prediction_residual_ambe_plus2(&lambda_hat, l_hat, &st);
         // Σ T̂_l = Σ Λ̂_l − ρ·Σ (P_l − P̄) = Σ Λ̂_l − 0 = Σ Λ̂_l.
         let sum_t: f64 = t_hat[1..=l_hat as usize].iter().sum();
         let sum_lambda: f64 = lambda_hat[1..=l_hat as usize].iter().sum();
@@ -746,7 +746,7 @@ mod halfrate_tests {
     }
 
     #[test]
-    fn halfrate_predictor_commit_advances_state() {
+    fn ambe_plus2_predictor_commit_advances_state() {
         let mut st = HalfratePredictorState::cold_start();
         let mut lambda_curr = [0.0f64; L_HAT_MAX as usize + 1];
         for l in 1..=12 {

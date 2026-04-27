@@ -6,8 +6,8 @@
 //! direct interop with DVSI's vocoder hardware over the chip serial
 //! protocol — distinct from any P25-on-the-air wire format.
 //!
-//! P25-specific wires live in [`crate::p25_fullrate`] and
-//! [`crate::p25_halfrate`]. Some rates here align with P25 (rate 33 =
+//! P25-specific wires live in [`crate::imbe_wire`] and
+//! [`crate::ambe_plus2_wire`]. Some rates here align with P25 (rate 33 =
 //! P25 half-rate with FEC, rate 34 = P25 half-rate without FEC), but
 //! the DVSI chip protocol carries additional framing that the
 //! over-the-air P25 modulators strip off.

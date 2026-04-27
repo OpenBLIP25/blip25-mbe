@@ -36,10 +36,10 @@ A consumer imports only these:
 
 ```rust
 // Wire layer — bits ↔ MbeParams
-blip25_mbe::p25_fullrate::Frame::decode(bits: &[u8])       -> Result<MbeParams>
-blip25_mbe::p25_fullrate::Frame::decode_soft(soft: &[i8])  -> Result<MbeParams>
-blip25_mbe::p25_halfrate::Frame::decode(bits: &[u8])       -> Result<(MbeParams, FrameKind)>
-blip25_mbe::p25_halfrate::Frame::decode_soft(soft: &[i8])  -> Result<(MbeParams, FrameKind)>
+blip25_mbe::imbe_wire::Frame::decode(bits: &[u8])       -> Result<MbeParams>
+blip25_mbe::imbe_wire::Frame::decode_soft(soft: &[i8])  -> Result<MbeParams>
+blip25_mbe::ambe_plus2_wire::Frame::decode(bits: &[u8])       -> Result<(MbeParams, FrameKind)>
+blip25_mbe::ambe_plus2_wire::Frame::decode_soft(soft: &[i8])  -> Result<(MbeParams, FrameKind)>
 blip25_mbe::dvsi_3000::Frame::decode(bits: &[u8], rate: RateConfig) -> Result<MbeParams>
 
 // Codec layer — MbeParams ↔ PCM
@@ -144,10 +144,10 @@ These are chip-protocol concerns that don't exist at the codec layer:
 
 For carriers whose post-FEC info layout differs (older DMR, AMBE+
 Gen 2 NXDN, D-STAR's specific bit layout), drop down a layer to
-`decode-raw-mbe` (raw 9-value `b̂₀..b̂₈`) or `decode-raw-halfrate`
+`decode-raw-mbe` (raw 9-value `b̂₀..b̂₈`) or `decode-raw-ambe-plus2`
 (post-FEC 4-vector info) — both are available as CLI subcommands of
 `conformance-speech-quality` and as direct library calls into
-`p25_halfrate::dequantize` + `codecs::ambe_plus2`.
+`ambe_plus2_wire::dequantize` + `codecs::ambe_plus2`.
 
 ## What Stays in the Consumer (p25-decoder example)
 
@@ -171,10 +171,10 @@ does not know about WACN/NAC either. The host feeds it already-descrambled
 Each consumer writes a small adapter between its legacy types and
 `MbeParams`. For p25-decoder, this is two files inside `blip25-vocoder`:
 
-- `imbe_adapter.rs` — wraps `p25_fullrate::Frame` + `MbeParams` into the
+- `imbe_adapter.rs` — wraps `imbe_wire::Frame` + `MbeParams` into the
   legacy `ImbeFrame`/`ImbeParams` shape, or migrates call sites to use
   `MbeParams` directly.
-- `ambe_adapter.rs` — same for `p25_halfrate::Frame`, plus `FrameKind`
+- `ambe_adapter.rs` — same for `ambe_plus2_wire::Frame`, plus `FrameKind`
   routing (voice vs. tone).
 
 Downstream orchestration (`Phase1Vocoder`, `TdmaVocoder`, per-call WAV
@@ -190,7 +190,7 @@ so future protocol consumers do not re-derive them.
 Detection is wire-layer (a specific bit pattern in the 72-bit AMBE+2
 frame). Synthesis is codec-layer (dual-sinusoid DTMF / ringback).
 
-- `p25_halfrate::Frame::decode` returns `FrameKind::{Voice(MbeParams), Tone(ToneParams)}`.
+- `ambe_plus2_wire::Frame::decode` returns `FrameKind::{Voice(MbeParams), Tone(ToneParams)}`.
 - `codecs::<gen>::synthesize_tone(&ToneParams)` renders audio.
 
 ### Spectral enhancement
@@ -201,7 +201,7 @@ in `codecs/ambe_plus` and `codecs/ambe_plus2`. They do not live in
 `mbe_params/` and they do not live in any wire submodule.
 
 A wire submodule's only contract with the codec is `bits ↔ MbeParams`.
-Pairing the `p25_fullrate` wire with the `codecs::ambe_plus2` codec is a
+Pairing the `imbe_wire` wire with the `codecs::ambe_plus2` codec is a
 valid combination (the SCBA-mask deployment pattern); the wire layer
 should make that combination expressible.
 
@@ -246,7 +246,7 @@ Reproducing the DVSI-parity measurement:
 
 ```
 cargo run -p blip25-conformance-vectors --release -- \
-    decode-pcm-halfrate clean --write-pcm /tmp/ours.pcm
+    decode-pcm-ambe-plus2 clean --write-pcm /tmp/ours.pcm
 ```
 
 and compare RMS to `DVSI/Vectors/tv-rc/r33/clean.pcm` — expect

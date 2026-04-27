@@ -30,26 +30,26 @@ use std::time::Instant;
 
 use blip25_mbe::codecs::ambe_plus2;
 use blip25_mbe::codecs::mbe_baseline::analysis::{
-    AnalysisOutput, AnalysisState, encode as analysis_encode, encode_halfrate as analysis_encode_halfrate,
+    AnalysisOutput, AnalysisState, encode as analysis_encode, encode_ambe_plus2 as analysis_encode_ambe_plus2,
 };
 use blip25_mbe::codecs::mbe_baseline::{
     FrameErrorContext, GAMMA_W, SynthState, synthesize_frame,
 };
 use blip25_mbe::mbe_params::MbeParams;
-use blip25_mbe::p25_fullrate::dequantize::{
+use blip25_mbe::imbe_wire::dequantize::{
     DecoderState, dequantize as dequantize_full, quantize as quantize_full,
 };
-use blip25_mbe::p25_fullrate::frame::{
+use blip25_mbe::imbe_wire::frame::{
     decode_frame as decode_full_frame, encode_frame as encode_full_frame,
 };
-use blip25_mbe::p25_fullrate::priority::{
+use blip25_mbe::imbe_wire::priority::{
     deprioritize as deprioritize_full, prioritize as prioritize_full,
 };
-use blip25_mbe::p25_halfrate::dequantize::{
+use blip25_mbe::ambe_plus2_wire::dequantize::{
     DecoderState as HalfDecoderState, Decoded as HalfDecoded,
     decode_to_params as decode_to_params_half, quantize as quantize_half,
 };
-use blip25_mbe::p25_halfrate::frame::{
+use blip25_mbe::ambe_plus2_wire::frame::{
     DIBITS_PER_FRAME as HALF_DIBITS_PER_FRAME,
     decode_frame as decode_half_frame, encode_frame as encode_half_frame,
 };
@@ -127,8 +127,8 @@ enum Cmd {
     },
     /// Self-baseline our_enc → our_dec PESQ on the half-rate (AMBE+2)
     /// path. Slim version of `ab-matrix`: no chip side, just our
-    /// pipeline through `encode_halfrate` + `p25_halfrate::quantize` +
-    /// 9-byte FEC frames + `p25_halfrate::dequantize` + AMBE+2 synth.
+    /// pipeline through `encode_ambe_plus2` + `ambe_plus2_wire::quantize` +
+    /// 9-byte FEC frames + `ambe_plus2_wire::dequantize` + AMBE+2 synth.
     HalfrateAbMatrix {
         /// Path to reference PCM (8 kHz mono LE i16, raw, no header).
         #[arg(long)]
@@ -157,7 +157,7 @@ enum Cmd {
     /// decode, PN demodulation). Useful for decoding voice frames from
     /// non-P25 AMBE+2 carriers — DMR, NXDN, D-STAR — once the consumer
     /// has stripped the wire-specific FEC into the same 4-vector
-    /// post-FEC info shape that `p25_halfrate::dequantize::dequantize`
+    /// post-FEC info shape that `ambe_plus2_wire::dequantize::dequantize`
     /// consumes. The 49-bit b̂₀..b̂₈ layout is shared across AMBE+2
     /// standards; the prioritization into 4 info vectors is also
     /// shared (per BABA-C / DVSI AMBE-3000 protocol). FEC and frame
@@ -184,7 +184,7 @@ enum Cmd {
     /// (b̂₀..b̂₈, one frame per line, 9 space-separated decimal
     /// values) directly into 8 kHz mono i16 PCM.
     ///
-    /// One step lower than `decode-raw-halfrate`: the consumer
+    /// One step lower than `decode-raw-ambe-plus2`: the consumer
     /// supplies the 9 b̂ values directly, we run prioritize +
     /// dequantize + AMBE+2 synth. The b̂₀..b̂₈ shape is shared across
     /// AMBE+2 standards (P25 Phase 2 / DMR enhanced / NXDN type-2),
@@ -203,7 +203,7 @@ enum Cmd {
     },
     /// Decode a stream of P25 Phase 2 / AMBE+2 half-rate FEC frames
     /// (9 bytes per frame = 36 dibits) into 8 kHz mono i16 PCM. Runs
-    /// the full p25_halfrate decode chain: unpack dibits →
+    /// the full ambe_plus2_wire decode chain: unpack dibits →
     /// `decode_frame` (Annex H deinterleave + Golay/Hamming) →
     /// `dequantize` → AMBE+2 synth.
     ///
@@ -225,7 +225,7 @@ enum Cmd {
     },
     /// Decode a stream of P25 Phase 1 / IMBE full-rate FEC frames
     /// (18 bytes per frame = 72 dibits) into 8 kHz mono i16 PCM.
-    /// Runs the full p25_fullrate decode chain through the chip-shaped
+    /// Runs the full imbe_wire decode chain through the chip-shaped
     /// `Vocoder::decode_bits`.
     ///
     /// Two input formats:
@@ -287,7 +287,7 @@ fn main() -> Result<()> {
             silence_dispatch,
             pitch_silence_override,
             default_pitch_on_silence,
-        } => cmd_halfrate_ab_matrix(
+        } => cmd_ambe_plus2_ab_matrix(
             &pcm,
             &out_dir,
             frames,
@@ -296,14 +296,14 @@ fn main() -> Result<()> {
             default_pitch_on_silence,
         ),
         Cmd::DecodeRawHalfrate { input, out_wav, binary } => {
-            cmd_decode_raw_halfrate(&input, &out_wav, binary)
+            cmd_decode_raw_ambe_plus2(&input, &out_wav, binary)
         }
         Cmd::DecodeRawMbe { input, out_wav } => cmd_decode_raw_mbe(&input, &out_wav),
         Cmd::DecodeFecHalfrate { input, out_wav, binary } => {
-            cmd_decode_fec_halfrate(&input, &out_wav, binary)
+            cmd_decode_fec_ambe_plus2(&input, &out_wav, binary)
         }
         Cmd::DecodeFecFullrate { input, out_wav, binary } => {
-            cmd_decode_fec_fullrate(&input, &out_wav, binary)
+            cmd_decode_fec_imbe(&input, &out_wav, binary)
         }
     }
 }
@@ -610,7 +610,7 @@ fn our_decode(fec: &[u8], repeat_reset_after: u32) -> Vec<i16> {
 // Half-rate (AMBE+2) self-baseline.
 // ----------------------------------------------------------------------------
 
-fn cmd_halfrate_ab_matrix(
+fn cmd_ambe_plus2_ab_matrix(
     pcm_path: &Path,
     out_dir: &Path,
     frames: Option<usize>,
@@ -637,7 +637,7 @@ fn cmd_halfrate_ab_matrix(
     write_wav(&ref_wav, pcm)?;
 
     let t0 = Instant::now();
-    let our_bits = our_encode_halfrate(
+    let our_bits = our_encode_ambe_plus2(
         pcm,
         silence_dispatch,
         pitch_silence_override,
@@ -645,7 +645,7 @@ fn cmd_halfrate_ab_matrix(
     )?;
     let enc_secs = t0.elapsed().as_secs_f64();
     eprintln!(
-        "halfrate encode: {} frames in {:.2} s ({:.1} ms/frame)",
+        "ambe_plus2 encode: {} frames in {:.2} s ({:.1} ms/frame)",
         our_bits.len() / HALF_BYTES_PER_FEC_FRAME,
         enc_secs,
         1000.0 * enc_secs / (our_bits.len() / HALF_BYTES_PER_FEC_FRAME).max(1) as f64
@@ -656,12 +656,12 @@ fn cmd_halfrate_ab_matrix(
         .with_context(|| format!("write our.bit {}", our_bit_path.display()))?;
 
     let t0 = Instant::now();
-    let our_pcm = our_decode_halfrate(&our_bits);
+    let our_pcm = our_decode_ambe_plus2(&our_bits);
     let dec_secs = t0.elapsed().as_secs_f64();
     let wav_path = out_dir.join("our_enc_our_dec.wav");
     write_wav(&wav_path, &our_pcm)?;
     eprintln!(
-        "halfrate decode: {} samples in {:.2} s → {}",
+        "ambe_plus2 decode: {} samples in {:.2} s → {}",
         our_pcm.len(),
         dec_secs,
         wav_path.display()
@@ -669,7 +669,7 @@ fn cmd_halfrate_ab_matrix(
     Ok(())
 }
 
-fn our_encode_halfrate(
+fn our_encode_ambe_plus2(
     pcm: &[i16],
     silence_dispatch: bool,
     pitch_silence_override: bool,
@@ -690,24 +690,24 @@ fn our_encode_halfrate(
     let mut out = Vec::with_capacity(n_frames * HALF_BYTES_PER_FEC_FRAME);
     for f in 0..n_frames {
         let frame = &pcm[f * FRAME_SAMPLES..(f + 1) * FRAME_SAMPLES];
-        // `encode_halfrate` now dispatches PitchOutOfRange as Silence
-        // internally (blip25-mbe Wave 1.1 fix). `MbeParams::silence_halfrate`
+        // `encode_ambe_plus2` now dispatches PitchOutOfRange as Silence
+        // internally (blip25-mbe Wave 1.1 fix). `MbeParams::silence_ambe_plus2`
         // gives a half-rate-table-compatible placeholder. Only treat
         // remaining analysis errors as fatal.
-        let params = match analysis_encode_halfrate(frame, &mut state) {
+        let params = match analysis_encode_ambe_plus2(frame, &mut state) {
             Ok(AnalysisOutput::Voice(p)) => p,
-            Ok(AnalysisOutput::Silence) => MbeParams::silence_halfrate(),
-            Err(e) => return Err(anyhow!("analysis-halfrate error at frame {f}: {e:?}")),
+            Ok(AnalysisOutput::Silence) => MbeParams::silence_ambe_plus2(),
+            Err(e) => return Err(anyhow!("analysis-ambe-plus2 error at frame {f}: {e:?}")),
         };
         let info = quantize_half(&params, &mut decoder_state)
-            .map_err(|e| anyhow!("halfrate quantize error at frame {f}: {e:?}"))?;
+            .map_err(|e| anyhow!("ambe_plus2 quantize error at frame {f}: {e:?}"))?;
         let dibits = encode_half_frame(&info);
         out.extend_from_slice(&pack_dibits_half(&dibits));
     }
     Ok(out)
 }
 
-fn our_decode_halfrate(fec: &[u8]) -> Vec<i16> {
+fn our_decode_ambe_plus2(fec: &[u8]) -> Vec<i16> {
     let n_frames = fec.len() / HALF_BYTES_PER_FEC_FRAME;
     let mut decoder_state = HalfDecoderState::new();
     let mut synth = SynthState::new();
@@ -744,7 +744,7 @@ fn our_decode_halfrate(fec: &[u8]) -> Vec<i16> {
 /// carrier whose voice frames carry the same post-FEC info-vector
 /// layout (P25 Phase 2, DMR enhanced full-rate, NXDN type-2) once the
 /// consumer's wire-extractor has stripped that carrier's FEC.
-fn cmd_decode_raw_halfrate(input: &Path, out_wav: &Path, binary: bool) -> Result<()> {
+fn cmd_decode_raw_ambe_plus2(input: &Path, out_wav: &Path, binary: bool) -> Result<()> {
     use std::io::Read;
     let raw: Vec<u8> = if input == Path::new("-") {
         let mut buf = Vec::new();
@@ -847,8 +847,8 @@ fn cmd_decode_raw_halfrate(input: &Path, out_wav: &Path, binary: bool) -> Result
 /// Decode a text stream of raw AMBE+2 half-rate parameter words
 /// (b̂₀..b̂₈, one frame per line, 9 decimal values) directly into PCM.
 ///
-/// One step lower than `cmd_decode_raw_halfrate`: the caller supplies
-/// the 9 b̂ values pre-prioritization. We run `p25_halfrate::priority::
+/// One step lower than `cmd_decode_raw_ambe_plus2`: the caller supplies
+/// the 9 b̂ values pre-prioritization. We run `ambe_plus2_wire::priority::
 /// prioritize` to produce the 4 info vectors, then `dequantize` +
 /// AMBE+2 synth.
 ///
@@ -856,7 +856,7 @@ fn cmd_decode_raw_halfrate(input: &Path, out_wav: &Path, binary: bool) -> Result
 /// b̂₁=5 (V/UV), b̂₂=5 (gain), b̂₃=11, b̂₄=4, b̂₅=4, b̂₆=4, b̂₇=4, b̂₈=4.
 /// Total 48 bits + 1 don't-care padding = 49-bit voice payload.
 fn cmd_decode_raw_mbe(input: &Path, out_wav: &Path) -> Result<()> {
-    use blip25_mbe::p25_halfrate::priority::prioritize as prioritize_half;
+    use blip25_mbe::ambe_plus2_wire::priority::prioritize as prioritize_half;
     use std::io::Read;
     let raw: Vec<u8> = if input == Path::new("-") {
         let mut buf = Vec::new();
@@ -962,9 +962,9 @@ fn cmd_decode_raw_mbe(input: &Path, out_wav: &Path) -> Result<()> {
 ///
 /// Wire-FEC-aware entry point. Useful for raw chip dumps, off-air
 /// captures, and any consumer that has 9-byte AMBE+2 FEC frames in
-/// hand. Mirrors `decode-raw-halfrate` but one layer up — input is
+/// hand. Mirrors `decode-raw-ambe-plus2` but one layer up — input is
 /// pre-FEC-decode bytes, output is PCM after the full wire chain.
-fn cmd_decode_fec_halfrate(input: &Path, out_wav: &Path, binary: bool) -> Result<()> {
+fn cmd_decode_fec_ambe_plus2(input: &Path, out_wav: &Path, binary: bool) -> Result<()> {
     use std::io::Read;
     let raw: Vec<u8> = if input == Path::new("-") {
         let mut buf = Vec::new();
@@ -1022,7 +1022,7 @@ fn cmd_decode_fec_halfrate(input: &Path, out_wav: &Path, binary: bool) -> Result
         out
     };
 
-    // Drive the chip-shaped Vocoder API rather than `our_decode_halfrate`'s
+    // Drive the chip-shaped Vocoder API rather than `our_decode_ambe_plus2`'s
     // probe-flag-aware path -- this is a clean carrier-agnostic decode and
     // wants the carrier-agnostic surface.
     use blip25_mbe::vocoder::{Rate, Vocoder};
@@ -1052,8 +1052,8 @@ fn cmd_decode_fec_halfrate(input: &Path, out_wav: &Path, binary: bool) -> Result
 /// Decode FEC-level full-rate IMBE frames (18 bytes / 72 dibits each)
 /// into PCM via the chip-shaped Vocoder API.
 ///
-/// Mirrors `cmd_decode_fec_halfrate` but for P25 Phase 1 input.
-fn cmd_decode_fec_fullrate(input: &Path, out_wav: &Path, binary: bool) -> Result<()> {
+/// Mirrors `cmd_decode_fec_ambe_plus2` but for P25 Phase 1 input.
+fn cmd_decode_fec_imbe(input: &Path, out_wav: &Path, binary: bool) -> Result<()> {
     use blip25_mbe::vocoder::{Rate, Vocoder};
     use std::io::Read;
     let raw: Vec<u8> = if input == Path::new("-") {

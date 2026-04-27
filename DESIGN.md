@@ -77,8 +77,8 @@ codecs/           — analysis/synthesis, one submodule per generation.
   ambe/           — AMBE-1000, Generation 1.
   ambe_plus/      — AMBE-2000, Generation 2. US5701390 phase regeneration.
   ambe_plus2/     — AMBE-3000, Generation 3. US8595002, US8315860.
-p25_fullrate/     — P25 Phase 1 FDMA: 144-bit IMBE wire (BABA-A §1–§12).
-p25_halfrate/     — P25 Phase 2 TDMA: 72-bit AMBE+2 wire (BABA-A §13–§17 +
+imbe_wire/     — P25 Phase 1 FDMA: 144-bit IMBE wire (BABA-A §1–§12).
+ambe_plus2_wire/     — P25 Phase 2 TDMA: 72-bit AMBE+2 wire (BABA-A §13–§17 +
                     Annexes L–T; renamed "Half-Rate Vocoder" in the spec
                     to dodge DVSI's trademark, but the wire is AMBE+2).
 dvsi_3000/        — DVSI AMBE-3000 chip protocol (r0..r63 rate configurations).
@@ -96,16 +96,16 @@ Three concerns, three top-level axes, one interchange type.
 because non-P25 protocols (DMR, D-STAR, NXDN, …) share codecs from the
 MBE family but use entirely different over-the-air bit containers,
 FEC, and prioritization. When DMR voice support is added it becomes
-`dmr_voice/` as a sibling of `p25_fullrate/` and `p25_halfrate/`, not
+`dmr_voice/` as a sibling of `imbe_wire/` and `ambe_plus2_wire/`, not
 a sub-rate of either. The codec layer (`codecs/`) remains shared
 across protocols.
 
-**Why `p25_fullrate` is not equivalent to "IMBE wire."** BABA-A is a
+**Why `imbe_wire` is not equivalent to "IMBE wire."** BABA-A is a
 consolidation of two independent vocoder specs: the original 1998
 BABA (full-rate IMBE) and the BABA-1 addendum (half-rate AMBE+2).
 The two wires are governed by the same document but they are not the
 same vocoder. P25 Phase 1 fire-channel deployments in particular
-sometimes pair the `p25_fullrate` wire with the `codecs::ambe_plus2`
+sometimes pair the `imbe_wire` wire with the `codecs::ambe_plus2`
 codec for SCBA-mask noise immunity — a valid combination because the
 wire layer's only contract with the codec is `bits ↔ MbeParams`.
 
