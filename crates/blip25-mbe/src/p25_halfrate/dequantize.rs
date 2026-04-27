@@ -46,6 +46,36 @@ use crate::mbe_params::{L_MAX, MbeParams};
 /// `J̃₄ = 17`). Sized generously to cover the full table.
 pub const MAX_BLOCK_SIZE: usize = 17;
 
+/// Per-block DCT cosine lookup, lazily built once. `dct_cos(j_i)`
+/// returns `&[f64; j_i*j_i]` indexed by `k_0 * j_i + j_0`, holding
+/// `cos(π · k_0 · (j_0 + 0.5) / j_i)` — the kernel shared by both
+/// [`forward_block_dct`] and [`inverse_block_dct`]. Without the LUT
+/// each block does `j_i²` `f64::cos` calls per direction; the
+/// roundtrip in the analysis encoder hits both directions per frame,
+/// giving up to ~1 200 transcendentals/frame in worst-case `J̃ = 17`
+/// blocks. With the LUT it's a single multiply + table read.
+fn dct_cos(j_i: usize) -> &'static [f64] {
+    use std::sync::OnceLock;
+    static TABLES: OnceLock<[Vec<f64>; MAX_BLOCK_SIZE + 1]> = OnceLock::new();
+    let tables = TABLES.get_or_init(|| {
+        core::array::from_fn(|j| {
+            if j == 0 {
+                Vec::new()
+            } else {
+                let mut t = vec![0f64; j * j];
+                for k_0 in 0..j {
+                    for j_0 in 0..j {
+                        t[k_0 * j + j_0] =
+                            (PI64 * (k_0 as f64) * (j_0 as f64 + 0.5) / j as f64).cos();
+                    }
+                }
+                t
+            }
+        })
+    });
+    &tables[j_i]
+}
+
 /// Initial value of `L̃(−1)` for the half-rate decoder (§2.13 Annex A).
 /// Differs from full-rate's 30 (§1.8.5).
 pub const INIT_PREV_L: u8 = 15;
@@ -345,12 +375,15 @@ pub fn inverse_block_dct(
     let mut l_offset = 0usize;
     for i in 0..4 {
         let j_i = blocks[i] as usize;
+        if j_i == 0 {
+            continue;
+        }
+        let cos_tab = dct_cos(j_i);
         for j_0 in 0..j_i {
             let mut acc = 0f64;
             for k_0 in 0..j_i {
                 let alpha = if k_0 == 0 { 1.0 } else { 2.0 };
-                let arg = PI64 * (k_0 as f64) * (j_0 as f64 + 0.5) / j_i as f64;
-                acc += alpha * c[i][k_0] * arg.cos();
+                acc += alpha * c[i][k_0] * cos_tab[k_0 * j_i + j_0];
             }
             t[l_offset + j_0] = acc;
         }
@@ -717,13 +750,17 @@ pub fn forward_block_dct(
     let mut l_offset = 0usize;
     for i in 0..4 {
         let j_i = blocks[i] as usize;
+        if j_i == 0 {
+            continue;
+        }
+        let cos_tab = dct_cos(j_i);
+        let inv_j = 1.0 / j_i as f64;
         for k_0 in 0..j_i {
             let mut acc = 0f64;
             for j_0 in 0..j_i {
-                let arg = PI64 * (k_0 as f64) * (j_0 as f64 + 0.5) / j_i as f64;
-                acc += t[l_offset + j_0] * arg.cos();
+                acc += t[l_offset + j_0] * cos_tab[k_0 * j_i + j_0];
             }
-            c[i][k_0] = acc / j_i as f64;
+            c[i][k_0] = acc * inv_j;
         }
         l_offset += j_i;
     }

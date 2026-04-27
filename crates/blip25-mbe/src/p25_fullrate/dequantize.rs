@@ -245,14 +245,13 @@ pub fn decode_gain_dct(b: &[u16; 59], l: u8) -> [f32; 6] {
 /// `analysis/vocoder_decode_disambiguations.md §2` (2026-04-16
 /// correction) for the full derivation.
 pub fn gain_to_residuals(g: &[f32; 6]) -> [f32; 6] {
+    let cos_tab = dct6_cos();
     let mut r = [0f32; 6];
     for i_0 in 0..6 {
-        let i_half = i_0 as f32 + 0.5;
         let mut acc = 0.0f32;
         for m_0 in 0..6 {
             let alpha = if m_0 == 0 { 1.0 } else { 2.0 };
-            let arg = PI * (m_0 as f32) * i_half / 6.0;
-            acc += alpha * g[m_0] * arg.cos();
+            acc += alpha * g[m_0] * cos_tab[m_0 * 6 + i_0];
         }
         r[i_0] = acc;
     }
@@ -265,6 +264,52 @@ pub fn gain_to_residuals(g: &[f32; 6]) -> [f32; 6] {
 
 /// Maximum block size: ⌈56 / 6⌉ = 10. Used to size HOC matrix rows.
 pub const MAX_BLOCK_SIZE: usize = 10;
+
+/// Lazily-built per-block DCT cosine LUT (f32). `dct_cos(j_i)`
+/// returns a flat `j_i*j_i` slice indexed by `k_0 * j_i + j_0`,
+/// holding `cos(π · k_0 · (j_0 + 0.5) / j_i)` — the kernel shared
+/// by [`forward_block_dct`] and [`inverse_block_dct`]. Same memo
+/// pattern as the half-rate equivalent in
+/// [`crate::p25_halfrate::dequantize`]; without it each block does
+/// `j_i²` `f32::cos` calls per direction in the encoder roundtrip.
+fn dct_cos(j_i: usize) -> &'static [f32] {
+    use std::sync::OnceLock;
+    static TABLES: OnceLock<[Vec<f32>; MAX_BLOCK_SIZE + 1]> = OnceLock::new();
+    let tables = TABLES.get_or_init(|| {
+        core::array::from_fn(|j| {
+            if j == 0 {
+                Vec::new()
+            } else {
+                let mut t = vec![0f32; j * j];
+                for k_0 in 0..j {
+                    for j_0 in 0..j {
+                        t[k_0 * j + j_0] =
+                            (PI * (k_0 as f32) * (j_0 as f32 + 0.5) / j as f32).cos();
+                    }
+                }
+                t
+            }
+        })
+    });
+    &tables[j_i]
+}
+
+/// Fixed-N=6 cos LUT used by `gain_to_residuals` and the `m_0 → r`
+/// forward DCT. Computed once at first call.
+fn dct6_cos() -> &'static [f32; 36] {
+    use std::sync::OnceLock;
+    static TABLE: OnceLock<[f32; 36]> = OnceLock::new();
+    TABLE.get_or_init(|| {
+        let mut t = [0f32; 36];
+        for m_0 in 0..6 {
+            for i_0 in 0..6 {
+                t[m_0 * 6 + i_0] =
+                    (PI * (m_0 as f32) * (i_0 as f32 + 0.5) / 6.0).cos();
+            }
+        }
+        t
+    })
+}
 
 /// Assemble the per-block DCT coefficient matrix `C̃_{i,k}` for HOC
 /// reconstruction, per BABA-A §1.8 Eq. 67 + 72.
@@ -326,12 +371,15 @@ pub fn inverse_block_dct(
     let mut l_offset = 0usize;
     for i in 0..6 {
         let j_i = blocks[i] as usize;
+        if j_i == 0 {
+            continue;
+        }
+        let cos_tab = dct_cos(j_i);
         for j_0 in 0..j_i {
             let mut acc = 0.0f32;
             for k_0 in 0..j_i {
                 let alpha = if k_0 == 0 { 1.0 } else { 2.0 };
-                let arg = PI * (k_0 as f32) * (j_0 as f32 + 0.5) / j_i as f32;
-                acc += alpha * c[i][k_0] * arg.cos();
+                acc += alpha * c[i][k_0] * cos_tab[k_0 * j_i + j_0];
             }
             t[l_offset + j_0] = acc;
         }
@@ -772,13 +820,12 @@ pub fn encode_gain_dct(g: &[f32; 6], l: u8) -> [u16; 6] {
 /// `analysis/vocoder_decode_disambiguations.md` §2 (2026-04-16
 /// correction) for the derivation.
 pub fn residuals_to_gain(r: &[f32; 6]) -> [f32; 6] {
+    let cos_tab = dct6_cos();
     let mut g = [0f32; 6];
     for m_0 in 0..6 {
         let mut acc = 0f32;
         for i_0 in 0..6 {
-            let i_half = i_0 as f32 + 0.5;
-            let arg = PI * (m_0 as f32) * i_half / 6.0;
-            acc += r[i_0] * arg.cos();
+            acc += r[i_0] * cos_tab[m_0 * 6 + i_0];
         }
         g[m_0] = acc / 6.0;
     }
@@ -793,13 +840,17 @@ pub fn residuals_to_gain(r: &[f32; 6]) -> [f32; 6] {
 /// Run on each block independently to obtain `C̃_{i,k}`.
 pub fn forward_block_dct(samples: &[f32], n: usize) -> [f32; MAX_BLOCK_SIZE] {
     let mut c = [0f32; MAX_BLOCK_SIZE];
+    if n == 0 {
+        return c;
+    }
+    let cos_tab = dct_cos(n);
+    let inv_n = 1.0 / n as f32;
     for k_0 in 0..n {
         let mut acc = 0f32;
         for j_0 in 0..n {
-            let arg = PI * (k_0 as f32) * (j_0 as f32 + 0.5) / n as f32;
-            acc += samples[j_0] * arg.cos();
+            acc += samples[j_0] * cos_tab[k_0 * n + j_0];
         }
-        c[k_0] = acc / n as f32;
+        c[k_0] = acc * inv_n;
     }
     c
 }
