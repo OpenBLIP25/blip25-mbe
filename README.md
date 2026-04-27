@@ -8,7 +8,49 @@ Built from TIA-102 specifications and expired DVSI patents. Validated by
 black-box comparison against DVSI hardware and published test vectors.
 No code or algorithms borrowed from existing open-source vocoder projects.
 
-See [`DESIGN.md`](./DESIGN.md) for the architectural model.
+See [`DESIGN.md`](./DESIGN.md) for the architectural model and
+[`SCOPE_PLAN.md`](./SCOPE_PLAN.md) for the current roadmap status.
+
+## Quick start
+
+The recommended entry point for in-process Rust callers is the
+[`Vocoder`](./crates/blip25-mbe/src/vocoder.rs) handle, modeled on
+the DVSI AMBE-3000R chip's per-channel API:
+
+```rust
+use blip25_mbe::vocoder::{Rate, Vocoder};
+
+// Open a P25 Phase 1 (full-rate IMBE) channel.
+let mut tx = Vocoder::new(Rate::P25Phase1);
+let pcm: [i16; 160] = [0; 160];
+let bits = tx.encode_pcm(&pcm).unwrap();    // 18-byte FEC frame
+
+let mut rx = Vocoder::new(Rate::P25Phase1);
+let pcm = rx.decode_bits(&bits).unwrap();   // 160 samples
+```
+
+Beyond the per-frame primitive, the same handle exposes:
+
+- `encode_stream` / `decode_stream` — slice → `Iterator<Item = Result<…>>`.
+- `LiveEncoder` / `LiveDecoder` — chunk-driven with internal residue
+  buffer for audio-callback / socket use.
+- `extract_params` / `synthesize_params` — parameter-layer entries
+  that skip the wire FEC, useful for transcoding / analysis pipelines.
+- `Transcoder` — P25 Phase 1 ↔ Phase 2 wire-bit bridge.
+- `VocoderBuilder` — fluent configuration (tone detection, beyond-spec
+  repeat reset, silence dispatch, pitch-silence override).
+- Optional `serde` feature for shipping diagnostic types over RPC.
+
+Two runnable examples demonstrate everything:
+
+```bash
+cargo run --release --example vocoder_demo  -p blip25-mbe   # full API walkthrough
+cargo run --release --example vocoder_bench -p blip25-mbe   # throughput micro-benchmark
+```
+
+See [`INTEGRATION.md`](./INTEGRATION.md) for the AMBE-3000R protocol →
+`Vocoder` operation correspondence and the chip-vs-codec boundary
+principle.
 
 ## Layout
 
