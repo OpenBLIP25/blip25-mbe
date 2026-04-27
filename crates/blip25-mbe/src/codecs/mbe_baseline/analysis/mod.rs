@@ -452,6 +452,19 @@ pub struct AnalysisState {
     /// don't reach the 5-frame hysteresis threshold. Calibrated on
     /// tv-std/tv/p25/{clean,dam,mark}; off by default.
     pitch_silence_override_enabled: bool,
+    /// Opt-in: on near-silent frames, override the pitch *committed*
+    /// to history (NOT the pitch used to encode this frame) with a
+    /// short default period. Targets the 2-frame onset attack — when
+    /// quiet pre-onset frames phantom-lock the autocorrelation to a
+    /// long period, the next frame's `look_back` continuity window
+    /// `[0.8·P_prev, 1.2·P_prev]` is centered far from the actual
+    /// onset's fundamental, causing a 2-frame silencing at the
+    /// silence→loud transition. Memo:
+    /// `project_onset_attack_2frame_2026-04-25.md`. Independent of
+    /// `silence_detection_enabled` — the silent frame still encodes
+    /// as voice; only the pitch-history side-effect changes. Off by
+    /// default; eval via the 5-vector PESQ harness.
+    default_pitch_on_silence_enabled: bool,
 }
 
 /// `E(P̂_I)` threshold for the joint-signal silence override. Frames
@@ -462,6 +475,19 @@ pub const PITCH_SILENCE_EPI_THRESH: f64 = 0.4;
 /// `Ef/η` threshold for the joint-signal silence override. Frames
 /// below this are considered silence-like in energy.
 pub const PITCH_SILENCE_RATIO_THRESH: f64 = 2.0;
+
+/// Default-pitch-on-silence: pitch period (samples) committed to
+/// history when a near-silent frame is detected, in lieu of the
+/// phantom long-period autocorrelation peak. Period 25 = ω₀ ≈ 0.2513
+/// (≈ 320 Hz fundamental), matching the chip's b̂₀ ≈ 25 default per
+/// memo `project_onset_attack_2frame_2026-04-25.md`. Snapped to the
+/// half-sample grid (25.0 is exactly grid index 8).
+pub const DEFAULT_PITCH_ON_SILENCE_PERIOD: f64 = 25.0;
+/// `E(P̂)` value committed alongside `DEFAULT_PITCH_ON_SILENCE_PERIOD`.
+/// Set near zero so the next frame's `CE_B` (Eq. 11) doesn't get a
+/// stale "previous frame was lousy" tax — the override's whole point
+/// is to give look-back a clean starting position.
+pub const DEFAULT_PITCH_ON_SILENCE_E: f64 = 0.0;
 
 /// Preroll frame count at which the analysis encoder has enough
 /// look-ahead state to produce a valid `P̂_I` (§0.9.4).
@@ -482,6 +508,7 @@ impl AnalysisState {
             silence: SilenceDetector::cold_start(),
             silence_detection_enabled: false,
             pitch_silence_override_enabled: false,
+            default_pitch_on_silence_enabled: false,
         }
     }
 
@@ -512,6 +539,24 @@ impl AnalysisState {
     #[inline]
     pub fn pitch_silence_override_enabled(&self) -> bool {
         self.pitch_silence_override_enabled
+    }
+
+    /// Enable or disable the onset-attack mitigation — on near-silent
+    /// frames (`frame_energy < PITCH_SILENCE_RATIO_THRESH · η`),
+    /// commit a short default pitch ([`DEFAULT_PITCH_ON_SILENCE_PERIOD`])
+    /// to the look-back history instead of the phantom long-period
+    /// autocorrelation peak. Independent of `set_silence_detection` —
+    /// the silent frame still encodes through the full voice pipeline;
+    /// only the pitch-history side-effect changes. See memo
+    /// `project_onset_attack_2frame_2026-04-25.md`. Default off.
+    pub fn set_default_pitch_on_silence(&mut self, enabled: bool) {
+        self.default_pitch_on_silence_enabled = enabled;
+    }
+
+    /// Whether the default-pitch-on-silence override is currently enabled.
+    #[inline]
+    pub fn default_pitch_on_silence_enabled(&self) -> bool {
+        self.default_pitch_on_silence_enabled
     }
 
     /// Read-only access to the silence detector state (for inspection
@@ -810,8 +855,22 @@ pub fn encode_with_trace(
         && state.pitch_silence_override_enabled
         && e_p_hat_i >= PITCH_SILENCE_EPI_THRESH
         && frame_energy < PITCH_SILENCE_RATIO_THRESH * state.silence.noise_floor();
+
+    // Onset-attack mitigation (`set_default_pitch_on_silence`): when a
+    // frame is near-silent by the §0.8.4 per-frame ratio test, commit
+    // a short default pitch instead of the phantom long-period
+    // autocorrelation peak. Doesn't affect THIS frame's encoding —
+    // only the value committed to `state.pitch_history` for the next
+    // frame's `look_back`.
+    let near_silent = frame_energy < PITCH_SILENCE_RATIO_THRESH * state.silence.noise_floor();
+    let (commit_p, commit_e) = if state.default_pitch_on_silence_enabled && near_silent {
+        (DEFAULT_PITCH_ON_SILENCE_PERIOD, DEFAULT_PITCH_ON_SILENCE_E)
+    } else {
+        (p_hat_i, e_p_hat_i)
+    };
+
     if (state.silence_detection_enabled && silent) || override_silent {
-        state.commit_pitch(p_hat_i, e_p_hat_i);
+        state.commit_pitch(commit_p, commit_e);
         state.advance_preroll();
         return Ok((AnalysisOutput::Silence, Some(trace)));
     }
@@ -824,7 +883,7 @@ pub fn encode_with_trace(
     // Steps 11–12: commit state and emit voice.
     let params = profile::time(profile::Stage::Tail, || {
         state.predictor.commit(&m_tilde, refinement.l_hat);
-        state.commit_pitch(p_hat_i, e_p_hat_i);
+        state.commit_pitch(commit_p, commit_e);
 
         let mut amplitudes = Vec::with_capacity(refinement.l_hat as usize);
         let mut voiced = Vec::with_capacity(refinement.l_hat as usize);
@@ -907,6 +966,14 @@ pub fn encode_halfrate(
         (p_hat_i, e_p_hat_i)
     });
 
+    // Onset-attack mitigation — see encode_with_trace for rationale.
+    let near_silent = frame_energy < PITCH_SILENCE_RATIO_THRESH * state.silence.noise_floor();
+    let (commit_p, commit_e) = if state.default_pitch_on_silence_enabled && near_silent {
+        (DEFAULT_PITCH_ON_SILENCE_PERIOD, DEFAULT_PITCH_ON_SILENCE_E)
+    } else {
+        (p_hat_i, e_p_hat_i)
+    };
+
     let basis = shared_basis();
     let sw = profile::time(profile::Stage::SignalSpectrum, || {
         let sig_win = state.extract_refinement_window();
@@ -939,7 +1006,7 @@ pub fn encode_halfrate(
     let refinement = match refinement_result? {
         Some(r) => r,
         None => {
-            state.commit_pitch(p_hat_i, e_p_hat_i);
+            state.commit_pitch(commit_p, commit_e);
             state.advance_preroll();
             return Ok(AnalysisOutput::Silence);
         }
@@ -963,7 +1030,7 @@ pub fn encode_halfrate(
         && e_p_hat_i >= PITCH_SILENCE_EPI_THRESH
         && frame_energy < PITCH_SILENCE_RATIO_THRESH * state.silence.noise_floor();
     if (state.silence_detection_enabled && silent) || override_silent {
-        state.commit_pitch(p_hat_i, e_p_hat_i);
+        state.commit_pitch(commit_p, commit_e);
         state.advance_preroll();
         return Ok(AnalysisOutput::Silence);
     }
@@ -989,7 +1056,7 @@ pub fn encode_halfrate(
             rt.l_tilde_zero,
             rt.gamma_tilde_zero,
         );
-        state.commit_pitch(p_hat_i, e_p_hat_i);
+        state.commit_pitch(commit_p, commit_e);
 
         let mut amplitudes = Vec::with_capacity(refinement.l_hat as usize);
         let mut voiced = Vec::with_capacity(refinement.l_hat as usize);
@@ -1350,6 +1417,63 @@ mod tests {
             idx <= 4,
             "override fired at zero-frame #{idx}; expected ≤ 4"
         );
+    }
+
+    /// `set_default_pitch_on_silence` overrides the *committed* pitch
+    /// when a frame is near-silent, but leaves the encoded frame
+    /// unchanged. Compare prev_pitch in pitch_history before and after
+    /// a quiet frame, with the flag off vs. on.
+    #[test]
+    fn default_pitch_on_silence_overrides_committed_pitch_only() {
+        let warmup = |s: &mut AnalysisState| {
+            // Drain preroll + warm η.
+            let loud = periodic_pcm_frame(50.0, 10, 0.0);
+            for _ in 0..20 {
+                let _ = encode(&loud, s);
+            }
+        };
+        // Quiet noise frame whose energy is below 2·η after the loud
+        // warm-up — the §0.8.4 per-frame ratio test will mark it silent.
+        let quiet = [5i16; SAMPLES_PER_FRAME as usize];
+
+        // Flag OFF: the committed pitch is whatever the tracker picked
+        // from the autocorrelation peaks of the quiet input — typically
+        // a long-period phantom, never the override's 25.0.
+        let mut s_off = AnalysisState::new();
+        warmup(&mut s_off);
+        assert!(!s_off.default_pitch_on_silence_enabled());
+        let _ = encode(&quiet, &mut s_off).unwrap();
+        let phantom = s_off.pitch_history().prev_pitch;
+        assert_ne!(
+            phantom, DEFAULT_PITCH_ON_SILENCE_PERIOD,
+            "with flag off the committed pitch must NOT be the override"
+        );
+
+        // Flag ON: the committed pitch is the short default. The
+        // ENCODED frame (output) for the same input must be unchanged
+        // bit-for-bit since the override only affects pitch_history,
+        // not the rate-quantized output of THIS frame.
+        let mut s_on = AnalysisState::new();
+        s_on.set_default_pitch_on_silence(true);
+        warmup(&mut s_on);
+        assert!(s_on.default_pitch_on_silence_enabled());
+        let mut s_off_for_compare = AnalysisState::new();
+        warmup(&mut s_off_for_compare);
+        let out_off = encode(&quiet, &mut s_off_for_compare).unwrap();
+        let out_on = encode(&quiet, &mut s_on).unwrap();
+        assert_eq!(
+            format!("{out_off:?}"),
+            format!("{out_on:?}"),
+            "override changed THIS frame's encoded output — should only \
+             affect committed pitch_history"
+        );
+        assert_eq!(
+            s_on.pitch_history().prev_pitch,
+            DEFAULT_PITCH_ON_SILENCE_PERIOD,
+            "with flag on, near-silent frame's committed pitch must be \
+             the default short period"
+        );
+        assert_eq!(s_on.pitch_history().prev_err_1, DEFAULT_PITCH_ON_SILENCE_E);
     }
 
     /// `pitch_silence_override_enabled()` reflects the setter and the

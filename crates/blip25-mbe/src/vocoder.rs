@@ -365,6 +365,26 @@ impl Vocoder {
         self.analysis.pitch_silence_override_enabled()
     }
 
+    /// Enable or disable the onset-attack mitigation. On near-silent
+    /// frames the encoder commits a short default pitch
+    /// (≈ 25 samples / ~320 Hz) to its look-back history instead of
+    /// the phantom long-period autocorrelation peak that quiet input
+    /// otherwise produces. The silent frame still encodes through the
+    /// full voice pipeline; only the next frame's `look_back`
+    /// continuity window is affected. Targets the 2-frame onset attack
+    /// at silence→loud transitions documented in
+    /// `project_onset_attack_2frame_2026-04-25.md`. Default off — eval
+    /// via the 5-vector PESQ harness before enabling in production.
+    pub fn set_default_pitch_on_silence(&mut self, on: bool) {
+        self.analysis.set_default_pitch_on_silence(on);
+    }
+
+    /// Whether the onset-attack mitigation is currently enabled.
+    #[inline]
+    pub fn default_pitch_on_silence(&self) -> bool {
+        self.analysis.default_pitch_on_silence_enabled()
+    }
+
     /// Start a fluent builder for this rate. Equivalent to
     /// `VocoderBuilder::new(rate)`.
     #[inline]
@@ -995,6 +1015,7 @@ pub struct VocoderBuilder {
     repeat_reset_after: Option<u32>,
     silence_dispatch: bool,
     pitch_silence_override: bool,
+    default_pitch_on_silence: bool,
     halfrate_synth: HalfrateSynth,
 }
 
@@ -1008,6 +1029,7 @@ impl VocoderBuilder {
             repeat_reset_after: None,
             silence_dispatch: false,
             pitch_silence_override: false,
+            default_pitch_on_silence: false,
             halfrate_synth: HalfrateSynth::AmbePlus,
         }
     }
@@ -1045,6 +1067,15 @@ impl VocoderBuilder {
         self
     }
 
+    /// Enable the onset-attack mitigation (commit a short default
+    /// pitch on near-silent frames). See
+    /// [`Vocoder::set_default_pitch_on_silence`].
+    #[inline]
+    pub fn default_pitch_on_silence(mut self, on: bool) -> Self {
+        self.default_pitch_on_silence = on;
+        self
+    }
+
     /// Configure the half-rate synth flavor (no-op for full-rate).
     /// See [`Vocoder::set_halfrate_synth`].
     #[inline]
@@ -1060,6 +1091,7 @@ impl VocoderBuilder {
         v.set_repeat_reset_after(self.repeat_reset_after);
         v.set_silence_dispatch(self.silence_dispatch);
         v.set_pitch_silence_override(self.pitch_silence_override);
+        v.set_default_pitch_on_silence(self.default_pitch_on_silence);
         v.set_halfrate_synth(self.halfrate_synth);
         v
     }
