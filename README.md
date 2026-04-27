@@ -1,8 +1,11 @@
 # blip25-mbe
 
-A clean-room implementation of the MBE vocoder family: IMBE (P25 Phase 1),
-AMBE / AMBE+ / AMBE+2 (DVSI AMBE-1000/2000/3000 generations), and parametric
-rate conversion between them.
+A modern, spec-faithful Rust implementation of the DVSI MBE codec family
+(IMBE, AMBE, AMBE+, AMBE+2). Drop-in replacement for the AMBE-3000R chip's
+codec layer in P25, DMR, NXDN, and D-STAR pipelines.
+
+Covers IMBE (P25 Phase 1), AMBE / AMBE+ / AMBE+2 (DVSI AMBE-1000/2000/3000
+generations), and parametric rate conversion between them.
 
 Built from TIA-102 specifications and expired DVSI patents. Validated by
 black-box comparison against DVSI hardware and published test vectors.
@@ -10,6 +13,10 @@ No code or algorithms borrowed from existing open-source vocoder projects.
 
 See [`DESIGN.md`](./DESIGN.md) for the architectural model and
 [`SCOPE_PLAN.md`](./SCOPE_PLAN.md) for the current roadmap status.
+
+New to the DVSI codec family or curious why open-source P25 sounds worse than
+commercial radios? Read [`docs/codec_family_explainer.md`](./docs/codec_family_explainer.md)
+for the wire-format-vs-implementation story and what this project does about it.
 
 ## Quick start
 
