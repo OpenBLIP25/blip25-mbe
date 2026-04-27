@@ -146,6 +146,8 @@ pub use silence::SilenceDetector;
 pub mod tone_detect;
 pub use tone_detect::{ToneDetection, detect_dtmf, detect_single_tone, detect_tone};
 
+pub mod profile;
+
 /// Errors reported by the analysis encoder.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AnalysisError {
@@ -711,17 +713,20 @@ pub fn encode_with_trace(
 
     // Step 1: HPF the incoming frame.
     let mut hpf_out = [0.0f64; SAMPLES_PER_FRAME as usize];
-    state.hpf.run_pcm(pcm, &mut hpf_out);
+    profile::time(profile::Stage::Hpf, || state.hpf.run_pcm(pcm, &mut hpf_out));
 
     // §0.8.4: update the silence detector every frame with the
     // post-HPF frame energy (Σ s²(n)). The update runs whether or
     // not silence dispatch is enabled — the η tracker needs a
     // continuous signal to be useful.
-    let frame_energy: f64 = hpf_out.iter().map(|s| s * s).sum();
-    let silent = state.silence.update(frame_energy);
+    let (frame_energy, silent) = profile::time(profile::Stage::SilenceDetect, || {
+        let e: f64 = hpf_out.iter().map(|s| s * s).sum();
+        let s = state.silence.update(e);
+        (e, s)
+    });
 
     // Step 2: ingest into the lookahead buffer.
-    state.ingest_frame(&hpf_out);
+    profile::time(profile::Stage::Ingest, || state.ingest_frame(&hpf_out));
 
     // Step 3: preroll check.
     if state.in_preroll() {
@@ -730,16 +735,25 @@ pub fn encode_with_trace(
     }
 
     // Steps 4-5: pitch tracking over the three-frame PitchSearch window.
-    let cur_win = state.extract_pitch_window(0);
-    let f1_win = state.extract_pitch_window(1);
-    let f2_win = state.extract_pitch_window(2);
-    let search_cur = PitchSearch::new(&cur_win);
-    let search_f1 = PitchSearch::new(&f1_win);
-    let search_f2 = PitchSearch::new(&f2_win);
-    let (p_b, ce_b) = look_back(&search_cur, state.pitch_history);
-    let (p_f, ce_f) = look_ahead(&search_cur, &search_f1, &search_f2);
-    let p_hat_i = decide_initial_pitch(p_b, ce_b, p_f, ce_f);
-    let e_p_hat_i = search_cur.e_of_p(p_hat_i);
+    let (search_cur, search_f1, search_f2) =
+        profile::time(profile::Stage::PitchSearch, || {
+            let cur_win = state.extract_pitch_window(0);
+            let f1_win = state.extract_pitch_window(1);
+            let f2_win = state.extract_pitch_window(2);
+            (
+                PitchSearch::new(&cur_win),
+                PitchSearch::new(&f1_win),
+                PitchSearch::new(&f2_win),
+            )
+        });
+    let (p_b, ce_b, p_f, ce_f, p_hat_i, e_p_hat_i) =
+        profile::time(profile::Stage::PitchTrack, || {
+            let (p_b, ce_b) = look_back(&search_cur, state.pitch_history);
+            let (p_f, ce_f) = look_ahead(&search_cur, &search_f1, &search_f2);
+            let p_hat_i = decide_initial_pitch(p_b, ce_b, p_f, ce_f);
+            let e_p_hat_i = search_cur.e_of_p(p_hat_i);
+            (p_b, ce_b, p_f, ce_f, p_hat_i, e_p_hat_i)
+        });
     let mut trace = EncodeTrace {
         p_hat_b: p_b,
         ce_b,
@@ -756,18 +770,26 @@ pub fn encode_with_trace(
 
     // Step 6: signal DFT.
     let basis = shared_basis();
-    let sig_win = state.extract_refinement_window();
-    let sw = signal_spectrum(&sig_win);
+    let sw = profile::time(profile::Stage::SignalSpectrum, || {
+        let sig_win = state.extract_refinement_window();
+        signal_spectrum(&sig_win)
+    });
 
     // Step 7: pitch refinement.
-    let refinement = refine_pitch(&sw, basis, p_hat_i);
+    let refinement = profile::time(profile::Stage::RefinePitch, || {
+        refine_pitch(&sw, basis, p_hat_i)
+    });
 
     // Step 8: V/UV (must precede §0.5 per Figure 5).
-    let vuv_result = determine_vuv(&sw, basis, &refinement, e_p_hat_i, &mut state.vuv);
+    let vuv_result = profile::time(profile::Stage::Vuv, || {
+        determine_vuv(&sw, basis, &refinement, e_p_hat_i, &mut state.vuv)
+    });
     trace.vuv_result = Some(vuv_result.clone());
 
     // Step 9: spectral amplitude estimation.
-    let m_hat = estimate_spectral_amplitudes(&sw, basis, &refinement, &vuv_result);
+    let m_hat = profile::time(profile::Stage::Amplitude, || {
+        estimate_spectral_amplitudes(&sw, basis, &refinement, &vuv_result)
+    });
 
     // §0.8 silence gate. Per §13.3 prose: silence / tone / erasure
     // frames do NOT update the matched-decoder predictor state, but
@@ -790,29 +812,33 @@ pub fn encode_with_trace(
     }
 
     // Step 10: matched-decoder roundtrip (closed-loop §0.6.6).
-    let m_tilde =
-        matched_decoder_roundtrip(&m_hat, &refinement, &vuv_result, &state.predictor)?;
+    let m_tilde = profile::time(profile::Stage::MatchedDecoder, || {
+        matched_decoder_roundtrip(&m_hat, &refinement, &vuv_result, &state.predictor)
+    })?;
 
-    // Step 11: commit state for the next frame.
-    state.predictor.commit(&m_tilde, refinement.l_hat);
-    state.commit_pitch(p_hat_i, e_p_hat_i);
+    // Steps 11–12: commit state and emit voice.
+    let params = profile::time(profile::Stage::Tail, || {
+        state.predictor.commit(&m_tilde, refinement.l_hat);
+        state.commit_pitch(p_hat_i, e_p_hat_i);
 
-    // Step 12: emit voice.
-    let mut amplitudes = Vec::with_capacity(refinement.l_hat as usize);
-    let mut voiced = Vec::with_capacity(refinement.l_hat as usize);
-    for l in 1..=u32::from(refinement.l_hat) {
-        amplitudes.push(m_hat[l as usize] as f32);
-        let k = band_for_harmonic(l, vuv_result.k_hat);
-        voiced.push(k >= 1 && vuv_result.vuv[k as usize] == 1);
-    }
-    let params = MbeParams::new(
-        refinement.omega_hat as f32,
-        refinement.l_hat,
-        &voiced,
-        &amplitudes,
-    )
+        let mut amplitudes = Vec::with_capacity(refinement.l_hat as usize);
+        let mut voiced = Vec::with_capacity(refinement.l_hat as usize);
+        for l in 1..=u32::from(refinement.l_hat) {
+            amplitudes.push(m_hat[l as usize] as f32);
+            let k = band_for_harmonic(l, vuv_result.k_hat);
+            voiced.push(k >= 1 && vuv_result.vuv[k as usize] == 1);
+        }
+        let params = MbeParams::new(
+            refinement.omega_hat as f32,
+            refinement.l_hat,
+            &voiced,
+            &amplitudes,
+        )?;
+        state.advance_preroll();
+        Ok::<MbeParams, crate::mbe_params::MbeParamsError>(params)
+    })
     .map_err(|_| AnalysisError::PitchOutOfRange)?;
-    state.advance_preroll();
+
     Ok((AnalysisOutput::Voice(params), Some(trace)))
 }
 

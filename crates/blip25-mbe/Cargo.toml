@@ -18,6 +18,12 @@ default = []
 ## (gRPC / protobuf / WS) ship these over the wire without a
 ## hand-rolled converter. Off by default to keep the core dep-free.
 serde = ["dep:serde"]
+## Per-stage timing instrumentation in the analysis encoder. Wraps
+## each step of `encode_with_trace` with thread-local Instant
+## accumulators; disabled by default (zero overhead). When enabled,
+## consumers read snapshots via [`codecs::mbe_baseline::analysis::profile`].
+## See the `profile_encode` example for a usage walkthrough.
+profile = []
 
 [dependencies]
 rustfft = { workspace = true }

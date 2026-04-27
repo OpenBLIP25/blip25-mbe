@@ -92,6 +92,13 @@ pub struct PitchSearch {
     /// `R_MAX_LAG = W_I_HALF = 150`: Eq. 5's sum reaches lags
     /// `n·P` with `|n| ≤ ⌊150/P⌋`, so `|n·P| ≤ 150` by construction.
     r: [f64; R_MAX_LAG + 1],
+    /// `E(P)` precomputed at every half-sample grid point for fast
+    /// lookup. Indexed by `i ∈ [0, PITCH_GRID_LEN)` where the grid
+    /// pitch is `PITCH_GRID_MIN + i · PITCH_GRID_STEP`. Built once in
+    /// `from_lpf`; consumed by [`Self::argmin_in_range`] /
+    /// [`Self::e_of_p_grid`] / [`look_ahead`]. Off-grid queries still
+    /// recompute via [`Self::e_of_p`].
+    e_grid: [f64; PITCH_GRID_LEN],
 }
 
 const R_MAX_LAG: usize = W_I_HALF as usize;
@@ -138,11 +145,22 @@ impl PitchSearch {
             }
             r[t as usize] = acc;
         }
-        Self {
+        // Precompute E(P) at every half-sample grid point so the
+        // hot loops in look_back / look_ahead become slice scans
+        // instead of recomputing the Eq. 5 sum each visit.
+        let mut e_grid = [0.0f64; PITCH_GRID_LEN];
+        let mut tmp = Self {
             energy,
             w_i_fourth_moment: w4,
             r,
+            e_grid: [0.0; PITCH_GRID_LEN],
+        };
+        for (i, slot) in e_grid.iter_mut().enumerate() {
+            let p = PITCH_GRID_MIN + (i as f64) * PITCH_GRID_STEP;
+            *slot = tmp.e_of_p(p);
         }
+        tmp.e_grid = e_grid;
+        tmp
     }
 
     /// Eq. 8: linear interpolation of `r(t)` between integer lags.
@@ -175,6 +193,16 @@ impl PitchSearch {
         num / denom
     }
 
+    /// `E(P)` at the `i`-th half-sample grid point — i.e.
+    /// `E(PITCH_GRID_MIN + i · PITCH_GRID_STEP)`, looked up from the
+    /// cache built in `from_lpf`. Cheap: single array access.
+    /// Out-of-range `i` returns `1.0` (matching the off-grid `e_of_p`
+    /// silent-frame fallback).
+    #[inline]
+    pub fn e_of_p_grid(&self, i: usize) -> f64 {
+        self.e_grid.get(i).copied().unwrap_or(1.0)
+    }
+
     /// Argmin of `E(P)` over the half-sample grid within `[p_lo, p_hi]`,
     /// both bounds clamped to `[PITCH_GRID_MIN, PITCH_GRID_MAX]`. The
     /// range is inclusive on both ends. Returns `(P̂, E(P̂))`.
@@ -184,16 +212,22 @@ impl PitchSearch {
         // Round up to the next grid point at p_lo; round down at p_hi.
         let i_lo = ((p_lo - PITCH_GRID_MIN) / PITCH_GRID_STEP).ceil() as i32;
         let i_hi = ((p_hi - PITCH_GRID_MIN) / PITCH_GRID_STEP).floor() as i32;
-        let mut best_p = PITCH_GRID_MIN + f64::from(i_lo) * PITCH_GRID_STEP;
-        let mut best_e = self.e_of_p(best_p);
-        for i in (i_lo + 1)..=i_hi {
-            let p = PITCH_GRID_MIN + f64::from(i) * PITCH_GRID_STEP;
-            let e = self.e_of_p(p);
-            if e < best_e {
-                best_e = e;
-                best_p = p;
-            }
+        if i_lo > i_hi {
+            // Empty range after clamp — degenerate but possible if
+            // p_lo > p_hi or both fall in the same sub-grid bin.
+            let p = PITCH_GRID_MIN + f64::from(i_lo.max(0)) * PITCH_GRID_STEP;
+            return (p, 1.0);
         }
+        let i_lo_u = i_lo as usize;
+        let i_hi_u = (i_hi as usize).min(PITCH_GRID_LEN - 1);
+        let slice = &self.e_grid[i_lo_u..=i_hi_u];
+        let (rel_idx, &best_e) = slice
+            .iter()
+            .enumerate()
+            .min_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(core::cmp::Ordering::Equal))
+            .expect("non-empty slice");
+        let best_i = i_lo_u + rel_idx;
+        let best_p = PITCH_GRID_MIN + (best_i as f64) * PITCH_GRID_STEP;
         (best_p, best_e)
     }
 }
@@ -263,9 +297,9 @@ pub fn look_ahead(
     // [0.8·P̂_1, 1.2·P̂_1] minimizing E_2. CE_F(P_0) is the sum.
     let mut best_p0 = PITCH_GRID_MIN;
     let mut best_ce = f64::INFINITY;
-    for i in 0..PITCH_GRID_LEN as i32 {
-        let p0 = PITCH_GRID_MIN + f64::from(i) * PITCH_GRID_STEP;
-        let e0 = current.e_of_p(p0);
+    for i in 0..PITCH_GRID_LEN {
+        let p0 = PITCH_GRID_MIN + (i as f64) * PITCH_GRID_STEP;
+        let e0 = current.e_of_p_grid(i);
         let (p1, e1) = next1.argmin_in_range(
             PITCH_CONTINUITY_LO * p0,
             PITCH_CONTINUITY_HI * p0,
