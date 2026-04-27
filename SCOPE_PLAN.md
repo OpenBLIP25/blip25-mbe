@@ -105,7 +105,7 @@ the original sketch — see "What actually shipped" below.
 | Item | Status | Commit(s) |
 |------|--------|-----------|
 | 1.1 Half-rate API gotchas | done | `1531cb9` |
-| 1.2 AMBE+ Gen-2 dequantize wrapper | parked | — |
+| 1.2 AMBE+ Gen-2 dequantize wrapper | reframed + landed (synth-side, not dequant-side) | `87968e0` |
 | 1.3 Unified `Vocoder` trait + builder | done + expanded | `1be40b4`, `d0e6f2b`, `9c0cf58`, `d9a1820`, `399e903` |
 | 1.4 `serde` diagnostic types | done | `9f94296` |
 | 1.5 Streaming iterator API | done + expanded | `73d3e41`, `327dfc2`, `282a911` |
