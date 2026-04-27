@@ -76,14 +76,14 @@ A `Codec`/`Vocoder` handle would consolidate this:
 
 ```rust
 let mut vocoder = Vocoder::builder()
-    .rate(Rate::P25Phase1)        // or P25Phase2, NxdnType2, etc
+    .rate(Rate::Imbe7200x4400)        // or AmbePlus2_3600x2450, NxdnType2, etc
     .build();
 
 // Encoder side
 let bits = vocoder.encode(pcm_frame)?;
 
 // Decoder side — different vocoder instance for the receive direction
-let mut vocoder = Vocoder::builder().rate(Rate::P25Phase1).build();
+let mut vocoder = Vocoder::builder().rate(Rate::Imbe7200x4400).build();
 let pcm = vocoder.decode(&bits)?;
 
 // Stats / diagnostics
@@ -164,8 +164,8 @@ pub trait Vocoder {
 }
 
 pub enum Rate {
-    P25Phase1,                    // IMBE full-rate, 18-byte FEC frame
-    P25Phase2,                    // AMBE+2 half-rate, 9-byte FEC frame
+    Imbe7200x4400,                    // IMBE full-rate, 18-byte FEC frame
+    AmbePlus2_3600x2450,                    // AMBE+2 half-rate, 9-byte FEC frame
     // Future:
     // RawAmbePlus2 { width },    // bare 49-bit payload, no carrier FEC
     // RawAmbePlus { width },     // Gen 2 equivalent

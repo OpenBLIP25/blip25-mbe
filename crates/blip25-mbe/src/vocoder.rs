@@ -19,13 +19,13 @@
 //! use blip25_mbe::vocoder::{Rate, Vocoder};
 //!
 //! // P25 Phase 1 (full-rate IMBE) encoder
-//! let mut tx = Vocoder::new(Rate::P25Phase1);
+//! let mut tx = Vocoder::new(Rate::Imbe7200x4400);
 //! let pcm: [i16; 160] = [0; 160]; // one 20 ms frame at 8 kHz
 //! let bits = tx.encode_pcm(&pcm).expect("encode");
 //! assert_eq!(bits.len(), 18); // 18-byte FEC frame
 //!
 //! // P25 Phase 1 decoder (separate channel, separate state)
-//! let mut rx = Vocoder::new(Rate::P25Phase1);
+//! let mut rx = Vocoder::new(Rate::Imbe7200x4400);
 //! let pcm = rx.decode_bits(&bits).expect("decode");
 //! assert_eq!(pcm.len(), 160);
 //! ```
@@ -76,10 +76,10 @@ pub const FRAME_SAMPLES: usize = 160;
 pub enum Rate {
     /// P25 Phase 1 FDMA full-rate IMBE. 18-byte FEC frame (72 dibits).
     /// 7 200 bps total / 4 400 bps voice + 2 800 bps FEC.
-    P25Phase1,
+    Imbe7200x4400,
     /// P25 Phase 2 TDMA half-rate AMBE+2. 9-byte FEC frame (36 dibits).
     /// 3 600 bps total / 2 450 bps voice + 1 150 bps FEC.
-    P25Phase2,
+    AmbePlus2_3600x2450,
 }
 
 impl Rate {
@@ -87,8 +87,8 @@ impl Rate {
     #[inline]
     pub const fn fec_frame_bytes(self) -> usize {
         match self {
-            Rate::P25Phase1 => 18,
-            Rate::P25Phase2 => 9,
+            Rate::Imbe7200x4400 => 18,
+            Rate::AmbePlus2_3600x2450 => 9,
         }
     }
 
@@ -456,8 +456,8 @@ impl Vocoder {
             });
         }
         let (bytes, stats) = match self.rate {
-            Rate::P25Phase1 => fullrate::encode(pcm, self)?,
-            Rate::P25Phase2 => halfrate::encode(pcm, self)?,
+            Rate::Imbe7200x4400 => fullrate::encode(pcm, self)?,
+            Rate::AmbePlus2_3600x2450 => halfrate::encode(pcm, self)?,
         };
         self.last_stats.analysis = Some(stats);
         Ok(bytes)
@@ -475,8 +475,8 @@ impl Vocoder {
             });
         }
         let (pcm, stats) = match self.rate {
-            Rate::P25Phase1 => fullrate::decode(bits, self),
-            Rate::P25Phase2 => halfrate::decode(bits, self),
+            Rate::Imbe7200x4400 => fullrate::decode(bits, self),
+            Rate::AmbePlus2_3600x2450 => halfrate::decode(bits, self),
         };
         self.last_stats.decode = Some(stats);
         Ok(pcm)
@@ -497,7 +497,7 @@ impl Vocoder {
     /// ```rust
     /// # use blip25_mbe::vocoder::{Rate, Vocoder};
     /// # let pcm: Vec<i16> = vec![0; 160 * 5];
-    /// let mut tx = Vocoder::new(Rate::P25Phase1);
+    /// let mut tx = Vocoder::new(Rate::Imbe7200x4400);
     /// let bits: Result<Vec<Vec<u8>>, _> = tx.encode_stream(&pcm).collect();
     /// assert_eq!(bits.unwrap().len(), 5);
     /// ```
@@ -531,15 +531,15 @@ impl Vocoder {
         }
         let frame = pcm.try_into().expect("length already validated");
         let analysis_out = match self.rate {
-            Rate::P25Phase1 => analysis_encode(frame, &mut self.analysis),
-            Rate::P25Phase2 => analysis_encode_halfrate(frame, &mut self.analysis),
+            Rate::Imbe7200x4400 => analysis_encode(frame, &mut self.analysis),
+            Rate::AmbePlus2_3600x2450 => analysis_encode_halfrate(frame, &mut self.analysis),
         }
         .map_err(VocoderError::Analysis)?;
         Ok(match analysis_out {
             AnalysisOutput::Voice(p) => p,
             AnalysisOutput::Silence => match self.rate {
-                Rate::P25Phase1 => MbeParams::silence(),
-                Rate::P25Phase2 => MbeParams::silence_halfrate(),
+                Rate::Imbe7200x4400 => MbeParams::silence(),
+                Rate::AmbePlus2_3600x2450 => MbeParams::silence_halfrate(),
             },
         })
     }
@@ -573,8 +573,8 @@ impl Vocoder {
         let err = self.synth.err;
         let gamma_w = self.synth.gamma_w;
         let pcm: [i16; FRAME_SAMPLES] = match self.rate {
-            Rate::P25Phase1 => synthesize_frame(params, &err, gamma_w, &mut self.synth),
-            Rate::P25Phase2 => match self.halfrate_synth {
+            Rate::Imbe7200x4400 => synthesize_frame(params, &err, gamma_w, &mut self.synth),
+            Rate::AmbePlus2_3600x2450 => match self.halfrate_synth {
                 HalfrateSynth::AmbePlus => ambe_plus2::synthesize_frame(params, &mut self.synth),
                 HalfrateSynth::Baseline => synthesize_frame(params, &err, gamma_w, &mut self.synth),
             },
@@ -593,7 +593,7 @@ impl Vocoder {
     /// ```rust
     /// # use blip25_mbe::vocoder::{Rate, Vocoder};
     /// # let bits: Vec<u8> = vec![0; 18 * 5];
-    /// let mut rx = Vocoder::new(Rate::P25Phase1);
+    /// let mut rx = Vocoder::new(Rate::Imbe7200x4400);
     /// let pcm_frames: Result<Vec<Vec<i16>>, _> = rx.decode_stream(&bits).collect();
     /// assert_eq!(pcm_frames.unwrap().len(), 5);
     /// ```
@@ -666,10 +666,10 @@ impl ExactSizeIterator for DecodeStream<'_> {}
 pub enum TranscodeDirection {
     /// Convert P25 Phase 1 (full-rate IMBE, 18-byte FEC frames) to
     /// P25 Phase 2 (half-rate AMBE+2, 9-byte FEC frames).
-    P25Phase1ToPhase2,
+    Imbe7200x4400ToAmbePlus2_3600x2450,
     /// Convert P25 Phase 2 (half-rate AMBE+2, 9-byte) to P25 Phase 1
     /// (full-rate IMBE, 18-byte).
-    P25Phase2ToPhase1,
+    AmbePlus2_3600x2450ToImbe7200x4400,
 }
 
 impl TranscodeDirection {
@@ -677,8 +677,8 @@ impl TranscodeDirection {
     #[inline]
     pub const fn input_frame_bytes(self) -> usize {
         match self {
-            TranscodeDirection::P25Phase1ToPhase2 => 18,
-            TranscodeDirection::P25Phase2ToPhase1 => 9,
+            TranscodeDirection::Imbe7200x4400ToAmbePlus2_3600x2450 => 18,
+            TranscodeDirection::AmbePlus2_3600x2450ToImbe7200x4400 => 9,
         }
     }
 
@@ -686,8 +686,8 @@ impl TranscodeDirection {
     #[inline]
     pub const fn output_frame_bytes(self) -> usize {
         match self {
-            TranscodeDirection::P25Phase1ToPhase2 => 9,
-            TranscodeDirection::P25Phase2ToPhase1 => 18,
+            TranscodeDirection::Imbe7200x4400ToAmbePlus2_3600x2450 => 9,
+            TranscodeDirection::AmbePlus2_3600x2450ToImbe7200x4400 => 18,
         }
     }
 }
@@ -707,7 +707,7 @@ impl TranscodeDirection {
 /// ```rust
 /// use blip25_mbe::vocoder::{Transcoder, TranscodeDirection};
 ///
-/// let mut tx = Transcoder::new(TranscodeDirection::P25Phase1ToPhase2);
+/// let mut tx = Transcoder::new(TranscodeDirection::Imbe7200x4400ToAmbePlus2_3600x2450);
 /// let phase1_bits: [u8; 18] = [0; 18];
 /// let phase2_bits = tx.transcode(&phase1_bits).unwrap();
 /// assert_eq!(phase2_bits.len(), 9);
@@ -722,12 +722,12 @@ impl Transcoder {
     /// Open a new transcoder in the given direction.
     pub fn new(direction: TranscodeDirection) -> Self {
         match direction {
-            TranscodeDirection::P25Phase1ToPhase2 => Self {
+            TranscodeDirection::Imbe7200x4400ToAmbePlus2_3600x2450 => Self {
                 direction,
                 full_to_half: Some(crate::rate_conversion::FullToHalfConverter::new()),
                 half_to_full: None,
             },
-            TranscodeDirection::P25Phase2ToPhase1 => Self {
+            TranscodeDirection::AmbePlus2_3600x2450ToImbe7200x4400 => Self {
                 direction,
                 full_to_half: None,
                 half_to_full: Some(crate::rate_conversion::HalfToFullConverter::new()),
@@ -755,7 +755,7 @@ impl Transcoder {
             });
         }
         match self.direction {
-            TranscodeDirection::P25Phase1ToPhase2 => {
+            TranscodeDirection::Imbe7200x4400ToAmbePlus2_3600x2450 => {
                 let dibits_in = unpack_dibits_n::<72>(bits);
                 let dibits_out = self
                     .full_to_half
@@ -765,7 +765,7 @@ impl Transcoder {
                     .map_err(|e| VocoderError::Quantize(format!("{e:?}")))?;
                 Ok(pack_dibits_n::<36, 9>(&dibits_out).to_vec())
             }
-            TranscodeDirection::P25Phase2ToPhase1 => {
+            TranscodeDirection::AmbePlus2_3600x2450ToImbe7200x4400 => {
                 let dibits_in = unpack_dibits_n::<36>(bits);
                 let dibits_out = self
                     .half_to_full
@@ -824,7 +824,7 @@ fn pack_dibits_n<const N: usize, const B: usize>(dibits: &[u8; N]) -> [u8; B] {
 ///
 /// ```rust
 /// # use blip25_mbe::vocoder::{LiveEncoder, Rate};
-/// let mut enc = LiveEncoder::new(Rate::P25Phase1);
+/// let mut enc = LiveEncoder::new(Rate::Imbe7200x4400);
 /// // 256 samples (audio-device callback); not a multiple of 160.
 /// let chunk: [i16; 256] = [0; 256];
 /// let frames = enc.push(&chunk);
@@ -927,7 +927,7 @@ impl LiveEncoder {
 ///
 /// ```rust
 /// # use blip25_mbe::vocoder::{LiveDecoder, Rate};
-/// let mut dec = LiveDecoder::new(Rate::P25Phase2);
+/// let mut dec = LiveDecoder::new(Rate::AmbePlus2_3600x2450);
 /// let chunk: [u8; 23] = [0; 23];   // 2 full 9-byte frames + 5 byte residue
 /// let frames = dec.push(&chunk);
 /// assert_eq!(frames.len(), 2);
@@ -1002,10 +1002,10 @@ impl LiveDecoder {
 /// ```rust
 /// use blip25_mbe::vocoder::{Rate, Vocoder};
 ///
-/// let tx = Vocoder::builder(Rate::P25Phase2)
+/// let tx = Vocoder::builder(Rate::AmbePlus2_3600x2450)
 ///     .tone_detection(true)
 ///     .build();
-/// assert_eq!(tx.rate(), Rate::P25Phase2);
+/// assert_eq!(tx.rate(), Rate::AmbePlus2_3600x2450);
 /// assert!(tx.tone_detection());
 /// ```
 #[derive(Clone, Debug)]
@@ -1342,16 +1342,16 @@ mod tests {
 
     #[test]
     fn rate_byte_sizes_match_wire_layouts() {
-        assert_eq!(Rate::P25Phase1.fec_frame_bytes(), 18);
-        assert_eq!(Rate::P25Phase2.fec_frame_bytes(), 9);
-        assert_eq!(Rate::P25Phase1.frame_samples(), 160);
-        assert_eq!(Rate::P25Phase2.frame_samples(), 160);
+        assert_eq!(Rate::Imbe7200x4400.fec_frame_bytes(), 18);
+        assert_eq!(Rate::AmbePlus2_3600x2450.fec_frame_bytes(), 9);
+        assert_eq!(Rate::Imbe7200x4400.frame_samples(), 160);
+        assert_eq!(Rate::AmbePlus2_3600x2450.frame_samples(), 160);
     }
 
     #[test]
     fn fullrate_roundtrip_smoke() {
-        let mut tx = Vocoder::new(Rate::P25Phase1);
-        let mut rx = Vocoder::new(Rate::P25Phase1);
+        let mut tx = Vocoder::new(Rate::Imbe7200x4400);
+        let mut rx = Vocoder::new(Rate::Imbe7200x4400);
         // Three frames — first two are preroll on the analysis side
         // (return Silence dispatch), the third hits voice.
         for _ in 0..5 {
@@ -1367,8 +1367,8 @@ mod tests {
 
     #[test]
     fn halfrate_roundtrip_smoke() {
-        let mut tx = Vocoder::new(Rate::P25Phase2);
-        let mut rx = Vocoder::new(Rate::P25Phase2);
+        let mut tx = Vocoder::new(Rate::AmbePlus2_3600x2450);
+        let mut rx = Vocoder::new(Rate::AmbePlus2_3600x2450);
         for _ in 0..5 {
             let pcm = periodic_pcm(40, 8000);
             let bits = tx.encode_pcm(&pcm).expect("encode");
@@ -1382,19 +1382,19 @@ mod tests {
 
     #[test]
     fn wrong_pcm_length_errors() {
-        let mut v = Vocoder::new(Rate::P25Phase1);
+        let mut v = Vocoder::new(Rate::Imbe7200x4400);
         let r = v.encode_pcm(&[0i16; 159]);
         assert!(matches!(r, Err(VocoderError::WrongPcmLength { expected: 160, got: 159 })));
     }
 
     #[test]
     fn wrong_bits_length_errors_per_rate() {
-        let mut a = Vocoder::new(Rate::P25Phase1);
+        let mut a = Vocoder::new(Rate::Imbe7200x4400);
         assert!(matches!(
             a.decode_bits(&[0u8; 9]),
             Err(VocoderError::WrongBitsLength { expected: 18, got: 9 })
         ));
-        let mut b = Vocoder::new(Rate::P25Phase2);
+        let mut b = Vocoder::new(Rate::AmbePlus2_3600x2450);
         assert!(matches!(
             b.decode_bits(&[0u8; 18]),
             Err(VocoderError::WrongBitsLength { expected: 9, got: 18 })
@@ -1403,13 +1403,13 @@ mod tests {
 
     #[test]
     fn reset_clears_state_and_keeps_rate() {
-        let mut v = Vocoder::new(Rate::P25Phase2);
+        let mut v = Vocoder::new(Rate::AmbePlus2_3600x2450);
         let pcm = periodic_pcm(40, 8000);
         let _ = v.encode_pcm(&pcm).unwrap();
         assert!(v.last_stats().analysis.is_some());
         v.reset();
         assert!(v.last_stats().analysis.is_none());
-        assert_eq!(v.rate(), Rate::P25Phase2);
+        assert_eq!(v.rate(), Rate::AmbePlus2_3600x2450);
     }
 
     /// Diagnostic types round-trip through JSON when the `serde`
@@ -1419,7 +1419,7 @@ mod tests {
     #[cfg(feature = "serde")]
     #[test]
     fn frame_stats_round_trip_through_json() {
-        let mut v = Vocoder::new(Rate::P25Phase1);
+        let mut v = Vocoder::new(Rate::Imbe7200x4400);
         let pcm = periodic_pcm(40, 8000);
         for _ in 0..3 {
             let bits = v.encode_pcm(&pcm).unwrap();
@@ -1449,17 +1449,17 @@ mod tests {
     #[cfg(feature = "serde")]
     #[test]
     fn rate_serializes_as_named_variant() {
-        let s = serde_json::to_string(&Rate::P25Phase1).unwrap();
-        assert_eq!(s, "\"P25Phase1\"");
+        let s = serde_json::to_string(&Rate::Imbe7200x4400).unwrap();
+        assert_eq!(s, "\"Imbe7200x4400\"");
         let back: Rate = serde_json::from_str(&s).unwrap();
-        assert_eq!(back, Rate::P25Phase1);
+        assert_eq!(back, Rate::Imbe7200x4400);
     }
 
     /// Streaming encode iterator yields exactly `pcm.len() /
     /// frame_samples()` items and drops a trailing partial frame.
     #[test]
     fn encode_stream_yields_one_per_frame_drops_partial() {
-        let mut v = Vocoder::new(Rate::P25Phase1);
+        let mut v = Vocoder::new(Rate::Imbe7200x4400);
         // 5 full frames + 50 trailing samples (partial — should drop).
         let mut pcm: Vec<i16> = Vec::with_capacity(5 * FRAME_SAMPLES + 50);
         for f in 0..5 {
@@ -1471,7 +1471,7 @@ mod tests {
         let bits: Vec<Vec<u8>> = stream.collect::<Result<Vec<_>, _>>().unwrap();
         assert_eq!(bits.len(), 5);
         for b in &bits {
-            assert_eq!(b.len(), 18); // P25Phase1 FEC frame size
+            assert_eq!(b.len(), 18); // Imbe7200x4400 FEC frame size
         }
     }
 
@@ -1479,7 +1479,7 @@ mod tests {
     /// trailing partial bytes dropped, output 160 samples each.
     #[test]
     fn decode_stream_yields_one_per_frame_drops_partial() {
-        let mut tx = Vocoder::new(Rate::P25Phase2);
+        let mut tx = Vocoder::new(Rate::AmbePlus2_3600x2450);
         let mut pcm: Vec<i16> = Vec::with_capacity(7 * FRAME_SAMPLES);
         for _ in 0..7 {
             pcm.extend_from_slice(&periodic_pcm(40, 5000));
@@ -1495,7 +1495,7 @@ mod tests {
         let mut padded = bits.clone();
         padded.extend_from_slice(&[0; 4]);
 
-        let mut rx = Vocoder::new(Rate::P25Phase2);
+        let mut rx = Vocoder::new(Rate::AmbePlus2_3600x2450);
         let frames: Vec<Vec<i16>> = rx
             .decode_stream(&padded)
             .collect::<Result<Vec<_>, _>>()
@@ -1512,8 +1512,8 @@ mod tests {
     /// pre-loading `state.epsilon_r`) it should be `Mute`.
     #[test]
     fn decode_stats_carry_disposition() {
-        let mut tx = Vocoder::new(Rate::P25Phase1);
-        let mut rx = Vocoder::new(Rate::P25Phase1);
+        let mut tx = Vocoder::new(Rate::Imbe7200x4400);
+        let mut rx = Vocoder::new(Rate::Imbe7200x4400);
         for _ in 0..5 {
             let pcm = periodic_pcm(40, 8000);
             let bits = tx.encode_pcm(&pcm).unwrap();
@@ -1538,7 +1538,7 @@ mod tests {
     #[test]
     fn tone_detection_emits_tone_frame_and_decoder_recognises_it() {
         // Half-rate is the only rate with tone-frame signaling.
-        let mut tx = Vocoder::new(Rate::P25Phase2);
+        let mut tx = Vocoder::new(Rate::AmbePlus2_3600x2450);
         tx.set_tone_detection(true);
         // Annex T id=10 → 312.5 Hz. Generate one full frame of clean
         // sine at i16 amplitude 8000.
@@ -1580,7 +1580,7 @@ mod tests {
         // path); we don't assert frequency parity because tone-synth
         // calibration depends on §1.10/§11 amplitude scaling that's
         // separately tracked, but the output should be non-trivial.
-        let mut rx = Vocoder::new(Rate::P25Phase2);
+        let mut rx = Vocoder::new(Rate::AmbePlus2_3600x2450);
         let out = rx.decode_bits(&bits).unwrap();
         assert_eq!(out.len(), FRAME_SAMPLES);
     }
@@ -1590,7 +1590,7 @@ mod tests {
     /// regular voice frame.
     #[test]
     fn tone_detection_off_means_voice_path_even_for_pure_sine() {
-        let mut tx = Vocoder::new(Rate::P25Phase2);
+        let mut tx = Vocoder::new(Rate::AmbePlus2_3600x2450);
         // (default) tone_detection == false
         let mut pcm = [0i16; FRAME_SAMPLES];
         let two_pi = 2.0 * core::f64::consts::PI;
@@ -1614,13 +1614,13 @@ mod tests {
             total_pcm.extend_from_slice(&periodic_pcm(40, 6000));
         }
         // Reference: per-frame Vocoder loop on the same input.
-        let mut ref_v = Vocoder::new(Rate::P25Phase1);
+        let mut ref_v = Vocoder::new(Rate::Imbe7200x4400);
         let mut ref_bits: Vec<u8> = Vec::new();
         for chunk in total_pcm.chunks_exact(FRAME_SAMPLES) {
             ref_bits.extend(ref_v.encode_pcm(chunk).unwrap());
         }
         // Live: feed in mismatched chunk sizes (250, 50, 333, rest).
-        let mut live = LiveEncoder::new(Rate::P25Phase1);
+        let mut live = LiveEncoder::new(Rate::Imbe7200x4400);
         let mut live_bits: Vec<u8> = Vec::new();
         let splits = [250usize, 50, 333];
         let mut pos = 0;
@@ -1643,7 +1643,7 @@ mod tests {
     /// mid-frame.
     #[test]
     fn live_encoder_residue_held_across_calls() {
-        let mut live = LiveEncoder::new(Rate::P25Phase1);
+        let mut live = LiveEncoder::new(Rate::Imbe7200x4400);
         // 1.5 frames of input split into two pushes.
         let pcm: Vec<i16> = periodic_pcm(40, 6000)
             .iter()
@@ -1664,7 +1664,7 @@ mod tests {
     /// and matches a per-frame `Vocoder::decode_bits` loop.
     #[test]
     fn live_decoder_handles_arbitrary_chunk_sizes() {
-        let mut tx = Vocoder::new(Rate::P25Phase2);
+        let mut tx = Vocoder::new(Rate::AmbePlus2_3600x2450);
         let mut all_pcm: Vec<i16> = Vec::with_capacity(5 * FRAME_SAMPLES);
         for _ in 0..5 {
             all_pcm.extend_from_slice(&periodic_pcm(40, 5000));
@@ -1676,12 +1676,12 @@ mod tests {
             .into_iter()
             .flatten()
             .collect();
-        let mut ref_v = Vocoder::new(Rate::P25Phase2);
+        let mut ref_v = Vocoder::new(Rate::AmbePlus2_3600x2450);
         let mut ref_pcm: Vec<i16> = Vec::new();
         for chunk in bits.chunks_exact(9) {
             ref_pcm.extend(ref_v.decode_bits(chunk).unwrap());
         }
-        let mut live = LiveDecoder::new(Rate::P25Phase2);
+        let mut live = LiveDecoder::new(Rate::AmbePlus2_3600x2450);
         let mut live_pcm: Vec<i16> = Vec::new();
         // Feed in 7-byte chunks (less than one frame each).
         for chunk in bits.chunks(7) {
@@ -1696,7 +1696,7 @@ mod tests {
     /// `discard_pending` drops residue without emitting partial output.
     #[test]
     fn live_encoder_discard_pending_clears_residue() {
-        let mut live = LiveEncoder::new(Rate::P25Phase1);
+        let mut live = LiveEncoder::new(Rate::Imbe7200x4400);
         let pcm = periodic_pcm(40, 6000);
         let frames = live.push(&pcm[..80]);
         assert!(frames.is_empty());
@@ -1709,10 +1709,10 @@ mod tests {
     /// boundary. State advances per call; rates are validated.
     #[test]
     fn transcoder_phase1_to_phase2_changes_frame_size() {
-        let mut tx = Transcoder::new(TranscodeDirection::P25Phase1ToPhase2);
-        assert_eq!(tx.direction(), TranscodeDirection::P25Phase1ToPhase2);
+        let mut tx = Transcoder::new(TranscodeDirection::Imbe7200x4400ToAmbePlus2_3600x2450);
+        assert_eq!(tx.direction(), TranscodeDirection::Imbe7200x4400ToAmbePlus2_3600x2450);
         // Encode some Phase 1 frames first to get realistic bits.
-        let mut enc = Vocoder::new(Rate::P25Phase1);
+        let mut enc = Vocoder::new(Rate::Imbe7200x4400);
         let pcm = periodic_pcm(40, 6000);
         for _ in 0..3 {
             let phase1 = enc.encode_pcm(&pcm).unwrap();
@@ -1724,8 +1724,8 @@ mod tests {
 
     #[test]
     fn transcoder_phase2_to_phase1_changes_frame_size() {
-        let mut tx = Transcoder::new(TranscodeDirection::P25Phase2ToPhase1);
-        let mut enc = Vocoder::new(Rate::P25Phase2);
+        let mut tx = Transcoder::new(TranscodeDirection::AmbePlus2_3600x2450ToImbe7200x4400);
+        let mut enc = Vocoder::new(Rate::AmbePlus2_3600x2450);
         let pcm = periodic_pcm(40, 6000);
         for _ in 0..3 {
             let phase2 = enc.encode_pcm(&pcm).unwrap();
@@ -1737,7 +1737,7 @@ mod tests {
 
     #[test]
     fn transcoder_rejects_wrong_input_length() {
-        let mut tx = Transcoder::new(TranscodeDirection::P25Phase1ToPhase2);
+        let mut tx = Transcoder::new(TranscodeDirection::Imbe7200x4400ToAmbePlus2_3600x2450);
         assert!(matches!(
             tx.transcode(&[0u8; 9]),
             Err(VocoderError::WrongBitsLength { expected: 18, got: 9 })
@@ -1749,7 +1749,7 @@ mod tests {
     /// → voice transition).
     #[test]
     fn extract_params_returns_params_per_frame() {
-        let mut v = Vocoder::new(Rate::P25Phase1);
+        let mut v = Vocoder::new(Rate::Imbe7200x4400);
         // First few frames are preroll; analysis should still return
         // silence params, not error.
         let pcm = periodic_pcm(40, 6000);
@@ -1773,8 +1773,8 @@ mod tests {
     /// well-defined.)
     #[test]
     fn extract_then_synthesize_roundtrips_through_params() {
-        let mut a = Vocoder::new(Rate::P25Phase1);
-        let mut b = Vocoder::new(Rate::P25Phase1);
+        let mut a = Vocoder::new(Rate::Imbe7200x4400);
+        let mut b = Vocoder::new(Rate::Imbe7200x4400);
         let pcm = periodic_pcm(40, 6000);
         for _ in 0..5 {
             let params = a.extract_params(&pcm).unwrap();
@@ -1789,14 +1789,14 @@ mod tests {
     /// silence params synthesize to (near-)silent output.
     #[test]
     fn synthesize_params_emits_one_frame_per_call() {
-        let mut tx = Vocoder::new(Rate::P25Phase1);
+        let mut tx = Vocoder::new(Rate::Imbe7200x4400);
         let pcm = tx.synthesize_params(&MbeParams::silence());
         assert_eq!(pcm.len(), FRAME_SAMPLES);
         // Silence params → low-amplitude output.
         let peak = pcm.iter().map(|&s| s.unsigned_abs()).max().unwrap_or(0);
         assert!(peak < 5000, "silence params produced peak={peak}");
 
-        let mut rx = Vocoder::new(Rate::P25Phase2);
+        let mut rx = Vocoder::new(Rate::AmbePlus2_3600x2450);
         let pcm = rx.synthesize_params(&MbeParams::silence_halfrate());
         assert_eq!(pcm.len(), FRAME_SAMPLES);
         let peak = pcm.iter().map(|&s| s.unsigned_abs()).max().unwrap_or(0);
@@ -1807,7 +1807,7 @@ mod tests {
     /// `last_disposition` reflects the most-recent frame.
     #[test]
     fn synthesize_params_advances_synth_disposition() {
-        let mut v = Vocoder::new(Rate::P25Phase1);
+        let mut v = Vocoder::new(Rate::Imbe7200x4400);
         assert_eq!(v.last_disposition(), None);
         let _ = v.synthesize_params(&MbeParams::silence());
         // Clean params + zero error context → Use.
@@ -1817,14 +1817,14 @@ mod tests {
     /// Builder applies all five config knobs in one expression.
     #[test]
     fn builder_configures_all_knobs() {
-        let v = Vocoder::builder(Rate::P25Phase2)
+        let v = Vocoder::builder(Rate::AmbePlus2_3600x2450)
             .tone_detection(true)
             .repeat_reset_after(Some(3))
             .silence_dispatch(true)
             .pitch_silence_override(true)
             .halfrate_synth(HalfrateSynth::Baseline)
             .build();
-        assert_eq!(v.rate(), Rate::P25Phase2);
+        assert_eq!(v.rate(), Rate::AmbePlus2_3600x2450);
         assert!(v.tone_detection());
         assert_eq!(v.repeat_reset_after(), Some(3));
         assert!(v.silence_dispatch());
@@ -1839,7 +1839,7 @@ mod tests {
     /// assertion is non-silent + correct rate, not bit-difference.
     #[test]
     fn halfrate_synth_modes_both_decode_cleanly() {
-        let mut tx = Vocoder::new(Rate::P25Phase2);
+        let mut tx = Vocoder::new(Rate::AmbePlus2_3600x2450);
         let pcm = periodic_pcm(40, 6000);
         let mut bits_buf: Vec<u8> = Vec::new();
         for _ in 0..5 {
@@ -1847,7 +1847,7 @@ mod tests {
         }
 
         for gen in [HalfrateSynth::AmbePlus, HalfrateSynth::Baseline] {
-            let mut rx = Vocoder::builder(Rate::P25Phase2)
+            let mut rx = Vocoder::builder(Rate::AmbePlus2_3600x2450)
                 .halfrate_synth(gen)
                 .build();
             assert_eq!(rx.halfrate_synth(), gen);
@@ -1864,8 +1864,8 @@ mod tests {
     /// Default builder = spec-faithful (no beyond-spec or opt-in knobs).
     #[test]
     fn builder_defaults_match_vocoder_new() {
-        let a = Vocoder::builder(Rate::P25Phase1).build();
-        let b = Vocoder::new(Rate::P25Phase1);
+        let a = Vocoder::builder(Rate::Imbe7200x4400).build();
+        let b = Vocoder::new(Rate::Imbe7200x4400);
         assert_eq!(a.rate(), b.rate());
         assert_eq!(a.tone_detection(), b.tone_detection());
         assert_eq!(a.repeat_reset_after(), b.repeat_reset_after());
@@ -1883,7 +1883,7 @@ mod tests {
     /// empty buffer it's a no-op returning `Ok(None)`.
     #[test]
     fn live_encoder_flush_emits_padded_residue() {
-        let mut live = LiveEncoder::new(Rate::P25Phase1);
+        let mut live = LiveEncoder::new(Rate::Imbe7200x4400);
         // Empty buffer → flush is a no-op.
         assert!(matches!(live.flush(), Ok(None)));
 
@@ -1902,7 +1902,7 @@ mod tests {
     /// `reset` clears both vocoder state and the residue buffer.
     #[test]
     fn live_encoder_reset_clears_everything() {
-        let mut live = LiveEncoder::new(Rate::P25Phase2);
+        let mut live = LiveEncoder::new(Rate::AmbePlus2_3600x2450);
         let pcm = periodic_pcm(40, 5000);
         let _ = live.push(&pcm[..120]);
         assert_eq!(live.pending_samples(), 120);
@@ -1910,7 +1910,7 @@ mod tests {
         live.reset();
         assert_eq!(live.pending_samples(), 0);
         assert!(live.vocoder().last_stats().analysis.is_none());
-        assert_eq!(live.rate(), Rate::P25Phase2);
+        assert_eq!(live.rate(), Rate::AmbePlus2_3600x2450);
     }
 
     /// Streaming and per-frame paths produce identical output —
@@ -1918,8 +1918,8 @@ mod tests {
     /// state advances the same way.
     #[test]
     fn encode_stream_matches_per_frame_calls_byte_for_byte() {
-        let mut a = Vocoder::new(Rate::P25Phase1);
-        let mut b = Vocoder::new(Rate::P25Phase1);
+        let mut a = Vocoder::new(Rate::Imbe7200x4400);
+        let mut b = Vocoder::new(Rate::Imbe7200x4400);
         let mut pcm: Vec<i16> = Vec::with_capacity(4 * FRAME_SAMPLES);
         for _ in 0..4 {
             pcm.extend_from_slice(&periodic_pcm(40, 6000));

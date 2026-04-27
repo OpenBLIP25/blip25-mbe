@@ -17,7 +17,7 @@ const FRAME_SAMPLES: usize = 160;
 fn main() {
     let pcm = synthetic_speech(N_FRAMES);
 
-    for &rate in &[Rate::P25Phase1, Rate::P25Phase2] {
+    for &rate in &[Rate::Imbe7200x4400, Rate::AmbePlus2_3600x2450] {
         bench_rate(rate, &pcm);
     }
 }

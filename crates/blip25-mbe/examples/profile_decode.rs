@@ -32,9 +32,9 @@ fn main() {
     }
     let pcm = synthetic_speech(N_FRAMES);
 
-    run(Rate::P25Phase1, "Phase 1", &pcm);
+    run(Rate::Imbe7200x4400, "Phase 1", &pcm);
     println!();
-    run(Rate::P25Phase2, "Phase 2", &pcm);
+    run(Rate::AmbePlus2_3600x2450, "Phase 2", &pcm);
 
     let _ = Stage::ALL;
 }

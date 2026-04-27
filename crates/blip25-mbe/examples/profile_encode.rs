@@ -32,7 +32,7 @@ fn main() {
     }
     let pcm = synthetic_speech(N_FRAMES);
 
-    let mut tx = Vocoder::new(Rate::P25Phase1);
+    let mut tx = Vocoder::new(Rate::Imbe7200x4400);
     reset();
     let t0 = Instant::now();
     for chunk in pcm.chunks_exact(160) {
@@ -68,7 +68,7 @@ fn main() {
     );
 
     // Same for Phase 2.
-    let mut tx = Vocoder::new(Rate::P25Phase2);
+    let mut tx = Vocoder::new(Rate::AmbePlus2_3600x2450);
     reset();
     let t0 = Instant::now();
     for chunk in pcm.chunks_exact(160) {

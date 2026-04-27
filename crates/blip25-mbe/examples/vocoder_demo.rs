@@ -35,8 +35,8 @@ fn main() {
 }
 
 fn one_shot(pcm: &[i16]) {
-    let mut tx = Vocoder::new(Rate::P25Phase1);
-    let mut rx = Vocoder::new(Rate::P25Phase1);
+    let mut tx = Vocoder::new(Rate::Imbe7200x4400);
+    let mut rx = Vocoder::new(Rate::Imbe7200x4400);
     let mut encoded: Vec<u8> = Vec::new();
     let mut decoded: Vec<i16> = Vec::new();
 
@@ -59,7 +59,7 @@ fn one_shot(pcm: &[i16]) {
 }
 
 fn slice_streaming(pcm: &[i16]) {
-    let mut tx = Vocoder::new(Rate::P25Phase2); // half-rate for variety
+    let mut tx = Vocoder::new(Rate::AmbePlus2_3600x2450); // half-rate for variety
     let bits: Vec<Vec<u8>> = tx
         .encode_stream(pcm)
         .collect::<Result<Vec<_>, _>>()
@@ -68,7 +68,7 @@ fn slice_streaming(pcm: &[i16]) {
 
     // Flatten bits + decode through a fresh channel.
     let bytes: Vec<u8> = bits.into_iter().flatten().collect();
-    let mut rx = Vocoder::new(Rate::P25Phase2);
+    let mut rx = Vocoder::new(Rate::AmbePlus2_3600x2450);
     let frames: Vec<Vec<i16>> = rx
         .decode_stream(&bytes)
         .collect::<Result<Vec<_>, _>>()
@@ -77,7 +77,7 @@ fn slice_streaming(pcm: &[i16]) {
 }
 
 fn live_streaming(pcm: &[i16]) {
-    let mut enc = LiveEncoder::new(Rate::P25Phase1);
+    let mut enc = LiveEncoder::new(Rate::Imbe7200x4400);
     // Feed in odd-sized chunks (250, 50, 333, …) so residue
     // accumulates across calls.
     let splits = [250usize, 50, 333, 256, 128];
@@ -109,8 +109,8 @@ fn live_streaming(pcm: &[i16]) {
 fn parameter_layer(pcm: &[i16]) {
     // Extract params on one channel, optionally tweak, synthesize on another.
     // Useful for transcoding, analysis-only tooling, or custom synth chains.
-    let mut analyzer = Vocoder::new(Rate::P25Phase1);
-    let mut synth = Vocoder::new(Rate::P25Phase1);
+    let mut analyzer = Vocoder::new(Rate::Imbe7200x4400);
+    let mut synth = Vocoder::new(Rate::Imbe7200x4400);
     let mut got_voice = 0;
     for chunk in pcm.chunks_exact(analyzer.frame_samples()) {
         let mut params = analyzer.extract_params(chunk).expect("extract");
@@ -129,7 +129,7 @@ fn parameter_layer(pcm: &[i16]) {
 }
 
 fn builder_demo(pcm: &[i16]) {
-    let mut tx = Vocoder::builder(Rate::P25Phase2)
+    let mut tx = Vocoder::builder(Rate::AmbePlus2_3600x2450)
         .tone_detection(true)            // opt-in: emit Annex T tone frames on detected tones
         .repeat_reset_after(Some(3))     // beyond-spec, JMBE-style chip-interop
         .silence_dispatch(false)         // spec default
@@ -152,8 +152,8 @@ fn transcode_demo(pcm: &[i16]) {
     // the parameter domain — no PCM round-trip — so quality stays at
     // the parameter-extraction floor instead of the lossy
     // analysis-encode → synthesis → analysis-encode chain.
-    let mut enc = Vocoder::new(Rate::P25Phase1);
-    let mut tx = Transcoder::new(TranscodeDirection::P25Phase1ToPhase2);
+    let mut enc = Vocoder::new(Rate::Imbe7200x4400);
+    let mut tx = Transcoder::new(TranscodeDirection::Imbe7200x4400ToAmbePlus2_3600x2450);
     let mut p1_total = 0usize;
     let mut p2_total = 0usize;
     for chunk in pcm.chunks_exact(enc.frame_samples()) {

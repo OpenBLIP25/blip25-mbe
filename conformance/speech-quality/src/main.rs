@@ -1026,7 +1026,7 @@ fn cmd_decode_fec_halfrate(input: &Path, out_wav: &Path, binary: bool) -> Result
     // probe-flag-aware path -- this is a clean carrier-agnostic decode and
     // wants the carrier-agnostic surface.
     use blip25_mbe::vocoder::{Rate, Vocoder};
-    let mut vocoder = Vocoder::new(Rate::P25Phase2);
+    let mut vocoder = Vocoder::new(Rate::AmbePlus2_3600x2450);
     let mut pcm: Vec<i16> = Vec::with_capacity(frames.len() * FRAME_SAMPLES);
     for (f, bytes) in frames.iter().enumerate() {
         let frame = vocoder
@@ -1111,7 +1111,7 @@ fn cmd_decode_fec_fullrate(input: &Path, out_wav: &Path, binary: bool) -> Result
         out
     };
 
-    let mut vocoder = Vocoder::new(Rate::P25Phase1);
+    let mut vocoder = Vocoder::new(Rate::Imbe7200x4400);
     let mut pcm: Vec<i16> = Vec::with_capacity(frames.len() * FRAME_SAMPLES);
     for (f, bytes) in frames.iter().enumerate() {
         let frame = vocoder

@@ -28,11 +28,11 @@ the DVSI AMBE-3000R chip's per-channel API:
 use blip25_mbe::vocoder::{Rate, Vocoder};
 
 // Open a P25 Phase 1 (full-rate IMBE) channel.
-let mut tx = Vocoder::new(Rate::P25Phase1);
+let mut tx = Vocoder::new(Rate::Imbe7200x4400);
 let pcm: [i16; 160] = [0; 160];
 let bits = tx.encode_pcm(&pcm).unwrap();    // 18-byte FEC frame
 
-let mut rx = Vocoder::new(Rate::P25Phase1);
+let mut rx = Vocoder::new(Rate::Imbe7200x4400);
 let pcm = rx.decode_bits(&bits).unwrap();   // 160 samples
 ```
 

@@ -74,10 +74,10 @@ behind a single handle the way the chip presents a single channel.
 use blip25_mbe::vocoder::{Rate, Vocoder};
 
 // One channel direction = one Vocoder. Two channels for full-duplex.
-let mut tx = Vocoder::new(Rate::P25Phase1);    // or Rate::P25Phase2
+let mut tx = Vocoder::new(Rate::Imbe7200x4400);    // or Rate::AmbePlus2_3600x2450
 let bits = tx.encode_pcm(&pcm_frame)?;          // 18-byte FEC frame (or 9 for Phase 2)
 
-let mut rx = Vocoder::new(Rate::P25Phase1);
+let mut rx = Vocoder::new(Rate::Imbe7200x4400);
 let pcm = rx.decode_bits(&bits)?;               // 160 samples i16
 
 // Streaming variants for whole-buffer encode/decode:
@@ -137,8 +137,8 @@ These are chip-protocol concerns that don't exist at the codec layer:
 
 | Rate           | FEC bytes | Codec        | End-to-end | Carriers                                      |
 |----------------|----------:|--------------|:---------:|------------------------------------------------|
-| `P25Phase1`    |        18 | IMBE Gen 1   | ✅        | P25 Phase 1 FDMA voice                         |
-| `P25Phase2`    |         9 | AMBE+2 Gen 3 | ✅        | P25 Phase 2 TDMA voice; carrier-agnostic for any AMBE+2 sink that lays its post-FEC info as 4 vectors of widths {12,12,12,12} (NXDN type-2 typical, DMR enhanced) |
+| `Imbe7200x4400`    |        18 | IMBE Gen 1   | ✅        | P25 Phase 1 FDMA voice                         |
+| `AmbePlus2_3600x2450`    |         9 | AMBE+2 Gen 3 | ✅        | P25 Phase 2 TDMA voice; carrier-agnostic for any AMBE+2 sink that lays its post-FEC info as 4 vectors of widths {12,12,12,12} (NXDN type-2 typical, DMR enhanced) |
 
 For carriers whose post-FEC info layout differs (older DMR, AMBE+
 Gen 2 NXDN, D-STAR's specific bit layout), drop down a layer to

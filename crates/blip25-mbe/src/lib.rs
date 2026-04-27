@@ -11,12 +11,12 @@
 //! use blip25_mbe::vocoder::{Rate, Vocoder};
 //!
 //! // Open a P25 Phase 1 (full-rate IMBE) channel.
-//! let mut tx = Vocoder::new(Rate::P25Phase1);
+//! let mut tx = Vocoder::new(Rate::Imbe7200x4400);
 //! let pcm: [i16; 160] = [0; 160];
 //! let bits = tx.encode_pcm(&pcm).unwrap();
 //! assert_eq!(bits.len(), 18);
 //!
-//! let mut rx = Vocoder::new(Rate::P25Phase1);
+//! let mut rx = Vocoder::new(Rate::Imbe7200x4400);
 //! let out = rx.decode_bits(&bits).unwrap();
 //! assert_eq!(out.len(), 160);
 //! ```
