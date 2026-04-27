@@ -996,6 +996,39 @@ pub fn parse_tone_frame(u: &[u16; 4]) -> Option<ToneFrameFields> {
     Some(ToneFrameFields { id, amplitude })
 }
 
+/// Encode a tone-frame's `(I_D, A_D)` into the prioritized 4-info-vector
+/// shape that goes into [`crate::p25_halfrate::frame::encode_frame`].
+///
+/// Inverse of [`parse_tone_frame`] — produces û₀..û₃ with the §2.10.1
+/// signature (`û₀(11..6) = 0x3F`) and Table 20 layout (4 redundant
+/// copies of `I_D`, split-encoded `A_D`, fixed-zero trailer in
+/// `û₃(3..0)`). Caller feeds this directly to `encode_frame` to
+/// produce the 36-dibit / 9-byte FEC frame; the dequantize side will
+/// classify it as `FrameKind::Tone` and route through `parse_tone_frame`.
+///
+/// `id == 255` is the silence sentinel (zero-amplitude regardless of
+/// `amplitude`); other reserved IDs (`ANNEX_T[id] == None`) are encoded
+/// faithfully but `tone_to_mbe_params` will return `None` on decode.
+pub fn encode_tone_frame_info(id: u8, amplitude: u8) -> [u16; 4] {
+    let amplitude = amplitude & 0x7F; // 7-bit field
+    let mut u = [0u16; 4];
+    let ad_hi = (amplitude >> 1) & 0x3F;
+    let ad_lo = amplitude & 1;
+    // û₀: 0x3F signature in (11..6); A_D(6..1) in (5..0).
+    u[0] = (0x3F << 6) | u16::from(ad_hi);
+    // û₁: I_D copy 1 full 8 bits at (11..4); copy 2 MSB nibble at (3..0).
+    u[1] = (u16::from(id) << 4) | u16::from(id >> 4);
+    // û₂: copy 2 LSB nibble at (10..7); copy 3 top 7 bits at (6..0).
+    let id_lo_nibble = u16::from(id & 0x0F);
+    u[2] = (id_lo_nibble << 7) | u16::from(id >> 1);
+    // û₃: bit 13 = I_D(0); bits (12..5) = copy 4 full 8 bits;
+    //     bit 4 = A_D(0); bits (3..0) = 0 (fixed trailer).
+    u[3] = (u16::from(id & 1) << 13)
+        | (u16::from(id) << 5)
+        | (u16::from(ad_lo) << 4);
+    u
+}
+
 /// Convert `(I_D, A_D)` to `MbeParams` via the MBE bridge of Eq. 206–209.
 ///
 /// Returns `None` for reserved `I_D` values (no row in `ANNEX_T`).

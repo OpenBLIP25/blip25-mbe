@@ -143,6 +143,9 @@ pub use hpf::{HPF_POLE, HpfState};
 pub mod silence;
 pub use silence::SilenceDetector;
 
+pub mod tone_detect;
+pub use tone_detect::{ToneDetection, detect_single_tone};
+
 /// Errors reported by the analysis encoder.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AnalysisError {

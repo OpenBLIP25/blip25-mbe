@@ -47,7 +47,8 @@
 
 use crate::codecs::ambe_plus2;
 use crate::codecs::mbe_baseline::analysis::{
-    AnalysisError, AnalysisOutput, AnalysisState, encode as analysis_encode,
+    AnalysisError, AnalysisOutput, AnalysisState, ToneDetection,
+    detect_single_tone, encode as analysis_encode,
     encode_halfrate as analysis_encode_halfrate,
 };
 use crate::codecs::mbe_baseline::{
@@ -135,6 +136,16 @@ pub enum AnalysisOutputKind {
     Voice,
     /// Silence-dispatched frame (rate-appropriate placeholder params).
     Silence,
+    /// Annex T tone frame — encode-side detected a clean tone in the
+    /// PCM and emitted the matching `(I_D, A_D)` payload instead of
+    /// running the voice analysis pipeline. Half-rate only; gated on
+    /// [`Vocoder::set_tone_detection`]. Default off.
+    Tone {
+        /// Annex T tone ID.
+        id: u8,
+        /// 7-bit log-amplitude (`A_D`).
+        amplitude: u8,
+    },
 }
 
 /// Decode-side per-frame stats.
@@ -203,6 +214,7 @@ pub struct Vocoder {
     halfrate_dec: p25_halfrate::dequantize::DecoderState,
     synth: SynthState,
     last_stats: FrameStats,
+    tone_detection: bool,
 }
 
 impl Vocoder {
@@ -215,7 +227,31 @@ impl Vocoder {
             halfrate_dec: p25_halfrate::dequantize::DecoderState::new(),
             synth: SynthState::new(),
             last_stats: FrameStats::default(),
+            tone_detection: false,
         }
+    }
+
+    /// Enable encode-side Annex T tone detection. When on (and rate
+    /// is half-rate), each PCM frame is first inspected for a clean
+    /// single-frequency tone matching an Annex T entry; on a hit the
+    /// channel emits a tone frame instead of running the voice
+    /// analysis pipeline. Default off.
+    ///
+    /// Spec context: BABA-A `§2.10` defines the tone-frame *payload*
+    /// (Annex T table + signature bits) but the spec leaves "is this
+    /// a tone?" to the implementer (per `§0.0.1` of the impl spec).
+    /// This is a DSP design choice, not a P25-IP question.
+    ///
+    /// No-op for full-rate (P25 Phase 1 IMBE has no tone-frame
+    /// signaling at the wire level).
+    pub fn set_tone_detection(&mut self, enabled: bool) {
+        self.tone_detection = enabled;
+    }
+
+    /// Whether encode-side tone detection is currently enabled.
+    #[inline]
+    pub fn tone_detection(&self) -> bool {
+        self.tone_detection
     }
 
     /// The rate this channel was constructed at. Cannot change for
@@ -259,14 +295,15 @@ impl Vocoder {
 
     /// Reset all channel state. Equivalent to the chip's PKT_RATEP
     /// re-send: clears predictor history, decoder predictor state,
-    /// synth substates, smoothed error rate, last-stats. Rate stays
-    /// the same.
+    /// synth substates, smoothed error rate, last-stats. Rate and
+    /// configuration knobs (tone detection) stay the same.
     pub fn reset(&mut self) {
         self.analysis = AnalysisState::new();
         self.fullrate_dec = p25_fullrate::dequantize::DecoderState::new();
         self.halfrate_dec = p25_halfrate::dequantize::DecoderState::new();
         self.synth = SynthState::new();
         self.last_stats = FrameStats::default();
+        // tone_detection: preserved (config, not state)
     }
 
     /// Encode one PCM frame into FEC-encoded bytes.
@@ -682,13 +719,36 @@ mod fullrate {
 
 mod halfrate {
     use super::*;
-    use crate::p25_halfrate::dequantize::{Decoded, decode_to_params, quantize};
+    use crate::p25_halfrate::dequantize::{
+        Decoded, decode_to_params, encode_tone_frame_info, quantize, tone_to_mbe_params,
+    };
     use crate::p25_halfrate::frame::{decode_frame, encode_frame};
 
     pub(super) fn encode(
         pcm: &[i16],
         vocoder: &mut Vocoder,
     ) -> Result<(Vec<u8>, AnalysisStats), VocoderError> {
+        // Tone-detect dispatch (opt-in). On a hit, bypass the voice
+        // analysis pipeline entirely and emit an Annex T tone frame.
+        if vocoder.tone_detection {
+            if let Some(ToneDetection { id, amplitude }) = detect_single_tone(pcm) {
+                let info = encode_tone_frame_info(id, amplitude);
+                let dibits = encode_frame(&info);
+                let bytes = pack_dibits_half(&dibits);
+                // Reconstruct the params the decoder will see, so
+                // FrameStats carries the actual audible content.
+                // tone_to_mbe_params returns Some for any valid Annex T
+                // row; for the unlikely None case (reserved id), fall
+                // back to a half-rate-friendly silence placeholder.
+                let params = tone_to_mbe_params(id, amplitude)
+                    .unwrap_or_else(MbeParams::silence_halfrate);
+                return Ok((
+                    bytes.to_vec(),
+                    AnalysisStats { output: AnalysisOutputKind::Tone { id, amplitude }, params },
+                ));
+            }
+        }
+
         let frame = pcm.try_into().expect("length already validated");
         let (kind, params) = match analysis_encode_halfrate(frame, &mut vocoder.analysis)
             .map_err(VocoderError::Analysis)?
@@ -957,6 +1017,79 @@ mod tests {
         // Clean own-encoded bits: 0 errors per frame, so Use.
         assert_eq!(disp, FrameDisposition::Use);
         assert_eq!(rx.last_disposition(), Some(FrameDisposition::Use));
+    }
+
+    /// Pure-sine input at an Annex T frequency, with tone detection
+    /// enabled, produces a tone frame instead of voice. The decoder
+    /// recognises the tone-frame signature and reconstructs the
+    /// matching MBE params.
+    #[test]
+    fn tone_detection_emits_tone_frame_and_decoder_recognises_it() {
+        // Half-rate is the only rate with tone-frame signaling.
+        let mut tx = Vocoder::new(Rate::P25Phase2);
+        tx.set_tone_detection(true);
+        // Annex T id=10 → 312.5 Hz. Generate one full frame of clean
+        // sine at i16 amplitude 8000.
+        let mut pcm = [0i16; FRAME_SAMPLES];
+        let two_pi = 2.0 * core::f64::consts::PI;
+        for (n, slot) in pcm.iter_mut().enumerate() {
+            let s = 8000.0_f64 * (two_pi * 312.5 * n as f64 / 8000.0).sin();
+            *slot = s.round() as i16;
+        }
+        let bits = tx.encode_pcm(&pcm).unwrap();
+        assert_eq!(bits.len(), 9);
+
+        // Confirm the encoder reported a Tone output.
+        match tx.last_stats().analysis.as_ref().unwrap().output {
+            AnalysisOutputKind::Tone { id, amplitude: _ } => assert_eq!(id, 10),
+            other => panic!("expected Tone, got {other:?}"),
+        }
+
+        // Decoder side: parse the bits and confirm it classifies as
+        // a tone frame (FrameKind::Tone via the §2.10.1 signature
+        // dispatch).
+        use crate::p25_halfrate::dequantize::{FrameKind, classify_halfrate_frame};
+        use crate::p25_halfrate::frame::decode_frame;
+        let mut dibits = [0u8; 36];
+        let mut bit = 0;
+        for slot in &mut dibits {
+            let mut d = 0u8;
+            for _ in 0..2 {
+                let b = (bits[bit / 8] >> (7 - (bit % 8))) & 1;
+                d = (d << 1) | b;
+                bit += 1;
+            }
+            *slot = d;
+        }
+        let frame = decode_frame(&dibits);
+        assert_eq!(classify_halfrate_frame(&frame.info), FrameKind::Tone);
+
+        // Decoding through the Vocoder yields PCM (synthesize_tone
+        // path); we don't assert frequency parity because tone-synth
+        // calibration depends on §1.10/§11 amplitude scaling that's
+        // separately tracked, but the output should be non-trivial.
+        let mut rx = Vocoder::new(Rate::P25Phase2);
+        let out = rx.decode_bits(&bits).unwrap();
+        assert_eq!(out.len(), FRAME_SAMPLES);
+    }
+
+    /// With tone-detection off (default), the same pure-sine input
+    /// goes through the voice analysis pipeline and produces a
+    /// regular voice frame.
+    #[test]
+    fn tone_detection_off_means_voice_path_even_for_pure_sine() {
+        let mut tx = Vocoder::new(Rate::P25Phase2);
+        // (default) tone_detection == false
+        let mut pcm = [0i16; FRAME_SAMPLES];
+        let two_pi = 2.0 * core::f64::consts::PI;
+        for (n, slot) in pcm.iter_mut().enumerate() {
+            let s = 8000.0_f64 * (two_pi * 312.5 * n as f64 / 8000.0).sin();
+            *slot = s.round() as i16;
+        }
+        let _ = tx.encode_pcm(&pcm).unwrap();
+        let kind = tx.last_stats().analysis.as_ref().unwrap().output;
+        assert!(matches!(kind, AnalysisOutputKind::Voice | AnalysisOutputKind::Silence));
+        assert!(!matches!(kind, AnalysisOutputKind::Tone { .. }));
     }
 
     /// `LiveEncoder` accepts arbitrary chunk sizes, holds residue
