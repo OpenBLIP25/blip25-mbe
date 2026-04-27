@@ -122,6 +122,58 @@ pub struct PitchSearch {
 
 const R_MAX_LAG: usize = W_I_HALF as usize;
 
+/// FFT length used for the §0.3.2 Eq. 7 autocorrelation. Must be ≥
+/// `sw2.len() + R_MAX_LAG` so circular wraparound doesn't pollute
+/// the lags we care about (`t ∈ [0, R_MAX_LAG]`). 512 is the next
+/// power of two above 301 + 150 = 451 — keeps rustfft on its
+/// fastest radix-2 path.
+const AUTOCORR_FFT_LEN: usize = 512;
+
+/// Compute r(t) = Σ_j sw2[j] · sw2[j+t] for t ∈ [0, R_MAX_LAG] via
+/// FFT-based autocorrelation. Faster than the direct O(N²) form
+/// for the (N=301, R=150) sizes used here — rustfft's radix-2 path
+/// at length 512 is heavily SIMD-optimized.
+fn autocorr_via_fft(sw2: &[f64; (2 * W_I_HALF + 1) as usize]) -> [f64; R_MAX_LAG + 1] {
+    use num_complex::Complex;
+    use rustfft::{Fft, FftPlanner};
+    use std::sync::OnceLock;
+
+    static FFT_FWD: OnceLock<std::sync::Arc<dyn Fft<f64>>> = OnceLock::new();
+    static FFT_INV: OnceLock<std::sync::Arc<dyn Fft<f64>>> = OnceLock::new();
+    let fft_fwd = FFT_FWD.get_or_init(|| {
+        let mut planner = FftPlanner::<f64>::new();
+        planner.plan_fft_forward(AUTOCORR_FFT_LEN)
+    });
+    let fft_inv = FFT_INV.get_or_init(|| {
+        let mut planner = FftPlanner::<f64>::new();
+        planner.plan_fft_inverse(AUTOCORR_FFT_LEN)
+    });
+
+    let mut buf = [Complex::<f64>::new(0.0, 0.0); AUTOCORR_FFT_LEN];
+    for (i, &x) in sw2.iter().enumerate() {
+        buf[i].re = x;
+    }
+    fft_fwd.process(&mut buf);
+    // |X(f)|² in-place; for real input X has hermitian symmetry so
+    // the result is real, but we keep the complex layout for the IFFT.
+    for c in buf.iter_mut() {
+        c.re = c.re * c.re + c.im * c.im;
+        c.im = 0.0;
+    }
+    fft_inv.process(&mut buf);
+
+    // rustfft's inverse is unnormalized — divide by N. Lag t is at
+    // index t in the IFFT output (positive lags are at the start of
+    // the buffer; circular-aliased negative lags fold to the tail and
+    // we don't read them).
+    let scale = 1.0 / AUTOCORR_FFT_LEN as f64;
+    let mut r = [0.0f64; R_MAX_LAG + 1];
+    for (t, slot) in r.iter_mut().enumerate() {
+        *slot = buf[t].re * scale;
+    }
+    r
+}
+
 impl PitchSearch {
     /// Build the per-frame pitch search from the 321-sample analysis
     /// buffer (see [`PITCH_INPUT_LEN`]).
@@ -151,24 +203,14 @@ impl PitchSearch {
             energy += s * s * w2;
             w4 += w2 * w2;
         }
-        // Eq. 7 via hoisted envelope — r(t) = Σ sw2[j]·sw2[j+t].
-        // Express as a slice-aligned dot product so LLVM can autovectorize
-        // the inner sum (the bounds-arithmetic version masked the access
-        // pattern from the optimizer). For t ≥ 0 the valid range is
-        // j ∈ [−W_I_HALF, W_I_HALF − t]; in array-index form `i = j +
-        // W_I_HALF` runs over [0, 2·W_I_HALF − t], the `a` read is
-        // sw2[i] and the `b` read is sw2[i + t].
-        let mut r = [0.0f64; R_MAX_LAG + 1];
-        let n = sw2.len();
-        for t in 0..=R_MAX_LAG {
-            let a = &sw2[..n - t];
-            let b = &sw2[t..];
-            let mut acc = 0.0;
-            for i in 0..a.len() {
-                acc += a[i] * b[i];
-            }
-            r[t] = acc;
-        }
+        // Eq. 7 via FFT — r(t) = Σ sw2[j]·sw2[j+t] is the
+        // autocorrelation of sw2, so r = IFFT(|FFT(zero-padded sw2)|²).
+        // We zero-pad to AUTOCORR_FFT_LEN (= 512, the next pow-2 ≥
+        // sw2.len() + R_MAX_LAG) so the circular autocorrelation
+        // matches the linear one over t ∈ [0, R_MAX_LAG]. FFT is
+        // general DSP, not P25 IP — same clean-room justification as
+        // the §0.2 signal_spectrum and §1.12.1 unvoiced-synth FFT.
+        let r = autocorr_via_fft(&sw2);
         // Precompute E(P) at every half-sample grid point so the
         // hot loops in look_back / look_ahead become slice scans
         // instead of recomputing the Eq. 5 sum each visit.
