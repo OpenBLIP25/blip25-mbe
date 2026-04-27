@@ -94,6 +94,40 @@ That's the shape. Rate selection at runtime; state internal; uniform
 operations. Maps cleanly onto a future RPC surface (one streaming
 RPC per direction, one config RPC for rate selection).
 
+## Status as of 2026-04-26
+
+Wave 1 + Wave 2 are complete except 1.2 (AMBE+ Gen-2 wrapper, parked
+until a real test case lands). The Vocoder API has expanded beyond
+the original sketch — see "What actually shipped" below.
+
+### What actually shipped
+
+| Item | Status | Commit(s) |
+|------|--------|-----------|
+| 1.1 Half-rate API gotchas | done | `1531cb9` |
+| 1.2 AMBE+ Gen-2 dequantize wrapper | parked | — |
+| 1.3 Unified `Vocoder` trait + builder | done + expanded | `1be40b4`, `d0e6f2b`, `9c0cf58`, `d9a1820`, `399e903` |
+| 1.4 `serde` diagnostic types | done | `9f94296` |
+| 1.5 Streaming iterator API | done + expanded | `73d3e41`, `327dfc2`, `282a911` |
+| 2.1 Chip-correspondence doc | done | `a4ed2fb` |
+| 2.2 JMBE oracle tooling decision | done (kept here, README) | `a4ed2fb` |
+
+Plus several beyond-plan additions:
+- Encode-side tone dispatch with single + DTMF detection (`cbb898b`,
+  `65bb025`).
+- `LiveEncoder::flush()` for end-of-stream tail-encode (`282a911`).
+- `Vocoder::synthesize_params` / `extract_params` — parameter-layer
+  API without wire FEC, enabling rate-conversion / analysis / playback
+  pipelines (`9c0cf58`, `d9a1820`).
+- `Vocoder::set_silence_dispatch` / `set_pitch_silence_override`
+  surfaced from the inner AnalysisState (`399e903`).
+- Disposition surfacing (`f9c5497`) — `Vocoder::last_disposition()`
+  reflects the synth's per-frame Use/Repeat/Mute decision.
+- Crate-root rustdoc refresh (`4eff935`).
+
+Test counts: 401 with `--features serde`, 399 default. Started this
+plan at 364.
+
 ## Wave 1 — codec-API hardening (small, sequenced)
 
 ### 1.1 Half-rate API gotchas (1 session)
