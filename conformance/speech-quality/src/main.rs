@@ -213,6 +213,25 @@ enum Cmd {
         #[arg(long)]
         binary: bool,
     },
+    /// Decode a stream of P25 Phase 1 / IMBE full-rate FEC frames
+    /// (18 bytes per frame = 72 dibits) into 8 kHz mono i16 PCM.
+    /// Runs the full p25_fullrate decode chain through the chip-shaped
+    /// `Vocoder::decode_bits`.
+    ///
+    /// Two input formats:
+    /// - Text: one 36-hex-char line per frame, `#`-comments OK.
+    /// - Binary: raw 18-byte frames concatenated (`--binary`).
+    DecodeFecFullrate {
+        /// Path to FEC-frame input. Use `-` for stdin.
+        #[arg(long)]
+        input: PathBuf,
+        /// Output WAV path.
+        #[arg(long)]
+        out_wav: PathBuf,
+        /// Treat input as packed binary (18 bytes per frame).
+        #[arg(long)]
+        binary: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
@@ -268,6 +287,9 @@ fn main() -> Result<()> {
         Cmd::DecodeRawMbe { input, out_wav } => cmd_decode_raw_mbe(&input, &out_wav),
         Cmd::DecodeFecHalfrate { input, out_wav, binary } => {
             cmd_decode_fec_halfrate(&input, &out_wav, binary)
+        }
+        Cmd::DecodeFecFullrate { input, out_wav, binary } => {
+            cmd_decode_fec_fullrate(&input, &out_wav, binary)
         }
     }
 }
@@ -969,6 +991,91 @@ fn cmd_decode_fec_halfrate(input: &Path, out_wav: &Path, binary: bool) -> Result
     // wants the carrier-agnostic surface.
     use blip25_mbe::vocoder::{Rate, Vocoder};
     let mut vocoder = Vocoder::new(Rate::P25Phase2);
+    let mut pcm: Vec<i16> = Vec::with_capacity(frames.len() * FRAME_SAMPLES);
+    for (f, bytes) in frames.iter().enumerate() {
+        let frame = vocoder
+            .decode_bits(bytes)
+            .with_context(|| format!("decode frame {f}"))?;
+        pcm.extend_from_slice(&frame);
+    }
+    write_wav(out_wav, &pcm)?;
+    eprintln!(
+        "frames={}  samples={}  rms={:.0}  → {}",
+        frames.len(),
+        pcm.len(),
+        if pcm.is_empty() {
+            0.0
+        } else {
+            (pcm.iter().map(|&s| (s as f64) * (s as f64)).sum::<f64>() / pcm.len() as f64).sqrt()
+        },
+        out_wav.display()
+    );
+    Ok(())
+}
+
+/// Decode FEC-level full-rate IMBE frames (18 bytes / 72 dibits each)
+/// into PCM via the chip-shaped Vocoder API.
+///
+/// Mirrors `cmd_decode_fec_halfrate` but for P25 Phase 1 input.
+fn cmd_decode_fec_fullrate(input: &Path, out_wav: &Path, binary: bool) -> Result<()> {
+    use blip25_mbe::vocoder::{Rate, Vocoder};
+    use std::io::Read;
+    let raw: Vec<u8> = if input == Path::new("-") {
+        let mut buf = Vec::new();
+        std::io::stdin().read_to_end(&mut buf)?;
+        buf
+    } else {
+        fs::read(input).with_context(|| format!("read {}", input.display()))?
+    };
+
+    let frames: Vec<[u8; BYTES_PER_FEC_FRAME]> = if binary {
+        if raw.len() % BYTES_PER_FEC_FRAME != 0 {
+            return Err(anyhow!(
+                "binary input must be a whole number of {}-byte frames; got {} bytes",
+                BYTES_PER_FEC_FRAME,
+                raw.len()
+            ));
+        }
+        raw.chunks_exact(BYTES_PER_FEC_FRAME)
+            .map(|c| {
+                let mut a = [0u8; BYTES_PER_FEC_FRAME];
+                a.copy_from_slice(c);
+                a
+            })
+            .collect()
+    } else {
+        let text = String::from_utf8(raw).context("input is not valid UTF-8 text")?;
+        let mut out = Vec::new();
+        for (lineno, line) in text.lines().enumerate() {
+            let stripped = line.split('#').next().unwrap_or("").trim();
+            if stripped.is_empty() {
+                continue;
+            }
+            let hex: String = stripped
+                .chars()
+                .filter(|c| !c.is_whitespace() && *c != ':' && *c != '-')
+                .collect();
+            if hex.len() != 2 * BYTES_PER_FEC_FRAME {
+                return Err(anyhow!(
+                    "line {}: expected {} hex chars (= {} bytes), got {} ({})",
+                    lineno + 1,
+                    2 * BYTES_PER_FEC_FRAME,
+                    BYTES_PER_FEC_FRAME,
+                    hex.len(),
+                    stripped
+                ));
+            }
+            let mut bytes = [0u8; BYTES_PER_FEC_FRAME];
+            for (i, b) in bytes.iter_mut().enumerate() {
+                *b = u8::from_str_radix(&hex[2 * i..2 * i + 2], 16)
+                    .with_context(|| format!("line {}: parse hex byte at {}", lineno + 1, i))?;
+            }
+            out.push(bytes);
+        }
+        out
+    };
+
+    let mut vocoder = Vocoder::new(Rate::P25Phase1);
     let mut pcm: Vec<i16> = Vec::with_capacity(frames.len() * FRAME_SAMPLES);
     for (f, bytes) in frames.iter().enumerate() {
         let frame = vocoder
