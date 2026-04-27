@@ -271,6 +271,36 @@ impl Vocoder {
         self.synth.repeat_reset_after()
     }
 
+    /// Enable the §0.8.4 silence-dispatch path on the analysis encoder.
+    /// When on, frames whose energy clears the silence detector's
+    /// hysteresis emit `AnalysisOutput::Silence` (rate-appropriate
+    /// silence params) instead of running the full pitch / V-UV /
+    /// amplitude pipeline. Default off — pass-through per addendum
+    /// §0.8.8 recommendation.
+    pub fn set_silence_dispatch(&mut self, on: bool) {
+        self.analysis.set_silence_detection(on);
+    }
+
+    /// Whether silence dispatch is currently enabled.
+    #[inline]
+    pub fn silence_dispatch(&self) -> bool {
+        self.analysis.silence_detection_enabled()
+    }
+
+    /// Enable the joint-signal silence override — dispatches
+    /// pitch-unreliable low-energy frames as silence even if they
+    /// don't reach the §0.8.4 hysteresis threshold. Requires
+    /// [`Self::set_silence_dispatch`] also be on. Default off.
+    pub fn set_pitch_silence_override(&mut self, on: bool) {
+        self.analysis.set_pitch_silence_override(on);
+    }
+
+    /// Whether the joint-signal silence override is currently enabled.
+    #[inline]
+    pub fn pitch_silence_override(&self) -> bool {
+        self.analysis.pitch_silence_override_enabled()
+    }
+
     /// Start a fluent builder for this rate. Equivalent to
     /// `VocoderBuilder::new(rate)`.
     #[inline]
@@ -673,13 +703,21 @@ pub struct VocoderBuilder {
     rate: Rate,
     tone_detection: bool,
     repeat_reset_after: Option<u32>,
+    silence_dispatch: bool,
+    pitch_silence_override: bool,
 }
 
 impl VocoderBuilder {
     /// New builder defaulting to spec-faithful behavior at `rate`.
     #[inline]
     pub fn new(rate: Rate) -> Self {
-        Self { rate, tone_detection: false, repeat_reset_after: None }
+        Self {
+            rate,
+            tone_detection: false,
+            repeat_reset_after: None,
+            silence_dispatch: false,
+            pitch_silence_override: false,
+        }
     }
 
     /// Enable encode-side Annex T tone detection (half-rate only).
@@ -698,11 +736,30 @@ impl VocoderBuilder {
         self
     }
 
+    /// Enable §0.8.4 silence dispatch on the analysis encoder.
+    /// See [`Vocoder::set_silence_dispatch`].
+    #[inline]
+    pub fn silence_dispatch(mut self, on: bool) -> Self {
+        self.silence_dispatch = on;
+        self
+    }
+
+    /// Enable the joint-signal silence override (requires
+    /// [`Self::silence_dispatch`] also on).
+    /// See [`Vocoder::set_pitch_silence_override`].
+    #[inline]
+    pub fn pitch_silence_override(mut self, on: bool) -> Self {
+        self.pitch_silence_override = on;
+        self
+    }
+
     /// Materialize the [`Vocoder`].
     pub fn build(self) -> Vocoder {
         let mut v = Vocoder::new(self.rate);
         v.set_tone_detection(self.tone_detection);
         v.set_repeat_reset_after(self.repeat_reset_after);
+        v.set_silence_dispatch(self.silence_dispatch);
+        v.set_pitch_silence_override(self.pitch_silence_override);
         v
     }
 }
@@ -1289,20 +1346,23 @@ mod tests {
         assert_eq!(live.pending_samples(), 0);
     }
 
-    /// Builder applies tone-detection + repeat-reset config in one
-    /// expression and produces an equivalent Vocoder.
+    /// Builder applies all four config knobs in one expression.
     #[test]
-    fn builder_configures_tone_detection_and_repeat_reset() {
+    fn builder_configures_all_knobs() {
         let v = Vocoder::builder(Rate::P25Phase2)
             .tone_detection(true)
             .repeat_reset_after(Some(3))
+            .silence_dispatch(true)
+            .pitch_silence_override(true)
             .build();
         assert_eq!(v.rate(), Rate::P25Phase2);
         assert!(v.tone_detection());
         assert_eq!(v.repeat_reset_after(), Some(3));
+        assert!(v.silence_dispatch());
+        assert!(v.pitch_silence_override());
     }
 
-    /// Default builder = spec-faithful (no beyond-spec knobs).
+    /// Default builder = spec-faithful (no beyond-spec or opt-in knobs).
     #[test]
     fn builder_defaults_match_vocoder_new() {
         let a = Vocoder::builder(Rate::P25Phase1).build();
@@ -1310,8 +1370,12 @@ mod tests {
         assert_eq!(a.rate(), b.rate());
         assert_eq!(a.tone_detection(), b.tone_detection());
         assert_eq!(a.repeat_reset_after(), b.repeat_reset_after());
+        assert_eq!(a.silence_dispatch(), b.silence_dispatch());
+        assert_eq!(a.pitch_silence_override(), b.pitch_silence_override());
         assert!(!a.tone_detection());
         assert!(a.repeat_reset_after().is_none());
+        assert!(!a.silence_dispatch());
+        assert!(!a.pitch_silence_override());
     }
 
     /// `flush` zero-pads residue and emits one final frame; on an
