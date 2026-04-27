@@ -225,6 +225,14 @@ pub enum VocoderError {
     Analysis(AnalysisError),
     /// Wire-quantize failure (e.g. predictor returned a non-finite value).
     Quantize(String),
+    /// Requested transcode direction is not supported. The pair of rates
+    /// has no parameter-domain converter wired up.
+    UnsupportedTranscode {
+        /// Rate of the input FEC frame.
+        from: Rate,
+        /// Rate of the output FEC frame.
+        to: Rate,
+    },
 }
 
 impl core::fmt::Display for VocoderError {
@@ -238,6 +246,9 @@ impl core::fmt::Display for VocoderError {
             }
             VocoderError::Analysis(e) => write!(f, "analysis encoder error: {e:?}"),
             VocoderError::Quantize(msg) => write!(f, "quantize error: {msg}"),
+            VocoderError::UnsupportedTranscode { from, to } => {
+                write!(f, "unsupported transcode direction: {from:?} -> {to:?}")
+            }
         }
     }
 }
@@ -660,35 +671,37 @@ impl Iterator for DecodeStream<'_> {
 
 impl ExactSizeIterator for DecodeStream<'_> {}
 
-/// Direction of a [`Transcoder`].
+/// Direction of a [`Transcoder`] — the input/output rate pair.
+///
+/// Scales O(N) for N rates instead of O(N²) enum variants. Not every
+/// `(from, to)` pair has a wired parameter-domain converter; see
+/// [`Transcoder::new`] for the supported set.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub enum TranscodeDirection {
-    /// Convert P25 Phase 1 (full-rate IMBE, 18-byte FEC frames) to
-    /// P25 Phase 2 (half-rate AMBE+2, 9-byte FEC frames).
-    Imbe7200x4400ToAmbePlus2_3600x2450,
-    /// Convert P25 Phase 2 (half-rate AMBE+2, 9-byte) to P25 Phase 1
-    /// (full-rate IMBE, 18-byte).
-    AmbePlus2_3600x2450ToImbe7200x4400,
+pub struct TranscodeDirection {
+    /// Rate of the input FEC frame.
+    pub from: Rate,
+    /// Rate of the output FEC frame.
+    pub to: Rate,
 }
 
 impl TranscodeDirection {
+    /// Construct a direction from a `(from, to)` pair.
+    #[inline]
+    pub const fn new(from: Rate, to: Rate) -> Self {
+        Self { from, to }
+    }
+
     /// Bytes per input FEC frame for this direction.
     #[inline]
     pub const fn input_frame_bytes(self) -> usize {
-        match self {
-            TranscodeDirection::Imbe7200x4400ToAmbePlus2_3600x2450 => 18,
-            TranscodeDirection::AmbePlus2_3600x2450ToImbe7200x4400 => 9,
-        }
+        self.from.fec_frame_bytes()
     }
 
     /// Bytes per output FEC frame for this direction.
     #[inline]
     pub const fn output_frame_bytes(self) -> usize {
-        match self {
-            TranscodeDirection::Imbe7200x4400ToAmbePlus2_3600x2450 => 9,
-            TranscodeDirection::AmbePlus2_3600x2450ToImbe7200x4400 => 18,
-        }
+        self.to.fec_frame_bytes()
     }
 }
 
@@ -705,9 +718,9 @@ impl TranscodeDirection {
 /// last-good frame for repeats) is internal and advances per call.
 ///
 /// ```rust
-/// use blip25_mbe::vocoder::{Transcoder, TranscodeDirection};
+/// use blip25_mbe::vocoder::{Rate, Transcoder};
 ///
-/// let mut tx = Transcoder::new(TranscodeDirection::Imbe7200x4400ToAmbePlus2_3600x2450);
+/// let mut tx = Transcoder::new(Rate::Imbe7200x4400, Rate::AmbePlus2_3600x2450).unwrap();
 /// let phase1_bits: [u8; 18] = [0; 18];
 /// let phase2_bits = tx.transcode(&phase1_bits).unwrap();
 /// assert_eq!(phase2_bits.len(), 9);
@@ -719,19 +732,28 @@ pub struct Transcoder {
 }
 
 impl Transcoder {
-    /// Open a new transcoder in the given direction.
-    pub fn new(direction: TranscodeDirection) -> Self {
-        match direction {
-            TranscodeDirection::Imbe7200x4400ToAmbePlus2_3600x2450 => Self {
+    /// Open a new transcoder for the `(from, to)` rate pair.
+    ///
+    /// Currently supported pairs:
+    /// - `(Rate::Imbe7200x4400, Rate::AmbePlus2_3600x2450)`
+    /// - `(Rate::AmbePlus2_3600x2450, Rate::Imbe7200x4400)`
+    ///
+    /// Any other combination returns
+    /// [`VocoderError::UnsupportedTranscode`].
+    pub fn new(from: Rate, to: Rate) -> Result<Self, VocoderError> {
+        let direction = TranscodeDirection { from, to };
+        match (from, to) {
+            (Rate::Imbe7200x4400, Rate::AmbePlus2_3600x2450) => Ok(Self {
                 direction,
                 full_to_half: Some(crate::rate_conversion::FullToHalfConverter::new()),
                 half_to_full: None,
-            },
-            TranscodeDirection::AmbePlus2_3600x2450ToImbe7200x4400 => Self {
+            }),
+            (Rate::AmbePlus2_3600x2450, Rate::Imbe7200x4400) => Ok(Self {
                 direction,
                 full_to_half: None,
                 half_to_full: Some(crate::rate_conversion::HalfToFullConverter::new()),
-            },
+            }),
+            _ => Err(VocoderError::UnsupportedTranscode { from, to }),
         }
     }
 
@@ -754,8 +776,8 @@ impl Transcoder {
                 got: bits.len(),
             });
         }
-        match self.direction {
-            TranscodeDirection::Imbe7200x4400ToAmbePlus2_3600x2450 => {
+        match (self.direction.from, self.direction.to) {
+            (Rate::Imbe7200x4400, Rate::AmbePlus2_3600x2450) => {
                 let dibits_in = unpack_dibits_n::<72>(bits);
                 let dibits_out = self
                     .full_to_half
@@ -765,7 +787,7 @@ impl Transcoder {
                     .map_err(|e| VocoderError::Quantize(format!("{e:?}")))?;
                 Ok(pack_dibits_n::<36, 9>(&dibits_out).to_vec())
             }
-            TranscodeDirection::AmbePlus2_3600x2450ToImbe7200x4400 => {
+            (Rate::AmbePlus2_3600x2450, Rate::Imbe7200x4400) => {
                 let dibits_in = unpack_dibits_n::<36>(bits);
                 let dibits_out = self
                     .half_to_full
@@ -775,13 +797,15 @@ impl Transcoder {
                     .map_err(|e| VocoderError::Quantize(format!("{e:?}")))?;
                 Ok(pack_dibits_n::<72, 18>(&dibits_out).to_vec())
             }
+            (from, to) => Err(VocoderError::UnsupportedTranscode { from, to }),
         }
     }
 
     /// Reset all transcoder state. Equivalent to opening a fresh
     /// channel.
     pub fn reset(&mut self) {
-        *self = Self::new(self.direction);
+        *self = Self::new(self.direction.from, self.direction.to)
+            .expect("direction was validated at construction");
     }
 }
 
@@ -1709,8 +1733,11 @@ mod tests {
     /// boundary. State advances per call; rates are validated.
     #[test]
     fn transcoder_phase1_to_phase2_changes_frame_size() {
-        let mut tx = Transcoder::new(TranscodeDirection::Imbe7200x4400ToAmbePlus2_3600x2450);
-        assert_eq!(tx.direction(), TranscodeDirection::Imbe7200x4400ToAmbePlus2_3600x2450);
+        let mut tx = Transcoder::new(Rate::Imbe7200x4400, Rate::AmbePlus2_3600x2450).unwrap();
+        assert_eq!(
+            tx.direction(),
+            TranscodeDirection::new(Rate::Imbe7200x4400, Rate::AmbePlus2_3600x2450)
+        );
         // Encode some Phase 1 frames first to get realistic bits.
         let mut enc = Vocoder::new(Rate::Imbe7200x4400);
         let pcm = periodic_pcm(40, 6000);
@@ -1724,7 +1751,7 @@ mod tests {
 
     #[test]
     fn transcoder_phase2_to_phase1_changes_frame_size() {
-        let mut tx = Transcoder::new(TranscodeDirection::AmbePlus2_3600x2450ToImbe7200x4400);
+        let mut tx = Transcoder::new(Rate::AmbePlus2_3600x2450, Rate::Imbe7200x4400).unwrap();
         let mut enc = Vocoder::new(Rate::AmbePlus2_3600x2450);
         let pcm = periodic_pcm(40, 6000);
         for _ in 0..3 {
@@ -1737,10 +1764,24 @@ mod tests {
 
     #[test]
     fn transcoder_rejects_wrong_input_length() {
-        let mut tx = Transcoder::new(TranscodeDirection::Imbe7200x4400ToAmbePlus2_3600x2450);
+        let mut tx = Transcoder::new(Rate::Imbe7200x4400, Rate::AmbePlus2_3600x2450).unwrap();
         assert!(matches!(
             tx.transcode(&[0u8; 9]),
             Err(VocoderError::WrongBitsLength { expected: 18, got: 9 })
+        ));
+    }
+
+    /// Unsupported `(from, to)` pair surfaces as `UnsupportedTranscode`
+    /// rather than a panic.
+    #[test]
+    fn transcoder_rejects_unsupported_pair() {
+        let res = Transcoder::new(Rate::Imbe7200x4400, Rate::Imbe7200x4400);
+        assert!(matches!(
+            res.err(),
+            Some(VocoderError::UnsupportedTranscode {
+                from: Rate::Imbe7200x4400,
+                to: Rate::Imbe7200x4400,
+            })
         ));
     }
 

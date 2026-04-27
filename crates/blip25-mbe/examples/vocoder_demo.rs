@@ -8,7 +8,7 @@
 //! streaming, the parameter-layer (extract_params / synthesize_params),
 //! the builder, and stats / disposition inspection.
 
-use blip25_mbe::vocoder::{LiveEncoder, Rate, TranscodeDirection, Transcoder, Vocoder};
+use blip25_mbe::vocoder::{LiveEncoder, Rate, Transcoder, Vocoder};
 
 const FRAMES: usize = 50; // 1.0 second of audio at 8 kHz / 20 ms/frame.
 
@@ -153,7 +153,8 @@ fn transcode_demo(pcm: &[i16]) {
     // the parameter-extraction floor instead of the lossy
     // analysis-encode → synthesis → analysis-encode chain.
     let mut enc = Vocoder::new(Rate::Imbe7200x4400);
-    let mut tx = Transcoder::new(TranscodeDirection::Imbe7200x4400ToAmbePlus2_3600x2450);
+    let mut tx = Transcoder::new(Rate::Imbe7200x4400, Rate::AmbePlus2_3600x2450)
+        .expect("supported direction");
     let mut p1_total = 0usize;
     let mut p2_total = 0usize;
     for chunk in pcm.chunks_exact(enc.frame_samples()) {
