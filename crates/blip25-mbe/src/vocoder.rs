@@ -573,6 +573,159 @@ impl Iterator for DecodeStream<'_> {
 
 impl ExactSizeIterator for DecodeStream<'_> {}
 
+/// Direction of a [`Transcoder`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum TranscodeDirection {
+    /// Convert P25 Phase 1 (full-rate IMBE, 18-byte FEC frames) to
+    /// P25 Phase 2 (half-rate AMBE+2, 9-byte FEC frames).
+    P25Phase1ToPhase2,
+    /// Convert P25 Phase 2 (half-rate AMBE+2, 9-byte) to P25 Phase 1
+    /// (full-rate IMBE, 18-byte).
+    P25Phase2ToPhase1,
+}
+
+impl TranscodeDirection {
+    /// Bytes per input FEC frame for this direction.
+    #[inline]
+    pub const fn input_frame_bytes(self) -> usize {
+        match self {
+            TranscodeDirection::P25Phase1ToPhase2 => 18,
+            TranscodeDirection::P25Phase2ToPhase1 => 9,
+        }
+    }
+
+    /// Bytes per output FEC frame for this direction.
+    #[inline]
+    pub const fn output_frame_bytes(self) -> usize {
+        match self {
+            TranscodeDirection::P25Phase1ToPhase2 => 9,
+            TranscodeDirection::P25Phase2ToPhase1 => 18,
+        }
+    }
+}
+
+/// Bridge P25 Phase 1 ↔ P25 Phase 2 at the wire-bits layer.
+///
+/// Internally the transcoder runs the parameter-domain converter
+/// (BABA-A §11 — extract params from one rate's bits, then re-quantize
+/// at the other rate without any PCM round-trip). Avoids the
+/// 8-kHz-PCM detour, so quality stays at the parameter-extraction
+/// floor rather than going through analysis-encode → synthesis →
+/// analysis-encode again.
+///
+/// Direction is fixed at construction. State (cross-rate predictor,
+/// last-good frame for repeats) is internal and advances per call.
+///
+/// ```no_run
+/// use blip25_mbe::vocoder::{Transcoder, TranscodeDirection};
+///
+/// let mut tx = Transcoder::new(TranscodeDirection::P25Phase1ToPhase2);
+/// let phase1_bits: [u8; 18] = [0; 18];
+/// let phase2_bits = tx.transcode(&phase1_bits).unwrap();
+/// assert_eq!(phase2_bits.len(), 9);
+/// ```
+pub struct Transcoder {
+    direction: TranscodeDirection,
+    full_to_half: Option<crate::rate_conversion::FullToHalfConverter>,
+    half_to_full: Option<crate::rate_conversion::HalfToFullConverter>,
+}
+
+impl Transcoder {
+    /// Open a new transcoder in the given direction.
+    pub fn new(direction: TranscodeDirection) -> Self {
+        match direction {
+            TranscodeDirection::P25Phase1ToPhase2 => Self {
+                direction,
+                full_to_half: Some(crate::rate_conversion::FullToHalfConverter::new()),
+                half_to_full: None,
+            },
+            TranscodeDirection::P25Phase2ToPhase1 => Self {
+                direction,
+                full_to_half: None,
+                half_to_full: Some(crate::rate_conversion::HalfToFullConverter::new()),
+            },
+        }
+    }
+
+    /// Direction this transcoder was opened in.
+    #[inline]
+    pub fn direction(&self) -> TranscodeDirection {
+        self.direction
+    }
+
+    /// Transcode one input FEC frame to one output FEC frame.
+    ///
+    /// `bits` must be exactly [`TranscodeDirection::input_frame_bytes`]
+    /// long; the returned `Vec` has exactly
+    /// [`TranscodeDirection::output_frame_bytes`].
+    pub fn transcode(&mut self, bits: &[u8]) -> Result<Vec<u8>, VocoderError> {
+        let in_n = self.direction.input_frame_bytes();
+        if bits.len() != in_n {
+            return Err(VocoderError::WrongBitsLength {
+                expected: in_n,
+                got: bits.len(),
+            });
+        }
+        match self.direction {
+            TranscodeDirection::P25Phase1ToPhase2 => {
+                let dibits_in = unpack_dibits_n::<72>(bits);
+                let dibits_out = self
+                    .full_to_half
+                    .as_mut()
+                    .expect("constructed with this direction")
+                    .convert(&dibits_in)
+                    .map_err(|e| VocoderError::Quantize(format!("{e:?}")))?;
+                Ok(pack_dibits_n::<36, 9>(&dibits_out).to_vec())
+            }
+            TranscodeDirection::P25Phase2ToPhase1 => {
+                let dibits_in = unpack_dibits_n::<36>(bits);
+                let dibits_out = self
+                    .half_to_full
+                    .as_mut()
+                    .expect("constructed with this direction")
+                    .convert(&dibits_in)
+                    .map_err(|e| VocoderError::Quantize(format!("{e:?}")))?;
+                Ok(pack_dibits_n::<72, 18>(&dibits_out).to_vec())
+            }
+        }
+    }
+
+    /// Reset all transcoder state. Equivalent to opening a fresh
+    /// channel.
+    pub fn reset(&mut self) {
+        *self = Self::new(self.direction);
+    }
+}
+
+fn unpack_dibits_n<const N: usize>(bytes: &[u8]) -> [u8; N] {
+    let mut out = [0u8; N];
+    let mut bit = 0usize;
+    for slot in &mut out {
+        let mut d = 0u8;
+        for _ in 0..2 {
+            let b = (bytes[bit / 8] >> (7 - (bit % 8))) & 1;
+            d = (d << 1) | b;
+            bit += 1;
+        }
+        *slot = d;
+    }
+    out
+}
+
+fn pack_dibits_n<const N: usize, const B: usize>(dibits: &[u8; N]) -> [u8; B] {
+    let mut out = [0u8; B];
+    let mut bit = 0usize;
+    for &d in dibits {
+        for pos in (0..2).rev() {
+            let b = (d >> pos) & 1;
+            out[bit / 8] |= b << (7 - (bit % 8));
+            bit += 1;
+        }
+    }
+    out
+}
+
 /// Push-driven encoder for live PCM streams that arrive in chunks
 /// of arbitrary length (audio device callbacks, file readers, sockets).
 /// Holds residual samples internally across calls so the caller can
@@ -1421,6 +1574,45 @@ mod tests {
         assert_eq!(live.pending_samples(), 80);
         live.discard_pending();
         assert_eq!(live.pending_samples(), 0);
+    }
+
+    /// Transcoder bridges P25 Phase 1 ↔ Phase 2 at the FEC-byte
+    /// boundary. State advances per call; rates are validated.
+    #[test]
+    fn transcoder_phase1_to_phase2_changes_frame_size() {
+        let mut tx = Transcoder::new(TranscodeDirection::P25Phase1ToPhase2);
+        assert_eq!(tx.direction(), TranscodeDirection::P25Phase1ToPhase2);
+        // Encode some Phase 1 frames first to get realistic bits.
+        let mut enc = Vocoder::new(Rate::P25Phase1);
+        let pcm = periodic_pcm(40, 6000);
+        for _ in 0..3 {
+            let phase1 = enc.encode_pcm(&pcm).unwrap();
+            assert_eq!(phase1.len(), 18);
+            let phase2 = tx.transcode(&phase1).unwrap();
+            assert_eq!(phase2.len(), 9, "P1→P2 transcode produces 9-byte frames");
+        }
+    }
+
+    #[test]
+    fn transcoder_phase2_to_phase1_changes_frame_size() {
+        let mut tx = Transcoder::new(TranscodeDirection::P25Phase2ToPhase1);
+        let mut enc = Vocoder::new(Rate::P25Phase2);
+        let pcm = periodic_pcm(40, 6000);
+        for _ in 0..3 {
+            let phase2 = enc.encode_pcm(&pcm).unwrap();
+            assert_eq!(phase2.len(), 9);
+            let phase1 = tx.transcode(&phase2).unwrap();
+            assert_eq!(phase1.len(), 18);
+        }
+    }
+
+    #[test]
+    fn transcoder_rejects_wrong_input_length() {
+        let mut tx = Transcoder::new(TranscodeDirection::P25Phase1ToPhase2);
+        assert!(matches!(
+            tx.transcode(&[0u8; 9]),
+            Err(VocoderError::WrongBitsLength { expected: 18, got: 9 })
+        ));
     }
 
     /// `extract_params` runs the analysis encoder on PCM and returns
