@@ -118,6 +118,48 @@ pub struct PitchSearch {
     /// [`Self::e_of_p_grid`] / [`look_ahead`]. Off-grid queries still
     /// recompute via [`Self::e_of_p`].
     e_grid: [f64; PITCH_GRID_LEN],
+    /// Sparse-table range-minimum index over `e_grid`. Optional —
+    /// only built for `PitchSearch` instances that will see many
+    /// `argmin_in_range` calls (typically `next1`/`next2` inside
+    /// [`look_ahead`]). When `None`, `argmin_in_range` falls back to
+    /// the linear-scan path. Boxed to keep the sparse-less
+    /// `PitchSearch` size small for `EncodeTrace::clone()`.
+    ///
+    /// Layout: `sparse[k][i]` = `(min_e, argmin_idx)` over
+    /// `e_grid[i..i+2^k]` with lex-ordering on `(min_e, argmin_idx)`
+    /// so that ties resolve to the smaller index — preserving the
+    /// linear-scan path's tie-break (first occurrence wins).
+    sparse: Option<Box<SparseRmq>>,
+}
+
+/// Number of sparse-table levels: `⌈log2(PITCH_GRID_LEN)⌉`. With
+/// `PITCH_GRID_LEN = 203`, k ranges 0..=7 (2^7 = 128 ≤ 203, 2^8 = 256 > 203).
+const SPARSE_LEVELS: usize = 8;
+
+/// One row of the sparse-table RMQ — `(min_e, argmin_idx)` per grid
+/// index `i`, covering `e_grid[i..min(i+2^k, PITCH_GRID_LEN)]`.
+type SparseRow = [(f64, u16); PITCH_GRID_LEN];
+
+/// Sparse-table range-min over `e_grid`. `sparse[k][i]` = lex-min over
+/// `e_grid[i..min(i+2^k, PITCH_GRID_LEN)]`.
+type SparseRmq = [SparseRow; SPARSE_LEVELS];
+
+/// Lex-min on `(value, idx)` pairs — ties on `value` resolve to the
+/// smaller `idx`, which mirrors the linear-scan path's "first
+/// occurrence wins" tie-break in [`PitchSearch::argmin_in_range`].
+#[inline]
+fn lex_min(a: (f64, u16), b: (f64, u16)) -> (f64, u16) {
+    match a.0.partial_cmp(&b.0) {
+        Some(core::cmp::Ordering::Less) => a,
+        Some(core::cmp::Ordering::Greater) => b,
+        _ => {
+            if a.1 <= b.1 {
+                a
+            } else {
+                b
+            }
+        }
+    }
 }
 
 const R_MAX_LAG: usize = W_I_HALF as usize;
@@ -220,6 +262,7 @@ impl PitchSearch {
             w_i_fourth_moment: w4,
             r,
             e_grid: [0.0; PITCH_GRID_LEN],
+            sparse: None,
         };
         for (i, slot) in e_grid.iter_mut().enumerate() {
             let p = PITCH_GRID_MIN + (i as f64) * PITCH_GRID_STEP;
@@ -227,6 +270,49 @@ impl PitchSearch {
         }
         tmp.e_grid = e_grid;
         tmp
+    }
+
+    /// Build the sparse-table RMQ over `e_grid` so that
+    /// [`Self::argmin_in_range`] runs in `O(1)` per call instead of the
+    /// default linear scan. Worth ~25 µs/frame on the [`look_ahead`]
+    /// 203-iteration outer loop where each step does two
+    /// `argmin_in_range` calls on the lookahead frames.
+    ///
+    /// Idempotent — calling more than once is a no-op (the table is
+    /// determined by `e_grid`, which doesn't change after construction).
+    pub fn enable_argmin_fast(&mut self) {
+        if self.sparse.is_some() {
+            return;
+        }
+        // Box the SparseRmq directly on the heap. The optimizer typically
+        // elides the stack copy via NRVO for Box::new of a fixed-size
+        // array literal, but core::array::from_fn keeps codegen sane on
+        // any Rust version.
+        let mut sparse: Box<SparseRmq> = Box::new(core::array::from_fn(|_| {
+            [(f64::INFINITY, 0u16); PITCH_GRID_LEN]
+        }));
+
+        // Level 0: each cell is the value at its own index.
+        for i in 0..PITCH_GRID_LEN {
+            sparse[0][i] = (self.e_grid[i], i as u16);
+        }
+        // Level k > 0: cell i covers e_grid[i..i+2^k] = union of
+        // (k−1, i) and (k−1, i + 2^(k−1)). When the right half spills
+        // off the grid, just reuse the left (which is already edge-
+        // clamped at the previous level).
+        for k in 1..SPARSE_LEVELS {
+            let half = 1usize << (k - 1);
+            for i in 0..PITCH_GRID_LEN {
+                let left = sparse[k - 1][i];
+                let right = if i + half < PITCH_GRID_LEN {
+                    sparse[k - 1][i + half]
+                } else {
+                    left
+                };
+                sparse[k][i] = lex_min(left, right);
+            }
+        }
+        self.sparse = Some(sparse);
     }
 
     /// Eq. 8: linear interpolation of `r(t)` between integer lags.
@@ -272,6 +358,10 @@ impl PitchSearch {
     /// Argmin of `E(P)` over the half-sample grid within `[p_lo, p_hi]`,
     /// both bounds clamped to `[PITCH_GRID_MIN, PITCH_GRID_MAX]`. The
     /// range is inclusive on both ends. Returns `(P̂, E(P̂))`.
+    ///
+    /// `O(N)` linear scan by default. When [`Self::enable_argmin_fast`]
+    /// has been called, falls through to the sparse-table RMQ for
+    /// `O(1)` per query — the hot path inside [`look_ahead`].
     pub fn argmin_in_range(&self, p_lo: f64, p_hi: f64) -> (f64, f64) {
         let p_lo = p_lo.max(PITCH_GRID_MIN);
         let p_hi = p_hi.min(PITCH_GRID_MAX);
@@ -286,6 +376,23 @@ impl PitchSearch {
         }
         let i_lo_u = i_lo as usize;
         let i_hi_u = (i_hi as usize).min(PITCH_GRID_LEN - 1);
+
+        // Fast path: sparse-table RMQ. Cover [i_lo, i_hi] with two
+        // pre-aggregated windows of length 2^k where
+        // k = ⌊log2(i_hi − i_lo + 1)⌋; lex-min the two cells.
+        if let Some(sparse) = self.sparse.as_deref() {
+            let len = i_hi_u - i_lo_u + 1;
+            // ⌊log2(len)⌋, valid because len ≥ 1 here.
+            let k = (len as u32).ilog2() as usize;
+            let window = 1usize << k;
+            let left = sparse[k][i_lo_u];
+            let right = sparse[k][i_hi_u + 1 - window];
+            let (best_e, best_i_u16) = lex_min(left, right);
+            let best_p = PITCH_GRID_MIN + f64::from(best_i_u16) * PITCH_GRID_STEP;
+            return (best_p, best_e);
+        }
+
+        // Slow path: linear scan.
         let slice = &self.e_grid[i_lo_u..=i_hi_u];
         let (rel_idx, &best_e) = slice
             .iter()

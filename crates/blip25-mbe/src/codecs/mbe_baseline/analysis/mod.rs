@@ -735,16 +735,21 @@ pub fn encode_with_trace(
     }
 
     // Steps 4-5: pitch tracking over the three-frame PitchSearch window.
+    // Enable the sparse-table RMQ on `next1` / `next2` only — those see
+    // ~200 argmin_in_range calls each inside `look_ahead`. `search_cur`
+    // is queried once by `look_back` (linear scan is fine) and is also
+    // cloned into the EncodeTrace, so skipping the table here keeps the
+    // trace's clone cost low.
     let (search_cur, search_f1, search_f2) =
         profile::time(profile::Stage::PitchSearch, || {
             let cur_win = state.extract_pitch_window(0);
             let f1_win = state.extract_pitch_window(1);
             let f2_win = state.extract_pitch_window(2);
-            (
-                PitchSearch::new(&cur_win),
-                PitchSearch::new(&f1_win),
-                PitchSearch::new(&f2_win),
-            )
+            let mut search_f1 = PitchSearch::new(&f1_win);
+            let mut search_f2 = PitchSearch::new(&f2_win);
+            search_f1.enable_argmin_fast();
+            search_f2.enable_argmin_fast();
+            (PitchSearch::new(&cur_win), search_f1, search_f2)
         });
     let (p_b, ce_b, p_f, ce_f, p_hat_i, e_p_hat_i) =
         profile::time(profile::Stage::PitchTrack, || {
@@ -888,11 +893,11 @@ pub fn encode_halfrate(
             let cur_win = state.extract_pitch_window(0);
             let f1_win = state.extract_pitch_window(1);
             let f2_win = state.extract_pitch_window(2);
-            (
-                PitchSearch::new(&cur_win),
-                PitchSearch::new(&f1_win),
-                PitchSearch::new(&f2_win),
-            )
+            let mut search_f1 = PitchSearch::new(&f1_win);
+            let mut search_f2 = PitchSearch::new(&f2_win);
+            search_f1.enable_argmin_fast();
+            search_f2.enable_argmin_fast();
+            (PitchSearch::new(&cur_win), search_f1, search_f2)
         });
     let (p_hat_i, e_p_hat_i) = profile::time(profile::Stage::PitchTrack, || {
         let (p_b, ce_b) = look_back(&search_cur, state.pitch_history);
