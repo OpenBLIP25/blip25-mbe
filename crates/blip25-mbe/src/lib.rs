@@ -2,23 +2,66 @@
 //!
 //! A clean-room implementation of the MBE vocoder family.
 //!
-//! See [`DESIGN.md`](https://github.com/) at the repository root for the
-//! architectural model. The public API is organized around three orthogonal
-//! axes joined at a common parameter type:
+//! ## Quick start
 //!
-//! - [`mbe_params`] — the parameter model. The interchange type and the
-//!   center of gravity of the crate.
-//! - [`codecs`] — analysis and synthesis algorithms, one submodule per
-//!   codec generation (`mbe_baseline`, `ambe`, `ambe_plus`, `ambe_plus2`).
+//! Most consumers should use the chip-shaped [`vocoder::Vocoder`]
+//! façade:
+//!
+//! ```no_run
+//! use blip25_mbe::vocoder::{Rate, Vocoder};
+//!
+//! // Open a P25 Phase 1 (full-rate IMBE) channel.
+//! let mut tx = Vocoder::new(Rate::P25Phase1);
+//! let pcm: [i16; 160] = [0; 160];
+//! let bits = tx.encode_pcm(&pcm).unwrap();      // 18 bytes
+//!
+//! let mut rx = Vocoder::new(Rate::P25Phase1);
+//! let out = rx.decode_bits(&bits).unwrap();     // 160 samples
+//! ```
+//!
+//! Three streaming variants on top of the per-frame primitive:
+//!
+//! - [`vocoder::Vocoder::encode_stream`] / [`vocoder::Vocoder::decode_stream`]
+//!   — slice → `Iterator<Item = Result<…>>`, drops trailing partial frames.
+//! - [`vocoder::LiveEncoder`] / [`vocoder::LiveDecoder`] — chunk-driven
+//!   with internal residue buffer for audio-callback / socket use.
+//! - [`vocoder::VocoderBuilder`] — fluent configuration of optional
+//!   knobs (tone detection, beyond-spec repeat reset).
+//!
+//! See [`vocoder`] for the full API and `INTEGRATION.md` for the
+//! AMBE-3000R protocol → Vocoder operation correspondence.
+//!
+//! ## Module organization
+//!
+//! See [`DESIGN.md`](https://github.com/) at the repository root for
+//! the architectural model. The public API is organized around four
+//! orthogonal axes joined at a common parameter type:
+//!
+//! - [`vocoder`] — chip-shaped façade. **Recommended entry point.**
+//! - [`mbe_params`] — the parameter model. The interchange type and
+//!   the center of gravity of the crate.
+//! - [`codecs`] — analysis and synthesis algorithms, one submodule
+//!   per codec generation (`mbe_baseline`, `ambe`, `ambe_plus`,
+//!   `ambe_plus2`).
 //! - **Wire formats**, one module per protocol-rate combination:
 //!   [`p25_fullrate`] (P25 Phase 1 IMBE, 144-bit), [`p25_halfrate`]
-//!   (P25 Phase 2 AMBE+2, 72-bit), and [`dvsi_3000`] (DVSI chip protocol,
-//!   r0..r63). Future protocols (DMR, D-STAR, NXDN, …) become sibling
-//!   modules.
+//!   (P25 Phase 2 AMBE+2, 72-bit), and [`dvsi_3000`] (DVSI chip
+//!   protocol, r0..r63). Future protocols (DMR, D-STAR, NXDN, …)
+//!   become sibling modules.
 //! - [`rate_conversion`] — parameter-domain bits-to-bits conversion,
 //!   a peer of the codec and wire layers, not a sub-concern of either.
 //!
 //! Primitives shared across layers live in [`fec`] and [`bits`].
+//!
+//! ## Cargo features
+//!
+//! - `serde` (off by default) — derive `Serialize` / `Deserialize` on
+//!   the diagnostic types in [`vocoder`] (`Rate`, `FrameStats`,
+//!   `AnalysisStats`, `AnalysisOutputKind`, `DecodeStats`) plus
+//!   [`mbe_params::MbeParams`] and
+//!   [`codecs::mbe_baseline::FrameDisposition`]. Useful for shipping
+//!   stats / params over a future RPC layer (gRPC / protobuf / WS)
+//!   without hand-rolled converters.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
