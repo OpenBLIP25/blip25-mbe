@@ -7,16 +7,18 @@
 //! Most consumers should use the chip-shaped [`vocoder::Vocoder`]
 //! façade:
 //!
-//! ```no_run
+//! ```rust
 //! use blip25_mbe::vocoder::{Rate, Vocoder};
 //!
 //! // Open a P25 Phase 1 (full-rate IMBE) channel.
 //! let mut tx = Vocoder::new(Rate::P25Phase1);
 //! let pcm: [i16; 160] = [0; 160];
-//! let bits = tx.encode_pcm(&pcm).unwrap();      // 18 bytes
+//! let bits = tx.encode_pcm(&pcm).unwrap();
+//! assert_eq!(bits.len(), 18);
 //!
 //! let mut rx = Vocoder::new(Rate::P25Phase1);
-//! let out = rx.decode_bits(&bits).unwrap();     // 160 samples
+//! let out = rx.decode_bits(&bits).unwrap();
+//! assert_eq!(out.len(), 160);
 //! ```
 //!
 //! Three streaming variants on top of the per-frame primitive:

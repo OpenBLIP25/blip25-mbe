@@ -15,7 +15,7 @@
 //!
 //! ## Quick start
 //!
-//! ```no_run
+//! ```rust
 //! use blip25_mbe::vocoder::{Rate, Vocoder};
 //!
 //! // P25 Phase 1 (full-rate IMBE) encoder
@@ -420,11 +420,12 @@ impl Vocoder {
     /// frames just as it would with manual per-frame
     /// [`Self::encode_pcm`] calls.
     ///
-    /// ```no_run
+    /// ```rust
     /// # use blip25_mbe::vocoder::{Rate, Vocoder};
-    /// # let pcm: Vec<i16> = vec![0; 160 * 50];
+    /// # let pcm: Vec<i16> = vec![0; 160 * 5];
     /// let mut tx = Vocoder::new(Rate::P25Phase1);
     /// let bits: Result<Vec<Vec<u8>>, _> = tx.encode_stream(&pcm).collect();
+    /// assert_eq!(bits.unwrap().len(), 5);
     /// ```
     pub fn encode_stream<'a>(&'a mut self, pcm: &'a [i16]) -> EncodeStream<'a> {
         EncodeStream { vocoder: self, pcm, pos: 0 }
@@ -514,11 +515,12 @@ impl Vocoder {
     /// frame consumed ([`Self::fec_frame_bytes`] per frame). Trailing
     /// partial frames are silently dropped.
     ///
-    /// ```no_run
+    /// ```rust
     /// # use blip25_mbe::vocoder::{Rate, Vocoder};
-    /// # let bits: Vec<u8> = vec![0; 18 * 50];
+    /// # let bits: Vec<u8> = vec![0; 18 * 5];
     /// let mut rx = Vocoder::new(Rate::P25Phase1);
     /// let pcm_frames: Result<Vec<Vec<i16>>, _> = rx.decode_stream(&bits).collect();
+    /// assert_eq!(pcm_frames.unwrap().len(), 5);
     /// ```
     pub fn decode_stream<'a>(&'a mut self, bits: &'a [u8]) -> DecodeStream<'a> {
         DecodeStream { vocoder: self, bits, pos: 0 }
@@ -627,7 +629,7 @@ impl TranscodeDirection {
 /// Direction is fixed at construction. State (cross-rate predictor,
 /// last-good frame for repeats) is internal and advances per call.
 ///
-/// ```no_run
+/// ```rust
 /// use blip25_mbe::vocoder::{Transcoder, TranscodeDirection};
 ///
 /// let mut tx = Transcoder::new(TranscodeDirection::P25Phase1ToPhase2);
@@ -745,18 +747,14 @@ fn pack_dibits_n<const N: usize, const B: usize>(dibits: &[u8; N]) -> [u8; B] {
 /// that already have whole-buffer PCM. `LiveEncoder` is for callers
 /// that don't.
 ///
-/// ```no_run
+/// ```rust
 /// # use blip25_mbe::vocoder::{LiveEncoder, Rate};
 /// let mut enc = LiveEncoder::new(Rate::P25Phase1);
 /// // 256 samples (audio-device callback); not a multiple of 160.
 /// let chunk: [i16; 256] = [0; 256];
 /// let frames = enc.push(&chunk);
-/// for f in frames {
-///     match f {
-///         Ok(bits) => { /* send 18 bytes */ }
-///         Err(e)   => { /* per-frame error */ }
-///     }
-/// }
+/// assert_eq!(frames.len(), 1);                   // one full frame produced
+/// assert!(frames[0].is_ok());
 /// // 96 samples residue; next push contributes them to the next frame.
 /// assert_eq!(enc.pending_samples(), 96);
 /// ```
@@ -852,17 +850,12 @@ impl LiveEncoder {
 /// of arbitrary length (network sockets, log replays, partial reads).
 /// Mirrors [`LiveEncoder`].
 ///
-/// ```no_run
+/// ```rust
 /// # use blip25_mbe::vocoder::{LiveDecoder, Rate};
 /// let mut dec = LiveDecoder::new(Rate::P25Phase2);
 /// let chunk: [u8; 23] = [0; 23];   // 2 full 9-byte frames + 5 byte residue
 /// let frames = dec.push(&chunk);
-/// for f in frames {
-///     match f {
-///         Ok(pcm) => { /* play 160 samples */ }
-///         Err(e)  => { /* per-frame error */ }
-///     }
-/// }
+/// assert_eq!(frames.len(), 2);
 /// assert_eq!(dec.pending_bytes(), 5);
 /// ```
 pub struct LiveDecoder {
@@ -931,12 +924,14 @@ impl LiveDecoder {
 /// setters. Mirrors the chip's "open channel + PKT_RATEP +
 /// configuration" sequence, but in one call.
 ///
-/// ```no_run
+/// ```rust
 /// use blip25_mbe::vocoder::{Rate, Vocoder};
 ///
-/// let mut tx = Vocoder::builder(Rate::P25Phase2)
+/// let tx = Vocoder::builder(Rate::P25Phase2)
 ///     .tone_detection(true)
 ///     .build();
+/// assert_eq!(tx.rate(), Rate::P25Phase2);
+/// assert!(tx.tone_detection());
 /// ```
 #[derive(Clone, Debug)]
 pub struct VocoderBuilder {
