@@ -521,6 +521,25 @@ impl LiveEncoder {
         self.pcm_buf.clear();
     }
 
+    /// Pad pending residue with zeros to a full frame and encode one
+    /// final frame. Returns `Ok(Some(bits))` if residue existed,
+    /// `Ok(None)` if the buffer was empty. Buffer is drained either
+    /// way.
+    ///
+    /// Use this at end-of-stream to avoid abruptly dropping the
+    /// trailing samples; the cost is at most one extra frame of
+    /// zero-padding tacked onto the last word of audio.
+    pub fn flush(&mut self) -> Result<Option<Vec<u8>>, VocoderError> {
+        if self.pcm_buf.is_empty() {
+            return Ok(None);
+        }
+        let n = self.vocoder.frame_samples();
+        self.pcm_buf.resize(n, 0);
+        let bits = self.vocoder.encode_pcm(&self.pcm_buf)?;
+        self.pcm_buf.clear();
+        Ok(Some(bits))
+    }
+
     /// Reset all state — both the inner [`Vocoder`] (predictor /
     /// look-ahead / synth substates) and the residual sample buffer.
     pub fn reset(&mut self) {
@@ -1193,6 +1212,26 @@ mod tests {
         assert_eq!(live.pending_samples(), 80);
         live.discard_pending();
         assert_eq!(live.pending_samples(), 0);
+    }
+
+    /// `flush` zero-pads residue and emits one final frame; on an
+    /// empty buffer it's a no-op returning `Ok(None)`.
+    #[test]
+    fn live_encoder_flush_emits_padded_residue() {
+        let mut live = LiveEncoder::new(Rate::P25Phase1);
+        // Empty buffer → flush is a no-op.
+        assert!(matches!(live.flush(), Ok(None)));
+
+        // Half-frame residue → flush emits one frame.
+        let pcm = periodic_pcm(40, 6000);
+        let _ = live.push(&pcm[..80]);
+        assert_eq!(live.pending_samples(), 80);
+        let tail = live.flush().unwrap().expect("residue → frame");
+        assert_eq!(tail.len(), 18);
+        assert_eq!(live.pending_samples(), 0);
+
+        // Subsequent flush is a no-op (buffer drained).
+        assert!(matches!(live.flush(), Ok(None)));
     }
 
     /// `reset` clears both vocoder state and the residue buffer.
