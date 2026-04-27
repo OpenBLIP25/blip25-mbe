@@ -144,7 +144,7 @@ pub mod silence;
 pub use silence::SilenceDetector;
 
 pub mod tone_detect;
-pub use tone_detect::{ToneDetection, detect_single_tone};
+pub use tone_detect::{ToneDetection, detect_dtmf, detect_single_tone, detect_tone};
 
 /// Errors reported by the analysis encoder.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

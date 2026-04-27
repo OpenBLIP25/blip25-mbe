@@ -48,7 +48,7 @@
 use crate::codecs::ambe_plus2;
 use crate::codecs::mbe_baseline::analysis::{
     AnalysisError, AnalysisOutput, AnalysisState, ToneDetection,
-    detect_single_tone, encode as analysis_encode,
+    detect_tone, encode as analysis_encode,
     encode_halfrate as analysis_encode_halfrate,
 };
 use crate::codecs::mbe_baseline::{
@@ -730,8 +730,10 @@ mod halfrate {
     ) -> Result<(Vec<u8>, AnalysisStats), VocoderError> {
         // Tone-detect dispatch (opt-in). On a hit, bypass the voice
         // analysis pipeline entirely and emit an Annex T tone frame.
+        // detect_tone tries DTMF (l1 != l2) first then falls through
+        // to single-tone (l1 == l2 == 1).
         if vocoder.tone_detection {
-            if let Some(ToneDetection { id, amplitude }) = detect_single_tone(pcm) {
+            if let Some(ToneDetection { id, amplitude }) = detect_tone(pcm) {
                 let info = encode_tone_frame_info(id, amplitude);
                 let dibits = encode_frame(&info);
                 let bytes = pack_dibits_half(&dibits);

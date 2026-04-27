@@ -58,25 +58,18 @@ const MATCH_TOLERANCE_HZ: f64 = 20.0;
 /// tone; emit a voice frame instead.
 const SNR_THRESHOLD: f64 = 100.0;
 
-/// Detect a single-frequency Annex T tone in `pcm`. Returns the
-/// matching `(I_D, A_D)` or `None` if the frame doesn't look like a
-/// tone (no dominant peak, peak-frequency mismatch, peak too weak
-/// vs the spectral floor).
+/// Compute the windowed PSD for one detection frame.
 ///
-/// `pcm.len()` must equal [`TONE_DETECT_FRAME`].
-pub fn detect_single_tone(pcm: &[i16]) -> Option<ToneDetection> {
-    if pcm.len() != TONE_DETECT_FRAME {
-        return None;
-    }
-    // Hann window + zero-pad to 256.
+/// Returns `(psd, floor)` where `psd[k] = |X(k)|²` for `k ∈ [0, 128]`
+/// and `floor` is the 25th-percentile bin power (broadband baseline).
+/// Hann-windowed, 256-point zero-padded direct DFT.
+fn compute_psd(pcm: &[i16; TONE_DETECT_FRAME]) -> ([f64; FFT_SIZE / 2 + 1], f64) {
     let mut buf = [0.0f64; FFT_SIZE];
     let two_pi = 2.0 * core::f64::consts::PI;
     for (n, &s) in pcm.iter().enumerate() {
         let w = 0.5 - 0.5 * (two_pi * n as f64 / TONE_DETECT_FRAME as f64).cos();
         buf[n] = (s as f64) * w;
     }
-    // Direct-form DFT — N=256 is small, simpler than pulling rustfft.
-    // Compute |X(k)|² for k ∈ [0, FFT_SIZE/2].
     let mut psd = [0.0f64; FFT_SIZE / 2 + 1];
     for k in 0..=FFT_SIZE / 2 {
         let omega = two_pi * k as f64 / FFT_SIZE as f64;
@@ -88,6 +81,57 @@ pub fn detect_single_tone(pcm: &[i16]) -> Option<ToneDetection> {
         }
         psd[k] = re * re + im * im;
     }
+    // 25th-percentile broadband floor, excluding DC.
+    let mut samples: Vec<f64> = psd.iter().skip(1).copied().collect();
+    samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(core::cmp::Ordering::Equal));
+    let floor = samples[samples.len() / 4];
+    (psd, floor)
+}
+
+/// Quadratic peak interpolation for sub-bin frequency accuracy.
+fn interpolate_peak_hz(psd: &[f64], k: usize) -> f64 {
+    if k > 0 && k + 1 < psd.len() {
+        let y_m1 = psd[k - 1].sqrt();
+        let y_0 = psd[k].sqrt();
+        let y_p1 = psd[k + 1].sqrt();
+        let denom = y_m1 - 2.0 * y_0 + y_p1;
+        let delta = if denom.abs() > 1e-12 {
+            0.5 * (y_m1 - y_p1) / denom
+        } else {
+            0.0
+        };
+        (k as f64 + delta) * SAMPLE_RATE_HZ / FFT_SIZE as f64
+    } else {
+        k as f64 * SAMPLE_RATE_HZ / FFT_SIZE as f64
+    }
+}
+
+/// Calibration: i16 sine amp 8000 (≈ −12 dBFS) → empirically produces
+/// FFT peak ≈ 320 000 (Hann-windowed, 256-DFT). The decoder's
+/// `tone_to_mbe_params` accepts any 0..127 amplitude; this maps our
+/// peak magnitude to a mid-range A_D so the synthesizer outputs a
+/// reasonable-volume tone.
+const REF_PEAK_MAG: f64 = 320_000.0;
+
+/// Convert a peak magnitude to the 7-bit `A_D` field.
+fn magnitude_to_amplitude(mag: f64) -> u8 {
+    let amp_db = 20.0 * (mag / REF_PEAK_MAG).log10();
+    (100.0 + amp_db / 0.5).round().clamp(0.0, 127.0) as u8
+}
+
+/// Detect a single-frequency Annex T tone in `pcm`. Returns the
+/// matching `(I_D, A_D)` or `None` if the frame doesn't look like a
+/// tone (no dominant peak, peak-frequency mismatch, peak too weak
+/// vs the spectral floor).
+///
+/// `pcm.len()` must equal [`TONE_DETECT_FRAME`].
+pub fn detect_single_tone(pcm: &[i16]) -> Option<ToneDetection> {
+    if pcm.len() != TONE_DETECT_FRAME {
+        return None;
+    }
+    let pcm: &[i16; TONE_DETECT_FRAME] = pcm.try_into().ok()?;
+    let (psd, floor) = compute_psd(pcm);
+
     // Find argmax peak excluding DC bin.
     let mut peak_k = 1usize;
     let mut peak_p = psd[1];
@@ -97,36 +141,10 @@ pub fn detect_single_tone(pcm: &[i16]) -> Option<ToneDetection> {
             peak_k = k;
         }
     }
-    // Compute floor as the median of the bottom-half bins (excluding
-    // the bin around the peak and DC). Robust against side-lobe
-    // bleed.
-    let mut samples = Vec::with_capacity(psd.len());
-    for (k, &p) in psd.iter().enumerate() {
-        if k == 0 || k.abs_diff(peak_k) <= 2 {
-            continue;
-        }
-        samples.push(p);
-    }
-    samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(core::cmp::Ordering::Equal));
-    let floor = samples[samples.len() / 4]; // 25th percentile — broadband baseline
     if floor <= 0.0 || peak_p / floor < SNR_THRESHOLD {
         return None;
     }
-    // Quadratic peak interpolation for sub-bin accuracy.
-    let f_hz = if peak_k > 0 && peak_k + 1 < psd.len() {
-        let y_m1 = psd[peak_k - 1].sqrt();
-        let y_0 = peak_p.sqrt();
-        let y_p1 = psd[peak_k + 1].sqrt();
-        let denom = y_m1 - 2.0 * y_0 + y_p1;
-        let delta = if denom.abs() > 1e-12 {
-            0.5 * (y_m1 - y_p1) / denom
-        } else {
-            0.0
-        };
-        (peak_k as f64 + delta) * SAMPLE_RATE_HZ / FFT_SIZE as f64
-    } else {
-        peak_k as f64 * SAMPLE_RATE_HZ / FFT_SIZE as f64
-    };
+    let f_hz = interpolate_peak_hz(&psd, peak_k);
 
     // Match against single-frequency Annex T rows (l1 == l2 == 1).
     let mut best: Option<(usize, f64)> = None;
@@ -143,27 +161,99 @@ pub fn detect_single_tone(pcm: &[i16]) -> Option<ToneDetection> {
         }
     }
     let id = best?.0 as u8;
-    // Map peak magnitude to A_D via inverse of Eq. 209:
-    // tone_magnitude = TONE_AMPLITUDE_PEAK · 10^(STEP·(A_D − 127))
-    // Empirical normalisation: the FFT peak magnitude for an i16
-    // sine of amplitude A is approx A · TONE_DETECT_FRAME/4 (Hann
-    // window mean = 0.5). We translate that to MBE-amplitude scale
-    // by dividing by ~i16-full-scale (32768). The decoder's
-    // tone_to_mbe_params then scales further via TONE_AMPLITUDE_PEAK
-    // — so the calibration constant below is a one-off match.
-    let mag = peak_p.sqrt();
-    // Calibration: i16 sine amp 8000 (≈ −12 dBFS) → empirically
-    // produces FFT peak ≈ 320000 (Hann-windowed, 256-DFT). Map that
-    // to A_D ≈ 100 (mid-range tone level). The exact value isn't
-    // critical for correctness; tone_to_mbe_params accepts any
-    // 0..127 amplitude.
-    const REF_PEAK_MAG: f64 = 320_000.0;
-    let amp_db = 20.0 * (mag / REF_PEAK_MAG).log10();
-    // Decoder uses A_D ∈ [0, 127], step 0.05 dB above a reference. Map our
-    // amp_db (which is 0 dB at REF_PEAK_MAG) to A_D ≈ 100 + amp_db/0.5.
-    let ad = (100.0 + amp_db / 0.5).round().clamp(0.0, 127.0) as u8;
+    Some(ToneDetection { id, amplitude: magnitude_to_amplitude(peak_p.sqrt()) })
+}
 
-    Some(ToneDetection { id, amplitude: ad })
+/// Detect a DTMF (two-tone) Annex T entry in `pcm`. Returns the
+/// matching `(I_D, A_D)` or `None` on no clean two-peak match.
+///
+/// DTMF rows in Annex T have `l1 != l2`; the audible tones are at
+/// `l1·f0` and `l2·f0`. Detection finds the two strongest spectral
+/// peaks (separated by ≥3 bins to avoid main-lobe siblings), then
+/// scans Annex T DTMF rows for the one whose `(l1·f0, l2·f0)` pair
+/// best matches the detected pair.
+///
+/// `pcm.len()` must equal [`TONE_DETECT_FRAME`].
+pub fn detect_dtmf(pcm: &[i16]) -> Option<ToneDetection> {
+    if pcm.len() != TONE_DETECT_FRAME {
+        return None;
+    }
+    let pcm: &[i16; TONE_DETECT_FRAME] = pcm.try_into().ok()?;
+    let (psd, floor) = compute_psd(pcm);
+
+    // Find primary peak.
+    let mut peak1_k = 1usize;
+    let mut peak1_p = psd[1];
+    for (k, &p) in psd.iter().enumerate().skip(2) {
+        if p > peak1_p {
+            peak1_p = p;
+            peak1_k = k;
+        }
+    }
+    if floor <= 0.0 || peak1_p / floor < SNR_THRESHOLD {
+        return None;
+    }
+
+    // Find secondary peak: best k >= 2 bins away from primary, also
+    // above floor.
+    let mut peak2_k: Option<usize> = None;
+    let mut peak2_p = floor; // must beat floor
+    for (k, &p) in psd.iter().enumerate().skip(1) {
+        if k.abs_diff(peak1_k) < 3 {
+            continue;
+        }
+        if p > peak2_p {
+            peak2_p = p;
+            peak2_k = Some(k);
+        }
+    }
+    let peak2_k = peak2_k?;
+    // Secondary peak must clear SNR floor on its own.
+    if peak2_p / floor < SNR_THRESHOLD {
+        return None;
+    }
+
+    let f1_hz = interpolate_peak_hz(&psd, peak1_k);
+    let f2_hz = interpolate_peak_hz(&psd, peak2_k);
+    let f_lo = f1_hz.min(f2_hz);
+    let f_hi = f1_hz.max(f2_hz);
+
+    // Scan DTMF rows in Annex T for the closest (l1·f0, l2·f0) match.
+    // Sort l1, l2 so we always compare against `(l_lo·f0, l_hi·f0)`
+    // with l_lo < l_hi.
+    let mut best: Option<(usize, f64)> = None;
+    for (id, entry) in ANNEX_T.iter().enumerate() {
+        let Some(t) = entry else { continue };
+        if t.l1 == t.l2 {
+            continue; // single-tone, handled by detect_single_tone
+        }
+        let f0 = f64::from(t.f0);
+        let l_lo = t.l1.min(t.l2) as f64;
+        let l_hi = t.l1.max(t.l2) as f64;
+        let expected_lo = l_lo * f0;
+        let expected_hi = l_hi * f0;
+        let err = (expected_lo - f_lo).abs() + (expected_hi - f_hi).abs();
+        if err < 2.0 * MATCH_TOLERANCE_HZ
+            && best.map_or(true, |(_, prev)| err < prev)
+        {
+            best = Some((id, err));
+        }
+    }
+    let id = best?.0 as u8;
+    // Use the larger of the two peak magnitudes for amplitude (DTMF
+    // tones are typically equal-amplitude; a one-off pick is fine).
+    let mag = peak1_p.sqrt().max(peak2_p.sqrt());
+    Some(ToneDetection { id, amplitude: magnitude_to_amplitude(mag) })
+}
+
+/// Try DTMF detection first, then single-tone. Returns whichever
+/// matches; `None` if neither does.
+///
+/// DTMF is more constraining (two peaks at specific harmonic ratios)
+/// so a hit is high-confidence; falling through to single-tone after
+/// DTMF fails handles the common case cleanly.
+pub fn detect_tone(pcm: &[i16]) -> Option<ToneDetection> {
+    detect_dtmf(pcm).or_else(|| detect_single_tone(pcm))
 }
 
 #[cfg(test)]
@@ -176,6 +266,17 @@ mod tests {
         for (n, slot) in out.iter_mut().enumerate() {
             let s = (amplitude as f64) * (two_pi * freq_hz * n as f64 / SAMPLE_RATE_HZ).sin();
             *slot = s.round() as i16;
+        }
+        out
+    }
+
+    fn dtmf_pair(f1: f64, f2: f64, amp_each: i16) -> [i16; TONE_DETECT_FRAME] {
+        let mut out = [0i16; TONE_DETECT_FRAME];
+        let two_pi = 2.0 * core::f64::consts::PI;
+        for (n, slot) in out.iter_mut().enumerate() {
+            let s1 = (amp_each as f64) * (two_pi * f1 * n as f64 / SAMPLE_RATE_HZ).sin();
+            let s2 = (amp_each as f64) * (two_pi * f2 * n as f64 / SAMPLE_RATE_HZ).sin();
+            *slot = (s1 + s2).round().clamp(-32768.0, 32767.0) as i16;
         }
         out
     }
@@ -234,5 +335,45 @@ mod tests {
         let pcm = pure_sine(316.0, 8000);
         let det = detect_single_tone(&pcm).expect("near-match should detect");
         assert_eq!(det.id, 10);
+    }
+
+    #[test]
+    fn detect_dtmf_matches_known_annex_t_pair() {
+        // Annex T id=128 → f0=78.5, l1=12, l2=17 → tones at 942 Hz
+        // and 1334.5 Hz (close to DTMF "1" 941/1336).
+        let pcm = dtmf_pair(942.0, 1334.5, 6000);
+        let det = detect_dtmf(&pcm).expect("clean DTMF should be detected");
+        assert_eq!(det.id, 128);
+    }
+
+    #[test]
+    fn detect_tone_prefers_dtmf_when_two_peaks_present() {
+        // Same DTMF input — `detect_tone` should route through DTMF
+        // rather than picking up either peak as a single-tone match.
+        let pcm = dtmf_pair(942.0, 1334.5, 6000);
+        let det = detect_tone(&pcm).expect("tone-detect dispatch hit");
+        assert_eq!(det.id, 128);
+    }
+
+    #[test]
+    fn detect_dtmf_rejects_single_tone_input() {
+        // A pure sine has only one peak; secondary-peak SNR check
+        // should reject as not-DTMF.
+        let pcm = pure_sine(312.5, 8000);
+        assert!(detect_dtmf(&pcm).is_none());
+        // But detect_tone() falls through to single-tone and finds it.
+        let det = detect_tone(&pcm).expect("falls through to single-tone");
+        assert_eq!(det.id, 10);
+    }
+
+    #[test]
+    fn detect_dtmf_rejects_noise() {
+        let mut pcm = [0i16; TONE_DETECT_FRAME];
+        let mut state: u32 = 9999;
+        for slot in pcm.iter_mut() {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            *slot = ((state as i32 >> 16) as i16) / 4;
+        }
+        assert!(detect_dtmf(&pcm).is_none());
     }
 }
