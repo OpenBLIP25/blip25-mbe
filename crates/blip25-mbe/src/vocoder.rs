@@ -420,6 +420,44 @@ impl Vocoder {
         EncodeStream { vocoder: self, pcm, pos: 0 }
     }
 
+    /// Synthesize one PCM frame directly from [`MbeParams`], skipping
+    /// the FEC + dequantize chain. Advances the channel's synth state
+    /// (so re-acquisition after silence and across-frame phase
+    /// continuity work the same way they would for a normal
+    /// [`Self::decode_bits`] call).
+    ///
+    /// Useful for playing back tone-frame params from
+    /// [`crate::p25_halfrate::dequantize::tone_to_mbe_params`], replaying
+    /// captured params in test harnesses, or driving synth from any
+    /// upstream that produces `MbeParams` without going through wire
+    /// bits.
+    ///
+    /// The dispatch is rate-aware: full-rate uses BABA-A baseline
+    /// phase; half-rate uses AMBE+2 (US5701390) phase regen, matching
+    /// what [`Self::decode_bits`] would do.
+    ///
+    /// `last_stats` is **not** updated by this call — it's reserved
+    /// for the wire-aware encode/decode paths. Read the synth's
+    /// disposition via [`Self::last_disposition`] which IS advanced
+    /// (the disposition reflects this synth call).
+    pub fn synthesize_params(&mut self, params: &MbeParams) -> Vec<i16> {
+        // No FEC errors on this path — caller is providing trusted
+        // params, not recovered ones. Use a clean error context so
+        // disposition is `Use` unless smoothed ε_R is already high.
+        let prev_err = self.synth.err;
+        self.synth.err = FrameErrorContext::default();
+        let pcm: [i16; FRAME_SAMPLES] = match self.rate {
+            Rate::P25Phase1 => {
+                let err = self.synth.err;
+                let gamma_w = self.synth.gamma_w;
+                synthesize_frame(params, &err, gamma_w, &mut self.synth)
+            }
+            Rate::P25Phase2 => ambe_plus2::synthesize_frame(params, &mut self.synth),
+        };
+        self.synth.err = prev_err;
+        pcm.to_vec()
+    }
+
     /// Decode an arbitrary-length FEC byte slice as a stream of PCM
     /// frames.
     ///
@@ -1344,6 +1382,37 @@ mod tests {
         assert_eq!(live.pending_samples(), 80);
         live.discard_pending();
         assert_eq!(live.pending_samples(), 0);
+    }
+
+    /// `synthesize_params` accepts arbitrary MbeParams and produces a
+    /// 160-sample PCM frame. Round-trips cleanly with `MbeParams::silence`
+    /// (full-rate) and `MbeParams::silence_halfrate` (half-rate) —
+    /// silence params synthesize to (near-)silent output.
+    #[test]
+    fn synthesize_params_emits_one_frame_per_call() {
+        let mut tx = Vocoder::new(Rate::P25Phase1);
+        let pcm = tx.synthesize_params(&MbeParams::silence());
+        assert_eq!(pcm.len(), FRAME_SAMPLES);
+        // Silence params → low-amplitude output.
+        let peak = pcm.iter().map(|&s| s.unsigned_abs()).max().unwrap_or(0);
+        assert!(peak < 5000, "silence params produced peak={peak}");
+
+        let mut rx = Vocoder::new(Rate::P25Phase2);
+        let pcm = rx.synthesize_params(&MbeParams::silence_halfrate());
+        assert_eq!(pcm.len(), FRAME_SAMPLES);
+        let peak = pcm.iter().map(|&s| s.unsigned_abs()).max().unwrap_or(0);
+        assert!(peak < 5000);
+    }
+
+    /// `synthesize_params` advances synth state so a follow-up
+    /// `last_disposition` reflects the most-recent frame.
+    #[test]
+    fn synthesize_params_advances_synth_disposition() {
+        let mut v = Vocoder::new(Rate::P25Phase1);
+        assert_eq!(v.last_disposition(), None);
+        let _ = v.synthesize_params(&MbeParams::silence());
+        // Clean params + zero error context → Use.
+        assert_eq!(v.last_disposition(), Some(FrameDisposition::Use));
     }
 
     /// Builder applies all four config knobs in one expression.
