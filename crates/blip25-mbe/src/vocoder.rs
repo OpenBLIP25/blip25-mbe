@@ -405,6 +405,177 @@ impl Iterator for DecodeStream<'_> {
 
 impl ExactSizeIterator for DecodeStream<'_> {}
 
+/// Push-driven encoder for live PCM streams that arrive in chunks
+/// of arbitrary length (audio device callbacks, file readers, sockets).
+/// Holds residual samples internally across calls so the caller can
+/// push whatever they have and harvest frames as they become available.
+///
+/// One-frame-at-a-time `Vocoder` is the right primitive for callers
+/// that already have whole-buffer PCM. `LiveEncoder` is for callers
+/// that don't.
+///
+/// ```no_run
+/// # use blip25_mbe::vocoder::{LiveEncoder, Rate};
+/// let mut enc = LiveEncoder::new(Rate::P25Phase1);
+/// // 256 samples (audio-device callback); not a multiple of 160.
+/// let chunk: [i16; 256] = [0; 256];
+/// let frames = enc.push(&chunk);
+/// for f in frames {
+///     match f {
+///         Ok(bits) => { /* send 18 bytes */ }
+///         Err(e)   => { /* per-frame error */ }
+///     }
+/// }
+/// // 96 samples residue; next push contributes them to the next frame.
+/// assert_eq!(enc.pending_samples(), 96);
+/// ```
+pub struct LiveEncoder {
+    vocoder: Vocoder,
+    pcm_buf: Vec<i16>,
+}
+
+impl LiveEncoder {
+    /// Open a new live encoder at the given rate, all state cold.
+    pub fn new(rate: Rate) -> Self {
+        Self {
+            vocoder: Vocoder::new(rate),
+            pcm_buf: Vec::new(),
+        }
+    }
+
+    /// Read-only access to the underlying [`Vocoder`] (for stats /
+    /// rate / disposition queries).
+    #[inline]
+    pub fn vocoder(&self) -> &Vocoder {
+        &self.vocoder
+    }
+
+    /// Append PCM samples and emit zero or more FEC frames. Per-frame
+    /// errors are surfaced as `Err` entries in the returned Vec; the
+    /// buffer drains regardless so a single bad frame doesn't stall
+    /// the stream.
+    pub fn push(&mut self, pcm: &[i16]) -> Vec<Result<Vec<u8>, VocoderError>> {
+        self.pcm_buf.extend_from_slice(pcm);
+        let n = self.vocoder.frame_samples();
+        let mut out = Vec::with_capacity(self.pcm_buf.len() / n);
+        while self.pcm_buf.len() >= n {
+            // Encode from the front of the buffer; drain after the call.
+            // Disjoint-field borrow keeps this clean (vocoder and
+            // pcm_buf are independent struct fields).
+            let result = self.vocoder.encode_pcm(&self.pcm_buf[..n]);
+            self.pcm_buf.drain(..n);
+            out.push(result);
+        }
+        out
+    }
+
+    /// Number of samples currently buffered (between 0 and
+    /// `frame_samples()-1` after every `push` returns).
+    #[inline]
+    pub fn pending_samples(&self) -> usize {
+        self.pcm_buf.len()
+    }
+
+    /// Drop any pending samples without encoding them. Useful at
+    /// stream shutdown when the caller doesn't want a partial-frame
+    /// flush.
+    #[inline]
+    pub fn discard_pending(&mut self) {
+        self.pcm_buf.clear();
+    }
+
+    /// Reset all state — both the inner [`Vocoder`] (predictor /
+    /// look-ahead / synth substates) and the residual sample buffer.
+    pub fn reset(&mut self) {
+        self.vocoder.reset();
+        self.pcm_buf.clear();
+    }
+
+    /// Configured rate.
+    #[inline]
+    pub fn rate(&self) -> Rate {
+        self.vocoder.rate()
+    }
+}
+
+/// Push-driven decoder for live FEC byte streams that arrive in chunks
+/// of arbitrary length (network sockets, log replays, partial reads).
+/// Mirrors [`LiveEncoder`].
+///
+/// ```no_run
+/// # use blip25_mbe::vocoder::{LiveDecoder, Rate};
+/// let mut dec = LiveDecoder::new(Rate::P25Phase2);
+/// let chunk: [u8; 23] = [0; 23];   // 2 full 9-byte frames + 5 byte residue
+/// let frames = dec.push(&chunk);
+/// for f in frames {
+///     match f {
+///         Ok(pcm) => { /* play 160 samples */ }
+///         Err(e)  => { /* per-frame error */ }
+///     }
+/// }
+/// assert_eq!(dec.pending_bytes(), 5);
+/// ```
+pub struct LiveDecoder {
+    vocoder: Vocoder,
+    bits_buf: Vec<u8>,
+}
+
+impl LiveDecoder {
+    /// Open a new live decoder at the given rate, all state cold.
+    pub fn new(rate: Rate) -> Self {
+        Self {
+            vocoder: Vocoder::new(rate),
+            bits_buf: Vec::new(),
+        }
+    }
+
+    /// Read-only access to the underlying [`Vocoder`].
+    #[inline]
+    pub fn vocoder(&self) -> &Vocoder {
+        &self.vocoder
+    }
+
+    /// Append FEC bytes and emit zero or more PCM frames. Per-frame
+    /// errors surface as `Err` entries in the returned Vec; the
+    /// buffer drains regardless.
+    pub fn push(&mut self, bits: &[u8]) -> Vec<Result<Vec<i16>, VocoderError>> {
+        self.bits_buf.extend_from_slice(bits);
+        let n = self.vocoder.fec_frame_bytes();
+        let mut out = Vec::with_capacity(self.bits_buf.len() / n);
+        while self.bits_buf.len() >= n {
+            let result = self.vocoder.decode_bits(&self.bits_buf[..n]);
+            self.bits_buf.drain(..n);
+            out.push(result);
+        }
+        out
+    }
+
+    /// Bytes currently buffered (between 0 and `fec_frame_bytes()-1`
+    /// after every `push` returns).
+    #[inline]
+    pub fn pending_bytes(&self) -> usize {
+        self.bits_buf.len()
+    }
+
+    /// Drop any pending bytes without decoding them.
+    #[inline]
+    pub fn discard_pending(&mut self) {
+        self.bits_buf.clear();
+    }
+
+    /// Reset all state — inner [`Vocoder`] + residual byte buffer.
+    pub fn reset(&mut self) {
+        self.vocoder.reset();
+        self.bits_buf.clear();
+    }
+
+    /// Configured rate.
+    #[inline]
+    pub fn rate(&self) -> Rate {
+        self.vocoder.rate()
+    }
+}
+
 impl core::fmt::Debug for Vocoder {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Vocoder")
@@ -786,6 +957,121 @@ mod tests {
         // Clean own-encoded bits: 0 errors per frame, so Use.
         assert_eq!(disp, FrameDisposition::Use);
         assert_eq!(rx.last_disposition(), Some(FrameDisposition::Use));
+    }
+
+    /// `LiveEncoder` accepts arbitrary chunk sizes, holds residue
+    /// across `push` calls, and emits the same bits as a one-shot
+    /// `Vocoder::encode_pcm` per-frame loop.
+    #[test]
+    fn live_encoder_handles_arbitrary_chunk_sizes() {
+        let mut total_pcm: Vec<i16> = Vec::with_capacity(7 * FRAME_SAMPLES);
+        for _ in 0..7 {
+            total_pcm.extend_from_slice(&periodic_pcm(40, 6000));
+        }
+        // Reference: per-frame Vocoder loop on the same input.
+        let mut ref_v = Vocoder::new(Rate::P25Phase1);
+        let mut ref_bits: Vec<u8> = Vec::new();
+        for chunk in total_pcm.chunks_exact(FRAME_SAMPLES) {
+            ref_bits.extend(ref_v.encode_pcm(chunk).unwrap());
+        }
+        // Live: feed in mismatched chunk sizes (250, 50, 333, rest).
+        let mut live = LiveEncoder::new(Rate::P25Phase1);
+        let mut live_bits: Vec<u8> = Vec::new();
+        let splits = [250usize, 50, 333];
+        let mut pos = 0;
+        for &n in &splits {
+            let end = (pos + n).min(total_pcm.len());
+            for r in live.push(&total_pcm[pos..end]) {
+                live_bits.extend(r.unwrap());
+            }
+            pos = end;
+        }
+        for r in live.push(&total_pcm[pos..]) {
+            live_bits.extend(r.unwrap());
+        }
+        assert_eq!(live_bits, ref_bits);
+        // Total samples 1120 = 7 frames exactly, so no residue.
+        assert_eq!(live.pending_samples(), 0);
+    }
+
+    /// `LiveEncoder` correctly retains residue when input ends
+    /// mid-frame.
+    #[test]
+    fn live_encoder_residue_held_across_calls() {
+        let mut live = LiveEncoder::new(Rate::P25Phase1);
+        // 1.5 frames of input split into two pushes.
+        let pcm: Vec<i16> = periodic_pcm(40, 6000)
+            .iter()
+            .copied()
+            .chain(periodic_pcm(40, 6000)[..80].iter().copied())
+            .collect();
+        assert_eq!(pcm.len(), 240);
+        let frames = live.push(&pcm[..120]);
+        assert!(frames.is_empty());
+        assert_eq!(live.pending_samples(), 120);
+        let frames = live.push(&pcm[120..]);
+        assert_eq!(frames.len(), 1);
+        assert!(frames[0].is_ok());
+        assert_eq!(live.pending_samples(), 80);
+    }
+
+    /// `LiveDecoder` handles arbitrary chunk sizes for the byte stream
+    /// and matches a per-frame `Vocoder::decode_bits` loop.
+    #[test]
+    fn live_decoder_handles_arbitrary_chunk_sizes() {
+        let mut tx = Vocoder::new(Rate::P25Phase2);
+        let mut all_pcm: Vec<i16> = Vec::with_capacity(5 * FRAME_SAMPLES);
+        for _ in 0..5 {
+            all_pcm.extend_from_slice(&periodic_pcm(40, 5000));
+        }
+        let bits: Vec<u8> = tx
+            .encode_stream(&all_pcm)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .into_iter()
+            .flatten()
+            .collect();
+        let mut ref_v = Vocoder::new(Rate::P25Phase2);
+        let mut ref_pcm: Vec<i16> = Vec::new();
+        for chunk in bits.chunks_exact(9) {
+            ref_pcm.extend(ref_v.decode_bits(chunk).unwrap());
+        }
+        let mut live = LiveDecoder::new(Rate::P25Phase2);
+        let mut live_pcm: Vec<i16> = Vec::new();
+        // Feed in 7-byte chunks (less than one frame each).
+        for chunk in bits.chunks(7) {
+            for r in live.push(chunk) {
+                live_pcm.extend(r.unwrap());
+            }
+        }
+        assert_eq!(live_pcm, ref_pcm);
+        assert_eq!(live.pending_bytes(), 0); // 5 frames × 9 bytes = 45, multiple of 7? No (45 = 6*7+3) — pending should be 3 bytes if 5 frames don't fully drain. Wait, 5 frames take 45 bytes, fed as 7 chunks of 7 + 1 chunk of 2 = 45 bytes total. After feeding all bytes, all 5 frames produced. pending = 0.
+    }
+
+    /// `discard_pending` drops residue without emitting partial output.
+    #[test]
+    fn live_encoder_discard_pending_clears_residue() {
+        let mut live = LiveEncoder::new(Rate::P25Phase1);
+        let pcm = periodic_pcm(40, 6000);
+        let frames = live.push(&pcm[..80]);
+        assert!(frames.is_empty());
+        assert_eq!(live.pending_samples(), 80);
+        live.discard_pending();
+        assert_eq!(live.pending_samples(), 0);
+    }
+
+    /// `reset` clears both vocoder state and the residue buffer.
+    #[test]
+    fn live_encoder_reset_clears_everything() {
+        let mut live = LiveEncoder::new(Rate::P25Phase2);
+        let pcm = periodic_pcm(40, 5000);
+        let _ = live.push(&pcm[..120]);
+        assert_eq!(live.pending_samples(), 120);
+        let _ = live.vocoder().last_stats();
+        live.reset();
+        assert_eq!(live.pending_samples(), 0);
+        assert!(live.vocoder().last_stats().analysis.is_none());
+        assert_eq!(live.rate(), Rate::P25Phase2);
     }
 
     /// Streaming and per-frame paths produce identical output —
