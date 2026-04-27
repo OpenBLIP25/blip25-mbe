@@ -77,18 +77,35 @@ pub enum Rate {
     /// P25 Phase 1 FDMA full-rate IMBE. 18-byte FEC frame (72 dibits).
     /// 7 200 bps total / 4 400 bps voice + 2 800 bps FEC.
     Imbe7200x4400,
+    /// IMBE info-only — same codec as [`Self::Imbe7200x4400`] with the
+    /// Annex H Golay/Hamming/PN FEC layer stripped. 11-byte wire frame
+    /// (88 prioritized info bits packed MSB-first). 4 400 bps total
+    /// (= voice). For lossless transports that already provide their
+    /// own integrity, or for diagnostic / cross-decoder tooling.
+    Imbe4400x4400,
     /// P25 Phase 2 TDMA half-rate AMBE+2. 9-byte FEC frame (36 dibits).
     /// 3 600 bps total / 2 450 bps voice + 1 150 bps FEC.
     AmbePlus2_3600x2450,
+    /// AMBE+2 half-rate info-only — same codec as
+    /// [`Self::AmbePlus2_3600x2450`] with the Golay/Hamming/PN FEC
+    /// layer stripped. 7-byte wire frame (49 info bits packed
+    /// MSB-first, 7 trailing pad bits). 2 450 bps total (= voice).
+    AmbePlus2_2450x2450,
 }
 
 impl Rate {
-    /// Number of bytes in one FEC-encoded frame at this rate.
+    /// Number of bytes in one wire frame at this rate. Includes FEC
+    /// for the FEC-bearing variants ([`Self::Imbe7200x4400`],
+    /// [`Self::AmbePlus2_3600x2450`]) and is just the packed info bits
+    /// for the no-FEC variants ([`Self::Imbe4400x4400`],
+    /// [`Self::AmbePlus2_2450x2450`]).
     #[inline]
     pub const fn fec_frame_bytes(self) -> usize {
         match self {
             Rate::Imbe7200x4400 => 18,
+            Rate::Imbe4400x4400 => 11,
             Rate::AmbePlus2_3600x2450 => 9,
+            Rate::AmbePlus2_2450x2450 => 7,
         }
     }
 
@@ -467,8 +484,10 @@ impl Vocoder {
             });
         }
         let (bytes, stats) = match self.rate {
-            Rate::Imbe7200x4400 => fullrate::encode(pcm, self)?,
-            Rate::AmbePlus2_3600x2450 => halfrate::encode(pcm, self)?,
+            Rate::Imbe7200x4400 => fullrate::encode(pcm, self, true)?,
+            Rate::Imbe4400x4400 => fullrate::encode(pcm, self, false)?,
+            Rate::AmbePlus2_3600x2450 => halfrate::encode(pcm, self, true)?,
+            Rate::AmbePlus2_2450x2450 => halfrate::encode(pcm, self, false)?,
         };
         self.last_stats.analysis = Some(stats);
         Ok(bytes)
@@ -486,8 +505,10 @@ impl Vocoder {
             });
         }
         let (pcm, stats) = match self.rate {
-            Rate::Imbe7200x4400 => fullrate::decode(bits, self),
-            Rate::AmbePlus2_3600x2450 => halfrate::decode(bits, self),
+            Rate::Imbe7200x4400 => fullrate::decode(bits, self, true),
+            Rate::Imbe4400x4400 => fullrate::decode(bits, self, false),
+            Rate::AmbePlus2_3600x2450 => halfrate::decode(bits, self, true),
+            Rate::AmbePlus2_2450x2450 => halfrate::decode(bits, self, false),
         };
         self.last_stats.decode = Some(stats);
         Ok(pcm)
@@ -542,15 +563,21 @@ impl Vocoder {
         }
         let frame = pcm.try_into().expect("length already validated");
         let analysis_out = match self.rate {
-            Rate::Imbe7200x4400 => analysis_encode(frame, &mut self.analysis),
-            Rate::AmbePlus2_3600x2450 => analysis_encode_halfrate(frame, &mut self.analysis),
+            Rate::Imbe7200x4400 | Rate::Imbe4400x4400 => {
+                analysis_encode(frame, &mut self.analysis)
+            }
+            Rate::AmbePlus2_3600x2450 | Rate::AmbePlus2_2450x2450 => {
+                analysis_encode_halfrate(frame, &mut self.analysis)
+            }
         }
         .map_err(VocoderError::Analysis)?;
         Ok(match analysis_out {
             AnalysisOutput::Voice(p) => p,
             AnalysisOutput::Silence => match self.rate {
-                Rate::Imbe7200x4400 => MbeParams::silence(),
-                Rate::AmbePlus2_3600x2450 => MbeParams::silence_halfrate(),
+                Rate::Imbe7200x4400 | Rate::Imbe4400x4400 => MbeParams::silence(),
+                Rate::AmbePlus2_3600x2450 | Rate::AmbePlus2_2450x2450 => {
+                    MbeParams::silence_halfrate()
+                }
             },
         })
     }
@@ -584,8 +611,10 @@ impl Vocoder {
         let err = self.synth.err;
         let gamma_w = self.synth.gamma_w;
         let pcm: [i16; FRAME_SAMPLES] = match self.rate {
-            Rate::Imbe7200x4400 => synthesize_frame(params, &err, gamma_w, &mut self.synth),
-            Rate::AmbePlus2_3600x2450 => match self.halfrate_synth {
+            Rate::Imbe7200x4400 | Rate::Imbe4400x4400 => {
+                synthesize_frame(params, &err, gamma_w, &mut self.synth)
+            }
+            Rate::AmbePlus2_3600x2450 | Rate::AmbePlus2_2450x2450 => match self.halfrate_synth {
                 HalfrateSynth::AmbePlus => ambe_plus2::synthesize_frame(params, &mut self.synth),
                 HalfrateSynth::Baseline => synthesize_frame(params, &err, gamma_w, &mut self.synth),
             },
@@ -1134,12 +1163,13 @@ impl core::fmt::Debug for Vocoder {
 mod fullrate {
     use super::*;
     use crate::p25_fullrate::dequantize::{dequantize, quantize};
-    use crate::p25_fullrate::frame::{decode_frame, encode_frame};
+    use crate::p25_fullrate::frame::{INFO_WIDTHS, decode_frame, encode_frame};
     use crate::p25_fullrate::priority::{deprioritize, prioritize};
 
     pub(super) fn encode(
         pcm: &[i16],
         vocoder: &mut Vocoder,
+        apply_fec: bool,
     ) -> Result<(Vec<u8>, AnalysisStats), VocoderError> {
         let frame = pcm.try_into().expect("length already validated");
         let (kind, params) = match analysis_encode(frame, &mut vocoder.analysis)
@@ -1159,28 +1189,44 @@ mod fullrate {
         let _ = deprioritize; // reserved for future per-priority diagnostics
         let _ = dequantize(&info, &mut snapshot);
         vocoder.fullrate_dec = snapshot;
-        let dibits = encode_frame(&info);
-        let bytes = pack_dibits_full(&dibits);
-        Ok((bytes.to_vec(), AnalysisStats { output: kind, params }))
+        let bytes: Vec<u8> = if apply_fec {
+            let dibits = encode_frame(&info);
+            pack_dibits_full(&dibits).to_vec()
+        } else {
+            pack_info_full(&info).to_vec()
+        };
+        Ok((bytes, AnalysisStats { output: kind, params }))
     }
 
-    pub(super) fn decode(bits: &[u8], vocoder: &mut Vocoder) -> (Vec<i16>, DecodeStats) {
-        let dibits = analysis_profile::time(analysis_profile::Stage::DibitUnpack, || {
-            unpack_dibits_full(bits)
-        });
-        let imbe = analysis_profile::time(analysis_profile::Stage::DecodeFrame, || {
-            decode_frame(&dibits)
-        });
-        let stats_eps0 = imbe.errors[0];
-        let stats_epst = imbe.error_total().min(255) as u8;
+    pub(super) fn decode(
+        bits: &[u8],
+        vocoder: &mut Vocoder,
+        apply_fec: bool,
+    ) -> (Vec<i16>, DecodeStats) {
+        let (info, stats_eps0, stats_epst, eps4) = if apply_fec {
+            let dibits = analysis_profile::time(analysis_profile::Stage::DibitUnpack, || {
+                unpack_dibits_full(bits)
+            });
+            let imbe = analysis_profile::time(analysis_profile::Stage::DecodeFrame, || {
+                decode_frame(&dibits)
+            });
+            let s0: u8 = imbe.errors[0];
+            let st: u8 = imbe.error_total().min(255) as u8;
+            let e4: u8 = imbe.errors[4];
+            (imbe.info, s0, st, e4)
+        } else {
+            // No FEC layer — info bits arrive verbatim, error counts are zero.
+            let info = unpack_info_full(bits);
+            (info, 0u8, 0u8, 0u8)
+        };
         let dq = analysis_profile::time(analysis_profile::Stage::Dequantize, || {
-            dequantize(&imbe.info, &mut vocoder.fullrate_dec)
+            dequantize(&info, &mut vocoder.fullrate_dec)
         });
         let pcm: [i16; FRAME_SAMPLES] = match dq {
             Ok(params) => {
                 let err = FrameErrorContext {
                     epsilon_0: stats_eps0,
-                    epsilon_4: imbe.errors[4],
+                    epsilon_4: eps4,
                     epsilon_t: stats_epst,
                     bad_pitch: false,
                 };
@@ -1197,6 +1243,18 @@ mod fullrate {
                 disposition,
             },
         )
+    }
+
+    fn pack_info_full(info: &[u16; 8]) -> [u8; 11] {
+        let mut out = [0u8; 11];
+        super::pack_info_bits(info, &INFO_WIDTHS, &mut out);
+        out
+    }
+
+    fn unpack_info_full(bytes: &[u8]) -> [u16; 8] {
+        let mut out = [0u16; 8];
+        super::unpack_info_bits(bytes, &INFO_WIDTHS, &mut out);
+        out
     }
 
     fn pack_dibits_full(dibits: &[u8; 72]) -> [u8; 18] {
@@ -1233,11 +1291,12 @@ mod halfrate {
     use crate::p25_halfrate::dequantize::{
         Decoded, decode_to_params, encode_tone_frame_info, quantize, tone_to_mbe_params,
     };
-    use crate::p25_halfrate::frame::{decode_frame, encode_frame};
+    use crate::p25_halfrate::frame::{INFO_WIDTHS, decode_frame, encode_frame};
 
     pub(super) fn encode(
         pcm: &[i16],
         vocoder: &mut Vocoder,
+        apply_fec: bool,
     ) -> Result<(Vec<u8>, AnalysisStats), VocoderError> {
         // Tone-detect dispatch (opt-in). On a hit, bypass the voice
         // analysis pipeline entirely and emit an Annex T tone frame.
@@ -1246,8 +1305,7 @@ mod halfrate {
         if vocoder.tone_detection {
             if let Some(ToneDetection { id, amplitude }) = detect_tone(pcm) {
                 let info = encode_tone_frame_info(id, amplitude);
-                let dibits = encode_frame(&info);
-                let bytes = pack_dibits_half(&dibits);
+                let bytes = pack_info_or_fec(&info, apply_fec);
                 // Reconstruct the params the decoder will see, so
                 // FrameStats carries the actual audible content.
                 // tone_to_mbe_params returns Some for any valid Annex T
@@ -1256,7 +1314,7 @@ mod halfrate {
                 let params = tone_to_mbe_params(id, amplitude)
                     .unwrap_or_else(MbeParams::silence_halfrate);
                 return Ok((
-                    bytes.to_vec(),
+                    bytes,
                     AnalysisStats { output: AnalysisOutputKind::Tone { id, amplitude }, params },
                 ));
             }
@@ -1271,28 +1329,48 @@ mod halfrate {
         };
         let info = quantize(&params, &mut vocoder.halfrate_dec)
             .map_err(|e| VocoderError::Quantize(format!("{e:?}")))?;
-        let dibits = encode_frame(&info);
-        let bytes = pack_dibits_half(&dibits);
-        Ok((bytes.to_vec(), AnalysisStats { output: kind, params }))
+        let bytes = pack_info_or_fec(&info, apply_fec);
+        Ok((bytes, AnalysisStats { output: kind, params }))
     }
 
-    pub(super) fn decode(bits: &[u8], vocoder: &mut Vocoder) -> (Vec<i16>, DecodeStats) {
-        let dibits = analysis_profile::time(analysis_profile::Stage::DibitUnpack, || {
-            unpack_dibits_half(bits)
-        });
-        let frame = analysis_profile::time(analysis_profile::Stage::DecodeFrame, || {
-            decode_frame(&dibits)
-        });
-        let stats_eps0 = frame.errors[0];
-        let stats_epst = frame.errors.iter().map(|&e| u16::from(e)).sum::<u16>().min(255) as u8;
+    fn pack_info_or_fec(info: &[u16; 4], apply_fec: bool) -> Vec<u8> {
+        if apply_fec {
+            let dibits = encode_frame(info);
+            pack_dibits_half(&dibits).to_vec()
+        } else {
+            pack_info_half(info).to_vec()
+        }
+    }
+
+    pub(super) fn decode(
+        bits: &[u8],
+        vocoder: &mut Vocoder,
+        apply_fec: bool,
+    ) -> (Vec<i16>, DecodeStats) {
+        let (info, stats_eps0, stats_epst, eps3) = if apply_fec {
+            let dibits = analysis_profile::time(analysis_profile::Stage::DibitUnpack, || {
+                unpack_dibits_half(bits)
+            });
+            let frame = analysis_profile::time(analysis_profile::Stage::DecodeFrame, || {
+                decode_frame(&dibits)
+            });
+            let s0: u8 = frame.errors[0];
+            let st: u8 = frame.errors.iter().map(|&e| u16::from(e)).sum::<u16>().min(255) as u8;
+            let e3: u8 = frame.errors[3];
+            (frame.info, s0, st, e3)
+        } else {
+            // No FEC layer — info bits arrive verbatim, error counts are zero.
+            let info = unpack_info_half(bits);
+            (info, 0u8, 0u8, 0u8)
+        };
         let err = FrameErrorContext {
             epsilon_0: stats_eps0,
-            epsilon_4: frame.errors[3], // half-rate has 4 codewords; index 3 = û₃
+            epsilon_4: eps3, // half-rate has 4 codewords; index 3 = û₃
             epsilon_t: stats_epst,
             bad_pitch: false,
         };
         let dq = analysis_profile::time(analysis_profile::Stage::Dequantize, || {
-            decode_to_params(&frame.info, &mut vocoder.halfrate_dec)
+            decode_to_params(&info, &mut vocoder.halfrate_dec)
         });
         let pcm: [i16; FRAME_SAMPLES] = match dq {
             Ok(Decoded::Voice(p)) => match vocoder.halfrate_synth {
@@ -1349,6 +1427,49 @@ mod halfrate {
         }
         out
     }
+
+    fn pack_info_half(info: &[u16; 4]) -> [u8; 7] {
+        let mut out = [0u8; 7];
+        super::pack_info_bits(info, &INFO_WIDTHS, &mut out);
+        out
+    }
+
+    fn unpack_info_half(bytes: &[u8]) -> [u16; 4] {
+        let mut out = [0u16; 4];
+        super::unpack_info_bits(bytes, &INFO_WIDTHS, &mut out);
+        out
+    }
+}
+
+/// Pack an info-bit vector MSB-first into a byte buffer. Bit `k` of
+/// `info[i]` is the high-order bit of that field; remaining bytes after
+/// the last info bit are left at their initial value (callers pass a
+/// zero-initialized slice when they want trailing pad bits to be zero).
+fn pack_info_bits<const N: usize>(info: &[u16; N], widths: &[u8; N], out: &mut [u8]) {
+    let mut bit_idx = 0usize;
+    for i in 0..N {
+        let w = widths[i] as usize;
+        let v = info[i];
+        for k in (0..w).rev() {
+            let b = ((v >> k) & 1) as u8;
+            out[bit_idx / 8] |= b << (7 - (bit_idx % 8));
+            bit_idx += 1;
+        }
+    }
+}
+
+fn unpack_info_bits<const N: usize>(bytes: &[u8], widths: &[u8; N], out: &mut [u16; N]) {
+    let mut bit_idx = 0usize;
+    for i in 0..N {
+        let w = widths[i] as usize;
+        let mut v = 0u16;
+        for _ in 0..w {
+            let b = (bytes[bit_idx / 8] >> (7 - (bit_idx % 8))) & 1;
+            v = (v << 1) | u16::from(b);
+            bit_idx += 1;
+        }
+        out[i] = v;
+    }
 }
 
 #[cfg(test)]
@@ -1367,9 +1488,87 @@ mod tests {
     #[test]
     fn rate_byte_sizes_match_wire_layouts() {
         assert_eq!(Rate::Imbe7200x4400.fec_frame_bytes(), 18);
+        assert_eq!(Rate::Imbe4400x4400.fec_frame_bytes(), 11);
         assert_eq!(Rate::AmbePlus2_3600x2450.fec_frame_bytes(), 9);
+        assert_eq!(Rate::AmbePlus2_2450x2450.fec_frame_bytes(), 7);
         assert_eq!(Rate::Imbe7200x4400.frame_samples(), 160);
         assert_eq!(Rate::AmbePlus2_3600x2450.frame_samples(), 160);
+    }
+
+    #[test]
+    fn no_fec_imbe_roundtrip_smoke() {
+        let mut tx = Vocoder::new(Rate::Imbe4400x4400);
+        let mut rx = Vocoder::new(Rate::Imbe4400x4400);
+        for _ in 0..5 {
+            let pcm = periodic_pcm(40, 8000);
+            let bits = tx.encode_pcm(&pcm).expect("encode");
+            assert_eq!(bits.len(), 11, "no-FEC IMBE wire frame is 11 bytes (88 info bits)");
+            let out = rx.decode_bits(&bits).expect("decode");
+            assert_eq!(out.len(), FRAME_SAMPLES);
+        }
+    }
+
+    #[test]
+    fn no_fec_ambeplus2_roundtrip_smoke() {
+        let mut tx = Vocoder::new(Rate::AmbePlus2_2450x2450);
+        let mut rx = Vocoder::new(Rate::AmbePlus2_2450x2450);
+        for _ in 0..5 {
+            let pcm = periodic_pcm(40, 6000);
+            let bits = tx.encode_pcm(&pcm).expect("encode");
+            assert_eq!(
+                bits.len(),
+                7,
+                "no-FEC AMBE+2 wire frame is 7 bytes (49 info bits + 7 pad)"
+            );
+            let out = rx.decode_bits(&bits).expect("decode");
+            assert_eq!(out.len(), FRAME_SAMPLES);
+        }
+    }
+
+    /// FEC and no-FEC variants should reach the same MbeParams (same
+    /// codec underneath) — verified by encoding both ways and decoding
+    /// the no-FEC bits, which must give identical PCM to a clean FEC
+    /// roundtrip when no channel errors are injected.
+    #[test]
+    fn no_fec_full_matches_fec_full_on_clean_channel() {
+        let mut tx_fec = Vocoder::new(Rate::Imbe7200x4400);
+        let mut rx_fec = Vocoder::new(Rate::Imbe7200x4400);
+        let mut tx_raw = Vocoder::new(Rate::Imbe4400x4400);
+        let mut rx_raw = Vocoder::new(Rate::Imbe4400x4400);
+        for k in 0..6 {
+            let pcm = periodic_pcm(40 + k, 8000);
+            let pcm_fec = rx_fec
+                .decode_bits(&tx_fec.encode_pcm(&pcm).unwrap())
+                .unwrap();
+            let pcm_raw = rx_raw
+                .decode_bits(&tx_raw.encode_pcm(&pcm).unwrap())
+                .unwrap();
+            assert_eq!(
+                pcm_fec, pcm_raw,
+                "no-FEC and FEC paths must match on a clean channel (frame {k})"
+            );
+        }
+    }
+
+    #[test]
+    fn no_fec_half_matches_fec_half_on_clean_channel() {
+        let mut tx_fec = Vocoder::new(Rate::AmbePlus2_3600x2450);
+        let mut rx_fec = Vocoder::new(Rate::AmbePlus2_3600x2450);
+        let mut tx_raw = Vocoder::new(Rate::AmbePlus2_2450x2450);
+        let mut rx_raw = Vocoder::new(Rate::AmbePlus2_2450x2450);
+        for k in 0..6 {
+            let pcm = periodic_pcm(40 + k, 6000);
+            let pcm_fec = rx_fec
+                .decode_bits(&tx_fec.encode_pcm(&pcm).unwrap())
+                .unwrap();
+            let pcm_raw = rx_raw
+                .decode_bits(&tx_raw.encode_pcm(&pcm).unwrap())
+                .unwrap();
+            assert_eq!(
+                pcm_fec, pcm_raw,
+                "no-FEC and FEC paths must match on a clean channel (frame {k})"
+            );
+        }
     }
 
     #[test]

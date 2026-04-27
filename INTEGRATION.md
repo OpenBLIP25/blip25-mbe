@@ -135,10 +135,12 @@ These are chip-protocol concerns that don't exist at the codec layer:
 
 ### Wire-format support matrix
 
-| Rate           | FEC bytes | Codec        | End-to-end | Carriers                                      |
-|----------------|----------:|--------------|:---------:|------------------------------------------------|
-| `Imbe7200x4400`    |        18 | IMBE Gen 1   | ✅        | P25 Phase 1 FDMA voice                         |
-| `AmbePlus2_3600x2450`    |         9 | AMBE+2 Gen 3 | ✅        | P25 Phase 2 TDMA voice; carrier-agnostic for any AMBE+2 sink that lays its post-FEC info as 4 vectors of widths {12,12,12,12} (NXDN type-2 typical, DMR enhanced) |
+| Rate                  | Wire bytes | Codec        | End-to-end | Carriers                                      |
+|-----------------------|-----------:|--------------|:---------:|------------------------------------------------|
+| `Imbe7200x4400`       |         18 | IMBE Gen 1   | ✅        | P25 Phase 1 FDMA voice                         |
+| `Imbe4400x4400`       |         11 | IMBE Gen 1   | ✅        | IMBE codec, FEC layer stripped (88 prioritized info bits packed MSB-first). For lossless transports or diagnostic / cross-decoder tooling |
+| `AmbePlus2_3600x2450` |          9 | AMBE+2 Gen 3 | ✅        | P25 Phase 2 TDMA voice; carrier-agnostic for any AMBE+2 sink that lays its post-FEC info as 4 vectors of widths {12,12,12,12} (NXDN type-2 typical, DMR enhanced) |
+| `AmbePlus2_2450x2450` |          7 | AMBE+2 Gen 3 | ✅        | AMBE+2 half-rate codec, FEC layer stripped (49 info bits + 7 pad bits, MSB-first). DVSI PKT_RATEP rate 34 |
 
 For carriers whose post-FEC info layout differs (older DMR, AMBE+
 Gen 2 NXDN, D-STAR's specific bit layout), drop down a layer to
