@@ -9,6 +9,18 @@ readme = "../../README.md"
 keywords = ["p25", "mbe", "imbe", "ambe", "vocoder"]
 categories = ["multimedia::audio", "encoding"]
 
+[features]
+default = []
+## Derive `Serialize` / `Deserialize` on the diagnostic types in
+## [`vocoder`] (`Rate`, `FrameStats`, `AnalysisStats`,
+## `AnalysisOutputKind`, `DecodeStats`) plus [`MbeParams`] and
+## [`codecs::mbe_baseline::FrameDisposition`]. Lets a future RPC layer
+## (gRPC / protobuf / WS) ship these over the wire without a
+## hand-rolled converter. Off by default to keep the core dep-free.
+serde = ["dep:serde"]
+
 [dependencies]
+serde = { workspace = true, optional = true }
 
 [dev-dependencies]
+serde_json = { workspace = true }

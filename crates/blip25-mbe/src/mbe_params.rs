@@ -54,16 +54,55 @@ const L_CAP: usize = L_MAX as usize;
 /// Storage is fixed-size (stack-allocated, no heap). Entries for `l > L`
 /// are implementation detail and must not be read.
 #[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct MbeParams {
     /// Fundamental frequency in radians/sample. Range `(0, π)`.
     omega_0: f32,
     /// Harmonic count. Invariant: `L_MIN <= l <= L_MAX`.
     l: u8,
     /// Per-harmonic voicing. Index `l-1` holds `v_l`; entries `>= l` unused.
+    #[cfg_attr(feature = "serde", serde(with = "serde_l_cap_bool"))]
     voiced: [bool; L_CAP],
     /// Per-harmonic spectral amplitudes. Index `l-1` holds `M_l`;
     /// entries `>= l` unused.
+    #[cfg_attr(feature = "serde", serde(with = "serde_l_cap_f32"))]
     amplitudes: [f32; L_CAP],
+}
+
+#[cfg(feature = "serde")]
+mod serde_l_cap_bool {
+    use super::L_CAP;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    pub fn serialize<S: Serializer>(v: &[bool; L_CAP], s: S) -> Result<S::Ok, S::Error> {
+        v.as_slice().serialize(s)
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[bool; L_CAP], D::Error> {
+        let v = Vec::<bool>::deserialize(d)?;
+        if v.len() != L_CAP {
+            return Err(serde::de::Error::invalid_length(v.len(), &format!("{L_CAP}").as_str()));
+        }
+        let mut out = [false; L_CAP];
+        out.copy_from_slice(&v);
+        Ok(out)
+    }
+}
+
+#[cfg(feature = "serde")]
+mod serde_l_cap_f32 {
+    use super::L_CAP;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    pub fn serialize<S: Serializer>(v: &[f32; L_CAP], s: S) -> Result<S::Ok, S::Error> {
+        v.as_slice().serialize(s)
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[f32; L_CAP], D::Error> {
+        let v = Vec::<f32>::deserialize(d)?;
+        if v.len() != L_CAP {
+            return Err(serde::de::Error::invalid_length(v.len(), &format!("{L_CAP}").as_str()));
+        }
+        let mut out = [0.0f32; L_CAP];
+        out.copy_from_slice(&v);
+        Ok(out)
+    }
 }
 
 /// Error returned when [`MbeParams`] inputs violate model invariants.

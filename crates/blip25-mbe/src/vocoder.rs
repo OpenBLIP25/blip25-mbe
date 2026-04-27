@@ -69,6 +69,7 @@ pub const FRAME_SAMPLES: usize = 160;
 /// is enough to know how many FEC bytes a frame is, what codec
 /// generation drives the synth, and which dequantize tables to use.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[non_exhaustive]
 pub enum Rate {
     /// P25 Phase 1 FDMA full-rate IMBE. 18-byte FEC frame (72 dibits).
@@ -103,6 +104,7 @@ impl Rate {
 ///
 /// Encode-side fills only `analysis`; decode-side fills only `decode`.
 #[derive(Clone, Debug, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct FrameStats {
     /// Stats from the last encoded frame.
     pub analysis: Option<AnalysisStats>,
@@ -112,6 +114,7 @@ pub struct FrameStats {
 
 /// Encode-side per-frame stats.
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct AnalysisStats {
     /// What the analysis encoder emitted (`Voice` / `Silence`).
     pub output: AnalysisOutputKind,
@@ -126,6 +129,7 @@ pub struct AnalysisStats {
 /// was emitted without holding a copy. The full params are in
 /// [`AnalysisStats::params`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum AnalysisOutputKind {
     /// Real voice frame derived from the input PCM.
     Voice,
@@ -135,6 +139,7 @@ pub enum AnalysisOutputKind {
 
 /// Decode-side per-frame stats.
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct DecodeStats {
     /// FEC error count on the leading codeword (Golay c̃₀ for full-rate,
     /// AMBE+2 c̃₀ for half-rate).
@@ -549,5 +554,48 @@ mod tests {
         v.reset();
         assert!(v.last_stats().analysis.is_none());
         assert_eq!(v.rate(), Rate::P25Phase2);
+    }
+
+    /// Diagnostic types round-trip through JSON when the `serde`
+    /// feature is on. Validates that a future RPC layer
+    /// (gRPC / protobuf / WS) can ship `FrameStats` over the wire
+    /// without bespoke conversion.
+    #[cfg(feature = "serde")]
+    #[test]
+    fn frame_stats_round_trip_through_json() {
+        let mut v = Vocoder::new(Rate::P25Phase1);
+        let pcm = periodic_pcm(40, 8000);
+        for _ in 0..3 {
+            let bits = v.encode_pcm(&pcm).unwrap();
+            let _ = v.decode_bits(&bits).unwrap();
+        }
+        let stats = v.last_stats().clone();
+        let s = serde_json::to_string(&stats).expect("serialize FrameStats");
+        let back: FrameStats = serde_json::from_str(&s).expect("deserialize FrameStats");
+        // Round-trip equality on the parts we can compare without
+        // full PartialEq derives — output kind + presence flags + the
+        // one Copy-able sub-field.
+        assert_eq!(stats.analysis.is_some(), back.analysis.is_some());
+        assert_eq!(stats.decode.is_some(), back.decode.is_some());
+        if let (Some(a), Some(b)) = (&stats.analysis, &back.analysis) {
+            assert_eq!(a.output, b.output);
+            assert_eq!(a.params, b.params);
+        }
+        if let (Some(a), Some(b)) = (&stats.decode, &back.decode) {
+            assert_eq!(a.epsilon_0, b.epsilon_0);
+            assert_eq!(a.epsilon_t, b.epsilon_t);
+            assert_eq!(a.disposition, b.disposition);
+        }
+    }
+
+    /// `Rate` round-trips as a plain enum — the public-name variants
+    /// stay stable across serde versions.
+    #[cfg(feature = "serde")]
+    #[test]
+    fn rate_serializes_as_named_variant() {
+        let s = serde_json::to_string(&Rate::P25Phase1).unwrap();
+        assert_eq!(s, "\"P25Phase1\"");
+        let back: Rate = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, Rate::P25Phase1);
     }
 }
