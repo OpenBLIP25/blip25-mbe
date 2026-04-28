@@ -434,6 +434,38 @@ impl Vocoder {
         self.analysis.default_pitch_on_silence_enabled()
     }
 
+    /// Enable or disable the PYIN pitch frontend. When on, the analysis
+    /// encoder uses [`crate::codecs::mbe_baseline::analysis::run_pyin`]
+    /// for `(p_hat_i, e_p_hat_i)` instead of the §0.3 look-back /
+    /// look-ahead tracker (Eq. 5–23). PYIN is post-2002 DSP outside
+    /// BABA-A's clean-room scope; landed for A/B PESQ evaluation. The
+    /// §0.3 path remains the default and the spec-faithful baseline.
+    pub fn set_pyin_pitch(&mut self, on: bool) {
+        self.analysis.set_pyin_pitch(on);
+    }
+
+    /// Whether the PYIN pitch frontend is currently enabled.
+    #[inline]
+    pub fn pyin_pitch(&self) -> bool {
+        self.analysis.pyin_pitch_enabled()
+    }
+
+    /// Enable or disable input-side spectral subtraction (Boll 1979)
+    /// applied to `signal_spectrum` output before §0.5 amplitude
+    /// estimation. Per-bin running noise PSD is updated on
+    /// silence-flagged frames; voiced frames hold. Off by default —
+    /// targets noisy-tone inputs (memo
+    /// `project_amp_noise_sensitivity_2026-04-24`).
+    pub fn set_spectral_subtraction(&mut self, on: bool) {
+        self.analysis.set_spectral_subtraction(on);
+    }
+
+    /// Whether spectral subtraction is currently enabled.
+    #[inline]
+    pub fn spectral_subtraction(&self) -> bool {
+        self.analysis.spectral_subtraction_enabled()
+    }
+
     /// Start a fluent builder for this rate. Equivalent to
     /// `VocoderBuilder::new(rate)`.
     #[inline]
@@ -1120,6 +1152,8 @@ pub struct VocoderBuilder {
     silence_dispatch: bool,
     pitch_silence_override: bool,
     default_pitch_on_silence: bool,
+    pyin_pitch: bool,
+    spectral_subtraction: bool,
     ambe_plus2_synth: AmbePlus2Synth,
 }
 
@@ -1135,6 +1169,8 @@ impl VocoderBuilder {
             silence_dispatch: false,
             pitch_silence_override: false,
             default_pitch_on_silence: false,
+            pyin_pitch: false,
+            spectral_subtraction: false,
             ambe_plus2_synth: AmbePlus2Synth::AmbePlus,
         }
     }
@@ -1189,6 +1225,22 @@ impl VocoderBuilder {
         self
     }
 
+    /// Enable the PYIN pitch frontend (post-2002 DSP, off by default).
+    /// See [`Vocoder::set_pyin_pitch`].
+    #[inline]
+    pub fn pyin_pitch(mut self, on: bool) -> Self {
+        self.pyin_pitch = on;
+        self
+    }
+
+    /// Enable spectral subtraction at the §0.5 amplitude input.
+    /// See [`Vocoder::set_spectral_subtraction`].
+    #[inline]
+    pub fn spectral_subtraction(mut self, on: bool) -> Self {
+        self.spectral_subtraction = on;
+        self
+    }
+
     /// Configure the half-rate synth flavor (no-op for full-rate).
     /// See [`Vocoder::set_ambe_plus2_synth`].
     #[inline]
@@ -1206,6 +1258,8 @@ impl VocoderBuilder {
         v.set_silence_dispatch(self.silence_dispatch);
         v.set_pitch_silence_override(self.pitch_silence_override);
         v.set_default_pitch_on_silence(self.default_pitch_on_silence);
+        v.set_pyin_pitch(self.pyin_pitch);
+        v.set_spectral_subtraction(self.spectral_subtraction);
         v.set_ambe_plus2_synth(self.ambe_plus2_synth);
         v
     }

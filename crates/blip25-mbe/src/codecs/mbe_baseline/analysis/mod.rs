@@ -148,6 +148,20 @@ pub use tone_detect::{ToneDetection, detect_dtmf, detect_single_tone, detect_ton
 
 pub mod profile;
 
+// ---------------------------------------------------------------------------
+// PYIN — opt-in alternative pitch frontend (post-2002 DSP, not §0.3).
+// ---------------------------------------------------------------------------
+
+pub mod pyin;
+pub use pyin::{PyinHmmState, run_pyin, run_pyin_smoothed};
+
+// ---------------------------------------------------------------------------
+// Spectral subtraction — opt-in input-side denoiser (post-2002 DSP).
+// ---------------------------------------------------------------------------
+
+pub mod denoise;
+pub use denoise::{NoiseSpectrum, apply_subtraction};
+
 /// Errors reported by the analysis encoder.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AnalysisError {
@@ -465,6 +479,26 @@ pub struct AnalysisState {
     /// as voice; only the pitch-history side-effect changes. Off by
     /// default; eval via the 5-vector PESQ harness.
     default_pitch_on_silence_enabled: bool,
+    /// Opt-in: replace the §0.3 pitch tracker (Eq. 5–23) with the
+    /// PYIN frontend (`run_pyin_smoothed`) for `(p_hat_i, e_p_hat_i)`.
+    /// PYIN is post-2002 DSP outside the BABA-A clean-room scope;
+    /// landed as a flag for A/B-vs-§0.3 evaluation. Off by default.
+    pyin_pitch_enabled: bool,
+    /// Streaming HMM-Viterbi state for the PYIN smoother. Only read
+    /// when `pyin_pitch_enabled` is true; reset alongside the encoder.
+    pyin_hmm: PyinHmmState,
+    /// Opt-in: apply Boll-style spectral subtraction to
+    /// `signal_spectrum` output before §0.5 amplitude estimation.
+    /// Targets noisy-tone vectors (knox_1) where §0.5's per-bin
+    /// integration is noise-sensitive (memo
+    /// `project_amp_noise_sensitivity_2026-04-24`). Off by default.
+    /// Different from the retired `--harmonic-bin-pad` and
+    /// `--noise-floor-beta` directions: those modified §0.5 internals;
+    /// this cleans the input spectrum upstream.
+    spectral_subtraction_enabled: bool,
+    /// Per-bin running noise PSD estimate, updated on silent frames.
+    /// Read only when `spectral_subtraction_enabled` is true.
+    noise_spectrum: NoiseSpectrum,
 }
 
 /// `E(P̂_I)` threshold for the joint-signal silence override. Frames
@@ -529,6 +563,10 @@ impl AnalysisState {
             silence_detection_enabled: false,
             pitch_silence_override_enabled: false,
             default_pitch_on_silence_enabled: false,
+            pyin_pitch_enabled: false,
+            pyin_hmm: PyinHmmState::new(),
+            spectral_subtraction_enabled: false,
+            noise_spectrum: NoiseSpectrum::new(),
         }
     }
 
@@ -577,6 +615,35 @@ impl AnalysisState {
     #[inline]
     pub fn default_pitch_on_silence_enabled(&self) -> bool {
         self.default_pitch_on_silence_enabled
+    }
+
+    /// Enable or disable the PYIN pitch frontend. When on, `encode` /
+    /// `encode_with_trace` / `encode_ambe_plus2` route the per-frame
+    /// `(p_hat_i, e_p_hat_i)` through [`pyin::run_pyin`] instead of
+    /// the §0.3 look-back/look-ahead tracker. Off by default — §0.3
+    /// remains the canonical spec-faithful path.
+    pub fn set_pyin_pitch(&mut self, enabled: bool) {
+        self.pyin_pitch_enabled = enabled;
+    }
+
+    /// Whether the PYIN pitch frontend is currently enabled.
+    #[inline]
+    pub fn pyin_pitch_enabled(&self) -> bool {
+        self.pyin_pitch_enabled
+    }
+
+    /// Enable or disable input-side spectral subtraction (Boll 1979)
+    /// applied to `signal_spectrum` output before §0.5 amplitude
+    /// estimation. Off by default. Targets noisy-tone vectors where
+    /// §0.5's per-bin integration is noise-sensitive.
+    pub fn set_spectral_subtraction(&mut self, enabled: bool) {
+        self.spectral_subtraction_enabled = enabled;
+    }
+
+    /// Whether spectral subtraction is currently enabled.
+    #[inline]
+    pub fn spectral_subtraction_enabled(&self) -> bool {
+        self.spectral_subtraction_enabled
     }
 
     /// Read-only access to the silence detector state (for inspection
@@ -835,9 +902,15 @@ pub fn encode_with_trace(
         profile::time(profile::Stage::PitchTrack, || {
             let (p_b, ce_b) = look_back(&search_cur, state.pitch_history);
             let (p_f, ce_f) = look_ahead(&search_cur, &search_f1, &search_f2);
-            let p_hat_i = decide_initial_pitch(p_b, ce_b, p_f, ce_f);
-            let e_p_hat_i = search_cur.e_of_p(p_hat_i);
-            (p_b, ce_b, p_f, ce_f, p_hat_i, e_p_hat_i)
+            if state.pyin_pitch_enabled {
+                let buf = *state.lookahead_buf();
+                let (p, e) = pyin::run_pyin_smoothed(&buf, &mut state.pyin_hmm);
+                (p_b, ce_b, p_f, ce_f, p, e)
+            } else {
+                let p_hat_i = decide_initial_pitch(p_b, ce_b, p_f, ce_f);
+                let e_p_hat_i = search_cur.e_of_p(p_hat_i);
+                (p_b, ce_b, p_f, ce_f, p_hat_i, e_p_hat_i)
+            }
         });
     let mut trace = EncodeTrace {
         p_hat_b: p_b,
@@ -860,6 +933,16 @@ pub fn encode_with_trace(
         signal_spectrum(&sig_win)
     });
 
+    // Step 6.5: maintain the running noise spectrum estimate. Strict
+    // gate (silent + low-energy + 5-frame eligible run) prevents
+    // mid-speech pauses from leaking voice harmonics into the noise
+    // model. Always updated regardless of the
+    // `spectral_subtraction_enabled` gate so the estimate is ready
+    // when the flag flips on.
+    state
+        .noise_spectrum
+        .update(&sw, silent, frame_energy, state.silence.noise_floor());
+
     // Step 7: pitch refinement.
     let refinement = profile::time(profile::Stage::RefinePitch, || {
         refine_pitch(&sw, basis, p_hat_i)
@@ -871,9 +954,17 @@ pub fn encode_with_trace(
     });
     trace.vuv_result = Some(vuv_result.clone());
 
-    // Step 9: spectral amplitude estimation.
+    // Step 9: spectral amplitude estimation. With spectral subtraction
+    // enabled, §0.5 sees a denoised spectrum; refinement (§0.4) and
+    // V/UV (§0.7) stay on the original `sw` so denoising can't corrupt
+    // pitch / voicing decisions.
+    let sw_for_amplitude = if state.spectral_subtraction_enabled {
+        apply_subtraction(&sw, &state.noise_spectrum)
+    } else {
+        sw
+    };
     let m_hat = profile::time(profile::Stage::Amplitude, || {
-        estimate_spectral_amplitudes(&sw, basis, &refinement, &vuv_result)
+        estimate_spectral_amplitudes(&sw_for_amplitude, basis, &refinement, &vuv_result)
     });
 
     // §0.8 silence gate. Per §13.3 prose: silence / tone / erasure
@@ -1011,11 +1102,16 @@ pub fn encode_ambe_plus2(
             )
         });
     let (p_hat_i, e_p_hat_i) = profile::time(profile::Stage::PitchTrack, || {
-        let (p_b, ce_b) = look_back(&search_cur, state.pitch_history);
-        let (p_f, ce_f) = look_ahead(&search_cur, &search_f1, &search_f2);
-        let p_hat_i = decide_initial_pitch(p_b, ce_b, p_f, ce_f);
-        let e_p_hat_i = search_cur.e_of_p(p_hat_i);
-        (p_hat_i, e_p_hat_i)
+        if state.pyin_pitch_enabled {
+            let buf = *state.lookahead_buf();
+            pyin::run_pyin_smoothed(&buf, &mut state.pyin_hmm)
+        } else {
+            let (p_b, ce_b) = look_back(&search_cur, state.pitch_history);
+            let (p_f, ce_f) = look_ahead(&search_cur, &search_f1, &search_f2);
+            let p_hat_i = decide_initial_pitch(p_b, ce_b, p_f, ce_f);
+            let e_p_hat_i = search_cur.e_of_p(p_hat_i);
+            (p_hat_i, e_p_hat_i)
+        }
     });
 
     // Onset-attack mitigation — see encode_with_trace for rationale.
@@ -1035,6 +1131,11 @@ pub fn encode_ambe_plus2(
         let sig_win = state.extract_refinement_window();
         signal_spectrum(&sig_win)
     });
+
+    // Step 6.5 (mirrors full-rate): strict-gated noise estimate update.
+    state
+        .noise_spectrum
+        .update(&sw, silent, frame_energy, state.silence.noise_floor());
 
     // Half-rate `L̂` is **Annex L table lookup at b̂₀**, not Eq. 31 on
     // ω̂₀ (gap 0019 resolution — BABA-A §13.1 + Annex L). Annex L's L
@@ -1070,8 +1171,13 @@ pub fn encode_ambe_plus2(
     let vuv_result = profile::time(profile::Stage::Vuv, || {
         determine_vuv(&sw, basis, &refinement, e_p_hat_i, &mut state.vuv)
     });
+    let sw_for_amplitude = if state.spectral_subtraction_enabled {
+        apply_subtraction(&sw, &state.noise_spectrum)
+    } else {
+        sw
+    };
     let m_hat = profile::time(profile::Stage::Amplitude, || {
-        estimate_spectral_amplitudes(&sw, basis, &refinement, &vuv_result)
+        estimate_spectral_amplitudes(&sw_for_amplitude, basis, &refinement, &vuv_result)
     });
 
     // §0.8 silence gate — half-rate silence dispatch would emit

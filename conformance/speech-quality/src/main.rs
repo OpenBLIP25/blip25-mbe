@@ -124,6 +124,17 @@ enum Cmd {
         /// (disabled, spec-faithful per gap 0022).
         #[arg(long, default_value_t = 0)]
         repeat_reset_after: u32,
+        /// Replace the §0.3 pitch tracker with the PYIN frontend
+        /// (post-2002 DSP). A/B against the spec-faithful path. Off by
+        /// default.
+        #[arg(long)]
+        pyin_pitch: bool,
+        /// Apply Boll 1979 spectral subtraction to `signal_spectrum`
+        /// output before §0.5 amplitude estimation. Per-bin noise PSD
+        /// is updated on silence-flagged frames; β=1.5, α=0.02.
+        /// Targets noisy-tone vectors. Off by default.
+        #[arg(long)]
+        spectral_subtraction: bool,
     },
     /// Self-baseline our_enc → our_dec PESQ on the half-rate (AMBE+2)
     /// path. Slim version of `ab-matrix`: no chip side, just our
@@ -279,6 +290,8 @@ fn main() -> Result<()> {
             amp_scale,
             vuv_override,
             repeat_reset_after,
+            pyin_pitch,
+            spectral_subtraction,
         } => cmd_ab_matrix(
             &pcm,
             &out_dir,
@@ -291,6 +304,8 @@ fn main() -> Result<()> {
             amp_scale,
             vuv_override,
             repeat_reset_after,
+            pyin_pitch,
+            spectral_subtraction,
         ),
         Cmd::HalfrateAbMatrix {
             pcm,
@@ -332,6 +347,8 @@ fn cmd_ab_matrix(
     amp_scale: f32,
     vuv_override: VuvOverride,
     repeat_reset_after: u32,
+    pyin_pitch: bool,
+    spectral_subtraction: bool,
 ) -> Result<()> {
     fs::create_dir_all(out_dir)
         .with_context(|| format!("create out_dir {}", out_dir.display()))?;
@@ -362,6 +379,8 @@ fn cmd_ab_matrix(
         default_pitch_on_silence,
         amp_scale,
         vuv_override,
+        pyin_pitch,
+        spectral_subtraction,
     )?;
     let our_enc_secs = t0.elapsed().as_secs_f64();
     eprintln!(
@@ -514,6 +533,8 @@ fn our_encode(
     default_pitch_on_silence: bool,
     amp_scale: f32,
     vuv_override: VuvOverride,
+    pyin_pitch: bool,
+    spectral_subtraction: bool,
 ) -> Result<Vec<u8>> {
     let n_frames = pcm.len() / FRAME_SAMPLES;
     let mut state = AnalysisState::new();
@@ -525,6 +546,15 @@ fn our_encode(
     }
     if default_pitch_on_silence {
         state.set_default_pitch_on_silence(true);
+    }
+    if pyin_pitch {
+        state.set_pyin_pitch(true);
+    }
+    if spectral_subtraction {
+        // Note: the §0.8.4 silence detector runs every frame even when
+        // dispatch is disabled, so the noise estimator gets primed
+        // without forcing silence-dispatch on.
+        state.set_spectral_subtraction(true);
     }
     let mut decoder_state_for_quantize = DecoderState::new();
     let mut out = Vec::with_capacity(n_frames * BYTES_PER_FEC_FRAME);
