@@ -959,7 +959,7 @@ pub fn encode_with_trace(
     // V/UV (§0.7) stay on the original `sw` so denoising can't corrupt
     // pitch / voicing decisions.
     let sw_for_amplitude = if state.spectral_subtraction_enabled {
-        apply_subtraction(&sw, &state.noise_spectrum)
+        apply_subtraction(&sw, &mut state.noise_spectrum)
     } else {
         sw
     };
@@ -1172,7 +1172,7 @@ pub fn encode_ambe_plus2(
         determine_vuv(&sw, basis, &refinement, e_p_hat_i, &mut state.vuv)
     });
     let sw_for_amplitude = if state.spectral_subtraction_enabled {
-        apply_subtraction(&sw, &state.noise_spectrum)
+        apply_subtraction(&sw, &mut state.noise_spectrum)
     } else {
         sw
     };

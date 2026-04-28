@@ -84,6 +84,50 @@ const STATIONARITY_COS_THRESHOLD: f64 = 0.999;
 /// effective window.
 const STATIONARITY_REF_LAMBDA: f64 = 0.7;
 
+/// Decision-directed a-priori SNR smoothing factor `α_DD` (Ephraim &
+/// Malah 1984, Eq. 51). Blends the previous frame's enhanced-magnitude
+/// SNR with the current a-posteriori SNR. `α_DD = 0.98` is the paper
+/// default — high values smooth out musical noise, low values track
+/// fast transients. We use the paper value.
+const DD_SNR_SMOOTHING: f64 = 0.98;
+
+/// Floor for the a-priori SNR estimate `ξ`. Prevents log/division blow
+/// up on bins where the previous-enhanced-magnitude is zero. -25 dB =
+/// ξ_min ≈ 0.00316 (paper recommendation).
+const A_PRIORI_SNR_FLOOR: f64 = 0.003_162_277_660;
+
+/// Suppression mode for the noise-removal step.
+///
+/// 5-vector A/B 2026-04-28 with the spectral-stationarity gate (cos
+/// ≥ 0.999, β=0.1, α=0.02):
+///
+/// | Vector | Boll  | Wiener+floor |
+/// |--------|-------|--------------|
+/// | clean  | 3.202 | 3.202        |
+/// | dam    | 3.304 | 3.304        |
+/// | alert  | 2.597 | 2.556        |
+/// | mark   | 2.699 | 2.699        |
+/// | knox_1 | 1.919 | 1.841        |
+///
+/// Boll wins overall (+0.111 vs +0.087 average across the set).
+/// Wiener has tighter STOI on alert (intelligibility) but PESQ
+/// scoring prefers Boll's curve. Boll is the default; the Wiener
+/// path stays in-tree as a documented alternative.
+const SUPPRESSION_MODE: SuppressionMode = SuppressionMode::Boll;
+
+/// Internal selector for the gain-curve to apply once the gate decides
+/// to suppress. Constant across the run; switching is a recompile.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SuppressionMode {
+    /// Boll 1979 power subtraction with `α` floor and `β`
+    /// over-subtraction.
+    Boll,
+    /// Wiener gain `G = ξ̂ / (1 + ξ̂)` with decision-directed
+    /// a-priori SNR `ξ̂`. Smoother gain curve than Boll; less
+    /// musical noise on residual spectra.
+    Wiener,
+}
+
 /// Per-bin noise-PSD estimate covering the same DFT layout as
 /// `signal_spectrum` (256-entry, half-spectrum used).
 #[derive(Clone, Debug)]
@@ -108,6 +152,10 @@ pub struct NoiseSpectrum {
     /// that the cosine-similarity test is undefined, so the gate
     /// treats it as ineligible.
     spectrum_ref_primed: bool,
+    /// Per-bin previous-frame enhanced-magnitude squared `|Â_{t-1}(m)|²`
+    /// — feeds the decision-directed a-priori SNR estimate in
+    /// `SuppressionMode::Wiener`. Unused under `SuppressionMode::Boll`.
+    prev_enhanced_psd: [f64; DFT_SIZE],
 }
 
 impl NoiseSpectrum {
@@ -119,6 +167,7 @@ impl NoiseSpectrum {
             eligible_run: 0,
             spectrum_ref: [0.0; DFT_SIZE],
             spectrum_ref_primed: false,
+            prev_enhanced_psd: [0.0; DFT_SIZE],
         }
     }
 
@@ -129,6 +178,7 @@ impl NoiseSpectrum {
         self.eligible_run = 0;
         self.spectrum_ref = [0.0; DFT_SIZE];
         self.spectrum_ref_primed = false;
+        self.prev_enhanced_psd = [0.0; DFT_SIZE];
     }
 
     /// Cosine similarity between `|sw|²` and the running spectrum
@@ -228,31 +278,64 @@ impl Default for NoiseSpectrum {
     }
 }
 
-/// Apply spectral subtraction to `sw` using the running noise estimate.
-/// No-op when `state.primed == false` (no noise model yet — happens
-/// during the first speech burst before any silence frame is seen).
+/// Apply noise suppression to `sw` using the running noise estimate.
+/// Dispatches on the compile-time `SUPPRESSION_MODE` constant: Boll
+/// 1979 power subtraction or Wiener gain with decision-directed
+/// a-priori SNR. No-op when `state.primed == false`.
 ///
-/// Returns a new `[Complex64; DFT_SIZE]` array; the caller chooses
-/// whether to feed it to §0.5 (amplitude only) or substitute it
-/// throughout (also affecting §0.4 refinement / §0.7 V/UV — see
-/// `mod.rs` for the policy choice). Phase is preserved.
+/// Mutates `state.prev_enhanced_psd` under `SuppressionMode::Wiener`
+/// so the next frame's decision-directed estimator sees this frame's
+/// enhanced magnitude. Boll mode does not touch state.
+///
+/// Phase is preserved; only the magnitude is scaled.
 pub fn apply_subtraction(
     sw: &[Complex64; DFT_SIZE],
-    state: &NoiseSpectrum,
+    state: &mut NoiseSpectrum,
 ) -> [Complex64; DFT_SIZE] {
     if !state.primed {
         return *sw;
     }
     let mut out = *sw;
-    for m in 0..DFT_SIZE {
-        let s_psd = sw[m].norm_sqr();
-        if s_psd <= 1e-30 {
-            continue;
+    match SUPPRESSION_MODE {
+        SuppressionMode::Boll => {
+            for m in 0..DFT_SIZE {
+                let s_psd = sw[m].norm_sqr();
+                if s_psd <= 1e-30 {
+                    continue;
+                }
+                let suppressed = (s_psd - SUBTRACTION_BETA * state.n_psd[m])
+                    .max(SPECTRAL_FLOOR_ALPHA * s_psd);
+                let gain = (suppressed / s_psd).sqrt();
+                out[m] = Complex64::new(sw[m].re * gain, sw[m].im * gain);
+            }
         }
-        let suppressed = (s_psd - SUBTRACTION_BETA * state.n_psd[m])
-            .max(SPECTRAL_FLOOR_ALPHA * s_psd);
-        let gain = (suppressed / s_psd).sqrt();
-        out[m] = Complex64::new(sw[m].re * gain, sw[m].im * gain);
+        SuppressionMode::Wiener => {
+            for m in 0..DFT_SIZE {
+                let s_psd = sw[m].norm_sqr();
+                let n_psd = state.n_psd[m].max(1e-30);
+                if s_psd <= 1e-30 {
+                    state.prev_enhanced_psd[m] = 0.0;
+                    continue;
+                }
+                // a-posteriori SNR γ = |Y|²/N (clamped at 0 to be
+                // robust against under-estimated noise floor).
+                let gamma = (s_psd / n_psd - 1.0).max(0.0);
+                // Decision-directed a-priori SNR ξ̂_t = α·|Â_{t-1}|²/N
+                //                              + (1-α)·max(γ - 1, 0).
+                let xi = (DD_SNR_SMOOTHING * state.prev_enhanced_psd[m] / n_psd
+                        + (1.0 - DD_SNR_SMOOTHING) * gamma)
+                        .max(A_PRIORI_SNR_FLOOR);
+                // Wiener gain, with the same `sqrt(α)` floor Boll mode
+                // uses — prevents the gain from collapsing on bins
+                // whose a-priori SNR estimate dips low (which on
+                // tonal sweeps tanks alert -0.76 PESQ).
+                let raw_gain = xi / (1.0 + xi);
+                let gain = raw_gain.max(SPECTRAL_FLOOR_ALPHA.sqrt());
+                out[m] = Complex64::new(sw[m].re * gain, sw[m].im * gain);
+                // Track |Â|² = G² · |Y|² for next frame's ξ̂.
+                state.prev_enhanced_psd[m] = gain * gain * s_psd;
+            }
+        }
     }
     out
 }
@@ -272,8 +355,8 @@ mod tests {
     #[test]
     fn unprimed_noise_state_is_passthrough() {
         let sw = flat_spectrum(2.0);
-        let state = NoiseSpectrum::new();
-        let out = apply_subtraction(&sw, &state);
+        let mut state = NoiseSpectrum::new();
+        let out = apply_subtraction(&sw, &mut state);
         for m in 0..DFT_SIZE {
             assert!((out[m].re - sw[m].re).abs() < 1e-12);
         }
@@ -357,7 +440,7 @@ mod tests {
         // at β=1.5 → sqrt(α) ≈ 0.141. Both regimes must yield gain
         // strictly less than 1 (the signal IS attenuated).
         let probe = flat_spectrum(0.5);
-        let out = apply_subtraction(&probe, &state);
+        let out = apply_subtraction(&probe, &mut state);
         let expected_gain = ((1.0 - SUBTRACTION_BETA).max(SPECTRAL_FLOOR_ALPHA)).sqrt();
         let expected_max = expected_gain * 0.5 + 1e-9;
         for m in 0..DFT_SIZE {
@@ -373,13 +456,16 @@ mod tests {
         let mut state = NoiseSpectrum::new();
         let noise = flat_spectrum(0.1);
         prime_with(&mut state, &noise);
-        // |signal|² = 100; after β·N = 1.5·0.01 = 0.015 subtraction,
-        // gain ≈ sqrt((100 - 0.015) / 100) ≈ 0.99992 ≈ 1.
+        // |signal|² = 100; |noise|² = 0.01; SNR ≈ 10000. Both Boll and
+        // Wiener should leave the signal almost intact (gain near 1);
+        // Wiener with cold prev_enhanced_psd attenuates ~0.5%.
         let signal = flat_spectrum(10.0);
-        let out = apply_subtraction(&signal, &state);
+        let out = apply_subtraction(&signal, &mut state);
         for m in 0..DFT_SIZE {
-            assert!((out[m].re - 10.0).abs() < 0.01,
+            assert!((out[m].re - 10.0).abs() < 0.5,
                 "bin {m} over-attenuated: {}", out[m].re);
+            assert!(out[m].re.abs() > 5.0,
+                "bin {m} excessively attenuated: {}", out[m].re);
         }
     }
 }
