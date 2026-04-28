@@ -1223,6 +1223,16 @@ fn synthesize_frame_with_mode(
         && state
             .repeat_reset_after
             .is_some_and(|n| state.repeat_count >= n);
+    // JMBE-cyclic behavior: when force_default fires, the substituted
+    // params become this frame's `last_good`, and `repeat_count` resets
+    // to 0 so subsequent frames inherit from the substituted defaults
+    // (rather than continuously substituting on every frame). This
+    // reproduces JMBE's `IMBEModelParameters.copy()` path where the
+    // new instance's `repeatCount` is default-init at 0 when defaults
+    // are substituted. Without this reset, our output settles into a
+    // continuous default-substitute drone instead of the cyclical
+    // recovery pattern JMBE produces.
+    let next_repeat_count = if force_default { 0 } else { next_repeat_count };
 
     // Choose which set of parameters drives this frame's synthesis.
     // On Mute we still want to advance every cross-frame piece of
@@ -1233,12 +1243,18 @@ fn synthesize_frame_with_mode(
     let (omega_0, l, voiced_arr, m_tilde_arr) = if force_default {
         // Default comfort-tone substitute: ω₀ ≈ 0.2985π (≈ 119 Hz F0,
         // ~3.4 ms period — JMBE / SDRTrunk's IMBEFundamentalFrequency.
-        // DEFAULT, b̂₀ = 134), L = 30, all bands voiced, amps = 1.0.
+        // DEFAULT, b̂₀ = 134), L = 30, **all bands UNVOICED**, amps = 1.0.
+        // Matches JMBE's `IMBEModelParameters.copy()` default-substitute
+        // branch: `setVoicingDecisions(new boolean[lplus1])` is
+        // boolean-default-init = all `false`. Synthesizing all-voiced
+        // produces a buzzy 30-harmonic tone; all-unvoiced produces soft
+        // noise that's perceptually closer to JMBE's recovery output and
+        // PESQ-scores materially higher on chip-encoded P25 traffic.
         let l = 30u8;
         let mut voiced = [false; L_MAX as usize];
         let mut m_tilde = [0f32; L_MAX as usize];
         for i in 0..l as usize {
-            voiced[i] = true;
+            // voiced[i] stays false — JMBE-style all-unvoiced default.
             m_tilde[i] = 1.0;
         }
         (DEFAULT_OMEGA_0, l, voiced, m_tilde)
