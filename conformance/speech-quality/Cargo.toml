@@ -23,6 +23,10 @@ path = "examples/diff_per_frame.rs"
 name = "sine_probe"
 path = "examples/sine_probe.rs"
 
+[[example]]
+name = "encode_pcm_to_bit"
+path = "examples/encode_pcm_to_bit.rs"
+
 [dependencies]
 blip25-mbe.workspace = true
 anyhow.workspace = true
