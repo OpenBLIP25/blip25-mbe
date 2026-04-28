@@ -1000,6 +1000,18 @@ pub struct SynthState {
     /// per-repeat attenuation; this knob exists only for chip-stream
     /// interop quality, not for spec conformance).
     repeat_reset_after: Option<u32>,
+    /// Beyond-spec error-rate freeze on Repeat. When `true`, a frame
+    /// whose disposition is `Repeat` does not advance `ε_R`; the
+    /// previous frame's `ε_R` is carried into the next frame
+    /// unchanged. Mirrors JMBE's `IMBEModelParameters.copy()` calling
+    /// `setErrorRate(previous.getErrorRate())` (gap 0021 resolution).
+    /// Default `false` keeps the spec-faithful path that always
+    /// smooths `ε_R = 0.95·prev + 0.05·(ε_T/144)` regardless of
+    /// disposition. Enable for chip-encoded-bits decode quality (the
+    /// chip emits frames with deterministic 13-error patterns that
+    /// would otherwise drive `ε_R` past the 0.0875 Mute threshold and
+    /// silence ~99% of frames).
+    chip_compat: bool,
     /// The disposition (`Use` / `Repeat` / `Mute`) selected by the
     /// most recent [`synthesize_frame`] / [`synthesize_frame_ambe_plus`]
     /// call. `None` until at least one frame has been synthesized.
@@ -1031,6 +1043,7 @@ impl SynthState {
             last_good: None,
             repeat_count: 0,
             repeat_reset_after: None,
+            chip_compat: false,
             last_disposition: None,
         }
     }
@@ -1061,6 +1074,22 @@ impl SynthState {
     #[inline]
     pub fn repeat_reset_after(&self) -> Option<u32> {
         self.repeat_reset_after
+    }
+
+    /// Enable JMBE-style error-rate freeze on Repeat (beyond-spec).
+    /// When enabled, frames whose disposition is `Repeat` do not
+    /// advance `ε_R`; the previous frame's value is carried forward.
+    /// This prevents runs of high-error chip-encoded frames from
+    /// driving `ε_R` past the Mute threshold. `false` (default) is
+    /// the spec-faithful path. See gap 0021.
+    pub fn set_chip_compat(&mut self, on: bool) {
+        self.chip_compat = on;
+    }
+
+    /// Current chip-compat (error-rate freeze on Repeat) setting.
+    #[inline]
+    pub fn chip_compat(&self) -> bool {
+        self.chip_compat
     }
 }
 
@@ -1164,7 +1193,19 @@ fn synthesize_frame_with_mode(
     state: &mut SynthState,
 ) -> [i16; FRAME_SAMPLES] {
     let (disp, epsilon_r) = frame_disposition(err, state.epsilon_r);
-    state.epsilon_r = epsilon_r;
+    // Beyond-spec error-rate freeze on Repeat (gap 0021, opt-in via
+    // `chip_compat`). When the disposition is Repeat, JMBE's
+    // `IMBEModelParameters.copy()` carries `previous.errorRate` into
+    // the next frame instead of advancing the smoothed value. This
+    // prevents `ε_R` from climbing past the 0.0875 Mute threshold
+    // during runs of high-error chip-encoded frames. Mute is checked
+    // first by `frame_disposition`, so the freeze only applies once
+    // Mute has not already been triggered.
+    state.epsilon_r = if state.chip_compat && disp == FrameDisposition::Repeat {
+        state.epsilon_r
+    } else {
+        epsilon_r
+    };
     state.last_disposition = Some(disp);
 
     // Track consecutive Repeat/Mute frames for the optional reset.
@@ -1482,6 +1523,74 @@ mod tests {
         // ε_R prev high enough that the smoothed value crosses 0.0875.
         let (d, _) = frame_disposition(&err(0, 50, 0), 0.5);
         assert_eq!(d, FrameDisposition::Mute);
+    }
+
+    /// Spec-faithful default: a run of high-error frames advances ε_R
+    /// every frame and eventually trips Mute. Reproduces the chip.bit
+    /// failure mode (gap 0021).
+    #[test]
+    fn synth_baseline_drives_chip_pattern_into_mute() {
+        let mut state = SynthState::new();
+        // Default: chip_compat = false. ε_R advances every frame.
+        assert!(!state.chip_compat());
+        // Chip.bit's deterministic 13-error pattern, ε_0 = 3 (≥ 2).
+        let err_ctx = err(3, 13, 1);
+        let voiced = vec![true; crate::mbe_params::L_MIN as usize];
+        let amps = vec![1.0f32; crate::mbe_params::L_MIN as usize];
+        let params = MbeParams::new(
+            2.0 * core::f32::consts::PI / 50.0,
+            crate::mbe_params::L_MIN,
+            &voiced,
+            &amps,
+        )
+        .unwrap();
+        // Run enough frames for ε_R to climb past 0.0875. Steady-state
+        // is 0.05·13/144 / (1−0.95) = 0.0903, just above the 0.0875
+        // Mute threshold, but it takes ≈70 frames to converge close
+        // enough (ε_R = 0.0903·(1−0.95^n), need n ≳ 70 for ε_R > 0.0875).
+        for _ in 0..120 {
+            let _ = synthesize_frame(&params, &err_ctx, GAMMA_W, &mut state);
+        }
+        assert_eq!(
+            state.last_disposition(),
+            Some(FrameDisposition::Mute),
+            "spec-faithful path should mute under sustained chip.bit errors"
+        );
+    }
+
+    /// chip_compat = true: same sustained 13-error pattern stays in
+    /// Repeat indefinitely. ε_R never advances past the first frame,
+    /// Mute never trips. Mirrors JMBE's `IMBEModelParameters.copy()`
+    /// `setErrorRate(previous.getErrorRate())` semantics.
+    #[test]
+    fn synth_chip_compat_freezes_error_rate_on_repeat() {
+        let mut state = SynthState::new();
+        state.set_chip_compat(true);
+        let err_ctx = err(3, 13, 1);
+        let voiced = vec![true; crate::mbe_params::L_MIN as usize];
+        let amps = vec![1.0f32; crate::mbe_params::L_MIN as usize];
+        let params = MbeParams::new(
+            2.0 * core::f32::consts::PI / 50.0,
+            crate::mbe_params::L_MIN,
+            &voiced,
+            &amps,
+        )
+        .unwrap();
+        for _ in 0..120 {
+            let _ = synthesize_frame(&params, &err_ctx, GAMMA_W, &mut state);
+        }
+        assert_eq!(
+            state.last_disposition(),
+            Some(FrameDisposition::Repeat),
+            "chip_compat path should hold Repeat (ε_R frozen below Mute)"
+        );
+        // ε_R should be near the cold-start single-step value
+        // (0.05·13/144 ≈ 0.00451), not the climbed steady-state.
+        assert!(
+            state.epsilon_r < 0.0875,
+            "frozen ε_R should stay below Mute threshold (got {})",
+            state.epsilon_r
+        );
     }
 
     #[test]

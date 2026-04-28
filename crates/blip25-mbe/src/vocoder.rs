@@ -363,6 +363,27 @@ impl Vocoder {
         self.synth.repeat_reset_after()
     }
 
+    /// Enable JMBE-style error-rate freeze on Repeat (beyond-spec; gap
+    /// 0021). When enabled, frames whose disposition is `Repeat` do
+    /// not advance `ε_R`; the previous frame's value is carried
+    /// forward. This mirrors JMBE's
+    /// `IMBEModelParameters.copy()` calling
+    /// `setErrorRate(previous.getErrorRate())` and prevents runs of
+    /// high-error chip-encoded frames from driving `ε_R` past the
+    /// 0.0875 Mute threshold. Default `false` is the spec-faithful
+    /// path. Enable for decoding chip-encoded P25 air traffic; leave
+    /// off for our-encoder → our-decoder loops and spec-conformance
+    /// testing.
+    pub fn set_chip_compat(&mut self, on: bool) {
+        self.synth.set_chip_compat(on);
+    }
+
+    /// Current chip-compat (error-rate freeze on Repeat) setting.
+    #[inline]
+    pub fn chip_compat(&self) -> bool {
+        self.synth.chip_compat()
+    }
+
     /// Enable the §0.8.4 silence-dispatch path on the analysis encoder.
     /// When on, frames whose energy clears the silence detector's
     /// hysteresis emit `AnalysisOutput::Silence` (rate-appropriate
@@ -1095,6 +1116,7 @@ pub struct VocoderBuilder {
     rate: Rate,
     tone_detection: bool,
     repeat_reset_after: Option<u32>,
+    chip_compat: bool,
     silence_dispatch: bool,
     pitch_silence_override: bool,
     default_pitch_on_silence: bool,
@@ -1109,6 +1131,7 @@ impl VocoderBuilder {
             rate,
             tone_detection: false,
             repeat_reset_after: None,
+            chip_compat: false,
             silence_dispatch: false,
             pitch_silence_override: false,
             default_pitch_on_silence: false,
@@ -1129,6 +1152,14 @@ impl VocoderBuilder {
     #[inline]
     pub fn repeat_reset_after(mut self, n: Option<u32>) -> Self {
         self.repeat_reset_after = n;
+        self
+    }
+
+    /// Enable JMBE-style error-rate freeze on Repeat (gap 0021).
+    /// See [`Vocoder::set_chip_compat`].
+    #[inline]
+    pub fn chip_compat(mut self, on: bool) -> Self {
+        self.chip_compat = on;
         self
     }
 
@@ -1171,6 +1202,7 @@ impl VocoderBuilder {
         let mut v = Vocoder::new(self.rate);
         v.set_tone_detection(self.tone_detection);
         v.set_repeat_reset_after(self.repeat_reset_after);
+        v.set_chip_compat(self.chip_compat);
         v.set_silence_dispatch(self.silence_dispatch);
         v.set_pitch_silence_override(self.pitch_silence_override);
         v.set_default_pitch_on_silence(self.default_pitch_on_silence);

@@ -241,6 +241,12 @@ enum Cmd {
         /// Treat input as packed binary (18 bytes per frame).
         #[arg(long)]
         binary: bool,
+        /// JMBE-style error-rate freeze on Repeat (gap 0021). Default
+        /// off — spec-faithful path. Enable for chip-encoded P25
+        /// traffic to keep ε_R from climbing past the Mute threshold
+        /// during runs of high-error frames.
+        #[arg(long)]
+        chip_compat: bool,
     },
 }
 
@@ -302,8 +308,8 @@ fn main() -> Result<()> {
         Cmd::DecodeFecHalfrate { input, out_wav, binary } => {
             cmd_decode_fec_ambe_plus2(&input, &out_wav, binary)
         }
-        Cmd::DecodeFecFullrate { input, out_wav, binary } => {
-            cmd_decode_fec_imbe(&input, &out_wav, binary)
+        Cmd::DecodeFecFullrate { input, out_wav, binary, chip_compat } => {
+            cmd_decode_fec_imbe(&input, &out_wav, binary, chip_compat)
         }
     }
 }
@@ -1053,7 +1059,12 @@ fn cmd_decode_fec_ambe_plus2(input: &Path, out_wav: &Path, binary: bool) -> Resu
 /// into PCM via the chip-shaped Vocoder API.
 ///
 /// Mirrors `cmd_decode_fec_ambe_plus2` but for P25 Phase 1 input.
-fn cmd_decode_fec_imbe(input: &Path, out_wav: &Path, binary: bool) -> Result<()> {
+fn cmd_decode_fec_imbe(
+    input: &Path,
+    out_wav: &Path,
+    binary: bool,
+    chip_compat: bool,
+) -> Result<()> {
     use blip25_mbe::vocoder::{Rate, Vocoder};
     use std::io::Read;
     let raw: Vec<u8> = if input == Path::new("-") {
@@ -1111,7 +1122,9 @@ fn cmd_decode_fec_imbe(input: &Path, out_wav: &Path, binary: bool) -> Result<()>
         out
     };
 
-    let mut vocoder = Vocoder::new(Rate::Imbe7200x4400);
+    let mut vocoder = Vocoder::builder(Rate::Imbe7200x4400)
+        .chip_compat(chip_compat)
+        .build();
     let mut pcm: Vec<i16> = Vec::with_capacity(frames.len() * FRAME_SAMPLES);
     for (f, bytes) in frames.iter().enumerate() {
         let frame = vocoder
