@@ -1,8 +1,8 @@
 # blip25-mbe
 
-A modern, spec-faithful Rust implementation of the DVSI MBE codec family
-(IMBE, AMBE, AMBE+, AMBE+2). Drop-in replacement for the AMBE-3000R chip's
-codec layer in P25, DMR, NXDN, and D-STAR pipelines.
+A research Rust implementation of the DVSI MBE codec family (IMBE, AMBE,
+AMBE+, AMBE+2) for P25, DMR, NXDN, and D-STAR pipelines. Functionally
+parallel to the AMBE-3000R chip's codec layer.
 
 Covers IMBE (P25 Phase 1), AMBE / AMBE+ / AMBE+2 (DVSI AMBE-1000/2000/3000
 generations), and parametric rate conversion between them.
@@ -10,6 +10,12 @@ generations), and parametric rate conversion between them.
 Built from TIA-102 specifications and expired DVSI patents. Validated by
 black-box comparison against DVSI hardware and published test vectors.
 No code or algorithms borrowed from existing open-source vocoder projects.
+
+> **Patent notice.** This source code is provided for research and
+> educational purposes only. The half-rate (AMBE+2) implementation
+> unavoidably reads on the claims of **US8359197**, active until
+> **2028-05-20**. See [`PATENT_NOTICE.md`](./PATENT_NOTICE.md) for the
+> full list, comparable-project survey, and project policy.
 
 See [`DESIGN.md`](./DESIGN.md) for the architectural model and
 [`SCOPE_PLAN.md`](./SCOPE_PLAN.md) for the current roadmap status.

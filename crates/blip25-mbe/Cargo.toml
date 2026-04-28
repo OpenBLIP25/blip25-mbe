@@ -1,6 +1,6 @@
 [package]
 name = "blip25-mbe"
-description = "Clean-room MBE / IMBE / AMBE+2 vocoder family: P25 wire formats, multi-generation codecs, and parametric rate conversion"
+description = "Research MBE / IMBE / AMBE+2 vocoder family: P25 wire formats, multi-generation codecs, and parametric rate conversion. Educational use; see PATENT_NOTICE.md."
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
