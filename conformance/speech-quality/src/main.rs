@@ -247,6 +247,12 @@ enum Cmd {
         /// during runs of high-error frames.
         #[arg(long)]
         chip_compat: bool,
+        /// Beyond-spec consecutive-repeat reset threshold. After N
+        /// consecutive Repeat/Mute frames, fall back to a default
+        /// fundamental + amps=1.0 frame instead of the prior snapshot.
+        /// JMBE / SDRTrunk use 3.
+        #[arg(long)]
+        repeat_reset_after: Option<u32>,
     },
 }
 
@@ -308,8 +314,8 @@ fn main() -> Result<()> {
         Cmd::DecodeFecHalfrate { input, out_wav, binary } => {
             cmd_decode_fec_ambe_plus2(&input, &out_wav, binary)
         }
-        Cmd::DecodeFecFullrate { input, out_wav, binary, chip_compat } => {
-            cmd_decode_fec_imbe(&input, &out_wav, binary, chip_compat)
+        Cmd::DecodeFecFullrate { input, out_wav, binary, chip_compat, repeat_reset_after } => {
+            cmd_decode_fec_imbe(&input, &out_wav, binary, chip_compat, repeat_reset_after)
         }
     }
 }
@@ -1064,6 +1070,7 @@ fn cmd_decode_fec_imbe(
     out_wav: &Path,
     binary: bool,
     chip_compat: bool,
+    repeat_reset_after: Option<u32>,
 ) -> Result<()> {
     use blip25_mbe::vocoder::{Rate, Vocoder};
     use std::io::Read;
@@ -1124,6 +1131,7 @@ fn cmd_decode_fec_imbe(
 
     let mut vocoder = Vocoder::builder(Rate::Imbe7200x4400)
         .chip_compat(chip_compat)
+        .repeat_reset_after(repeat_reset_after)
         .build();
     let mut pcm: Vec<i16> = Vec::with_capacity(frames.len() * FRAME_SAMPLES);
     for (f, bytes) in frames.iter().enumerate() {
