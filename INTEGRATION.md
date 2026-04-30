@@ -238,9 +238,49 @@ caveats analysis. This is the correct target; loudness parity with
 SDRTrunk is not.
 
 **Consumers requiring SDRTrunk-parity loudness for operational UX**
-should apply post-vocoder gain in the consumer (e.g. multiply the
-i16 PCM by the desired factor before handing to the WAV writer).
-That is an application-layer concern, not a codec concern.
+have two options:
+
+1. Apply post-vocoder gain at the application layer (multiply the
+   i16 PCM by the desired factor before handing to the WAV writer).
+2. Set `ClassicalConfig::output_gain_db` on the [`enhancement`]
+   chain — `+9.0` matches SDRTrunk's empirical post-decode gain. The
+   gain saturates at i16 clip and runs after all other enhancement
+   stages, so it composes cleanly with the HPF + peaking defaults.
+
+Either is an application-layer choice — the codec itself stays
+calibrated against DVSI parity per BABA-A.
+
+#### Tones vs speech: random-phase reconstruction artifact
+
+A pure-sine round-trip through the spec-faithful IMBE (full-rate)
+path does **not** reproduce a pure sine. Per BABA-A Eq. 141, voiced
+harmonics are synthesized with a fresh random phase per frame; the
+inter-frame phase interpolation creates a frequency-modulated
+approximation of the input tone. Empirical measurement (`amp_i16`
+sweep at 349 Hz, 100-frame round-trip):
+
+| Input amp | Δ peak | Δ RMS |
+|-----------|--------|-------|
+| 16384     | -0.86 dB | -4.91 dB |
+| 8192      | -0.52 dB | -5.19 dB |
+| 4096      | -0.26 dB | -5.00 dB |
+| 2048      | -0.65 dB | -5.14 dB |
+
+Peak amplitude is preserved; RMS is consistently ~5 dB lower
+because the reconstructed waveform has higher crest factor than a
+pure sine. **This is structural to MBE-class codecs** — fixing it
+would require beyond-spec phase tracking. On real speech, RMS
+round-trip is within ~0.3 dB (verified on the 5-vector PESQ
+harness's `clean.pcm`); the random-phase RMS drop only manifests
+on monotone / near-monotone inputs.
+
+For Phase 2 (AMBE+2) the **Annex T tone-frame path bypasses MBE
+synthesis entirely** and reconstructs deterministic sines from a
+lookup table — round-trip on a sine is unity (±0.3 dB) post-2026-04-30
+amplitude calibration fix. Use `Vocoder::set_tone_detection(true)`
+for half-rate consumers carrying DTMF/Knox/single-tone content.
+Phase 1 IMBE has no equivalent fast path; tones over Phase 1 will
+always exhibit the random-phase RMS drop.
 
 Reproducing the DVSI-parity measurement:
 

@@ -59,6 +59,14 @@ pub struct ClassicalConfig {
     /// frame whose previous-frame disposition was `Repeat` or `Mute`.
     /// Set to 0 to disable.
     pub boundary_fade_samples: usize,
+
+    /// Constant output gain in dB applied after all other stages.
+    /// Defaults to `0.0` (no gain change). Use to bring spec-faithful
+    /// output up to consumer-style "loud" presentation levels —
+    /// SDRTrunk and similar tools layer ~8-10 dB of post-decode gain
+    /// (project memory `sdrtrunk_scale_decoy_2026-04-19`); set this
+    /// to e.g. `+9.0` to match. Saturates at i16 clip.
+    pub output_gain_db: f32,
 }
 
 impl Default for ClassicalConfig {
@@ -86,6 +94,7 @@ impl Default for ClassicalConfig {
             ],
             compressor: None,
             boundary_fade_samples: 40, // 5 ms at 8 kHz
+            output_gain_db: 0.0,
         }
     }
 }
@@ -239,6 +248,14 @@ pub fn apply(
         (0.0, 0.0, 0.0, 1.0, 1.0)
     };
 
+    // Final-stage output gain (linear). Skipping the powf when zero
+    // dB keeps the default-config no-op path branchless.
+    let output_gain_lin = if cfg.output_gain_db != 0.0 {
+        10f32.powf(cfg.output_gain_db / 20.0)
+    } else {
+        1.0
+    };
+
     for (i, sample) in pcm.iter_mut().enumerate() {
         let mut x = (*sample as f32) / 32_768.0;
 
@@ -273,6 +290,9 @@ pub fn apply(
             x *= w;
             state.pending_fade -= 1;
         }
+
+        // Final-stage output gain.
+        x *= output_gain_lin;
 
         // Saturating cast back to i16.
         let y = (x * 32_768.0).clamp(-32_768.0, 32_767.0);
@@ -325,6 +345,7 @@ mod tests {
             biquads: [Some(Biquad::high_pass(8_000.0, 250.0, 0.707)), None],
             compressor: None,
             boundary_fade_samples: 0,
+            output_gain_db: 0.0,
         };
         apply(
             &EnhancementMode::Classical(cfg),
@@ -339,6 +360,40 @@ mod tests {
     }
 
     #[test]
+    fn output_gain_db_doubles_amplitude_at_plus_6db() {
+        let original: Vec<i16> = (0..160)
+            .map(|i| ((i as f32 * 0.1).sin() * 5000.0) as i16)
+            .collect();
+        let mut pcm = original.clone();
+        let cfg = ClassicalConfig {
+            biquads: [None, None],
+            compressor: None,
+            boundary_fade_samples: 0,
+            output_gain_db: 6.0,
+        };
+        let mut state = EnhancementState::default();
+        apply(
+            &EnhancementMode::Classical(cfg),
+            &mut state,
+            &mut pcm,
+            8_000.0,
+            true,
+        );
+        // +6 dB ≈ ×1.995 in linear amplitude. Per-sample ratio should
+        // hover near 2.0 (within rounding); ignore zero-input samples.
+        for (i, (&out, &inp)) in pcm.iter().zip(original.iter()).enumerate() {
+            if inp.abs() < 100 {
+                continue;
+            }
+            let ratio = out as f32 / inp as f32;
+            assert!(
+                (ratio - 2.0).abs() < 0.05,
+                "sample {i}: expected ratio ~2.0, got {ratio}"
+            );
+        }
+    }
+
+    #[test]
     fn fade_starts_after_mute() {
         let mut pcm = vec![20_000i16; 160];
         let mut state = EnhancementState::default();
@@ -346,6 +401,7 @@ mod tests {
             biquads: [None, None],
             compressor: None,
             boundary_fade_samples: 40,
+            output_gain_db: 0.0,
         };
         apply(
             &EnhancementMode::Classical(cfg),
