@@ -1251,7 +1251,7 @@ fn synthesize_frame_with_mode(
         // noise that's perceptually closer to JMBE's recovery output and
         // PESQ-scores materially higher on chip-encoded P25 traffic.
         let l = 30u8;
-        let mut voiced = [false; L_MAX as usize];
+        let voiced = [false; L_MAX as usize];
         let mut m_tilde = [0f32; L_MAX as usize];
         for i in 0..l as usize {
             // voiced[i] stays false — JMBE-style all-unvoiced default.

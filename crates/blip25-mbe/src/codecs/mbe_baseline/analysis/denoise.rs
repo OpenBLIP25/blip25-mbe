@@ -124,7 +124,11 @@ enum SuppressionMode {
     Boll,
     /// Wiener gain `G = ξ̂ / (1 + ξ̂)` with decision-directed
     /// a-priori SNR `ξ̂`. Smoother gain curve than Boll; less
-    /// musical noise on residual spectra.
+    /// musical noise on residual spectra. Kept in-tree as a
+    /// documented alternative to the default Boll path (see
+    /// `project_wiener_gain_null_vs_boll_2026-04-28` memory entry):
+    /// switch by changing the `SUPPRESSION_MODE` const above.
+    #[allow(dead_code)]
     Wiener,
 }
 

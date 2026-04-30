@@ -212,13 +212,12 @@ fn grid_index_to_period(i: f64) -> f64 {
 }
 
 /// Per-frame PYIN intermediates: emission distribution `prob[idx]`
-/// over `τ ∈ [τ_min, τ_max]`, the underlying `d'(τ)` curve (used for
-/// parabolic interp + e_p mapping), and the unconditional argmin of
-/// `d'` (silent-frame fallback).
+/// over `τ ∈ [τ_min, τ_max]` and the underlying `d'(τ)` curve (used
+/// for parabolic interp + e_p mapping). The silent-frame argmin
+/// fallback is consumed inside the construction loop and not stored.
 struct PyinFrame {
     prob: [f64; PYIN_GRID_LEN],
     d_prime: Vec<f64>,
-    argmin_idx: usize,
 }
 
 /// Compute the per-frame PYIN intermediates for an audio buffer of at
@@ -270,7 +269,7 @@ fn pyin_frame(x: &[f64]) -> PyinFrame {
         prob[idx] += weights[k];
     }
 
-    PyinFrame { prob, d_prime, argmin_idx: argmin_idx }
+    PyinFrame { prob, d_prime }
 }
 
 /// Convert a chosen grid index `best` (with parabolic refinement) into

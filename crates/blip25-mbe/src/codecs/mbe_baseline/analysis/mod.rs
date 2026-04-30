@@ -689,20 +689,6 @@ impl AnalysisState {
         &self.lookahead
     }
 
-    fn extract_pitch_window(&self, frame_slot: usize) -> [f64; PITCH_INPUT_LEN] {
-        let center = frame_slot * SAMPLES_PER_FRAME as usize
-            + (SAMPLES_PER_FRAME as usize) / 2;
-        let mut out = [0.0f64; PITCH_INPUT_LEN];
-        for i in 0..PITCH_INPUT_LEN {
-            let offset = i as i32 - PITCH_INPUT_HALF;
-            let buf_idx = center as i32 + offset;
-            if (0..LOOKAHEAD_LEN as i32).contains(&buf_idx) {
-                out[i] = self.lookahead[buf_idx as usize];
-            }
-        }
-        out
-    }
-
     /// Extract a 221-sample window centered on the current analyzable
     /// frame for §0.2 `signal_spectrum`.
     fn extract_refinement_window(&self) -> [f64; (2 * W_R_HALF + 1) as usize] {
