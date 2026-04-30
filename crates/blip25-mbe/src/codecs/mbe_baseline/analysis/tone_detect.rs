@@ -393,4 +393,56 @@ mod tests {
         }
         assert!(detect_dtmf(&pcm).is_none());
     }
+
+    /// Knox tone-pairs occupy Annex T IDs 144–159 (see analysis memo
+    /// `reference_tone_frames_phase1_vs_phase2_2026-04-30.md`). For each
+    /// in-range Knox ID, synthesize the matching `(l1·f0, l2·f0)` pair
+    /// and verify `detect_dtmf` returns that exact ID. Validates the
+    /// matcher against the full Knox sub-table at once — a regression
+    /// here would mean a mis-classification shipping into the
+    /// tone-frame dispatch path on real Knox traffic.
+    #[test]
+    fn detect_dtmf_round_trips_each_knox_id() {
+        // Skip IDs whose harmonic ratio places `l_lo·f0` below ~150 Hz
+        // (the lower edge of the Annex T frequency space) — those have
+        // a very low primary peak that gets close to DC and risks
+        // colliding with the DC-skip rule in `compute_psd`. None of
+        // the Knox IDs hit this in practice, but the guard makes the
+        // test robust against future table additions.
+        for knox_id in 144u8..=159 {
+            let entry = ANNEX_T[knox_id as usize].expect("Knox ID has Annex T row");
+            assert_ne!(entry.l1, entry.l2, "Knox IDs are pairs, l1 != l2");
+            let f0 = f64::from(entry.f0);
+            let f_lo = f0 * f64::from(entry.l1.min(entry.l2));
+            let f_hi = f0 * f64::from(entry.l1.max(entry.l2));
+            // Skip if either tone falls outside the FFT-resolvable band.
+            if f_lo < 150.0 || f_hi > 3500.0 {
+                continue;
+            }
+            let pcm = dtmf_pair(f_lo, f_hi, 6000);
+            let det = detect_dtmf(&pcm)
+                .unwrap_or_else(|| panic!("Knox ID {knox_id} should detect"));
+            assert_eq!(
+                det.id, knox_id,
+                "Knox ID {knox_id} (f_lo={f_lo:.1} Hz, f_hi={f_hi:.1} Hz) misdetected as {}",
+                det.id
+            );
+        }
+    }
+
+    /// `detect_tone` (the dispatch entry point) must route each Knox
+    /// pair through the DTMF matcher rather than falling through to
+    /// `detect_single_tone` (which would pick whichever single-tone
+    /// row sits closest to the louder peak).
+    #[test]
+    fn detect_tone_routes_knox_pairs_through_dtmf_matcher() {
+        // Spot-check id=145 (Knox A+B 603.6/1056.2 Hz — the actual
+        // pair in DVSI's knox_1.pcm test vector).
+        let entry = ANNEX_T[145].unwrap();
+        let f_lo = f64::from(entry.f0) * f64::from(entry.l1.min(entry.l2));
+        let f_hi = f64::from(entry.f0) * f64::from(entry.l1.max(entry.l2));
+        let pcm = dtmf_pair(f_lo, f_hi, 6000);
+        let det = detect_tone(&pcm).expect("Knox pair detect");
+        assert_eq!(det.id, 145);
+    }
 }

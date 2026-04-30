@@ -1016,13 +1016,21 @@ fn our_encode_ambe_plus2(
         let n_frames = pcm.len() / FRAME_SAMPLES;
         let mut out = Vec::with_capacity(n_frames * HALF_BYTES_PER_FEC_FRAME);
         let mut tone_count: u32 = 0;
+        let mut id_hist: std::collections::BTreeMap<u8, u32> = std::collections::BTreeMap::new();
+        let mut amp_sum: u64 = 0;
+        let mut amp_min: u8 = 127;
+        let mut amp_max: u8 = 0;
         for f in 0..n_frames {
             let frame = &pcm[f * FRAME_SAMPLES..(f + 1) * FRAME_SAMPLES];
             let bits = v.encode_pcm(frame)
                 .map_err(|e| anyhow!("vocoder encode error at frame {f}: {e:?}"))?;
             if let Some(stats) = v.last_stats().analysis.as_ref() {
-                if matches!(stats.output, AnalysisOutputKind::Tone { .. }) {
+                if let AnalysisOutputKind::Tone { id, amplitude } = stats.output {
                     tone_count += 1;
+                    *id_hist.entry(id).or_insert(0) += 1;
+                    amp_sum += u64::from(amplitude);
+                    amp_min = amp_min.min(amplitude);
+                    amp_max = amp_max.max(amplitude);
                 }
             }
             out.extend_from_slice(&bits);
@@ -1030,6 +1038,17 @@ fn our_encode_ambe_plus2(
         eprintln!(
             "tone-frame dispatch: {tone_count}/{n_frames} frames emitted as tone frames"
         );
+        if tone_count > 0 {
+            let summary: Vec<String> = id_hist
+                .iter()
+                .map(|(id, count)| format!("id={id}:{count}"))
+                .collect();
+            let amp_mean = amp_sum as f64 / tone_count as f64;
+            eprintln!("  tone-id histogram: {}", summary.join(" "));
+            eprintln!(
+                "  tone A_D: mean={amp_mean:.1} min={amp_min} max={amp_max} (range 0..127)"
+            );
+        }
         return Ok(out);
     }
 
