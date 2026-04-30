@@ -106,17 +106,33 @@ fn interpolate_peak_hz(psd: &[f64], k: usize) -> f64 {
     }
 }
 
-/// Calibration: i16 sine amp 8000 (≈ −12 dBFS) → empirically produces
-/// FFT peak ≈ 320 000 (Hann-windowed, 256-DFT). The decoder's
-/// `tone_to_mbe_params` accepts any 0..127 amplitude; this maps our
-/// peak magnitude to a mid-range A_D so the synthesizer outputs a
-/// reasonable-volume tone.
-const REF_PEAK_MAG: f64 = 320_000.0;
+/// Reference FFT magnitude for `A_D = 127`. Empirically calibrated so
+/// the round-trip (PCM in → tone-frame encode → decode → PCM out)
+/// preserves amplitude: an input sine at the level Annex T's "full
+/// scale" tone (`M̃_l = 16384`, the maximum representable A_D=127
+/// amplitude) maps to A_D = 127, and quieter input maps to lower A_D
+/// per the slope below.
+///
+/// The synth applies γ_w (146.64) plus its own per-band scaling on
+/// top of M̃_l, so the calibration constant is 9.3 dB above the
+/// "spec-literal" value of 640 000 (which would assume M̃_l=16384 ⇔
+/// i16 amplitude 16384). Confirmed empirically with a 4-amplitude
+/// sine round-trip probe — see commit message.
+const REF_PEAK_MAG: f64 = 1_830_000.0;
 
-/// Convert a peak magnitude to the 7-bit `A_D` field.
+/// dB per A_D step matching Annex T Eq. 209 exactly:
+/// `M̃_l = 16384 · 10^{0.03555·(A_D − 127)}` →
+/// `20·log10(10^0.03555) = 0.711 dB/step`. Using anything else creates
+/// a slope mismatch between the encoder's amplitude estimator and the
+/// decoder's amplitude reconstruction (e.g., 0.5 dB/step would
+/// expand round-trip error by 6 dB per 12 A_D steps).
+const DB_PER_AD_STEP: f64 = 0.7115;
+
+/// Convert a peak magnitude to the 7-bit `A_D` field. Inverse of Eq.
+/// 209: `A_D = 127 + 20·log10(mag / REF_PEAK_MAG) / DB_PER_AD_STEP`.
 fn magnitude_to_amplitude(mag: f64) -> u8 {
     let amp_db = 20.0 * (mag / REF_PEAK_MAG).log10();
-    (100.0 + amp_db / 0.5).round().clamp(0.0, 127.0) as u8
+    (127.0 + amp_db / DB_PER_AD_STEP).round().clamp(0.0, 127.0) as u8
 }
 
 /// Detect a single-frequency Annex T tone in `pcm`. Returns the
