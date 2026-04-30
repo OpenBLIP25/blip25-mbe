@@ -69,11 +69,18 @@ From cmpp25.txt + USB-3000 manual Table 8:
 """
 import argparse
 import math
+import os
 import struct
 import sys
 import time
 
 import serial
+
+# Set DVSI_DEBUG=1 in the env to log per-frame timing + parity audit
+# from read_response. Useful when rerunning on the chip after changing
+# the framing logic — confirms the new code reads exactly one packet's
+# worth of bytes per frame instead of stalling on a phantom byte read.
+DEBUG = bool(int(os.environ.get("DVSI_DEBUG", "0") or "0"))
 
 # ----------------------------------------------------------------------------
 # Protocol constants
@@ -127,23 +134,77 @@ def pack_packet(pkt_type, fields):
     return bytes([PKT_HEADER]) + body + bytes([parity(body)])
 
 def read_response(s, timeout_s=2.0):
-    """Read one complete response packet from the chip. Returns (type, body) or None."""
+    """Read one complete response packet from the chip. Returns (type, body) or None.
+
+    Wire layout (per `pack_packet`, mirror of the chip's response):
+
+        [HEADER 0x61] [LEN_HI] [LEN_LO] [TYPE] [...fields...] [MARKER 0x2F] [PARITY]
+
+    where `length = 1 (type) + len(fields) + 1 (marker)` — the length
+    field counts type, fields, and marker but **not** the trailing
+    parity byte. Total wire bytes per packet = 4 + length + 1.
+
+    After consuming the 4-byte header (which already includes `type`),
+    the remaining bytes on the wire are exactly `length - 1` field
+    bytes plus 1 marker plus 1 parity byte. Returned `body` is just
+    the field bytes — marker + parity are consumed and discarded.
+    """
     s.timeout = timeout_s
+    t0 = time.monotonic() if DEBUG else 0.0
     hdr = s.read(4)
     if len(hdr) < 4:
+        if DEBUG:
+            sys.stderr.write(
+                f"[dvsi] read_response: header timeout ({len(hdr)}/4 bytes in {time.monotonic()-t0:.2f}s)\n"
+            )
         return None
     if hdr[0] != PKT_HEADER:
+        if DEBUG:
+            sys.stderr.write(
+                f"[dvsi] read_response: bad header byte 0x{hdr[0]:02x} (expected 0x{PKT_HEADER:02x}); framing desync\n"
+            )
         return None
     plen = (hdr[1] << 8) | hdr[2]
     pkt_type = hdr[3]
+    # `length` covers type + fields + marker, so len(fields) = plen - 2.
+    # We've already consumed the type byte via the header read; remaining
+    # field bytes = plen - 2. Then 2 trailing bytes (marker + parity)
+    # complete the wire packet.
+    fields_len = plen - 2
+    if fields_len < 0:
+        return None
     body = b''
-    while len(body) < plen:
-        chunk = s.read(plen - len(body))
+    while len(body) < fields_len:
+        chunk = s.read(fields_len - len(body))
         if not chunk:
+            if DEBUG:
+                sys.stderr.write(
+                    f"[dvsi] read_response: body timeout ({len(body)}/{fields_len} bytes)\n"
+                )
             return None
         body += chunk
-    # Discard the trailing parity byte
-    s.read(1)
+    tail = s.read(2)  # PKT_PARITYBYTE marker + parity
+    if len(tail) < 2:
+        if DEBUG:
+            sys.stderr.write(
+                f"[dvsi] read_response: tail timeout ({len(tail)}/2 bytes)\n"
+            )
+        return None
+    if DEBUG:
+        # Parity audit: the trailing byte is XOR of all bytes between
+        # header and parity-byte (i.e. len_hi, len_lo, type, fields,
+        # marker). A mismatch points at framing or transmission corruption.
+        expected = 0
+        for byte in hdr[1:]:
+            expected ^= byte
+        for byte in body:
+            expected ^= byte
+        expected ^= tail[0]
+        ok = "OK" if expected == tail[1] else f"BAD (got 0x{tail[1]:02x}, expected 0x{expected:02x})"
+        elapsed = time.monotonic() - t0
+        sys.stderr.write(
+            f"[dvsi] read_response: type=0x{pkt_type:02x} fields={fields_len}B parity={ok} took {elapsed:.3f}s\n"
+        )
     return (pkt_type, body)
 
 def make_channel_packet(frame_bytes, n_bits=144, channel=0):

@@ -11,6 +11,10 @@
 # Listening-test drop zone (A/B PCM files, user-side only)
 /audition/
 
+# Python (mock-serial driver tests)
+__pycache__/
+*.pyc
+
 # Editor / OS
 .vscode/
 .idea/
