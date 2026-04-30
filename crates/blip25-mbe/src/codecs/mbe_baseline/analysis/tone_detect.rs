@@ -166,14 +166,19 @@ pub fn detect_single_tone(pcm: &[i16]) -> Option<ToneDetection> {
     }
     let f_hz = interpolate_peak_hz(&psd, peak_k);
 
-    // Match against single-frequency Annex T rows (l1 == l2 == 1).
+    // Match against single-tone Annex T rows (l1 == l2). The audible tone
+    // is at `l1·f0`; rows with l1>1 cover frequencies above the l=1 band's
+    // 156-375 Hz range (e.g. l1=l2=3 with f0≈343.76 ⇒ 1031 Hz, the
+    // Motorola standard tone test pattern). Multi-tone rows (l1!=l2)
+    // belong to detect_dtmf.
     let mut best: Option<(usize, f64)> = None;
     for (id, entry) in ANNEX_T.iter().enumerate() {
         let Some(t) = entry else { continue };
-        if t.l1 != t.l2 || t.l1 != 1 {
+        if t.l1 != t.l2 {
             continue;
         }
-        let diff = (f_hz - f64::from(t.f0)).abs();
+        let expected_hz = f64::from(t.l1) * f64::from(t.f0);
+        let diff = (f_hz - expected_hz).abs();
         if diff < MATCH_TOLERANCE_HZ
             && best.map_or(true, |(_, prev)| diff < prev)
         {
@@ -355,6 +360,26 @@ mod tests {
         let pcm = pure_sine(316.0, 8000);
         let det = detect_single_tone(&pcm).expect("near-match should detect");
         assert_eq!(det.id, 10);
+    }
+
+    #[test]
+    fn detects_standard_motorola_test_tone_at_l3_harmonic() {
+        // Motorola's Standard Tone Test Pattern is 1031.25 Hz IMBE-encoded.
+        // Annex T has a row at l1=l2=3, f0≈343.76 Hz where the audible tone
+        // is 3·f0 ≈ 1031.28 Hz — the natural target for half-rate Annex T
+        // dispatch on this conformance signal. Regression for the pre-fix
+        // bug where detect_single_tone restricted matches to l1=1 entries
+        // and silently dropped this whole class of tones.
+        let pcm = pure_sine(1031.25, 8000);
+        let det = detect_single_tone(&pcm).expect("1031 Hz tone should match an l=3 row");
+        let entry = ANNEX_T[det.id as usize].expect("matched id has Annex T entry");
+        assert_eq!(entry.l1, entry.l2, "single-tone row");
+        assert_eq!(entry.l1, 3, "1031 Hz is in the l=3 band of Annex T");
+        let expected_hz = f64::from(entry.l1) * f64::from(entry.f0);
+        assert!(
+            (expected_hz - 1031.25).abs() < f64::from(MATCH_TOLERANCE_HZ as f32),
+            "l·f0 ({expected_hz:.2}) should be within tolerance of 1031.25"
+        );
     }
 
     #[test]
