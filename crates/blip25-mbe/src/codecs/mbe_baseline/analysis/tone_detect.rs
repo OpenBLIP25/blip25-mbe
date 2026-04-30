@@ -107,19 +107,22 @@ fn interpolate_peak_hz(psd: &[f64], k: usize) -> f64 {
     }
 }
 
-/// Reference FFT magnitude for `A_D = 127`. Empirically calibrated so
-/// the round-trip (PCM in → tone-frame encode → decode → PCM out)
-/// preserves amplitude: an input sine at the level Annex T's "full
-/// scale" tone (`M̃_l = 16384`, the maximum representable A_D=127
-/// amplitude) maps to A_D = 127, and quieter input maps to lower A_D
-/// per the slope below.
+/// Reference FFT magnitude for `A_D = 127` — set so a full-scale sine
+/// (PCM peak 32767) round-trips at unity. Derivation:
 ///
-/// The synth applies γ_w (146.64) plus its own per-band scaling on
-/// top of M̃_l, so the calibration constant is 9.3 dB above the
-/// "spec-literal" value of 640 000 (which would assume M̃_l=16384 ⇔
-/// i16 amplitude 16384). Confirmed empirically with a 4-amplitude
-/// sine round-trip probe — see commit message.
-const REF_PEAK_MAG: f64 = 1_830_000.0;
+/// For an exact-bin sine of PCM peak `A` through a Hann window of
+/// length `N=160` (`Σw[n] = N/2 = 80`), the peak FFT magnitude is
+/// `A · Σw / 2 = A · 40`. Full-scale `A = 32767` ⇒ peak ≈ 1 310 680.
+///
+/// On the synth side, voiced harmonics add `2·M̃_l` to the time-domain
+/// output (`scale = 2.0 * m_curr_l` in the UvV branch); tone frames are
+/// all-voiced so `γ_w` does not enter the path. Setting
+/// `REF_PEAK_MAG = 1_310_000` makes the encoder emit `A_D = 127` exactly
+/// at full-scale input, where `M̃_l = 16384` and the synth output peak
+/// reaches `2·16384 = 32768` (i16 saturation). Across 24 dB the
+/// round-trip residual is within ±0.3 dB on the 32-amplitude / 4-frequency
+/// dense probe in `examples/tone_amp_audit.rs`.
+const REF_PEAK_MAG: f64 = 1_310_000.0;
 
 /// dB per A_D step matching Annex T Eq. 209 exactly:
 /// `M̃_l = 16384 · 10^{0.03555·(A_D − 127)}` →
