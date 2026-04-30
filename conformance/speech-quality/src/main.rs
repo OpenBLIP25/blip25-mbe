@@ -53,8 +53,7 @@ use blip25_mbe::ambe_plus2_wire::dequantize::{
     decode_to_params as decode_to_params_half, quantize as quantize_half,
 };
 use blip25_mbe::ambe_plus2_wire::frame::{
-    DIBITS_PER_FRAME as HALF_DIBITS_PER_FRAME,
-    decode_frame as decode_half_frame, encode_frame as encode_half_frame,
+    DIBITS_PER_FRAME as HALF_DIBITS_PER_FRAME, encode_frame as encode_half_frame,
 };
 
 const FRAME_SAMPLES: usize = 160;
@@ -200,6 +199,27 @@ enum Cmd {
         /// (AMBE+2 / Phase 2) pipeline.
         #[arg(long)]
         tone_detection: bool,
+        /// Post-decoder enhancement chain applied to PCM before
+        /// `our_enc_our_dec.wav` is written. Same chain used by the
+        /// full-rate `ab-matrix` subcommand. `none` (default) is
+        /// spec-faithful synthesis only; `classical` enables the
+        /// AIC33-shaped HPF + presence + compressor + boundary-fade
+        /// chain. Identical defaults across rates — the half-rate path
+        /// reuses `ClassicalConfig::default`.
+        #[arg(long, value_enum, default_value_t = EnhancementCli::None)]
+        enhancement: EnhancementCli,
+        /// Stage-isolation knobs for `--enhancement classical`. Same
+        /// semantics as the full-rate `ab-matrix` flags.
+        #[arg(long)]
+        enh_no_hpf: bool,
+        #[arg(long)]
+        enh_no_peaking: bool,
+        #[arg(long)]
+        enh_no_compressor: bool,
+        #[arg(long)]
+        enh_no_fade: bool,
+        #[arg(long)]
+        enh_hpf_cutoff: Option<f32>,
     },
     /// Decode a stream of post-FEC AMBE+2 half-rate info vectors (one
     /// frame per line, 4 space-separated hex words = û₀ û₁ û₂ û₃,
@@ -413,6 +433,12 @@ fn main() -> Result<()> {
             pitch_silence_override,
             default_pitch_on_silence,
             tone_detection,
+            enhancement,
+            enh_no_hpf,
+            enh_no_peaking,
+            enh_no_compressor,
+            enh_no_fade,
+            enh_hpf_cutoff,
         } => cmd_ambe_plus2_ab_matrix(
             &pcm,
             &out_dir,
@@ -421,6 +447,13 @@ fn main() -> Result<()> {
             pitch_silence_override,
             default_pitch_on_silence,
             tone_detection,
+            enhancement.to_mode(EnhancementOverrides {
+                no_hpf: enh_no_hpf,
+                no_peaking: enh_no_peaking,
+                no_compressor: enh_no_compressor,
+                no_fade: enh_no_fade,
+                hpf_cutoff_hz: enh_hpf_cutoff,
+            }),
         ),
         Cmd::DecodeRawHalfrate { input, out_wav, binary } => {
             cmd_decode_raw_ambe_plus2(&input, &out_wav, binary)
@@ -908,6 +941,7 @@ fn cmd_ambe_plus2_ab_matrix(
     pitch_silence_override: bool,
     default_pitch_on_silence: bool,
     tone_detection: bool,
+    enhancement: EnhancementMode,
 ) -> Result<()> {
     fs::create_dir_all(out_dir)
         .with_context(|| format!("create out_dir {}", out_dir.display()))?;
@@ -948,7 +982,7 @@ fn cmd_ambe_plus2_ab_matrix(
         .with_context(|| format!("write our.bit {}", our_bit_path.display()))?;
 
     let t0 = Instant::now();
-    let our_pcm = our_decode_ambe_plus2(&our_bits);
+    let our_pcm = our_decode_ambe_plus2(&our_bits, &enhancement);
     let dec_secs = t0.elapsed().as_secs_f64();
     let wav_path = out_dir.join("our_enc_our_dec.wav");
     write_wav(&wav_path, &our_pcm)?;
@@ -1031,31 +1065,23 @@ fn our_encode_ambe_plus2(
     Ok(out)
 }
 
-fn our_decode_ambe_plus2(fec: &[u8]) -> Vec<i16> {
+fn our_decode_ambe_plus2(fec: &[u8], enhancement: &EnhancementMode) -> Vec<i16> {
+    // Route through the Vocoder façade so the post-decoder enhancement
+    // chain (HPF + peaking + compressor + boundary-fade + output gain)
+    // applies to half-rate output identically to the full-rate path.
+    use blip25_mbe::vocoder::{Rate, Vocoder};
     let n_frames = fec.len() / HALF_BYTES_PER_FEC_FRAME;
-    let mut decoder_state = HalfDecoderState::new();
-    let mut synth = SynthState::new();
+    let mut v = Vocoder::builder(Rate::AmbePlus2_3600x2450)
+        .enhancement(enhancement.clone())
+        .build();
     let mut out = Vec::with_capacity(n_frames * FRAME_SAMPLES);
-    let mut last_voice_params: Option<MbeParams> = None;
     for f in 0..n_frames {
         let bytes = &fec[f * HALF_BYTES_PER_FEC_FRAME..(f + 1) * HALF_BYTES_PER_FEC_FRAME];
-        let dibits = unpack_dibits_half(bytes);
-        let frame = decode_half_frame(&dibits);
-        let pcm = match decode_to_params_half(&frame.info, &mut decoder_state) {
-            Ok(HalfDecoded::Voice(p)) => {
-                last_voice_params = Some(p.clone());
-                ambe_plus2::synthesize_frame(&p, &mut synth)
-            }
-            Ok(HalfDecoded::Tone { params, .. }) => {
-                last_voice_params = Some(params.clone());
-                ambe_plus2::synthesize_tone(&params, &mut synth)
-            }
-            Ok(HalfDecoded::Erasure) => match &last_voice_params {
-                Some(p) => ambe_plus2::synthesize_frame(p, &mut synth),
-                None => [0i16; FRAME_SAMPLES],
-            },
-            Err(_) => [0i16; FRAME_SAMPLES],
-        };
+        // decode_bits handles dibit unpack + Annex H decode + dequantize
+        // + Voice/Tone/Erasure dispatch internally.
+        let pcm = v
+            .decode_bits(bytes)
+            .unwrap_or_else(|_| vec![0i16; FRAME_SAMPLES]);
         out.extend_from_slice(&pcm);
     }
     out
@@ -1476,21 +1502,6 @@ fn pack_dibits_half(dibits: &[u8; HALF_DIBITS_PER_FRAME]) -> [u8; HALF_BYTES_PER
             out[bit / 8] |= b << (7 - (bit % 8));
             bit += 1;
         }
-    }
-    out
-}
-
-fn unpack_dibits_half(bytes: &[u8]) -> [u8; HALF_DIBITS_PER_FRAME] {
-    let mut out = [0u8; HALF_DIBITS_PER_FRAME];
-    let mut bit = 0usize;
-    for slot in &mut out {
-        let mut d = 0u8;
-        for _ in 0..2 {
-            let b = (bytes[bit / 8] >> (7 - (bit % 8))) & 1;
-            d = (d << 1) | b;
-            bit += 1;
-        }
-        *slot = d;
     }
     out
 }
