@@ -33,7 +33,10 @@ use blip25_mbe::codecs::mbe_baseline::analysis::{
     AnalysisOutput, AnalysisState, encode as analysis_encode, encode_ambe_plus2 as analysis_encode_ambe_plus2,
 };
 use blip25_mbe::codecs::mbe_baseline::{
-    FrameErrorContext, GAMMA_W, SynthState, synthesize_frame,
+    FrameDisposition, FrameErrorContext, GAMMA_W, SynthState, synthesize_frame,
+};
+use blip25_mbe::enhancement::{
+    self as enh, ClassicalConfig, EnhancementMode, EnhancementState,
 };
 use blip25_mbe::mbe_params::MbeParams;
 use blip25_mbe::imbe_wire::dequantize::{
@@ -135,6 +138,34 @@ enum Cmd {
         /// Targets noisy-tone vectors. Off by default.
         #[arg(long)]
         spectral_subtraction: bool,
+        /// Post-decoder enhancement chain applied to PCM before
+        /// `our_enc_our_dec.wav` / `chip_enc_our_dec.wav` are written.
+        /// `none` (default) is spec-faithful synthesis. `classical`
+        /// enables the AIC33-shaped HPF + presence + compressor +
+        /// boundary-fade chain.
+        #[arg(long, value_enum, default_value_t = EnhancementCli::None)]
+        enhancement: EnhancementCli,
+        /// Stage-isolation knobs for `--enhancement classical`. Each
+        /// `--enh-no-*` flag disables the corresponding stage so the
+        /// individual contribution can be A/B'd. `--enh-hpf-cutoff`
+        /// overrides the default 250 Hz HPF cutoff (set lower to avoid
+        /// eating low-male-voice fundamentals).
+        #[arg(long)]
+        enh_no_hpf: bool,
+        #[arg(long)]
+        enh_no_peaking: bool,
+        #[arg(long)]
+        enh_no_compressor: bool,
+        #[arg(long)]
+        enh_no_fade: bool,
+        #[arg(long)]
+        enh_hpf_cutoff: Option<f32>,
+        /// Instrumentation: classify each decoded frame as "tone-like"
+        /// (all-voiced + stable pitch + stable envelope) vs not, and
+        /// print per-frame + summary counts on the our_enc_our_dec
+        /// path. Doesn't change synthesis or enhancement output.
+        #[arg(long)]
+        log_tone_frames: bool,
     },
     /// Self-baseline our_enc → our_dec PESQ on the half-rate (AMBE+2)
     /// path. Slim version of `ab-matrix`: no chip side, just our
@@ -275,6 +306,48 @@ enum VuvOverride {
     Invert,
 }
 
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum EnhancementCli {
+    None,
+    Classical,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct EnhancementOverrides {
+    no_hpf: bool,
+    no_peaking: bool,
+    no_compressor: bool,
+    no_fade: bool,
+    hpf_cutoff_hz: Option<f32>,
+}
+
+impl EnhancementCli {
+    fn to_mode(self, ov: EnhancementOverrides) -> EnhancementMode {
+        match self {
+            EnhancementCli::None => EnhancementMode::None,
+            EnhancementCli::Classical => {
+                let mut cfg = ClassicalConfig::default();
+                if ov.no_hpf {
+                    cfg.biquads[0] = None;
+                } else if let Some(hz) = ov.hpf_cutoff_hz {
+                    cfg.biquads[0] =
+                        Some(blip25_mbe::enhancement::Biquad::high_pass(8_000.0, hz, 0.707));
+                }
+                if ov.no_peaking {
+                    cfg.biquads[1] = None;
+                }
+                if ov.no_compressor {
+                    cfg.compressor = None;
+                }
+                if ov.no_fade {
+                    cfg.boundary_fade_samples = 0;
+                }
+                EnhancementMode::Classical(cfg)
+            }
+        }
+    }
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
     match args.command {
@@ -292,6 +365,13 @@ fn main() -> Result<()> {
             repeat_reset_after,
             pyin_pitch,
             spectral_subtraction,
+            enhancement,
+            enh_no_hpf,
+            enh_no_peaking,
+            enh_no_compressor,
+            enh_no_fade,
+            enh_hpf_cutoff,
+            log_tone_frames,
         } => cmd_ab_matrix(
             &pcm,
             &out_dir,
@@ -306,6 +386,14 @@ fn main() -> Result<()> {
             repeat_reset_after,
             pyin_pitch,
             spectral_subtraction,
+            enhancement.to_mode(EnhancementOverrides {
+                no_hpf: enh_no_hpf,
+                no_peaking: enh_no_peaking,
+                no_compressor: enh_no_compressor,
+                no_fade: enh_no_fade,
+                hpf_cutoff_hz: enh_hpf_cutoff,
+            }),
+            log_tone_frames,
         ),
         Cmd::HalfrateAbMatrix {
             pcm,
@@ -349,6 +437,8 @@ fn cmd_ab_matrix(
     repeat_reset_after: u32,
     pyin_pitch: bool,
     spectral_subtraction: bool,
+    enhancement: EnhancementMode,
+    log_tone_frames: bool,
 ) -> Result<()> {
     fs::create_dir_all(out_dir)
         .with_context(|| format!("create out_dir {}", out_dir.display()))?;
@@ -391,7 +481,7 @@ fn cmd_ab_matrix(
     );
 
     let t0 = Instant::now();
-    let our_enc_our_dec = our_decode(&our_bits, repeat_reset_after);
+    let our_enc_our_dec = our_decode(&our_bits, repeat_reset_after, &enhancement, log_tone_frames);
     let our_dec_secs = t0.elapsed().as_secs_f64();
     let wav_path = out_dir.join("our_enc_our_dec.wav");
     write_wav(&wav_path, &our_enc_our_dec)?;
@@ -457,7 +547,7 @@ fn cmd_ab_matrix(
         let chip_bits = fs::read(&local_chip_bit)?;
 
         // ---- cell 3: chip_enc + our_dec ----
-        let chip_enc_our_dec = our_decode(&chip_bits, repeat_reset_after);
+        let chip_enc_our_dec = our_decode(&chip_bits, repeat_reset_after, &enhancement, false);
         let wav_path = out_dir.join("chip_enc_our_dec.wav");
         write_wav(&wav_path, &chip_enc_our_dec)?;
         eprintln!("chip_enc_our_dec → {}", wav_path.display());
@@ -616,13 +706,21 @@ fn our_encode(
 /// full-rate dequantize + synthesizer. Bad-pitch frames emit a silent
 /// 160-sample block (consistent with the `cmd_decode_pcm` behavior in
 /// the vectors harness).
-fn our_decode(fec: &[u8], repeat_reset_after: u32) -> Vec<i16> {
+fn our_decode(
+    fec: &[u8],
+    repeat_reset_after: u32,
+    enhancement: &EnhancementMode,
+    log_tone_frames: bool,
+) -> Vec<i16> {
     let n_frames = fec.len() / BYTES_PER_FEC_FRAME;
     let mut decoder_state = DecoderState::new();
     let mut synth_state = SynthState::new();
     if repeat_reset_after > 0 {
         synth_state.set_repeat_reset_after(Some(repeat_reset_after));
     }
+    let mut enh_state = EnhancementState::default();
+    let mut prev_disposition: Option<FrameDisposition> = None;
+    let mut tone_gate = ToneGate::default();
     let mut out = Vec::with_capacity(n_frames * FRAME_SAMPLES);
     for f in 0..n_frames {
         let bytes = &fec[f * BYTES_PER_FEC_FRAME..(f + 1) * BYTES_PER_FEC_FRAME];
@@ -633,6 +731,10 @@ fn our_decode(fec: &[u8], repeat_reset_after: u32) -> Vec<i16> {
             Ok(p) => p,
             Err(_) => {
                 out.extend(std::iter::repeat(0i16).take(FRAME_SAMPLES));
+                prev_disposition = None;
+                if log_tone_frames {
+                    tone_gate.observe_erasure(f);
+                }
                 continue;
             }
         };
@@ -642,10 +744,144 @@ fn our_decode(fec: &[u8], repeat_reset_after: u32) -> Vec<i16> {
             epsilon_t: imbe.error_total().min(255) as u8,
             bad_pitch: false,
         };
-        let pcm = synthesize_frame(&params, &err, GAMMA_W, &mut synth_state);
+        let mut pcm = synthesize_frame(&params, &err, GAMMA_W, &mut synth_state).to_vec();
+        if log_tone_frames {
+            tone_gate.observe(f, &params, &pcm);
+        }
+        let prev_was_use = matches!(prev_disposition, Some(FrameDisposition::Use));
+        enh::apply(enhancement, &mut enh_state, &mut pcm, SAMPLE_RATE as f32, prev_was_use);
+        prev_disposition = synth_state.last_disposition();
         out.extend_from_slice(&pcm);
     }
+    if log_tone_frames {
+        tone_gate.summary();
+    }
     out
+}
+
+/// Rolling tone-likeness classifier.
+///
+/// **Original design** required `all bands voiced` — but the prototype
+/// run on `knox_1` (the canonical "noisy tone" vector) showed 0 of 125
+/// frames had all bands voiced: the per-band V/UV decision marks noise
+/// bands as unvoiced *because of the noise floor*, even on a sustained
+/// tone. We drop that condition; the real noisy-tone signature is
+/// stable pitch + stable envelope alone. Voiced fraction is logged as
+/// instrumentation but doesn't gate.
+///
+/// A frame is "tone-like" iff:
+///   1. |Δ pitch| from prior frame ≤ 20 cents, AND
+///   2. last 4 frames all satisfied (1), AND
+///   3. envelope (frame RMS dB) σ across that 4-frame window < 0.5 dB.
+const TONE_GATE_WINDOW: usize = 4;
+const TONE_GATE_CENTS_TOL: f32 = 20.0;
+const TONE_GATE_RMS_SIGMA_DB: f32 = 0.5;
+
+#[derive(Default)]
+struct ToneGate {
+    last_omega_0: Option<f32>,
+    consec_stable: usize,
+    rms_db_window: std::collections::VecDeque<f32>,
+    total_frames: u32,
+    tone_frames: u32,
+    max_streak: u32,
+    cur_streak: u32,
+}
+
+impl ToneGate {
+    fn observe(&mut self, frame_idx: usize, params: &MbeParams, pcm: &[i16]) {
+        self.total_frames += 1;
+
+        let l = params.harmonic_count() as usize;
+        let voiced = params.voiced_slice();
+        let all_voiced = l > 0 && voiced.iter().take(l).all(|&v| v);
+
+        let omega_0 = params.omega_0();
+        let pitch_stable = match self.last_omega_0 {
+            Some(prev) if prev > 0.0 && omega_0 > 0.0 => {
+                let cents = 1200.0 * (omega_0 / prev).log2();
+                cents.abs() <= TONE_GATE_CENTS_TOL
+            }
+            _ => false,
+        };
+        self.last_omega_0 = Some(omega_0);
+
+        let rms_db = frame_rms_db(pcm);
+        if self.rms_db_window.len() == TONE_GATE_WINDOW {
+            self.rms_db_window.pop_front();
+        }
+        self.rms_db_window.push_back(rms_db);
+
+        if pitch_stable {
+            self.consec_stable += 1;
+        } else {
+            self.consec_stable = 0;
+        }
+
+        let env_stable = self.rms_db_window.len() == TONE_GATE_WINDOW
+            && rms_sigma(&self.rms_db_window) < TONE_GATE_RMS_SIGMA_DB;
+
+        let is_tone = self.consec_stable >= TONE_GATE_WINDOW && env_stable;
+        if is_tone {
+            self.tone_frames += 1;
+            self.cur_streak += 1;
+            if self.cur_streak > self.max_streak {
+                self.max_streak = self.cur_streak;
+            }
+        } else {
+            self.cur_streak = 0;
+        }
+
+        eprintln!(
+            "tone-gate frame={frame_idx:4} L={l:2} all_voiced={all_voiced} \
+             omega_0={omega_0:.4} pitch_stable={pitch_stable} rms_db={rms_db:6.2} \
+             tone={is_tone}"
+        );
+    }
+
+    fn observe_erasure(&mut self, frame_idx: usize) {
+        self.total_frames += 1;
+        self.consec_stable = 0;
+        self.cur_streak = 0;
+        self.last_omega_0 = None;
+        self.rms_db_window.clear();
+        eprintln!("tone-gate frame={frame_idx:4} ERASURE");
+    }
+
+    fn summary(&self) {
+        let pct = if self.total_frames > 0 {
+            100.0 * self.tone_frames as f32 / self.total_frames as f32
+        } else {
+            0.0
+        };
+        eprintln!(
+            "tone-gate SUMMARY: tone_frames={}/{} ({:.1}%) max_streak={}",
+            self.tone_frames, self.total_frames, pct, self.max_streak
+        );
+    }
+}
+
+fn frame_rms_db(pcm: &[i16]) -> f32 {
+    if pcm.is_empty() {
+        return -120.0;
+    }
+    let sumsq: f64 = pcm.iter().map(|&s| (s as f64) * (s as f64)).sum();
+    let rms = (sumsq / pcm.len() as f64).sqrt() / 32_768.0;
+    if rms > 1e-12 {
+        20.0 * (rms as f32).log10()
+    } else {
+        -120.0
+    }
+}
+
+fn rms_sigma(window: &std::collections::VecDeque<f32>) -> f32 {
+    let n = window.len() as f32;
+    if n < 2.0 {
+        return 0.0;
+    }
+    let mean = window.iter().sum::<f32>() / n;
+    let var = window.iter().map(|&x| (x - mean).powi(2)).sum::<f32>() / n;
+    var.sqrt()
 }
 
 // ----------------------------------------------------------------------------
