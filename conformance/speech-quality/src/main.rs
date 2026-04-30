@@ -190,6 +190,16 @@ enum Cmd {
         /// Enable the onset-attack mitigation. See AbMatrix doc.
         #[arg(long)]
         default_pitch_on_silence: bool,
+        /// Enable Annex T tone-frame dispatch on the encoder. When the
+        /// detector recognises a single-tone / DTMF / Knox / call-progress
+        /// input, the encoder bypasses the voice pipeline and emits a
+        /// tone-frame opcode instead. Decoder-side reconstruction is
+        /// deterministic from the Annex T table — no random-phase
+        /// harmonic synthesis. Off by default. Phase 1 IMBE has no
+        /// equivalent path; this flag only affects the half-rate
+        /// (AMBE+2 / Phase 2) pipeline.
+        #[arg(long)]
+        tone_detection: bool,
     },
     /// Decode a stream of post-FEC AMBE+2 half-rate info vectors (one
     /// frame per line, 4 space-separated hex words = û₀ û₁ û₂ û₃,
@@ -402,6 +412,7 @@ fn main() -> Result<()> {
             silence_dispatch,
             pitch_silence_override,
             default_pitch_on_silence,
+            tone_detection,
         } => cmd_ambe_plus2_ab_matrix(
             &pcm,
             &out_dir,
@@ -409,6 +420,7 @@ fn main() -> Result<()> {
             silence_dispatch,
             pitch_silence_override,
             default_pitch_on_silence,
+            tone_detection,
         ),
         Cmd::DecodeRawHalfrate { input, out_wav, binary } => {
             cmd_decode_raw_ambe_plus2(&input, &out_wav, binary)
@@ -895,6 +907,7 @@ fn cmd_ambe_plus2_ab_matrix(
     silence_dispatch: bool,
     pitch_silence_override: bool,
     default_pitch_on_silence: bool,
+    tone_detection: bool,
 ) -> Result<()> {
     fs::create_dir_all(out_dir)
         .with_context(|| format!("create out_dir {}", out_dir.display()))?;
@@ -920,6 +933,7 @@ fn cmd_ambe_plus2_ab_matrix(
         silence_dispatch,
         pitch_silence_override,
         default_pitch_on_silence,
+        tone_detection,
     )?;
     let enc_secs = t0.elapsed().as_secs_f64();
     eprintln!(
@@ -952,7 +966,39 @@ fn our_encode_ambe_plus2(
     silence_dispatch: bool,
     pitch_silence_override: bool,
     default_pitch_on_silence: bool,
+    tone_detection: bool,
 ) -> Result<Vec<u8>> {
+    if tone_detection {
+        // Use the Vocoder façade — the tone-frame dispatch lives in
+        // `ambe_plus2_pipeline::encode` (vocoder.rs) and isn't exposed
+        // by the lower-level `analysis_encode_ambe_plus2` path.
+        use blip25_mbe::vocoder::{AnalysisOutputKind, Rate, Vocoder};
+        let mut v = Vocoder::builder(Rate::AmbePlus2_3600x2450)
+            .silence_dispatch(silence_dispatch)
+            .pitch_silence_override(pitch_silence_override)
+            .default_pitch_on_silence(default_pitch_on_silence)
+            .tone_detection(true)
+            .build();
+        let n_frames = pcm.len() / FRAME_SAMPLES;
+        let mut out = Vec::with_capacity(n_frames * HALF_BYTES_PER_FEC_FRAME);
+        let mut tone_count: u32 = 0;
+        for f in 0..n_frames {
+            let frame = &pcm[f * FRAME_SAMPLES..(f + 1) * FRAME_SAMPLES];
+            let bits = v.encode_pcm(frame)
+                .map_err(|e| anyhow!("vocoder encode error at frame {f}: {e:?}"))?;
+            if let Some(stats) = v.last_stats().analysis.as_ref() {
+                if matches!(stats.output, AnalysisOutputKind::Tone { .. }) {
+                    tone_count += 1;
+                }
+            }
+            out.extend_from_slice(&bits);
+        }
+        eprintln!(
+            "tone-frame dispatch: {tone_count}/{n_frames} frames emitted as tone frames"
+        );
+        return Ok(out);
+    }
+
     let n_frames = pcm.len() / FRAME_SAMPLES;
     let mut state = AnalysisState::new();
     if silence_dispatch {
