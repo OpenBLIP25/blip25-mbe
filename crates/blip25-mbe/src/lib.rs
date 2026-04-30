@@ -82,4 +82,5 @@ pub mod dvsi_3000;
 
 pub mod rate_conversion;
 
+pub mod enhancement;
 pub mod vocoder;

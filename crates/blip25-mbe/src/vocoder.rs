@@ -55,9 +55,13 @@ use crate::codecs::mbe_baseline::analysis::{
 use crate::codecs::mbe_baseline::{
     FrameDisposition, FrameErrorContext, GAMMA_W, SynthState, synthesize_frame,
 };
+use crate::enhancement::{self, EnhancementMode, EnhancementState};
 use crate::mbe_params::MbeParams;
 use crate::imbe_wire;
 use crate::ambe_plus2_wire;
+
+/// 8 kHz mono — the only sample rate the vocoder produces.
+const SAMPLE_RATE_HZ: f32 = 8_000.0;
 
 /// Number of i16 PCM samples per 20 ms frame at 8 kHz. Constant across
 /// every supported rate.
@@ -292,6 +296,9 @@ pub struct Vocoder {
     last_stats: FrameStats,
     tone_detection: bool,
     ambe_plus2_synth: AmbePlus2Synth,
+    enhancement: EnhancementMode,
+    enhancement_state: EnhancementState,
+    prev_disposition: Option<FrameDisposition>,
 }
 
 impl Vocoder {
@@ -306,6 +313,9 @@ impl Vocoder {
             last_stats: FrameStats::default(),
             tone_detection: false,
             ambe_plus2_synth: AmbePlus2Synth::AmbePlus,
+            enhancement: EnhancementMode::default(),
+            enhancement_state: EnhancementState::default(),
+            prev_disposition: None,
         }
     }
 
@@ -466,6 +476,27 @@ impl Vocoder {
         self.analysis.spectral_subtraction_enabled()
     }
 
+    /// Configure the post-decoder enhancement chain. Off by default
+    /// ([`EnhancementMode::None`] — spec-faithful PCM). When set to
+    /// [`EnhancementMode::Classical`], decoded PCM passes through a
+    /// biquad cascade + soft-knee compressor + boundary-fade chain
+    /// before [`Self::decode_bits`] returns. See
+    /// [`crate::enhancement`] for stage details and AIC33 mapping.
+    ///
+    /// Resets the chain's runtime filter state (delay lines, envelope,
+    /// pending fade) so the new mode starts clean. Persistent: stays
+    /// configured across [`Self::reset`].
+    pub fn set_enhancement(&mut self, mode: EnhancementMode) {
+        self.enhancement = mode;
+        self.enhancement_state = EnhancementState::default();
+    }
+
+    /// Currently configured enhancement mode.
+    #[inline]
+    pub fn enhancement(&self) -> &EnhancementMode {
+        &self.enhancement
+    }
+
     /// Start a fluent builder for this rate. Equivalent to
     /// `VocoderBuilder::new(rate)`.
     #[inline]
@@ -522,7 +553,9 @@ impl Vocoder {
         self.ambe_plus2_dec = ambe_plus2_wire::dequantize::DecoderState::new();
         self.synth = SynthState::new();
         self.last_stats = FrameStats::default();
-        // tone_detection: preserved (config, not state)
+        self.enhancement_state = EnhancementState::default();
+        self.prev_disposition = None;
+        // tone_detection / enhancement: preserved (config, not state)
     }
 
     /// Encode one PCM frame into FEC-encoded bytes.
@@ -557,12 +590,21 @@ impl Vocoder {
                 got: bits.len(),
             });
         }
-        let (pcm, stats) = match self.rate {
+        let (mut pcm, stats) = match self.rate {
             Rate::Imbe7200x4400 => imbe_pipeline::decode(bits, self, true),
             Rate::Imbe4400x4400 => imbe_pipeline::decode(bits, self, false),
             Rate::AmbePlus2_3600x2450 => ambe_plus2_pipeline::decode(bits, self, true),
             Rate::AmbePlus2_2450x2450 => ambe_plus2_pipeline::decode(bits, self, false),
         };
+        let prev_was_use = matches!(self.prev_disposition, Some(FrameDisposition::Use));
+        enhancement::apply(
+            &self.enhancement,
+            &mut self.enhancement_state,
+            &mut pcm,
+            SAMPLE_RATE_HZ,
+            prev_was_use,
+        );
+        self.prev_disposition = stats.disposition;
         self.last_stats.decode = Some(stats);
         Ok(pcm)
     }
@@ -673,7 +715,17 @@ impl Vocoder {
             },
         };
         self.synth.err = prev_err;
-        pcm.to_vec()
+        let mut pcm = pcm.to_vec();
+        let prev_was_use = matches!(self.prev_disposition, Some(FrameDisposition::Use));
+        enhancement::apply(
+            &self.enhancement,
+            &mut self.enhancement_state,
+            &mut pcm,
+            SAMPLE_RATE_HZ,
+            prev_was_use,
+        );
+        self.prev_disposition = self.synth.last_disposition();
+        pcm
     }
 
     /// Decode an arbitrary-length FEC byte slice as a stream of PCM
@@ -1155,6 +1207,7 @@ pub struct VocoderBuilder {
     pyin_pitch: bool,
     spectral_subtraction: bool,
     ambe_plus2_synth: AmbePlus2Synth,
+    enhancement: EnhancementMode,
 }
 
 impl VocoderBuilder {
@@ -1172,6 +1225,7 @@ impl VocoderBuilder {
             pyin_pitch: false,
             spectral_subtraction: false,
             ambe_plus2_synth: AmbePlus2Synth::AmbePlus,
+            enhancement: EnhancementMode::None,
         }
     }
 
@@ -1249,6 +1303,14 @@ impl VocoderBuilder {
         self
     }
 
+    /// Configure the post-decoder enhancement chain.
+    /// See [`Vocoder::set_enhancement`].
+    #[inline]
+    pub fn enhancement(mut self, mode: EnhancementMode) -> Self {
+        self.enhancement = mode;
+        self
+    }
+
     /// Materialize the [`Vocoder`].
     pub fn build(self) -> Vocoder {
         let mut v = Vocoder::new(self.rate);
@@ -1261,6 +1323,7 @@ impl VocoderBuilder {
         v.set_pyin_pitch(self.pyin_pitch);
         v.set_spectral_subtraction(self.spectral_subtraction);
         v.set_ambe_plus2_synth(self.ambe_plus2_synth);
+        v.set_enhancement(self.enhancement);
         v
     }
 }
