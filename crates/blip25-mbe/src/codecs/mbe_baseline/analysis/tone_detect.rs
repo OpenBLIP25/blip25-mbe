@@ -31,6 +31,7 @@ use crate::ambe_plus2_wire::frame::ANNEX_T;
 
 /// What the tone detector returns on a hit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ToneDetection {
     /// Annex T tone ID (`I_D`) for the matched tone.
     pub id: u8,

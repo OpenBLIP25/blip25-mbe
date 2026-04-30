@@ -176,12 +176,22 @@ pub struct FrameStats {
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct AnalysisStats {
-    /// What the analysis encoder emitted (`Voice` / `Silence`).
+    /// What the analysis encoder emitted (`Voice` / `Silence` / `Tone`).
     pub output: AnalysisOutputKind,
     /// The MBE parameters that were quantized into the wire bits.
     /// Populated for both `Voice` and `Silence` (silence dispatches
     /// the rate-appropriate placeholder).
     pub params: MbeParams,
+    /// Tone-detection signal for the input frame, populated whenever
+    /// [`Vocoder::set_tone_detection`] is enabled and the detector
+    /// matched an Annex T entry. Decoupled from `output` because Phase
+    /// 1 IMBE has no tone-frame opcode (per BABA-A): on full-rate the
+    /// detector still surfaces `(I_D, A_D)` here for application-layer
+    /// signaling (LCW, paging, dispatch) while the wire frame remains
+    /// a regular voice / silence frame. On half-rate AMBE+2 a positive
+    /// detection is *also* dispatched as an Annex T tone frame (so
+    /// `output == Tone` and this field both populate).
+    pub tone_detect: Option<ToneDetection>,
 }
 
 /// Discriminator-only counterpart of `AnalysisOutput` — strips the
@@ -333,19 +343,29 @@ impl Vocoder {
         self.ambe_plus2_synth
     }
 
-    /// Enable encode-side Annex T tone detection. When on (and rate
-    /// is half-rate), each PCM frame is first inspected for a clean
-    /// single-frequency tone matching an Annex T entry; on a hit the
-    /// channel emits a tone frame instead of running the voice
-    /// analysis pipeline. Default off.
+    /// Enable encode-side Annex T tone detection. Each PCM frame is
+    /// inspected for a clean single-frequency tone or DTMF / Knox
+    /// pair matching an Annex T entry; on a hit the detection result
+    /// is surfaced via [`AnalysisStats::tone_detect`]. Default off.
+    ///
+    /// Wire behavior is rate-dependent:
+    ///
+    /// - **Half-rate (AMBE+2 Phase 2):** on a hit, the channel emits
+    ///   an Annex T tone frame instead of running the voice analysis
+    ///   pipeline; [`AnalysisStats::output`] is `Tone { id, amplitude }`
+    ///   and [`AnalysisStats::tone_detect`] mirrors the same values.
+    /// - **Full-rate (IMBE Phase 1):** the wire frame remains a
+    ///   regular voice / silence frame because P25 Phase 1 has no
+    ///   tone-frame opcode at the codec layer (BABA-A; spec-author
+    ///   confirmation 2026-04-30). [`AnalysisStats::tone_detect`] is
+    ///   still populated so application-layer consumers can route
+    ///   `(I_D, A_D)` to LCW, paging, or other out-of-band signaling
+    ///   per BABA-A `§5.4`.
     ///
     /// Spec context: BABA-A `§2.10` defines the tone-frame *payload*
     /// (Annex T table + signature bits) but the spec leaves "is this
     /// a tone?" to the implementer (per `§0.0.1` of the impl spec).
     /// This is a DSP design choice, not a P25-IP question.
-    ///
-    /// No-op for full-rate (P25 Phase 1 IMBE has no tone-frame
-    /// signaling at the wire level).
     pub fn set_tone_detection(&mut self, enabled: bool) {
         self.tone_detection = enabled;
     }
@@ -1349,6 +1369,15 @@ mod imbe_pipeline {
         vocoder: &mut Vocoder,
         apply_fec: bool,
     ) -> Result<(Vec<u8>, AnalysisStats), VocoderError> {
+        // Phase 1 has no tone-frame opcode at the wire layer, but with
+        // detection enabled we still run the detector and surface the
+        // (I_D, A_D) result via AnalysisStats::tone_detect so consumers
+        // can route it to LCW / app-layer signaling per BABA-A §5.4.
+        let tone_detect = if vocoder.tone_detection {
+            detect_tone(pcm)
+        } else {
+            None
+        };
         let frame = pcm.try_into().expect("length already validated");
         let (kind, params) = match analysis_encode(frame, &mut vocoder.analysis)
             .map_err(VocoderError::Analysis)?
@@ -1373,7 +1402,7 @@ mod imbe_pipeline {
         } else {
             pack_info_full(&info).to_vec()
         };
-        Ok((bytes, AnalysisStats { output: kind, params }))
+        Ok((bytes, AnalysisStats { output: kind, params, tone_detect }))
     }
 
     pub(super) fn decode(
@@ -1496,22 +1525,29 @@ mod ambe_plus2_pipeline {
         // analysis pipeline entirely and emit an Annex T tone frame.
         // detect_tone tries DTMF (l1 != l2) first then falls through
         // to single-tone (l1 == l2 == 1).
-        if vocoder.tone_detection {
-            if let Some(ToneDetection { id, amplitude }) = detect_tone(pcm) {
-                let info = encode_tone_frame_info(id, amplitude);
-                let bytes = pack_info_or_fec(&info, apply_fec);
-                // Reconstruct the params the decoder will see, so
-                // FrameStats carries the actual audible content.
-                // tone_to_mbe_params returns Some for any valid Annex T
-                // row; for the unlikely None case (reserved id), fall
-                // back to a half-rate-friendly silence placeholder.
-                let params = tone_to_mbe_params(id, amplitude)
-                    .unwrap_or_else(MbeParams::silence_ambe_plus2);
-                return Ok((
-                    bytes,
-                    AnalysisStats { output: AnalysisOutputKind::Tone { id, amplitude }, params },
-                ));
-            }
+        let tone_detect = if vocoder.tone_detection {
+            detect_tone(pcm)
+        } else {
+            None
+        };
+        if let Some(ToneDetection { id, amplitude }) = tone_detect {
+            let info = encode_tone_frame_info(id, amplitude);
+            let bytes = pack_info_or_fec(&info, apply_fec);
+            // Reconstruct the params the decoder will see, so
+            // FrameStats carries the actual audible content.
+            // tone_to_mbe_params returns Some for any valid Annex T
+            // row; for the unlikely None case (reserved id), fall
+            // back to a half-rate-friendly silence placeholder.
+            let params = tone_to_mbe_params(id, amplitude)
+                .unwrap_or_else(MbeParams::silence_ambe_plus2);
+            return Ok((
+                bytes,
+                AnalysisStats {
+                    output: AnalysisOutputKind::Tone { id, amplitude },
+                    params,
+                    tone_detect,
+                },
+            ));
         }
 
         let frame = pcm.try_into().expect("length already validated");
@@ -1524,7 +1560,7 @@ mod ambe_plus2_pipeline {
         let info = quantize(&params, &mut vocoder.ambe_plus2_dec)
             .map_err(|e| VocoderError::Quantize(format!("{e:?}")))?;
         let bytes = pack_info_or_fec(&info, apply_fec);
-        Ok((bytes, AnalysisStats { output: kind, params }))
+        Ok((bytes, AnalysisStats { output: kind, params, tone_detect }))
     }
 
     fn pack_info_or_fec(info: &[u16; 4], apply_fec: bool) -> Vec<u8> {
@@ -2032,9 +2068,46 @@ mod tests {
             *slot = s.round() as i16;
         }
         let _ = tx.encode_pcm(&pcm).unwrap();
-        let kind = tx.last_stats().analysis.as_ref().unwrap().output;
-        assert!(matches!(kind, AnalysisOutputKind::Voice | AnalysisOutputKind::Silence));
-        assert!(!matches!(kind, AnalysisOutputKind::Tone { .. }));
+        let stats = tx.last_stats().analysis.as_ref().unwrap();
+        assert!(matches!(
+            stats.output,
+            AnalysisOutputKind::Voice | AnalysisOutputKind::Silence
+        ));
+        assert!(!matches!(stats.output, AnalysisOutputKind::Tone { .. }));
+        assert!(stats.tone_detect.is_none());
+    }
+
+    /// On full-rate IMBE, tone detection is **detection-only**: the
+    /// wire frame stays a regular voice frame (Phase 1 has no
+    /// tone-frame opcode at the codec layer per BABA-A) but the
+    /// detected `(I_D, A_D)` is surfaced via `tone_detect` so
+    /// application-layer signaling (LCW, paging) can route on it.
+    #[test]
+    fn tone_detection_on_phase1_surfaces_metadata_without_changing_wire() {
+        let mut tx = Vocoder::new(Rate::Imbe7200x4400);
+        tx.set_tone_detection(true);
+        let mut pcm = [0i16; FRAME_SAMPLES];
+        let two_pi = 2.0 * core::f64::consts::PI;
+        for (n, slot) in pcm.iter_mut().enumerate() {
+            let s = 8000.0_f64 * (two_pi * 312.5 * n as f64 / 8000.0).sin();
+            *slot = s.round() as i16;
+        }
+        let bits_with_detect = tx.encode_pcm(&pcm).unwrap();
+        let stats = tx.last_stats().analysis.as_ref().unwrap();
+        // Wire output is still voice (no Phase 1 tone-frame opcode).
+        assert!(matches!(
+            stats.output,
+            AnalysisOutputKind::Voice | AnalysisOutputKind::Silence
+        ));
+        // But the detector populated tone_detect with the matching id.
+        let det = stats.tone_detect.expect("Phase 1 detection metadata");
+        assert_eq!(det.id, 10); // Annex T id=10 → 312.5 Hz
+
+        // Bit-exact equivalence with detection off — running the
+        // detector must not perturb the analysis encoder state.
+        let mut tx_off = Vocoder::new(Rate::Imbe7200x4400);
+        let bits_no_detect = tx_off.encode_pcm(&pcm).unwrap();
+        assert_eq!(bits_with_detect, bits_no_detect);
     }
 
     /// `LiveEncoder` accepts arbitrary chunk sizes, holds residue
