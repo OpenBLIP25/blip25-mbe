@@ -496,6 +496,23 @@ impl Vocoder {
         self.analysis.spectral_subtraction_enabled()
     }
 
+    /// Set the §0.5 amplitude EMA weight `α`. `0.0` disables the
+    /// smoother (default); `(0.0, 1.0]` enables
+    /// `M̂_l(t) = α · M̂_l + (1−α) · M̂_l(t−1)` per harmonic, gated by
+    /// pitch similarity. Targets the noisy-tone amp jitter described
+    /// in `project_amp_noise_sensitivity_2026-04-24`. Outside BABA-A
+    /// clean-room scope (general-DSP magnitude smoothing).
+    pub fn set_amp_ema_alpha(&mut self, alpha: f64) {
+        self.analysis.set_amp_ema_alpha(alpha);
+    }
+
+    /// Current §0.5 amplitude EMA weight; `0.0` means the smoother is
+    /// off.
+    #[inline]
+    pub fn amp_ema_alpha(&self) -> f64 {
+        self.analysis.amp_ema_alpha()
+    }
+
     /// Configure the post-decoder enhancement chain. Off by default
     /// ([`EnhancementMode::None`] — spec-faithful PCM). When set to
     /// [`EnhancementMode::Classical`], decoded PCM passes through a
@@ -1226,6 +1243,7 @@ pub struct VocoderBuilder {
     default_pitch_on_silence: bool,
     pyin_pitch: bool,
     spectral_subtraction: bool,
+    amp_ema_alpha: f64,
     ambe_plus2_synth: AmbePlus2Synth,
     enhancement: EnhancementMode,
 }
@@ -1244,6 +1262,7 @@ impl VocoderBuilder {
             default_pitch_on_silence: false,
             pyin_pitch: false,
             spectral_subtraction: false,
+            amp_ema_alpha: 0.0,
             ambe_plus2_synth: AmbePlus2Synth::AmbePlus,
             enhancement: EnhancementMode::None,
         }
@@ -1315,6 +1334,14 @@ impl VocoderBuilder {
         self
     }
 
+    /// Configure the §0.5 amplitude EMA weight (0.0 = off; default).
+    /// See [`Vocoder::set_amp_ema_alpha`].
+    #[inline]
+    pub fn amp_ema_alpha(mut self, alpha: f64) -> Self {
+        self.amp_ema_alpha = alpha;
+        self
+    }
+
     /// Configure the half-rate synth flavor (no-op for full-rate).
     /// See [`Vocoder::set_ambe_plus2_synth`].
     #[inline]
@@ -1342,6 +1369,7 @@ impl VocoderBuilder {
         v.set_default_pitch_on_silence(self.default_pitch_on_silence);
         v.set_pyin_pitch(self.pyin_pitch);
         v.set_spectral_subtraction(self.spectral_subtraction);
+        v.set_amp_ema_alpha(self.amp_ema_alpha);
         v.set_ambe_plus2_synth(self.ambe_plus2_synth);
         v.set_enhancement(self.enhancement);
         v

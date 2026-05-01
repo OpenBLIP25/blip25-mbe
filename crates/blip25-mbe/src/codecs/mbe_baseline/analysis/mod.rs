@@ -499,6 +499,24 @@ pub struct AnalysisState {
     /// Per-bin running noise PSD estimate, updated on silent frames.
     /// Read only when `spectral_subtraction_enabled` is true.
     noise_spectrum: NoiseSpectrum,
+    /// Opt-in EMA smoothing weight on §0.5 spectral amplitudes.
+    /// `0.0` (default) disables the smoother; `(0.0, 1.0]` enables
+    /// `M̂_l(t) = α · raw + (1−α) · M̂_l(t−1)` per harmonic. Targets the
+    /// ~1 dB amp jitter on noisy stationary tones (memo
+    /// `project_amp_noise_sensitivity_2026-04-24`); reference encoder
+    /// holds ~0.1 dB σ on similar SNR. General-DSP smoothing on a
+    /// magnitude estimate, outside BABA-A clean-room scope.
+    amp_ema_alpha: f64,
+    /// Last frame's smoothed `M̂_l` (post-EMA), pitch-gated history for
+    /// the smoother. Cleared on silence dispatch and on pitch jumps.
+    prev_m_hat: amplitude::SpectralAmplitudes,
+    /// Companion to `prev_m_hat`: the harmonic count from the last
+    /// frame (zero = no usable history).
+    prev_l_hat: u8,
+    /// Companion to `prev_m_hat`: ω̂_0 from the last frame, used to
+    /// gate index-based blending — large pitch jumps dissociate
+    /// harmonic indices, so we drop history.
+    prev_omega_hat: f64,
 }
 
 /// `E(P̂_I)` threshold for the joint-signal silence override. Frames
@@ -547,6 +565,15 @@ pub const DEFAULT_PITCH_ON_SILENCE_E: f64 = 1.0;
 /// look-ahead state to produce a valid `P̂_I` (§0.9.4).
 pub const PREROLL_FRAMES: u8 = 2;
 
+/// Maximum relative ω̂_0 change for which the §0.5 amplitude EMA still
+/// blends across frames. Beyond this threshold, harmonic index `l`
+/// from frame `t−1` and frame `t` no longer track the same physical
+/// frequency, so blending would smear unrelated bins together. 25 %
+/// matches the half-octave window the §0.3 tracker uses for look-back
+/// continuity (`[0.8·P, 1.2·P]`) — within that band, `l · ω̂_0` stays
+/// approximately constant per harmonic.
+const AMP_EMA_PITCH_GATE: f64 = 0.25;
+
 impl AnalysisState {
     /// Cold-start encoder state per §0.9.2 `analysis_encoder_state_init`.
     pub const fn new() -> Self {
@@ -567,6 +594,10 @@ impl AnalysisState {
             pyin_hmm: PyinHmmState::new(),
             spectral_subtraction_enabled: false,
             noise_spectrum: NoiseSpectrum::new(),
+            amp_ema_alpha: 0.0,
+            prev_m_hat: [0.0; L_HAT_MAX as usize + 1],
+            prev_l_hat: 0,
+            prev_omega_hat: 0.0,
         }
     }
 
@@ -644,6 +675,27 @@ impl AnalysisState {
     #[inline]
     pub fn spectral_subtraction_enabled(&self) -> bool {
         self.spectral_subtraction_enabled
+    }
+
+    /// Set the §0.5 amplitude EMA weight `α`. `0.0` disables the
+    /// smoother (default); values in `(0.0, 1.0]` enable
+    /// `M̂_l(t) = α · M̂_l + (1−α) · M̂_l(t−1)`. Out-of-range or
+    /// non-finite inputs are clamped to `[0, 1]`.
+    pub fn set_amp_ema_alpha(&mut self, alpha: f64) {
+        let a = if alpha.is_finite() { alpha.clamp(0.0, 1.0) } else { 0.0 };
+        self.amp_ema_alpha = a;
+        // Drop carry-over history when the smoother is reconfigured —
+        // avoids leaking stale amplitudes from a prior session into
+        // the first post-flip frame.
+        self.prev_l_hat = 0;
+        self.prev_omega_hat = 0.0;
+    }
+
+    /// Current §0.5 amplitude EMA weight; `0.0` means the smoother is
+    /// off.
+    #[inline]
+    pub fn amp_ema_alpha(&self) -> f64 {
+        self.amp_ema_alpha
     }
 
     /// Read-only access to the silence detector state (for inspection
@@ -758,6 +810,48 @@ impl AnalysisState {
     #[inline]
     pub fn vuv(&self) -> &VuvState {
         &self.vuv
+    }
+
+    /// Apply the §0.5 amplitude EMA in-place: when the smoother is on
+    /// and the previous frame produced usable amplitudes at a similar
+    /// pitch, blend `M̂_l(t) ← α · M̂_l(t) + (1−α) · M̂_l(t−1)` for
+    /// `1 ≤ l ≤ min(L̂_t, L̂_{t−1})`. Updates the per-frame history
+    /// (post-blend value, current `L̂`, current `ω̂_0`).
+    ///
+    /// Pitch-similarity gate: `|Δω̂_0| / ω̂_0 < AMP_EMA_PITCH_GATE`.
+    /// Beyond that, harmonic indices stop tracking the same physical
+    /// frequency, so we drop history and treat the current frame as
+    /// the new reference.
+    fn apply_amp_ema(
+        &mut self,
+        m_hat: &mut amplitude::SpectralAmplitudes,
+        l_hat: u8,
+        omega_hat: f64,
+    ) {
+        let alpha = self.amp_ema_alpha;
+        if alpha > 0.0 && alpha < 1.0 && self.prev_l_hat > 0 && self.prev_omega_hat > 0.0 {
+            let rel = (omega_hat - self.prev_omega_hat).abs() / self.prev_omega_hat;
+            if rel < AMP_EMA_PITCH_GATE {
+                let overlap = u32::from(l_hat.min(self.prev_l_hat));
+                for l in 1..=overlap {
+                    let raw = m_hat[l as usize];
+                    let prev = self.prev_m_hat[l as usize];
+                    m_hat[l as usize] = alpha * raw + (1.0 - alpha) * prev;
+                }
+            }
+        }
+        // Update history with the (possibly-smoothed) current frame.
+        self.prev_m_hat = *m_hat;
+        self.prev_l_hat = l_hat;
+        self.prev_omega_hat = omega_hat;
+    }
+
+    /// Drop EMA carry-over history. Called on silence dispatch so
+    /// subsequent voice frames don't blend across a silence gap.
+    #[inline]
+    fn reset_amp_ema_history(&mut self) {
+        self.prev_l_hat = 0;
+        self.prev_omega_hat = 0.0;
     }
 
     /// Mutable predictor state — caller is the §0.6.6 matched-decoder
@@ -949,9 +1043,10 @@ pub fn encode_with_trace(
     } else {
         sw
     };
-    let m_hat = profile::time(profile::Stage::Amplitude, || {
+    let mut m_hat = profile::time(profile::Stage::Amplitude, || {
         estimate_spectral_amplitudes(&sw_for_amplitude, basis, &refinement, &vuv_result)
     });
+    state.apply_amp_ema(&mut m_hat, refinement.l_hat, refinement.omega_hat);
 
     // §0.8 silence gate. Per §13.3 prose: silence / tone / erasure
     // frames do NOT update the matched-decoder predictor state, but
@@ -996,6 +1091,7 @@ pub fn encode_with_trace(
     };
 
     if (state.silence_detection_enabled && silent) || override_silent {
+        state.reset_amp_ema_history();
         state.commit_pitch(commit_p, commit_e);
         state.advance_preroll();
         return Ok((AnalysisOutput::Silence, Some(trace)));
@@ -1149,6 +1245,7 @@ pub fn encode_ambe_plus2(
     let refinement = match refinement_result? {
         Some(r) => r,
         None => {
+            state.reset_amp_ema_history();
             state.commit_pitch(commit_p, commit_e);
             state.advance_preroll();
             return Ok(AnalysisOutput::Silence);
@@ -1162,9 +1259,10 @@ pub fn encode_ambe_plus2(
     } else {
         sw
     };
-    let m_hat = profile::time(profile::Stage::Amplitude, || {
+    let mut m_hat = profile::time(profile::Stage::Amplitude, || {
         estimate_spectral_amplitudes(&sw_for_amplitude, basis, &refinement, &vuv_result)
     });
+    state.apply_amp_ema(&mut m_hat, refinement.l_hat, refinement.omega_hat);
 
     // §0.8 silence gate — half-rate silence dispatch would emit
     // `b̂_0 ∈ [124, 125]` per §13.1 Table 14, but the addendum §0.8
@@ -1178,6 +1276,7 @@ pub fn encode_ambe_plus2(
         && e_p_hat_i >= PITCH_SILENCE_EPI_THRESH
         && frame_energy < PITCH_SILENCE_RATIO_THRESH * state.silence.noise_floor();
     if (state.silence_detection_enabled && silent) || override_silent {
+        state.reset_amp_ema_history();
         state.commit_pitch(commit_p, commit_e);
         state.advance_preroll();
         return Ok(AnalysisOutput::Silence);
@@ -1786,5 +1885,77 @@ mod tests {
         }
         s.predictor_mut().commit(&m_tilde, 16);
         assert_eq!(s.predictor().l_tilde_prev(), 16);
+    }
+
+    /// EMA disabled (`α = 0.0`, default) leaves `M̂_l` untouched.
+    #[test]
+    fn amp_ema_off_is_passthrough() {
+        let mut s = AnalysisState::new();
+        let mut m = [0.0f64; L_HAT_MAX as usize + 1];
+        m[1] = 1.0;
+        m[2] = 2.0;
+        s.apply_amp_ema(&mut m, 2, 0.1);
+        assert_eq!(m[1], 1.0);
+        assert_eq!(m[2], 2.0);
+    }
+
+    /// First EMA frame has no prior history to blend with — output
+    /// matches input regardless of `α`.
+    #[test]
+    fn amp_ema_first_frame_is_passthrough() {
+        let mut s = AnalysisState::new();
+        s.set_amp_ema_alpha(0.5);
+        let mut m = [0.0f64; L_HAT_MAX as usize + 1];
+        m[1] = 4.0;
+        s.apply_amp_ema(&mut m, 1, 0.1);
+        assert!((m[1] - 4.0).abs() < 1e-12);
+    }
+
+    /// Two-frame blend with stable pitch produces the expected
+    /// `α·raw + (1−α)·prev` linear combination.
+    #[test]
+    fn amp_ema_blends_when_pitch_stable() {
+        let mut s = AnalysisState::new();
+        s.set_amp_ema_alpha(0.5);
+        let mut frame_a = [0.0f64; L_HAT_MAX as usize + 1];
+        frame_a[1] = 10.0;
+        s.apply_amp_ema(&mut frame_a, 1, 0.10);
+        let mut frame_b = [0.0f64; L_HAT_MAX as usize + 1];
+        frame_b[1] = 20.0;
+        s.apply_amp_ema(&mut frame_b, 1, 0.10);
+        // 0.5·20 + 0.5·10 = 15.
+        assert!((frame_b[1] - 15.0).abs() < 1e-12);
+    }
+
+    /// Pitch jumps outside the similarity gate cause the EMA to drop
+    /// history; the new frame's amplitudes pass through untouched.
+    #[test]
+    fn amp_ema_resets_on_pitch_jump() {
+        let mut s = AnalysisState::new();
+        s.set_amp_ema_alpha(0.5);
+        let mut frame_a = [0.0f64; L_HAT_MAX as usize + 1];
+        frame_a[1] = 10.0;
+        s.apply_amp_ema(&mut frame_a, 1, 0.10);
+        let mut frame_b = [0.0f64; L_HAT_MAX as usize + 1];
+        frame_b[1] = 20.0;
+        // 100 % pitch increase — well past the 25 % gate.
+        s.apply_amp_ema(&mut frame_b, 1, 0.20);
+        assert!((frame_b[1] - 20.0).abs() < 1e-12);
+    }
+
+    /// Silence dispatch clears the EMA history so the next voice
+    /// frame doesn't blend across a silence gap.
+    #[test]
+    fn amp_ema_history_cleared_by_reset() {
+        let mut s = AnalysisState::new();
+        s.set_amp_ema_alpha(0.5);
+        let mut frame_a = [0.0f64; L_HAT_MAX as usize + 1];
+        frame_a[1] = 10.0;
+        s.apply_amp_ema(&mut frame_a, 1, 0.10);
+        s.reset_amp_ema_history();
+        let mut frame_b = [0.0f64; L_HAT_MAX as usize + 1];
+        frame_b[1] = 20.0;
+        s.apply_amp_ema(&mut frame_b, 1, 0.10);
+        assert!((frame_b[1] - 20.0).abs() < 1e-12);
     }
 }

@@ -137,6 +137,13 @@ enum Cmd {
         /// Targets noisy-tone vectors. Off by default.
         #[arg(long)]
         spectral_subtraction: bool,
+        /// EMA weight on §0.5 spectral amplitudes. `0.0` (default) =
+        /// off; `(0.0, 1.0]` enables `M̂_l(t) = α·M̂_l + (1−α)·M̂_l(t−1)`,
+        /// pitch-gated. Targets the noisy-tone amp-jitter described in
+        /// `project_amp_noise_sensitivity_2026-04-24`. General-DSP
+        /// magnitude smoothing, outside BABA-A clean-room scope.
+        #[arg(long, default_value_t = 0.0)]
+        amp_ema_alpha: f64,
         /// Post-decoder enhancement chain applied to PCM before
         /// `our_enc_our_dec.wav` / `chip_enc_our_dec.wav` are written.
         /// `none` (default) is spec-faithful synthesis. `classical`
@@ -199,6 +206,10 @@ enum Cmd {
         /// (AMBE+2 / Phase 2) pipeline.
         #[arg(long)]
         tone_detection: bool,
+        /// EMA weight on §0.5 spectral amplitudes — see `ab-matrix`
+        /// for semantics. `0.0` (default) = off.
+        #[arg(long, default_value_t = 0.0)]
+        amp_ema_alpha: f64,
         /// Post-decoder enhancement chain applied to PCM before
         /// `our_enc_our_dec.wav` is written. Same chain used by the
         /// full-rate `ab-matrix` subcommand. `none` (default) is
@@ -395,6 +406,7 @@ fn main() -> Result<()> {
             repeat_reset_after,
             pyin_pitch,
             spectral_subtraction,
+            amp_ema_alpha,
             enhancement,
             enh_no_hpf,
             enh_no_peaking,
@@ -416,6 +428,7 @@ fn main() -> Result<()> {
             repeat_reset_after,
             pyin_pitch,
             spectral_subtraction,
+            amp_ema_alpha,
             enhancement.to_mode(EnhancementOverrides {
                 no_hpf: enh_no_hpf,
                 no_peaking: enh_no_peaking,
@@ -433,6 +446,7 @@ fn main() -> Result<()> {
             pitch_silence_override,
             default_pitch_on_silence,
             tone_detection,
+            amp_ema_alpha,
             enhancement,
             enh_no_hpf,
             enh_no_peaking,
@@ -447,6 +461,7 @@ fn main() -> Result<()> {
             pitch_silence_override,
             default_pitch_on_silence,
             tone_detection,
+            amp_ema_alpha,
             enhancement.to_mode(EnhancementOverrides {
                 no_hpf: enh_no_hpf,
                 no_peaking: enh_no_peaking,
@@ -482,6 +497,7 @@ fn cmd_ab_matrix(
     repeat_reset_after: u32,
     pyin_pitch: bool,
     spectral_subtraction: bool,
+    amp_ema_alpha: f64,
     enhancement: EnhancementMode,
     log_tone_frames: bool,
 ) -> Result<()> {
@@ -516,6 +532,7 @@ fn cmd_ab_matrix(
         vuv_override,
         pyin_pitch,
         spectral_subtraction,
+        amp_ema_alpha,
     )?;
     let our_enc_secs = t0.elapsed().as_secs_f64();
     eprintln!(
@@ -670,6 +687,7 @@ fn our_encode(
     vuv_override: VuvOverride,
     pyin_pitch: bool,
     spectral_subtraction: bool,
+    amp_ema_alpha: f64,
 ) -> Result<Vec<u8>> {
     let n_frames = pcm.len() / FRAME_SAMPLES;
     let mut state = AnalysisState::new();
@@ -690,6 +708,9 @@ fn our_encode(
         // dispatch is disabled, so the noise estimator gets primed
         // without forcing silence-dispatch on.
         state.set_spectral_subtraction(true);
+    }
+    if amp_ema_alpha > 0.0 {
+        state.set_amp_ema_alpha(amp_ema_alpha);
     }
     let mut decoder_state_for_quantize = DecoderState::new();
     let mut out = Vec::with_capacity(n_frames * BYTES_PER_FEC_FRAME);
@@ -941,6 +962,7 @@ fn cmd_ambe_plus2_ab_matrix(
     pitch_silence_override: bool,
     default_pitch_on_silence: bool,
     tone_detection: bool,
+    amp_ema_alpha: f64,
     enhancement: EnhancementMode,
 ) -> Result<()> {
     fs::create_dir_all(out_dir)
@@ -968,6 +990,7 @@ fn cmd_ambe_plus2_ab_matrix(
         pitch_silence_override,
         default_pitch_on_silence,
         tone_detection,
+        amp_ema_alpha,
     )?;
     let enc_secs = t0.elapsed().as_secs_f64();
     eprintln!(
@@ -1001,6 +1024,7 @@ fn our_encode_ambe_plus2(
     pitch_silence_override: bool,
     default_pitch_on_silence: bool,
     tone_detection: bool,
+    amp_ema_alpha: f64,
 ) -> Result<Vec<u8>> {
     if tone_detection {
         // Use the Vocoder façade — the tone-frame dispatch lives in
@@ -1012,6 +1036,7 @@ fn our_encode_ambe_plus2(
             .pitch_silence_override(pitch_silence_override)
             .default_pitch_on_silence(default_pitch_on_silence)
             .tone_detection(true)
+            .amp_ema_alpha(amp_ema_alpha)
             .build();
         let n_frames = pcm.len() / FRAME_SAMPLES;
         let mut out = Vec::with_capacity(n_frames * HALF_BYTES_PER_FEC_FRAME);
@@ -1062,6 +1087,9 @@ fn our_encode_ambe_plus2(
     }
     if default_pitch_on_silence {
         state.set_default_pitch_on_silence(true);
+    }
+    if amp_ema_alpha > 0.0 {
+        state.set_amp_ema_alpha(amp_ema_alpha);
     }
     let mut decoder_state = HalfDecoderState::new();
     let mut out = Vec::with_capacity(n_frames * HALF_BYTES_PER_FEC_FRAME);

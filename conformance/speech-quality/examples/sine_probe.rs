@@ -24,7 +24,7 @@ fn read_pcm(path: &str) -> Vec<i16> {
 fn main() {
     let args: Vec<_> = env::args().collect();
     if args.len() < 2 {
-        eprintln!("usage: sine_probe <in.pcm> [--dump-harmonics N]");
+        eprintln!("usage: sine_probe <in.pcm> [--dump-harmonics N] [--amp-ema-alpha A]");
         std::process::exit(2);
     }
     let path = &args[1];
@@ -33,12 +33,24 @@ fn main() {
         .position(|a| a == "--dump-harmonics")
         .and_then(|i| args.get(i + 1))
         .and_then(|s| s.parse().ok());
+    let amp_ema_alpha: f64 = args
+        .iter()
+        .position(|a| a == "--amp-ema-alpha")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.0);
 
     let pcm = read_pcm(path);
     let n_frames = pcm.len() / FRAME_SAMPLES;
-    eprintln!("input: {} ({} frames × {} samples)", path, n_frames, FRAME_SAMPLES);
+    eprintln!(
+        "input: {} ({} frames × {} samples), amp_ema_alpha = {amp_ema_alpha}",
+        path, n_frames, FRAME_SAMPLES
+    );
 
     let mut state = AnalysisState::new();
+    if amp_ema_alpha > 0.0 {
+        state.set_amp_ema_alpha(amp_ema_alpha);
+    }
 
     // Header.
     let mut hdr = format!("{:>5}  {:>9}  {:>3} {:>3}  {:>8}  {:>8}  {:>8}  {:>8}",
