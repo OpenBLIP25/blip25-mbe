@@ -517,6 +517,15 @@ pub struct AnalysisState {
     /// gate index-based blending — large pitch jumps dissociate
     /// harmonic indices, so we drop history.
     prev_omega_hat: f64,
+    /// Companion to `prev_m_hat`: per-band V/UV bits from the last
+    /// frame. The EMA only blends harmonic `l` when band
+    /// `⌈l/3⌉`'s bit matches between frames — Eq. 43 (voiced) and
+    /// Eq. 44 (unvoiced) produce differently-scaled `M̂_l`, so
+    /// blending across a V/UV flip would mix incommensurate values.
+    prev_vuv_bits: [u8; (vuv::K_HAT_MAX + 1) as usize],
+    /// Companion to `prev_m_hat`: K̂ from the last frame, used to
+    /// bound the per-band V/UV match check.
+    prev_k_hat: u8,
 }
 
 /// `E(P̂_I)` threshold for the joint-signal silence override. Frames
@@ -598,6 +607,8 @@ impl AnalysisState {
             prev_m_hat: [0.0; L_HAT_MAX as usize + 1],
             prev_l_hat: 0,
             prev_omega_hat: 0.0,
+            prev_vuv_bits: [0; (vuv::K_HAT_MAX + 1) as usize],
+            prev_k_hat: 0,
         }
     }
 
@@ -816,24 +827,44 @@ impl AnalysisState {
     /// and the previous frame produced usable amplitudes at a similar
     /// pitch, blend `M̂_l(t) ← α · M̂_l(t) + (1−α) · M̂_l(t−1)` for
     /// `1 ≤ l ≤ min(L̂_t, L̂_{t−1})`. Updates the per-frame history
-    /// (post-blend value, current `L̂`, current `ω̂_0`).
+    /// (post-blend value, current `L̂`, current `ω̂_0`,
+    /// current per-band V/UV bits).
     ///
-    /// Pitch-similarity gate: `|Δω̂_0| / ω̂_0 < AMP_EMA_PITCH_GATE`.
-    /// Beyond that, harmonic indices stop tracking the same physical
-    /// frequency, so we drop history and treat the current frame as
-    /// the new reference.
+    /// Two gates:
+    /// * Pitch similarity: `|Δω̂_0| / ω̂_0 < AMP_EMA_PITCH_GATE`. Beyond
+    ///   that, harmonic indices stop tracking the same physical
+    ///   frequency, so we drop history and treat the current frame as
+    ///   the new reference.
+    /// * Per-band V/UV match: harmonic `l`'s band `⌈l/3⌉` must have
+    ///   the same V/UV bit in both frames. Eq. 43 (voiced) and Eq. 44
+    ///   (unvoiced) produce differently-normalized `M̂_l`; blending
+    ///   across a flip would mix incommensurate values. Speech-only
+    ///   case: vowel-onset / fricative boundaries shift V/UV bits,
+    ///   so this gate auto-suppresses blending precisely where
+    ///   formant motion would otherwise smear.
     fn apply_amp_ema(
         &mut self,
         m_hat: &mut amplitude::SpectralAmplitudes,
         l_hat: u8,
         omega_hat: f64,
+        vuv: &VuvResult,
     ) {
         let alpha = self.amp_ema_alpha;
         if alpha > 0.0 && alpha < 1.0 && self.prev_l_hat > 0 && self.prev_omega_hat > 0.0 {
             let rel = (omega_hat - self.prev_omega_hat).abs() / self.prev_omega_hat;
             if rel < AMP_EMA_PITCH_GATE {
                 let overlap = u32::from(l_hat.min(self.prev_l_hat));
+                let k_hat = vuv.k_hat;
+                let prev_k_hat = self.prev_k_hat;
                 for l in 1..=overlap {
+                    let k_now = amplitude::band_for_harmonic(l, k_hat);
+                    let k_prev = amplitude::band_for_harmonic(l, prev_k_hat);
+                    if k_now == 0 || k_prev == 0 {
+                        continue;
+                    }
+                    if vuv.vuv[k_now as usize] != self.prev_vuv_bits[k_prev as usize] {
+                        continue;
+                    }
                     let raw = m_hat[l as usize];
                     let prev = self.prev_m_hat[l as usize];
                     m_hat[l as usize] = alpha * raw + (1.0 - alpha) * prev;
@@ -844,6 +875,8 @@ impl AnalysisState {
         self.prev_m_hat = *m_hat;
         self.prev_l_hat = l_hat;
         self.prev_omega_hat = omega_hat;
+        self.prev_vuv_bits = vuv.vuv;
+        self.prev_k_hat = vuv.k_hat;
     }
 
     /// Drop EMA carry-over history. Called on silence dispatch so
@@ -852,6 +885,7 @@ impl AnalysisState {
     fn reset_amp_ema_history(&mut self) {
         self.prev_l_hat = 0;
         self.prev_omega_hat = 0.0;
+        self.prev_k_hat = 0;
     }
 
     /// Mutable predictor state — caller is the §0.6.6 matched-decoder
@@ -1046,7 +1080,7 @@ pub fn encode_with_trace(
     let mut m_hat = profile::time(profile::Stage::Amplitude, || {
         estimate_spectral_amplitudes(&sw_for_amplitude, basis, &refinement, &vuv_result)
     });
-    state.apply_amp_ema(&mut m_hat, refinement.l_hat, refinement.omega_hat);
+    state.apply_amp_ema(&mut m_hat, refinement.l_hat, refinement.omega_hat, &vuv_result);
 
     // §0.8 silence gate. Per §13.3 prose: silence / tone / erasure
     // frames do NOT update the matched-decoder predictor state, but
@@ -1262,7 +1296,7 @@ pub fn encode_ambe_plus2(
     let mut m_hat = profile::time(profile::Stage::Amplitude, || {
         estimate_spectral_amplitudes(&sw_for_amplitude, basis, &refinement, &vuv_result)
     });
-    state.apply_amp_ema(&mut m_hat, refinement.l_hat, refinement.omega_hat);
+    state.apply_amp_ema(&mut m_hat, refinement.l_hat, refinement.omega_hat, &vuv_result);
 
     // §0.8 silence gate — half-rate silence dispatch would emit
     // `b̂_0 ∈ [124, 125]` per §13.1 Table 14, but the addendum §0.8
@@ -1887,6 +1921,36 @@ mod tests {
         assert_eq!(s.predictor().l_tilde_prev(), 16);
     }
 
+    /// Helper: build a `VuvResult` with all bands voiced.
+    fn vuv_voiced(k_hat: u8) -> VuvResult {
+        let mut bits = [0u8; (K_HAT_MAX + 1) as usize];
+        for k in 1..=k_hat {
+            bits[k as usize] = 1;
+        }
+        VuvResult {
+            k_hat,
+            vuv: bits,
+            d_k: [0.0; (K_HAT_MAX + 1) as usize],
+            theta_k: [0.0; (K_HAT_MAX + 1) as usize],
+            m_xi: 0.0,
+            xi_0: 0.0,
+            xi_max_after: XI_MAX_FLOOR,
+        }
+    }
+
+    /// Helper: build a `VuvResult` with all bands unvoiced.
+    fn vuv_unvoiced(k_hat: u8) -> VuvResult {
+        VuvResult {
+            k_hat,
+            vuv: [0u8; (K_HAT_MAX + 1) as usize],
+            d_k: [1.0; (K_HAT_MAX + 1) as usize],
+            theta_k: [0.0; (K_HAT_MAX + 1) as usize],
+            m_xi: 0.0,
+            xi_0: 0.0,
+            xi_max_after: XI_MAX_FLOOR,
+        }
+    }
+
     /// EMA disabled (`α = 0.0`, default) leaves `M̂_l` untouched.
     #[test]
     fn amp_ema_off_is_passthrough() {
@@ -1894,7 +1958,8 @@ mod tests {
         let mut m = [0.0f64; L_HAT_MAX as usize + 1];
         m[1] = 1.0;
         m[2] = 2.0;
-        s.apply_amp_ema(&mut m, 2, 0.1);
+        let v = vuv_voiced(1);
+        s.apply_amp_ema(&mut m, 2, 0.1, &v);
         assert_eq!(m[1], 1.0);
         assert_eq!(m[2], 2.0);
     }
@@ -1907,22 +1972,24 @@ mod tests {
         s.set_amp_ema_alpha(0.5);
         let mut m = [0.0f64; L_HAT_MAX as usize + 1];
         m[1] = 4.0;
-        s.apply_amp_ema(&mut m, 1, 0.1);
+        let v = vuv_voiced(1);
+        s.apply_amp_ema(&mut m, 1, 0.1, &v);
         assert!((m[1] - 4.0).abs() < 1e-12);
     }
 
-    /// Two-frame blend with stable pitch produces the expected
-    /// `α·raw + (1−α)·prev` linear combination.
+    /// Two-frame blend with stable pitch + matching V/UV produces
+    /// the expected `α·raw + (1−α)·prev` linear combination.
     #[test]
-    fn amp_ema_blends_when_pitch_stable() {
+    fn amp_ema_blends_when_pitch_and_vuv_stable() {
         let mut s = AnalysisState::new();
         s.set_amp_ema_alpha(0.5);
+        let v = vuv_voiced(1);
         let mut frame_a = [0.0f64; L_HAT_MAX as usize + 1];
         frame_a[1] = 10.0;
-        s.apply_amp_ema(&mut frame_a, 1, 0.10);
+        s.apply_amp_ema(&mut frame_a, 1, 0.10, &v);
         let mut frame_b = [0.0f64; L_HAT_MAX as usize + 1];
         frame_b[1] = 20.0;
-        s.apply_amp_ema(&mut frame_b, 1, 0.10);
+        s.apply_amp_ema(&mut frame_b, 1, 0.10, &v);
         // 0.5·20 + 0.5·10 = 15.
         assert!((frame_b[1] - 15.0).abs() < 1e-12);
     }
@@ -1933,13 +2000,35 @@ mod tests {
     fn amp_ema_resets_on_pitch_jump() {
         let mut s = AnalysisState::new();
         s.set_amp_ema_alpha(0.5);
+        let v = vuv_voiced(1);
         let mut frame_a = [0.0f64; L_HAT_MAX as usize + 1];
         frame_a[1] = 10.0;
-        s.apply_amp_ema(&mut frame_a, 1, 0.10);
+        s.apply_amp_ema(&mut frame_a, 1, 0.10, &v);
         let mut frame_b = [0.0f64; L_HAT_MAX as usize + 1];
         frame_b[1] = 20.0;
         // 100 % pitch increase — well past the 25 % gate.
-        s.apply_amp_ema(&mut frame_b, 1, 0.20);
+        s.apply_amp_ema(&mut frame_b, 1, 0.20, &v);
+        assert!((frame_b[1] - 20.0).abs() < 1e-12);
+    }
+
+    /// V/UV bit flips between frames suppress the per-harmonic blend
+    /// even when pitch is stable. Eq. 43 vs Eq. 44 produce
+    /// differently-normalized M̂_l, so blending across a flip would
+    /// mix incommensurate values.
+    #[test]
+    fn amp_ema_skips_blend_on_vuv_flip() {
+        let mut s = AnalysisState::new();
+        s.set_amp_ema_alpha(0.5);
+        let voiced = vuv_voiced(1);
+        let unvoiced = vuv_unvoiced(1);
+        let mut frame_a = [0.0f64; L_HAT_MAX as usize + 1];
+        frame_a[1] = 10.0;
+        s.apply_amp_ema(&mut frame_a, 1, 0.10, &voiced);
+        let mut frame_b = [0.0f64; L_HAT_MAX as usize + 1];
+        frame_b[1] = 20.0;
+        // Same pitch, but band 1's V/UV bit flipped voiced → unvoiced.
+        s.apply_amp_ema(&mut frame_b, 1, 0.10, &unvoiced);
+        // Blend is skipped for harmonic 1 — output passes through.
         assert!((frame_b[1] - 20.0).abs() < 1e-12);
     }
 
@@ -1949,13 +2038,14 @@ mod tests {
     fn amp_ema_history_cleared_by_reset() {
         let mut s = AnalysisState::new();
         s.set_amp_ema_alpha(0.5);
+        let v = vuv_voiced(1);
         let mut frame_a = [0.0f64; L_HAT_MAX as usize + 1];
         frame_a[1] = 10.0;
-        s.apply_amp_ema(&mut frame_a, 1, 0.10);
+        s.apply_amp_ema(&mut frame_a, 1, 0.10, &v);
         s.reset_amp_ema_history();
         let mut frame_b = [0.0f64; L_HAT_MAX as usize + 1];
         frame_b[1] = 20.0;
-        s.apply_amp_ema(&mut frame_b, 1, 0.10);
+        s.apply_amp_ema(&mut frame_b, 1, 0.10, &v);
         assert!((frame_b[1] - 20.0).abs() < 1e-12);
     }
 }
