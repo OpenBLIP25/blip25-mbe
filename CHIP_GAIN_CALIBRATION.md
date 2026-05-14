@@ -23,6 +23,74 @@ cp31 — all within ±6.7% of DVSI). We are at parity with DVSI chip output.
 Fitting `γ_w` to SDRTrunk would push it to ≈1200, well past the spec
 bound of 146.64 from §1.12.1, and would break BABA-A conformance.
 
+## Half-rate AMBE+2 (P25 Phase 2) — same conclusion (2026-05-13)
+
+A symmetric measurement on **half-rate** (AMBE+2 / P25 Phase 2 TDMA)
+against the live AMBE-3000R chip running rate-table index 33
+(`PKT_RATET 33`, the half-rate path) extended this finding to the
+second codec path. Six field-collected Phase 2 calls were decoded through
+both the chip and our codec from the same `.ambe9` byte streams:
+
+| Source | Full-file RMS | Peak | Per-frame chip/ours ratio (median) |
+|--------|--------------:|-----:|------------------------------------:|
+| Chip   |        506.6  | 5545 |                              0.99× |
+| Ours   |        511.1  | 6409 |                              1.00× |
+| JMBE   |       3479.4  |31128 |                              6.87× |
+
+Chip ≈ Ours at 0.99× (within −0.08 dB). **JMBE renders the half-rate
+path 16.7 dB louder than the actual DVSI chip emits.** That extra gain
+comes from JMBE's `DifferentialGain.java` per-bin `mAdjustment` table
+(+1.0 .. +1.55 log₂ offset added at gain decode), which the JMBE
+maintainer's own comment describes as "adjustment to increase gain
+level of generated audio that more closely matches output gain of
+hardware generated audio." The actual hardware does *not* emit at JMBE's
+levels — JMBE's calibration overshoots.
+
+The same SDRTrunk decision applies: half-rate consumers wanting
+JMBE-equivalent loudness should layer a constant gain in the rendering
+pipeline (the `BLIP25_VOICE_GAIN_DB=+9` consumer default brings us
+partway; +17 dB would match JMBE on average), **not** modify
+`compute_m_tilde` or `decode_gain` in `ambe_plus2_wire/dequantize.rs`.
+
+Gap report `~/blip25-specs/gap_reports/0024_*.md` documents the JMBE
+adjustment table as a JMBE-side UX choice, not chip-emulation.
+
+### PCM round-trip sanity check on `tv-rc/r33/clean.bit`
+
+A PCM-in / PCM-out round-trip must preserve loudness (within codec
+quantization loss). Decoding the DVSI-supplied half-rate test vector
+`Research/DVSI Vectors/tv-rc/r33/clean.bit` (3700 chip-encoded
+9-byte frames produced from `tv-rc/clean.pcm`) through each path:
+
+| Source                            | RMS    | Peak   | vs input PCM |
+|-----------------------------------|-------:|-------:|-------------:|
+| Input PCM (`tv-rc/clean.pcm`)     | 1291.6 | 22 266 |    +0.00 dB  |
+| DVSI r33 reference output (oracle)| 1283.9 | 19 005 |    −0.05 dB  |
+| Live chip decode (AMBE-3000R)     | 1283.9 | 19 005 |    −0.05 dB  |
+| **Ours (native, no enhancement)** |**1261.1**|**20 816**|**−0.21 dB** |
+| JMBE 1.0.9 decode                 | 5114.7 | 31 128 |   **+11.95 dB** |
+
+Live chip ≡ DVSI oracle (byte-identical, both at −0.05 dB vs input).
+Ours sits 0.16 dB quieter than the chip — within codec quantization
+loss and exactly consistent with the per-call measurements above.
+JMBE outputs 4× the input PCM amplitude, which is structurally
+impossible for a conformant decode of a recorded-then-encoded signal.
+(The +17 dB measured on the field calls is larger than +11.95 dB
+here because JMBE's internal `0.95 × Short.MAX_VALUE` clipper truncates
+the loud transients on this longer test file; the field-call analysis
+captured the pre-clip ratio.)
+
+Repro:
+
+```
+cp '/mnt/share/P25-IQ-Samples/Research/DVSI Vectors/tv-rc/r33/clean.bit' /tmp/tv.bit
+cargo run --release --bin conformance-speech-quality -- \
+    decode-fec-halfrate --binary --input /tmp/tv.bit --out-wav /tmp/tv_ours.wav
+java -cp "$JMBE_CP:conformance/scripts" \
+    JMBEDecodeAMBE /tmp/tv.bit /tmp/tv_jmbe.wav
+ssh root@192.168.1.6 'dvsi decode-halfrate /tmp/tv.bit /tmp/tv_chip.pcm'
+```
+
 ## Reproduce
 
 ```

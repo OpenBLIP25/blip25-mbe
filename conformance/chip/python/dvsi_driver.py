@@ -117,6 +117,10 @@ FIELD_RESET      = 0x33  # hangs chip — never use
 P25_FULLRATE_FEC_RCWS   = [0x0558, 0x086B, 0x1030, 0x0000, 0x0000, 0x0190]
 P25_FULLRATE_NOFEC_RCWS = [0x0558, 0x086B, 0x0000, 0x0000, 0x0000, 0x0158]
 
+# P25 half-rate AMBE+2 rate-table indices (Columbia DVSI api.h, AMBE-3003 §11)
+P25_HALFRATE_FEC_INDEX    = 33  # 3600 / 2450 / 1150, 9 bytes = 72 bits per frame
+P25_HALFRATE_NOFEC_INDEX  = 34  # 2450 / 2450 / 0, info-only path
+
 # ----------------------------------------------------------------------------
 # Packet construction / parsing
 # ----------------------------------------------------------------------------
@@ -319,6 +323,100 @@ def set_p25_fullrate(s, with_fec=True):
     s.write(pkt); s.flush()
     return read_response(s)
 
+def set_p25_halfrate(s, with_fec=True):
+    """Configure chip for P25 half-rate AMBE+2 decode/encode via PKT_RATET.
+
+    Uses the AMBE-3000 rate-table indices (33 / 34) instead of explicit
+    rate-config words — the by-index path is simpler for half-rate and
+    matches the Columbia DVSI API documentation
+    (`AMBE-3003 ratet(channel, 33)` for FEC, 34 for no-FEC).
+
+    Channel packets after this call carry 72-bit (9-byte) FEC frames
+    when `with_fec=True`, or 49-bit (7-byte) info-only payloads when
+    `with_fec=False`. The driver's `decode_halfrate_frame` /
+    `encode_halfrate_frame` helpers default to the FEC variant.
+    """
+    idx = P25_HALFRATE_FEC_INDEX if with_fec else P25_HALFRATE_NOFEC_INDEX
+    fields = [FIELD_RATET, idx & 0xFF]
+    pkt = pack_packet(PKT_TYPE_CONTROL, fields)
+    s.write(pkt); s.flush()
+    return read_response(s)
+
+def decode_halfrate_frame(s, frame_bytes, with_fec=True):
+    """Send one P25 half-rate AMBE+2 frame, return 160 PCM samples (i16 list).
+
+    `frame_bytes` is 9 bytes (72 bits) with FEC, or 7 bytes (49 bits)
+    info-only. The chip must already be in the matching
+    `set_p25_halfrate(with_fec=...)` mode.
+    """
+    if with_fec:
+        if len(frame_bytes) != 9:
+            raise ValueError(f"expected 9 bytes, got {len(frame_bytes)}")
+        n_bits = 72
+    else:
+        if len(frame_bytes) != 7:
+            raise ValueError(f"expected 7 bytes, got {len(frame_bytes)}")
+        n_bits = 49
+    pkt = make_channel_packet(frame_bytes, n_bits=n_bits)
+    s.write(pkt); s.flush()
+    resp = read_response(s, timeout_s=2.0)
+    if resp is None:
+        return None
+    pkt_type, body = resp
+    if pkt_type != PKT_TYPE_SPEECH:
+        return None
+    return extract_pcm(body)
+
+def encode_halfrate_frame(s, pcm_160_samples, with_fec=True):
+    """Send 160 PCM samples, return half-rate frame bytes.
+
+    Chip must be in half-rate mode (set_p25_halfrate). Returns 9 bytes
+    (FEC) or 7 bytes (info-only).
+    """
+    if len(pcm_160_samples) != 160:
+        raise ValueError(f"expected 160 samples, got {len(pcm_160_samples)}")
+    expected_n_bits = 72 if with_fec else 49
+    expected_n_bytes = (expected_n_bits + 7) // 8
+    pkt = make_speech_packet(pcm_160_samples)
+    s.write(pkt); s.flush()
+    resp = read_response(s, timeout_s=2.0)
+    if resp is None:
+        return None
+    pkt_type, body = resp
+    if pkt_type != PKT_TYPE_CHANNEL:
+        return None
+    parsed = extract_channel_bits(body)
+    if parsed is None:
+        return None
+    n_bits, data = parsed
+    if n_bits != expected_n_bits or len(data) != expected_n_bytes:
+        return None
+    return data
+
+def decode_halfrate_file(s, ambe9_path, out_path, n_frames=None, with_fec=True):
+    """Decode an .ambe9 file (concatenated 9-byte AMBE+2 frames) to PCM."""
+    fb = 9 if with_fec else 7
+    with open(ambe9_path, 'rb') as f:
+        fec = f.read()
+    total = len(fec) // fb
+    if n_frames is None:
+        n_frames = total
+    n_frames = min(n_frames, total)
+    pcm_out = bytearray()
+    errors = 0
+    for f_idx in range(n_frames):
+        frame = fec[f_idx*fb:(f_idx+1)*fb]
+        samples = decode_halfrate_frame(s, frame, with_fec=with_fec)
+        if samples is None:
+            errors += 1
+            pcm_out += bytes(320)
+            continue
+        for v in samples:
+            pcm_out += struct.pack('<h', v)
+    with open(out_path, 'wb') as f:
+        f.write(pcm_out)
+    return n_frames, errors
+
 def decode_frame(s, frame_18_bytes):
     """Send one P25 full-rate FEC frame, return 160 PCM samples (i16 list)."""
     if len(frame_18_bytes) != 18:
@@ -441,6 +539,12 @@ def main():
     p_round.add_argument('--no-fec', action='store_true')
     p_round.add_argument('--bit-out', default=None, help='Optional path to also save the intermediate .bit stream')
 
+    p_hd = sub.add_parser('decode-halfrate', help='Decode a P25 half-rate AMBE+2 .ambe9 file (9-byte frames) via chip')
+    p_hd.add_argument('ambe9_path')
+    p_hd.add_argument('pcm_out')
+    p_hd.add_argument('--frames', type=int, default=None)
+    p_hd.add_argument('--no-fec', action='store_true', help='Treat input as 7-byte info-only frames')
+
     args = ap.parse_args()
     with serial.Serial(args.port, args.baud, timeout=2.0) as s:
         s.reset_input_buffer()
@@ -455,8 +559,23 @@ def main():
         if args.cmd in ('encode', 'roundtrip'):
             init_flags = INIT_ENCODER | INIT_DECODER
         init_codec(s, init_flags)
-        set_p25_fullrate(s, with_fec=not args.no_fec)
+        # Rate config: half-rate commands need PKT_RATET 33/34, all
+        # others stay on the full-rate PKT_RATEP path.
+        if args.cmd in ('decode-halfrate',):
+            set_p25_halfrate(s, with_fec=not args.no_fec)
+        else:
+            set_p25_fullrate(s, with_fec=not args.no_fec)
         time.sleep(0.1)
+
+        if args.cmd == 'decode-halfrate':
+            n, errors = decode_halfrate_file(
+                s, args.ambe9_path, args.pcm_out, args.frames,
+                with_fec=not args.no_fec,
+            )
+            print(f"decoded {n - errors}/{n} half-rate frames to {args.pcm_out}")
+            if errors:
+                print(f"errors: {errors}")
+            return
 
         if args.cmd == 'decode':
             n, errors = decode_file(s, args.bit_path, args.pcm_out, args.frames)
