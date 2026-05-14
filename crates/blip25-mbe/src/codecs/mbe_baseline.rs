@@ -161,8 +161,14 @@ pub fn enhance_spectral_amplitudes(
 pub const INIT_TAU_M: f64 = 20480.0;
 
 /// Smoothed-error-rate threshold above which the frame is muted
-/// (Eq. mute condition in §1.11.2).
+/// (full-rate IMBE §1.11.2 mute condition).
 pub const MUTE_EPSILON_R_THRESHOLD: f64 = 0.0875;
+
+/// Smoothed-error-rate threshold above which a half-rate AMBE+2 frame
+/// is muted (BABA-A §2.8.3 Eq. 199). Different from full-rate's 0.0875
+/// because the half-rate ε_R recurrence (Eq. 197, weight 0.001064)
+/// scales differently than the full-rate recurrence.
+pub const MUTE_EPSILON_R_THRESHOLD_HALFRATE: f64 = 0.096;
 
 /// Gain applied to the unvoiced LCG output when synthesizing the mute
 /// frame's comfort-noise output. §1.11.2 calls for "random
@@ -215,7 +221,7 @@ pub enum FrameDisposition {
 }
 
 /// Update the smoothed error rate `ε_R(0) = 0.95·ε_R(−1) + 0.05·(ε_T/144)`
-/// and decide the frame disposition.
+/// and decide the frame disposition (full-rate IMBE).
 ///
 /// Per §1.11.1 the repeat trigger is:
 /// `b̂₀ invalid` **OR** (`ε₀ ≥ 2` AND `ε_T ≥ 10 + 40·ε_R(0)`).
@@ -232,6 +238,39 @@ pub fn frame_disposition(
     } else if err.bad_pitch
         || (err.epsilon_0 >= 2
             && f64::from(err.epsilon_t) >= 10.0 + 40.0 * epsilon_r)
+    {
+        FrameDisposition::Repeat
+    } else {
+        FrameDisposition::Use
+    };
+    (disp, epsilon_r)
+}
+
+/// Half-rate AMBE+2 counterpart of [`frame_disposition`] per BABA-A
+/// §2.8.1–§2.8.3 (Eq. 196–199).
+///
+/// Differs from full-rate in four places:
+///
+/// - `ε_T = ε₀ + ε₁` (Eq. 196) — only the two Golay codewords contribute,
+///   not all four cosets. The caller is responsible for passing
+///   `err.epsilon_t = ε₀ + ε₁`; this function does not re-derive it.
+/// - ε_R recurrence weight is `0.001064` (Eq. 197) rather than `0.05/144`.
+///   Per §2.8.1 commentary this matches `0.05 / 47 ≈ 0.001064` scaled by
+///   the half-rate frame size.
+/// - Repeat trigger is `(ε₀ ≥ 4) OR (ε₀ ≥ 2 AND ε_T ≥ 6)` (Eq. 198-199) —
+///   constant 6 threshold, not `10 + 40·ε_R`.
+/// - Mute threshold is `ε_R(0) > 0.096` (§2.8.3) rather than 0.0875.
+pub fn frame_disposition_halfrate(
+    err: &FrameErrorContext,
+    epsilon_r_prev: f64,
+) -> (FrameDisposition, f64) {
+    // Eq. 197: ε_R(0) = 0.95·ε_R(−1) + 0.001064·ε_T (no /144 divisor).
+    let epsilon_r = 0.95 * epsilon_r_prev + 0.001064 * f64::from(err.epsilon_t);
+    let disp = if epsilon_r > MUTE_EPSILON_R_THRESHOLD_HALFRATE {
+        FrameDisposition::Mute
+    } else if err.bad_pitch
+        || err.epsilon_0 >= 4
+        || (err.epsilon_0 >= 2 && err.epsilon_t >= 6)
     {
         FrameDisposition::Repeat
     } else {
@@ -321,9 +360,69 @@ pub fn apply_smoothing(
 /// Samples per 20 ms frame at 8 kHz (`N` in §1.12).
 pub const FRAME_SAMPLES: usize = 160;
 
-/// Initial state of the white-noise LCG: `u(−105) = 3147` per
-/// BABA-A §10 Annex A.
+/// Spec-conformant initial state of the white-noise LCG (`u(−105) = 3147`
+/// per BABA-A §10 Annex A). Used when [`UnvoicedNoiseGen::SpecLcg`]
+/// is selected. The DVSI hardware does NOT use the spec generator on
+/// the half-rate (AMBE+2) path — see [`UnvoicedNoiseGen::ChipLcg`].
 pub const NOISE_INIT: u32 = 3147;
+
+/// Unvoiced noise generator selector.
+///
+/// BABA-A §1.12.1 Eq. 117 specifies the LCG
+/// `u(n+1) = (171·u(n) + 11213) mod 53125`, seed `u(−105) = 3147`. The
+/// IMBE full-rate path on the DVSI chip matches this generator.
+///
+/// On the **half-rate (AMBE+2) path** the chip uses a different LCG —
+/// `(173·u(n) + 13849) mod 65536` with an internal seed equivalent to
+/// 60 584 at our `t=0 sample 0` — verified by Probe 1 of the chip-vs-spec
+/// noise investigation (gap report `0025_chip_uses_pn_lcg_for_halfrate`).
+/// That is the recurrence BABA-A §1.5 Eq. 84-85 specifies for **FEC
+/// masking**, repurposed by DVSI for the AMBE+2 unvoiced synth.
+///
+/// Default: [`ChipLcg`] — match the de-facto industry reference. Switch
+/// to [`SpecLcg`] for BABA-A §1.12.1 spec-literal output (useful for
+/// conformance testing against the spec rather than the chip).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum UnvoicedNoiseGen {
+    /// `(171, 11213, 53125)` LCG with seed `3147`. BABA-A §1.12.1 Eq. 117.
+    /// JMBE 1.0.9 uses this. Matches chip's IMBE full-rate path.
+    SpecLcg,
+    /// `(173, 13849, 65536)` LCG with seed `60584`. Matches the DVSI
+    /// AMBE-3000R chip on the P25 half-rate path. Empirically derived
+    /// by Probe 1 (correlation 0.945 vs chip on an all-UV probe stream).
+    ChipLcg,
+}
+
+impl UnvoicedNoiseGen {
+    /// LCG params: (multiplier, addend, modulus, initial state).
+    pub const fn params(self) -> (u32, u32, u32, u32) {
+        match self {
+            UnvoicedNoiseGen::SpecLcg => (171, 11213, 53125, 3147),
+            UnvoicedNoiseGen::ChipLcg => (173, 13849, 65536, 60584),
+        }
+    }
+}
+
+/// Default LCG generator when [`UnvoicedSynthState::new`] is called
+/// without an explicit selection. Matches the DVSI chip's half-rate
+/// behaviour (Probe 1 finding). Override via env var `BLIP25_LCG=spec`
+/// for the BABA-A §1.12.1 spec-literal LCG.
+///
+/// Per-rate paths construct their state via [`UnvoicedSynthState::with_gen`]
+/// to pick the right LCG explicitly:
+///   - IMBE full-rate (Phase 1) → [`UnvoicedNoiseGen::SpecLcg`]
+///   - AMBE+2 half-rate (Phase 2) → [`UnvoicedNoiseGen::ChipLcg`]
+///
+/// The env override only affects bare `new()` calls; rate-aware paths
+/// continue to dispatch explicitly so existing test behaviour is
+/// preserved.
+fn default_lcg_gen() -> UnvoicedNoiseGen {
+    match std::env::var("BLIP25_LCG").ok().as_deref() {
+        Some("spec") | Some("Spec") => UnvoicedNoiseGen::SpecLcg,
+        _ => UnvoicedNoiseGen::ChipLcg,
+    }
+}
 
 /// Unvoiced-synthesis spectral scale `γ_w` per BABA-A §1.12.1 Eq. 121:
 ///
@@ -340,7 +439,14 @@ pub const GAMMA_W: f64 = 146.643269;
 /// Cross-frame state for the unvoiced synthesizer (§1.12.1).
 #[derive(Clone, Debug)]
 pub struct UnvoicedSynthState {
-    /// LCG state. Initial value: 3147 (= `u(−105)`).
+    /// LCG multiplier `a`, addend `c`, modulus `m` and live state. The
+    /// generator runs `lcg ← (a·lcg + c) mod m`. Default (spec LCG) is
+    /// `(171, 11213, 53125)` with seed `3147`; the chip LCG used by
+    /// the AMBE-3000R half-rate path is `(173, 13849, 65536)` with
+    /// seed `60584` — selected via [`UnvoicedSynthState::with_gen`].
+    lcg_a: u32,
+    lcg_c: u32,
+    lcg_m: u32,
     lcg: u32,
     /// Most recent 209 noise samples covering the synthesis window
     /// `wS` over `n = −104..104`.
@@ -353,33 +459,70 @@ pub struct UnvoicedSynthState {
 }
 
 impl UnvoicedSynthState {
-    /// Cold-start state per §1.13 / Annex A: empty noise window,
-    /// LCG seeded with `u(−105) = 3147`, prev IDFT all zero.
+    /// Cold-start state per §1.13 / Annex A: empty noise window, LCG
+    /// seeded per [`default_lcg_gen`] (chip generator by default, spec
+    /// when `BLIP25_LCG=spec`), prev IDFT all zero.
     pub fn new() -> Self {
+        Self::with_gen(default_lcg_gen())
+    }
+
+    /// Construct with an explicit LCG generator. Rate-aware code should
+    /// always use this (e.g. IMBE full-rate → [`UnvoicedNoiseGen::SpecLcg`],
+    /// AMBE+2 half-rate → [`UnvoicedNoiseGen::ChipLcg`]) so the env
+    /// override doesn't accidentally cross-contaminate generations.
+    pub fn with_gen(gen: UnvoicedNoiseGen) -> Self {
+        let (a, c, m, seed) = gen.params();
         Self {
-            lcg: NOISE_INIT,
+            lcg_a: a,
+            lcg_c: c,
+            lcg_m: m,
+            lcg: seed,
             noise_window: [0.0; 209],
             prev_idft: [0.0; 256],
             initialized: false,
         }
     }
 
-    /// Advance the LCG one step: `u(n+1) = (171·u(n) + 11213) mod 53125`.
+    /// Advance the LCG one step using the per-instance params:
+    /// `lcg ← (a·lcg + c) mod m`. Defaults follow [`UnvoicedNoiseGen`].
     #[inline]
     fn next_noise(&mut self) -> f64 {
-        self.lcg = (171u32
+        self.lcg = self.lcg_a
             .wrapping_mul(self.lcg)
-            .wrapping_add(11213))
-            % 53125;
+            .wrapping_add(self.lcg_c)
+            % self.lcg_m;
         f64::from(self.lcg)
     }
 
     /// Per-frame: shift the noise window forward by N=160 samples.
-    /// First call generates 209 fresh samples; subsequent calls reuse
-    /// the trailing 49 samples and generate 160 new ones.
+    ///
+    /// Frame-0 init scheme is controlled by env `BLIP25_LCG_INIT`:
+    ///   - `burn` (default): fill all 209 positions from LCG up front.
+    ///   - `zero`: start with all-zero buffer (JMBE-style; first frame
+    ///     uses no LCG samples on the synth side).
+    ///   - `burn_160` / `burn_96` / `burn_64` / `burn_49`: partial burn
+    ///     for chip-init alignment probes.
+    /// Subsequent frames always reuse the trailing 49 samples and
+    /// generate 160 new ones (this matches the geometry of our
+    /// 209-sample window).
     fn advance_window(&mut self) {
         if !self.initialized {
-            for i in 0..209 {
+            let burn = match std::env::var("BLIP25_LCG_INIT").ok().as_deref() {
+                Some("zero") | Some("Zero") => 0,
+                Some("burn_64") => 64,
+                Some("burn_96") => 96,
+                Some("burn_128") => 128,
+                Some("burn_160") => 160,
+                Some("burn_49") => 49,
+                _ => 209,
+            };
+            // Fill the latest `burn` positions of the window from LCG;
+            // earlier positions stay at their default 0.0. When burn=209
+            // (default) the whole window is fresh LCG; when burn=0 the
+            // whole window is zero (JMBE-style); intermediate values
+            // emulate a partial chip-side init.
+            let start = 209usize.saturating_sub(burn);
+            for i in start..209 {
                 self.noise_window[i] = self.next_noise();
             }
             self.initialized = true;
@@ -534,12 +677,20 @@ fn shape_spectrum(
         band_norm.push(norm);
     }
 
-    // Per-band assignment.
+    // Per-band assignment. Half-open `[a_l, b_l)` so adjacent bands
+    // tile cleanly: `b_l == a_{l+1}` by construction (Eq. 122/123),
+    // so the bin at `m = b_l` belongs to band l+1, not band l. Using
+    // an inclusive range `[a_l, b_l]` here (an earlier port) caused
+    // that shared bin to (a) get scaled by the latter band's factor
+    // but (b) not contribute to the *current* band's norm sum, which
+    // mis-balanced unvoiced energy on dense-band frames (audible on
+    // fricatives like the /ks/ in "axe"). JMBE / the DVSI chip both
+    // use `[a, b)` consistently across norm and application.
     for (l_idx, &(a_l, b_l)) in band_edges.iter().enumerate() {
         let voiced = v_bar[l_idx];
         if voiced {
             // Eq. 119: zero voiced bands.
-            for m_abs in a_l..=b_l {
+            for m_abs in a_l..b_l {
                 for &sign in &[1i32, -1] {
                     let m = sign * m_abs;
                     let m_idx = (m + 128) as usize;
@@ -558,7 +709,7 @@ fn shape_spectrum(
             } else {
                 0.0
             };
-            for m_abs in a_l..=b_l {
+            for m_abs in a_l..b_l {
                 for &sign in &[1i32, -1] {
                     let m = sign * m_abs;
                     let m_idx = (m + 128) as usize;
@@ -735,6 +886,26 @@ pub fn synthesize_voiced(
     phase_mode: PhaseMode,
     state: &mut VoicedSynthState,
 ) -> [f64; FRAME_SAMPLES] {
+    // Default to the spec LCG modulus for ρ_l (Eq. 141) — used by all
+    // existing tests and by full-rate IMBE. AmbePlus phase mode ignores
+    // the modulus (it bypasses Eq. 141 in favour of phase regen).
+    synthesize_voiced_with_lcg_modulus(omega_0, m_bar, v_bar, noise_samples, phase_mode, 53125, state)
+}
+
+/// Variant of [`synthesize_voiced`] that lets the caller specify the
+/// LCG modulus used in Eq. 141's `ρ_l = (2π/m)·u(l) − π`. Set this to
+/// the same modulus used by the unvoiced [`UnvoicedSynthState`]'s
+/// generator so ρ_l stays uniform in `[−π, π)` regardless of which
+/// LCG generates the noise samples.
+pub fn synthesize_voiced_with_lcg_modulus(
+    omega_0: f32,
+    m_bar: &[f32],
+    v_bar: &[bool],
+    noise_samples: &[f64; L_MAX as usize],
+    phase_mode: PhaseMode,
+    state_lcg_m: u32,
+    state: &mut VoicedSynthState,
+) -> [f64; FRAME_SAMPLES] {
     let l_curr = m_bar.len() as u8;
     let l_prev = state.prev_l;
     let max_l = l_curr.max(l_prev) as usize;
@@ -766,12 +937,17 @@ pub fn synthesize_voiced(
     match phase_mode {
         PhaseMode::Baseline => {
             let l_uv: u8 = (0..l_curr as usize).filter(|&i| !v_bar[i]).count() as u8;
+            // The 53125 in Eq. 141's ρ_l = (2π/53125)·u(l) − π is the
+            // SPEC LCG modulus. For the chip LCG (modulus 65536), the
+            // formula should use 65536 instead so ρ_l stays uniform
+            // in [-π, π). Map the divisor to the live LCG modulus.
+            let lcg_m = f64::from(state_lcg_m);
             for l in 1..=L_MAX as usize {
                 if l <= l_quarter {
                     phi_curr[l] = psi_curr[l];
                 } else {
                     let u_l = noise_samples[l - 1];
-                    let rho_l = (2.0 * PI64 / 53125.0) * u_l - PI64; // Eq. 141
+                    let rho_l = (2.0 * PI64 / lcg_m) * u_l - PI64; // Eq. 141
                     let l_curr_f = if l_curr > 0 { f64::from(l_curr) } else { 1.0 };
                     phi_curr[l] = psi_curr[l]
                         + f64::from(l_uv) * rho_l / l_curr_f * (l as f64);
@@ -1012,6 +1188,20 @@ pub struct SynthState {
     /// would otherwise drive `ε_R` past the 0.0875 Mute threshold and
     /// silence ~99% of frames).
     chip_compat: bool,
+    /// Beyond-spec spectral-discontinuity clamp (gap 0026). When
+    /// `true`, frames whose harmonic count `L` jumps by more than
+    /// [`SPECTRAL_CLAMP_L_THRESHOLD`] from the previous frame have
+    /// their post-smoothing amplitudes scaled by
+    /// [`SPECTRAL_CLAMP_GAMMA`] for one frame. Mirrors observed
+    /// DVSI AMBE-3000R behavior on pitch/L jumps (chip RMS ~73 % of
+    /// ours at the jump frame, transient single-frame). BABA-A
+    /// §1.11.3 does not describe this clamp; gap 0026 documents the
+    /// probe data. Default `false` keeps the spec-faithful path.
+    chip_compat_spectral_clamp: bool,
+    /// Previous frame's harmonic count `L`, for
+    /// [`Self::chip_compat_spectral_clamp`] discontinuity detection.
+    /// 0 means no prior frame yet (no clamp on first frame).
+    prev_l: u8,
     /// The disposition (`Use` / `Repeat` / `Mute`) selected by the
     /// most recent [`synthesize_frame`] / [`synthesize_frame_ambe_plus`]
     /// call. `None` until at least one frame has been synthesized.
@@ -1020,6 +1210,30 @@ pub struct SynthState {
     /// frame's decision, not the prior one.
     last_disposition: Option<FrameDisposition>,
 }
+
+/// Minimum |ΔL| between consecutive frames that triggers the beyond-spec
+/// spectral-discontinuity clamp ([`SynthState::chip_compat_spectral_clamp`]).
+/// Calibrated from the 2-D b̂₀ sweep (2026-05-14, 25 probes spanning
+/// ΔL ∈ [−37, 40] on a steady-state-with-single-jump-frame schedule):
+///
+/// | \|ΔL\| range | chip/ours ratio at jump frame |
+/// |--------------|-------------------------------|
+/// |   1 – 5      | 0.99 – 1.04 (within probe noise, no clamp) |
+/// |   6 – 25     | 0.94 – 1.17 (mostly chip *louder* — overlap-add redistribution) |
+/// |  26 – 40     | 0.74 – 0.82 (chip clamps consistently) |
+/// |  35 – 37 down| 0.81 – 0.83 (clamp fires on big down-jumps too) |
+///
+/// So the clamp fires symmetrically for `|ΔL| > 25`. A previous, narrower
+/// `> 5` threshold over-fired on natural speech transitions where the chip
+/// does not clamp.
+pub const SPECTRAL_CLAMP_L_THRESHOLD: i16 = 25;
+
+/// Per-frame amplitude scale factor applied to `M̄_l` when the spectral-
+/// discontinuity clamp fires. Mean chip/ours ratio across the
+/// `|ΔL| > 25` regime in the 2-D sweep is ~0.78; on the noisy #3537 case
+/// (FEC-error-driven trigger) the chip's RMS is ~0.72 of ours. We pick
+/// the average so both regimes land within a few percent of chip behaviour.
+pub const SPECTRAL_CLAMP_GAMMA: f64 = 0.75;
 
 #[derive(Clone, Debug)]
 struct LastGoodFrame {
@@ -1030,13 +1244,24 @@ struct LastGoodFrame {
 }
 
 impl SynthState {
-    /// Cold-start synthesis state per §1.13 / Annex A.
+    /// Cold-start synthesis state per §1.13 / Annex A. Uses the
+    /// default LCG generator (chip LCG unless `BLIP25_LCG=spec`).
+    /// Rate-aware paths should prefer [`SynthState::with_unvoiced_gen`]
+    /// to make the LCG choice explicit.
     pub fn new() -> Self {
+        Self::with_unvoiced_gen(default_lcg_gen())
+    }
+
+    /// Cold-start with an explicit unvoiced LCG generator. Used by
+    /// rate-aware codec wrappers:
+    ///   - IMBE full-rate → [`UnvoicedNoiseGen::SpecLcg`]
+    ///   - AMBE+2 half-rate → [`UnvoicedNoiseGen::ChipLcg`]
+    pub fn with_unvoiced_gen(gen: UnvoicedNoiseGen) -> Self {
         Self {
             s_e: INIT_S_E,
             tau_m: INIT_TAU_M,
             epsilon_r: 0.0,
-            unvoiced: UnvoicedSynthState::new(),
+            unvoiced: UnvoicedSynthState::with_gen(gen),
             voiced: VoicedSynthState::new(),
             err: FrameErrorContext::default(),
             gamma_w: GAMMA_W,
@@ -1044,6 +1269,8 @@ impl SynthState {
             repeat_count: 0,
             repeat_reset_after: None,
             chip_compat: false,
+            chip_compat_spectral_clamp: false,
+            prev_l: 0,
             last_disposition: None,
         }
     }
@@ -1090,6 +1317,24 @@ impl SynthState {
     #[inline]
     pub fn chip_compat(&self) -> bool {
         self.chip_compat
+    }
+
+    /// Force the beyond-spec spectral-discontinuity clamp on
+    /// independently of [`Self::set_chip_compat`]. Most consumers
+    /// should leave this off and rely on the umbrella `chip_compat`
+    /// flag, which auto-enables the clamp alongside the gap-0021
+    /// ε_R freeze on Repeat. This standalone toggle is for the
+    /// narrow case of wanting the clamp without the ε_R freeze.
+    pub fn set_chip_compat_spectral_clamp(&mut self, on: bool) {
+        self.chip_compat_spectral_clamp = on;
+    }
+
+    /// Current standalone spectral-discontinuity clamp setting.
+    /// Note: the clamp also fires whenever
+    /// [`Self::chip_compat`] is `true`.
+    #[inline]
+    pub fn chip_compat_spectral_clamp(&self) -> bool {
+        self.chip_compat_spectral_clamp
     }
 }
 
@@ -1192,7 +1437,14 @@ fn synthesize_frame_with_mode(
     phase_mode: PhaseMode,
     state: &mut SynthState,
 ) -> [i16; FRAME_SAMPLES] {
-    let (disp, epsilon_r) = frame_disposition(err, state.epsilon_r);
+    // §1.11 (full-rate) vs §2.8 (half-rate) use different repeat/mute
+    // thresholds and ε_R recurrences. In this codebase `PhaseMode::AmbePlus`
+    // is uniquely used by the half-rate Phase 2 path (AMBE+/AMBE+2 codecs),
+    // and `PhaseMode::Baseline` is uniquely used by full-rate IMBE.
+    let (disp, epsilon_r) = match phase_mode {
+        PhaseMode::Baseline => frame_disposition(err, state.epsilon_r),
+        PhaseMode::AmbePlus => frame_disposition_halfrate(err, state.epsilon_r),
+    };
     // Beyond-spec error-rate freeze on Repeat (gap 0021, opt-in via
     // `chip_compat`). When the disposition is Repeat, JMBE's
     // `IMBEModelParameters.copy()` carries `previous.errorRate` into
@@ -1294,7 +1546,7 @@ fn synthesize_frame_with_mode(
     state.s_e = s_e_new;
 
     // §1.11.3 V/UV-and-amplitude smoothing.
-    let smoothed = analysis::profile::time(analysis::profile::Stage::Smoothing, || {
+    let mut smoothed = analysis::profile::time(analysis::profile::Stage::Smoothing, || {
         apply_smoothing(
             &m_bar_full[..l as usize],
             &voiced_arr[..l as usize],
@@ -1307,6 +1559,51 @@ fn synthesize_frame_with_mode(
     });
     state.tau_m = smoothed.tau_m;
 
+    // Beyond-spec spectral-discontinuity clamp (gap 0026). DVSI
+    // AMBE-3000R attenuates frames where the spectral envelope grows
+    // abruptly relative to the previous frame, *or* where FEC reported
+    // ε₀ ≥ 2 (the boundary where Golay correction confidence drops).
+    // §1.11.3's τ_M/γ_M is magnitude-based (Eq. 115-116) and doesn't
+    // fire when A_M < τ_M, missing both cases. Triggers, per the 2-D
+    // b̂₀ sweep (2026-05-14, see SPECTRAL_CLAMP_L_THRESHOLD):
+    //   - |L_curr − L_prev| > SPECTRAL_CLAMP_L_THRESHOLD (bidirectional).
+    //     Small |ΔL| (≤ 5) shows no chip clamp; medium |ΔL| (6–25) has
+    //     the chip running *louder* than us (overlap-add redistribution
+    //     across the boundary); only |ΔL| > 25 consistently shows the
+    //     chip attenuating. Down-jumps clamp at the same magnitude.
+    //   - err.epsilon_0 ≥ 2: covers Repeat frames (the spec-faithful
+    //     Repeat path replays last_good's params, so ΔL = 0 and the
+    //     jump detector misses #3537 f=773-style cases). Real-world
+    //     noisy field audio hits this branch on every Golay-corrected
+    //     2-3-error frame, which is why it's the dominant useful
+    //     trigger on noisy traffic.
+    // Enabled either by the umbrella `chip_compat` flag (paired with
+    // the gap-0021 ε_R freeze for full chip-interop) or by the
+    // standalone `chip_compat_spectral_clamp` flag (for consumers who
+    // want only the clamp). Both default off, so spec-faithful mode is
+    // unchanged.
+    //
+    // **Half-rate (PhaseMode::AmbePlus) only.** The empirical formula
+    // and constants are fit against the AMBE-3000R chip at
+    // PKT_RATET 33; that chip is an AMBE+2 codec and is not a true
+    // IMBE oracle. Applying this heuristic to full-rate IMBE
+    // (PhaseMode::Baseline) is speculative — we have no IMBE chip
+    // oracle to justify it. Strict-spec IMBE behavior remains the
+    // default for full-rate regardless of chip_compat.
+    if matches!(phase_mode, PhaseMode::AmbePlus)
+        && (state.chip_compat || state.chip_compat_spectral_clamp)
+    {
+        let l_jump = state.prev_l > 0
+            && (i16::from(l) - i16::from(state.prev_l)).abs() > SPECTRAL_CLAMP_L_THRESHOLD;
+        let err_jump = err.epsilon_0 >= 2;
+        if l_jump || err_jump {
+            for v in smoothed.m_bar.iter_mut().take(l as usize) {
+                *v = (f64::from(*v) * SPECTRAL_CLAMP_GAMMA) as f32;
+            }
+        }
+    }
+    state.prev_l = l;
+
     // §1.12.1 unvoiced + §1.12.2 voiced + Eq. 142 sum.
     let s_uv = analysis::profile::time(analysis::profile::Stage::SynthUnvoiced, || {
         synthesize_unvoiced(
@@ -1318,13 +1615,15 @@ fn synthesize_frame_with_mode(
         )
     });
     let noise_samples = voiced_noise_samples(&state.unvoiced);
+    let lcg_m = state.unvoiced.lcg_m;
     let s_v = analysis::profile::time(analysis::profile::Stage::SynthVoiced, || {
-        synthesize_voiced(
+        synthesize_voiced_with_lcg_modulus(
             omega_0,
             &smoothed.m_bar[..l as usize],
             &smoothed.v_bar[..l as usize],
             &noise_samples,
             phase_mode,
+            lcg_m,
             &mut state.voiced,
         )
     });
@@ -1666,20 +1965,24 @@ mod tests {
 
     #[test]
     fn lcg_first_few_values_match_recurrence() {
-        // u(n+1) = (171·u(n) + 11213) mod 53125, u(−105) = 3147.
-        let mut state = UnvoicedSynthState::new();
-        // First call: u(−104) = (171·3147 + 11213) mod 53125
-        //           = (538137 + 11213) mod 53125
-        //           = 549350 mod 53125
-        //           = 549350 - 10·53125 = 549350 - 531250 = 18100
-        let v1 = state.next_noise();
-        assert_eq!(v1 as u32, 18100);
-        // Second: u(−103) = (171·18100 + 11213) mod 53125
-        //                 = (3095100 + 11213) mod 53125
-        //                 = 3106313 mod 53125
-        //                 = 3106313 - 58·53125 = 3106313 - 3081250 = 25063
-        let v2 = state.next_noise();
-        assert_eq!(v2 as u32, 25063);
+        // The cold-start `UnvoicedSynthState::new()` now defaults to the
+        // chip's LCG (probed: 173/13849/65536, seed 60584) rather than
+        // BABA-A §1.12.1's spec LCG. Verify both recurrences via their
+        // first advance from the seed:
+        //
+        // Chip LCG: (173·60584 + 13849) mod 65536
+        //         = (10481032 + 13849) mod 65536 = 10494881 mod 65536
+        //         = 10494881 - 160·65536 = 10494881 - 10485760 = 9121
+        let mut chip_state = UnvoicedSynthState::new();
+        assert_eq!(chip_state.next_noise() as u32, 9121);
+
+        // Spec LCG: u(n+1) = (171·u(n) + 11213) mod 53125, u(−105) = 3147.
+        // First call: (171·3147 + 11213) mod 53125
+        //           = (538137 + 11213) mod 53125 = 549350 mod 53125 = 18100
+        let (a, c, m, seed) = UnvoicedNoiseGen::SpecLcg.params();
+        assert_eq!((a.wrapping_mul(seed).wrapping_add(c)) % m, 18100);
+        // Second: (171·18100 + 11213) mod 53125 = 25063
+        assert_eq!((a.wrapping_mul(18100).wrapping_add(c)) % m, 25063);
     }
 
     #[test]
@@ -2130,6 +2433,194 @@ mod tests {
                 pcm_repeat[i], pcm_use_again[i]
             );
         }
+    }
+
+    #[test]
+    fn spectral_clamp_does_not_fire_on_full_rate_imbe() {
+        // We have no IMBE chip oracle (AMBE-3000R is AMBE+2, not IMBE),
+        // so the empirically-fit clamp is gated to PhaseMode::AmbePlus
+        // (half-rate). Full-rate IMBE goes through PhaseMode::Baseline
+        // and must NOT trigger the clamp regardless of chip_compat.
+        let p_low = build_params(0.5, &vec![true; 9], &vec![50f32; 9]);
+        let p_high = build_params(0.1, &vec![true; 30], &vec![50f32; 30]);
+        let err = FrameErrorContext::default();
+
+        let mut state_off = SynthState::new();
+        let _ = synthesize_frame(&p_low, &err, GAMMA_W, &mut state_off);
+        let pcm_off = synthesize_frame(&p_high, &err, GAMMA_W, &mut state_off);
+
+        let mut state_on = SynthState::new();
+        state_on.set_chip_compat(true);
+        state_on.set_chip_compat_spectral_clamp(true);
+        let _ = synthesize_frame(&p_low, &err, GAMMA_W, &mut state_on);
+        let pcm_on = synthesize_frame(&p_high, &err, GAMMA_W, &mut state_on);
+
+        assert_eq!(
+            &pcm_off[..], &pcm_on[..],
+            "full-rate IMBE (PhaseMode::Baseline) must be unaffected by chip_compat flags"
+        );
+    }
+
+    #[test]
+    fn spectral_clamp_auto_enables_under_chip_compat() {
+        // The umbrella `chip_compat` flag should enable the spectral
+        // clamp without needing the standalone toggle. Auto-on under
+        // chip_compat is the recommended consumer profile. Uses a
+        // large L jump (9→45, |ΔL|=36) to exceed the threshold of 25.
+        let p_low = build_params(0.5, &vec![true; 9], &vec![50f32; 9]);
+        let p_high = build_params(0.05, &vec![true; 45], &vec![50f32; 45]);
+        let err = FrameErrorContext::default();
+
+        let rms = |pcm: &[i16]| {
+            (pcm.iter().map(|&s| f64::from(s).powi(2)).sum::<f64>() / pcm.len() as f64).sqrt()
+        };
+
+        let mut state_off = SynthState::new();
+        let _ = synthesize_frame_ambe_plus(&p_low, &err, GAMMA_W, &mut state_off);
+        let pcm_off = synthesize_frame_ambe_plus(&p_high, &err, GAMMA_W, &mut state_off);
+
+        let mut state_on = SynthState::new();
+        state_on.set_chip_compat(true);
+        assert!(!state_on.chip_compat_spectral_clamp(),
+            "standalone flag should stay off — clamp is enabled via chip_compat");
+        let _ = synthesize_frame_ambe_plus(&p_low, &err, GAMMA_W, &mut state_on);
+        let pcm_on = synthesize_frame_ambe_plus(&p_high, &err, GAMMA_W, &mut state_on);
+
+        let rms_off = rms(&pcm_off);
+        let rms_on = rms(&pcm_on);
+        assert!(rms_on < rms_off,
+            "chip_compat should auto-enable the clamp on large L-jump: off={rms_off:.1} on={rms_on:.1}");
+    }
+
+    #[test]
+    fn spectral_clamp_default_off_leaves_synth_unchanged() {
+        // With the flag off (default), the synth path must match the
+        // spec-faithful behavior bit-for-bit.
+        let p_low = build_params(0.5, &vec![true; 9], &vec![50f32; 9]);
+        let p_high = build_params(0.1, &vec![true; 30], &vec![50f32; 30]); // L=9 → 30
+        let err = FrameErrorContext::default();
+
+        let mut state_a = SynthState::new();
+        let _ = synthesize_frame_ambe_plus(&p_low, &err, GAMMA_W, &mut state_a);
+        let pcm_a = synthesize_frame_ambe_plus(&p_high, &err, GAMMA_W, &mut state_a);
+
+        let mut state_b = SynthState::new();
+        assert!(!state_b.chip_compat_spectral_clamp(), "default must be off");
+        let _ = synthesize_frame_ambe_plus(&p_low, &err, GAMMA_W, &mut state_b);
+        let pcm_b = synthesize_frame_ambe_plus(&p_high, &err, GAMMA_W, &mut state_b);
+
+        assert_eq!(&pcm_a[..], &pcm_b[..], "default-off must not alter synth output");
+    }
+
+    #[test]
+    fn spectral_clamp_fires_on_large_l_jump_when_enabled() {
+        // L jumps 9 → 45 (Δ = +36, well above the threshold of 25).
+        // Clamp-on should produce smaller RMS than clamp-off.
+        let p_low = build_params(0.5, &vec![true; 9], &vec![50f32; 9]);
+        let p_high = build_params(0.05, &vec![true; 45], &vec![50f32; 45]);
+        let err = FrameErrorContext::default();
+
+        let rms = |pcm: &[i16]| {
+            (pcm.iter().map(|&s| f64::from(s).powi(2)).sum::<f64>() / pcm.len() as f64).sqrt()
+        };
+
+        let mut state_off = SynthState::new();
+        let _ = synthesize_frame_ambe_plus(&p_low, &err, GAMMA_W, &mut state_off);
+        let pcm_off = synthesize_frame_ambe_plus(&p_high, &err, GAMMA_W, &mut state_off);
+
+        let mut state_on = SynthState::new();
+        state_on.set_chip_compat_spectral_clamp(true);
+        let _ = synthesize_frame_ambe_plus(&p_low, &err, GAMMA_W, &mut state_on);
+        let pcm_on = synthesize_frame_ambe_plus(&p_high, &err, GAMMA_W, &mut state_on);
+
+        let rms_off = rms(&pcm_off);
+        let rms_on = rms(&pcm_on);
+        assert!(rms_on < rms_off, "clamp must reduce RMS on large L-jump: off={rms_off:.1} on={rms_on:.1}");
+        // Roughly 0.75× per sweep data — allow generous bounds.
+        let ratio = rms_on / rms_off;
+        assert!(ratio < 0.95, "expected ratio < 0.95, got {ratio:.3}");
+        assert!(ratio > 0.5, "expected ratio > 0.5 (sanity), got {ratio:.3}");
+    }
+
+    #[test]
+    fn spectral_clamp_fires_on_large_l_down_jump() {
+        // L drops 45 → 9 (Δ = −36). 2-D sweep (2026-05-14) shows the
+        // chip clamps both directions when |ΔL| > 25 — the previous
+        // "down-jumps don't clamp" hypothesis was based on a different
+        // probe schedule (single-frame return-to-baseline) that
+        // confounded the direction with the recovery transient.
+        let p_high = build_params(0.05, &vec![true; 45], &vec![50f32; 45]);
+        let p_low = build_params(0.5, &vec![true; 9], &vec![50f32; 9]);
+        let err = FrameErrorContext::default();
+
+        let rms = |pcm: &[i16]| {
+            (pcm.iter().map(|&s| f64::from(s).powi(2)).sum::<f64>() / pcm.len() as f64).sqrt()
+        };
+
+        let mut state_off = SynthState::new();
+        let _ = synthesize_frame_ambe_plus(&p_high, &err, GAMMA_W, &mut state_off);
+        let pcm_off = synthesize_frame_ambe_plus(&p_low, &err, GAMMA_W, &mut state_off);
+
+        let mut state_on = SynthState::new();
+        state_on.set_chip_compat_spectral_clamp(true);
+        let _ = synthesize_frame_ambe_plus(&p_high, &err, GAMMA_W, &mut state_on);
+        let pcm_on = synthesize_frame_ambe_plus(&p_low, &err, GAMMA_W, &mut state_on);
+
+        let rms_off = rms(&pcm_off);
+        let rms_on = rms(&pcm_on);
+        assert!(rms_on < rms_off,
+            "clamp must reduce RMS on large L-down-jump: off={rms_off:.1} on={rms_on:.1}");
+    }
+
+    #[test]
+    fn spectral_clamp_does_not_fire_on_small_l_change() {
+        // L jumps 18 → 25 (Δ = +7). Under the new |ΔL| > 25 threshold,
+        // this is below the chip-clamp regime and the clamp must NOT
+        // fire. Verifies we don't over-clamp natural voice transitions.
+        let p_a = build_params(0.2, &vec![true; 18], &vec![50f32; 18]);
+        let p_b = build_params(0.15, &vec![true; 25], &vec![50f32; 25]);
+        let err = FrameErrorContext::default();
+
+        let mut state_off = SynthState::new();
+        let _ = synthesize_frame_ambe_plus(&p_a, &err, GAMMA_W, &mut state_off);
+        let pcm_off = synthesize_frame_ambe_plus(&p_b, &err, GAMMA_W, &mut state_off);
+
+        let mut state_on = SynthState::new();
+        state_on.set_chip_compat_spectral_clamp(true);
+        let _ = synthesize_frame_ambe_plus(&p_a, &err, GAMMA_W, &mut state_on);
+        let pcm_on = synthesize_frame_ambe_plus(&p_b, &err, GAMMA_W, &mut state_on);
+
+        assert_eq!(&pcm_off[..], &pcm_on[..],
+            "small L change (|ΔL|=7, below threshold of 25) must not trigger clamp");
+    }
+
+    #[test]
+    fn spectral_clamp_fires_on_high_epsilon_0() {
+        // No L change, but ε₀ ≥ 2 → clamp must fire (covers the Repeat
+        // case where last_good replay yields ΔL = 0 yet the chip
+        // attenuates). Peak is dominated by overlap-add from the prior
+        // frame's window tail (which the clamp doesn't reach), so
+        // assert on RMS instead — it integrates the whole frame.
+        let p = build_params(0.3, &vec![true; 20], &vec![50f32; 20]);
+        let err_clean = FrameErrorContext::default();
+        let err_e2 = FrameErrorContext { epsilon_0: 2, epsilon_t: 2, ..Default::default() };
+
+        // Warm up state with a clean frame so ΔL=0 on the next call.
+        let mut state_off = SynthState::new();
+        let _ = synthesize_frame_ambe_plus(&p, &err_clean, GAMMA_W, &mut state_off);
+        let pcm_off = synthesize_frame_ambe_plus(&p, &err_e2, GAMMA_W, &mut state_off);
+
+        let mut state_on = SynthState::new();
+        state_on.set_chip_compat_spectral_clamp(true);
+        let _ = synthesize_frame_ambe_plus(&p, &err_clean, GAMMA_W, &mut state_on);
+        let pcm_on = synthesize_frame_ambe_plus(&p, &err_e2, GAMMA_W, &mut state_on);
+
+        let rms = |pcm: &[i16]| {
+            (pcm.iter().map(|&s| f64::from(s).powi(2)).sum::<f64>() / pcm.len() as f64).sqrt()
+        };
+        let rms_off = rms(&pcm_off);
+        let rms_on = rms(&pcm_on);
+        assert!(rms_on < rms_off, "ε₀≥2 must trigger clamp: off={rms_off:.1} on={rms_on:.1}");
     }
 
     #[test]

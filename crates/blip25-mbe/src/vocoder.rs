@@ -53,7 +53,7 @@ use crate::codecs::mbe_baseline::analysis::{
     profile as analysis_profile,
 };
 use crate::codecs::mbe_baseline::{
-    FrameDisposition, FrameErrorContext, GAMMA_W, SynthState, synthesize_frame,
+    FrameDisposition, FrameErrorContext, GAMMA_W, SynthState, UnvoicedNoiseGen, synthesize_frame,
 };
 use crate::enhancement::{self, EnhancementMode, EnhancementState};
 use crate::mbe_params::MbeParams;
@@ -313,13 +313,25 @@ pub struct Vocoder {
 
 impl Vocoder {
     /// Open a new channel at the given rate, all state cold.
+    ///
+    /// The unvoiced noise generator is selected per-rate: IMBE full-rate
+    /// uses the BABA-A §1.12.1 spec LCG (171/11213/53125, seed 3147)
+    /// because the DVSI chip's full-rate path matches that recurrence;
+    /// AMBE+2 half-rate uses the chip-empirical LCG (173/13849/65536,
+    /// seed 60584) — see gap report 0025. Probe 1 confirmed 0.945
+    /// sample-level correlation against the live chip on the half-rate
+    /// path.
     pub fn new(rate: Rate) -> Self {
+        let noise_gen = match rate {
+            Rate::Imbe7200x4400 | Rate::Imbe4400x4400 => UnvoicedNoiseGen::SpecLcg,
+            Rate::AmbePlus2_3600x2450 | Rate::AmbePlus2_2450x2450 => UnvoicedNoiseGen::ChipLcg,
+        };
         Self {
             rate,
             analysis: AnalysisState::new(),
             imbe_dec: imbe_wire::dequantize::DecoderState::new(),
             ambe_plus2_dec: ambe_plus2_wire::dequantize::DecoderState::new(),
-            synth: SynthState::new(),
+            synth: SynthState::with_unvoiced_gen(noise_gen),
             last_stats: FrameStats::default(),
             tone_detection: false,
             ambe_plus2_synth: AmbePlus2Synth::AmbePlus,
@@ -412,6 +424,32 @@ impl Vocoder {
     #[inline]
     pub fn chip_compat(&self) -> bool {
         self.synth.chip_compat()
+    }
+
+    /// Force the beyond-spec spectral-discontinuity clamp on (gap 0026)
+    /// independently of [`Self::set_chip_compat`]. Most consumers
+    /// should leave this off — the umbrella `chip_compat` flag already
+    /// auto-enables the clamp alongside the gap-0021 ε_R freeze.
+    /// This standalone toggle exists for the narrow case of wanting
+    /// the clamp without the ε_R freeze. With either flag enabled,
+    /// frames whose harmonic count `L` jumps by more than 5 from the
+    /// previous frame (up-jumps only) **or** whose `err.epsilon_0 ≥ 2`
+    /// have their post-smoothing amplitudes scaled by 0.73 for one
+    /// frame. Mirrors observed DVSI AMBE-3000R behavior on pitch/L
+    /// jumps and Repeat frames; reduces audible "scratch" on noisy
+    /// Phase 2 traffic where Golay-corrected frames decode to
+    /// spectrally-distant params from their neighbors. Default
+    /// `false` keeps the spec-faithful path.
+    pub fn set_chip_compat_spectral_clamp(&mut self, on: bool) {
+        self.synth.set_chip_compat_spectral_clamp(on);
+    }
+
+    /// Current standalone spectral-discontinuity clamp setting.
+    /// Note: the clamp also fires whenever [`Self::chip_compat`] is
+    /// `true`, regardless of this setting.
+    #[inline]
+    pub fn chip_compat_spectral_clamp(&self) -> bool {
+        self.synth.chip_compat_spectral_clamp()
     }
 
     /// Enable the §0.8.4 silence-dispatch path on the analysis encoder.
@@ -1612,8 +1650,28 @@ mod ambe_plus2_pipeline {
             let frame = analysis_profile::time(analysis_profile::Stage::DecodeFrame, || {
                 decode_frame(&dibits)
             });
-            let s0: u8 = frame.errors[0];
-            let st: u8 = frame.errors.iter().map(|&e| u16::from(e)).sum::<u16>().min(255) as u8;
+            // BABA-A §2.8.1 Eq. 196: half-rate ε_T = ε₀ + ε₁ only (the
+            // two Golay codewords). The Hamming-protected ε₂/ε₃ are *not*
+            // summed into the disposition's ε_T per the spec, even though
+            // they're reported separately for diagnostics. Summing all
+            // four cosets here was a port of the full-rate convention
+            // and miscalibrates the Repeat/Mute thresholds for half-rate.
+            //
+            // Uncorrectable Golay-24 (≥4 errors detected) is reported as
+            // ε₀ = u8::MAX from our FEC decoder. Per chip A/B (5/2026):
+            // controlled 4-error c̃₀ injects keep the chip at peak ~5800
+            // without a multi-frame Mute, so the chip caps the contribution
+            // to ε_R. We model that as "ε₀ → 4": still trips Repeat via
+            // the ε₀ ≥ 4 branch of Eq. 198, but the ε_R recurrence Eq. 197
+            // (0.95·prev + 0.001064·ε_T) stays well below 0.096 instead of
+            // climbing to 0.27 and Muting ~20 frames.
+            const E0_UNCORRECTABLE_CAP: u8 = 4;
+            let raw_e0 = frame.errors[0];
+            let s0: u8 = if raw_e0 == u8::MAX { E0_UNCORRECTABLE_CAP } else { raw_e0 };
+            let s1: u8 = frame.errors[1];
+            let st: u8 = u16::from(s0)
+                .saturating_add(u16::from(s1))
+                .min(255) as u8;
             let e3: u8 = frame.errors[3];
             (frame.info, s0, st, e3)
         } else {
@@ -1627,6 +1685,13 @@ mod ambe_plus2_pipeline {
             epsilon_t: stats_epst,
             bad_pitch: false,
         };
+        // Publish the per-frame err context to the synth state so the
+        // AmbePlus path (which reads `state.err` rather than taking an
+        // explicit err parameter) sees the actual FEC counts. Without
+        // this, AmbePlus synth always saw the default-zero err and the
+        // §2.8 Repeat/Mute thresholds never tripped, allowing spurious
+        // post-FEC transients (call_3537 frame 773 → peak 23553).
+        vocoder.synth.err = err;
         let dq = analysis_profile::time(analysis_profile::Stage::Dequantize, || {
             decode_to_params(&info, &mut vocoder.ambe_plus2_dec)
         });
