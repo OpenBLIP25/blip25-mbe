@@ -1,0 +1,32 @@
+# Halfrate 2-D b̂₀ sweep analysis (930 cells)
+chip_atten = 1 - chip_rms / chip_pre_rms
+ours_atten = 1 - ours_rms / ours_pre_rms
+excess_atten = chip_atten - ours_atten  (positive ⇒ chip drops more than us at trigger)
+
+## Aggregate stats
+  chip_atten: mean=0.155, median=0.147, std=0.103, min=-0.075, max=0.385
+  ours_atten: mean=0.122, median=0.121, std=0.070, min=-0.128, max=0.328
+  excess_atten: mean=0.032, median=0.028, std=0.094, min=-0.326, max=0.302
+
+## Correlations against excess_atten
+  vs |ΔL|: Spearman ρ = 0.135, Pearson r = 0.228
+  vs |Δω̃₀| (rad/sample): Spearman ρ = 0.352, Pearson r = 0.377
+  vs cos_sim(M̄_lo, M̄_hi): Spearman ρ = -0.261, Pearson r = -0.316
+
+## Off-diagonal only (870 cells, low_b0 != high_b0)
+  vs |ΔL|: Spearman ρ = 0.099, Pearson r = 0.204
+  vs |Δω̃₀| (rad/sample): Spearman ρ = 0.341, Pearson r = 0.365
+  vs cos_sim(M̄_lo, M̄_hi): Spearman ρ = -0.240, Pearson r = -0.299
+
+## Top-10 strongest clamp (highest excess_atten)
+  cell  low_b0 high_b0 b2 low_l high_l |ΔL| Δω̃₀     cos_sim  chip_at ours_at excess
+   629      20     116 20    12     54   42 0.1781   0.2866  0.356  0.053  0.302
+   164      20     116  8    12     54   42 0.1781   0.2866  0.338  0.043  0.295
+   457     104     112  8    45     51    6 0.0073   0.9243  0.234  -0.036  0.271
+   163      20     112  8    12     51   39 0.1747   0.2945  0.335  0.068  0.267
+   628      20     112 20    12     51   39 0.1747   0.2945  0.345  0.079  0.266
+   458     104     116  8    45     54    9 0.0107   0.9008  0.205  -0.053  0.259
+   922     104     112 20    45     51    6 0.0073   0.9243  0.238  -0.018  0.256
+   456     104     108  8    45     48    3 0.0038   0.9381  0.213  -0.036  0.250
+   137      16     108  8    11     48   37 0.1857   0.2822  0.286  0.040  0.246
+   188      24     116  8    13     54   41 0.1644   0.2886  0.290  0.045  0.244
