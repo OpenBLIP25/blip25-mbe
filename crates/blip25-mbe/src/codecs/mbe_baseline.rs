@@ -1197,6 +1197,19 @@ pub struct SynthState {
     /// ours at the jump frame, transient single-frame). BABA-A
     /// §1.11.3 does not describe this clamp; gap 0026 documents the
     /// probe data. Default `false` keeps the spec-faithful path.
+    ///
+    /// **Tracks a sweep characterisation, not a chip model.** Gap
+    /// 0029 falsified the per-bin amplitude lowpass mechanism at
+    /// the M̄ level — the chip ≈ spec-faithful `√(Σ M̄²)` energy
+    /// on average, with a structured ~8% residual concentrated in
+    /// the (low_b̂₀ ∈ [10, 40], high_b̂₀ ∈ [60, 119]) corner of the
+    /// (b̂₀_lo, b̂₀_hi) plane. The |ΔL|-keyed heuristic implemented
+    /// here is a correlation, not a mechanism; spec-author
+    /// recommends strict-spec (`γ_M = 1.0`) as the default and
+    /// flags this knob as "likely to be revised pending the 4%
+    /// PCM-vs-`spec_atten` offset investigation on the implementer
+    /// side." Keep the default `false`; only enable for downstream
+    /// demos that already opted into chip-correlation behaviour.
     chip_compat_spectral_clamp: bool,
     /// Previous frame's harmonic count `L`, for
     /// [`Self::chip_compat_spectral_clamp`] discontinuity detection.

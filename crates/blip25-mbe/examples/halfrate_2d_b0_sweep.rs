@@ -20,9 +20,9 @@ use std::fs;
 use std::path::PathBuf;
 
 use blip25_mbe::ambe_plus2_wire::dequantize::{
-    DecoderState, Decoded, decode_to_params,
+    DecoderState, Decoded, decode_to_params, dequantize,
 };
-use blip25_mbe::ambe_plus2_wire::frame::{encode_frame, DIBITS_PER_FRAME};
+use blip25_mbe::ambe_plus2_wire::frame::{decode_frame, encode_frame, DIBITS_PER_FRAME};
 use blip25_mbe::ambe_plus2_wire::priority::{prioritize, AMBE_B_COUNT};
 use blip25_mbe::mbe_params::MbeParams;
 use blip25_mbe::vocoder::{Rate, Vocoder};
@@ -222,12 +222,74 @@ fn cmd_score(args: &[String]) -> std::io::Result<()> {
     Ok(())
 }
 
+fn unpack_dibits_half(bytes: &[u8]) -> [u8; DIBITS_PER_FRAME] {
+    let mut out = [0u8; DIBITS_PER_FRAME];
+    let mut bit = 0usize;
+    for slot in &mut out {
+        let mut d = 0u8;
+        for _ in 0..2 {
+            let b = (bytes[bit / 8] >> (7 - (bit % 8))) & 1;
+            d = (d << 1) | b;
+            bit += 1;
+        }
+        *slot = d;
+    }
+    out
+}
+
+fn cmd_dump_params(args: &[String]) -> std::io::Result<()> {
+    let out_dir = PathBuf::from(&args[0]);
+    let manifest = fs::read_to_string(out_dir.join("manifest.csv"))?;
+    // Header: per-cell metadata then per-frame (omega_0, L, M̄_1..M̄_56)
+    let params_dir = out_dir.join("params");
+    fs::create_dir_all(&params_dir)?;
+    for (li, line) in manifest.lines().enumerate() {
+        if li == 0 { continue; }
+        let f: Vec<&str> = line.split(',').collect();
+        if f.len() != 11 { continue; }
+        let cell_idx: usize = f[0].parse().unwrap();
+        let ambe_path = out_dir.join(format!("cell_{:05}.ambe9", cell_idx));
+        let ambe = fs::read(&ambe_path)?;
+        let mut state = DecoderState::new();
+        let mut buf = String::new();
+        buf.push_str("frame,omega_0,l");
+        for k in 1..=56 { buf.push_str(&format!(",M{}", k)); }
+        buf.push('\n');
+        let fb = 9; // half-rate FEC frame is 9 bytes
+        let n = ambe.len() / fb;
+        for i in 0..n {
+            let frame_bytes = &ambe[i * fb..(i + 1) * fb];
+            let dibits = unpack_dibits_half(frame_bytes);
+            let frame = decode_frame(<&[u8; DIBITS_PER_FRAME]>::try_from(&dibits[..]).unwrap());
+            // dequantize takes the 4 info codewords directly
+            let params = match dequantize(&frame.info, &mut state) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("cell {} frame {} dequantize failed: {:?}", cell_idx, i, e);
+                    continue;
+                }
+            };
+            buf.push_str(&format!("{},{:.6},{}", i, params.omega_0(), params.harmonic_count()));
+            let amps = params.amplitudes_slice();
+            for k in 0..56 {
+                let v = if k < amps.len() { amps[k] } else { 0.0 };
+                buf.push_str(&format!(",{:.4}", v));
+            }
+            buf.push('\n');
+        }
+        fs::write(params_dir.join(format!("params_{:05}.csv", cell_idx)), buf)?;
+    }
+    eprintln!("wrote per-cell params to {}/params/", out_dir.display());
+    Ok(())
+}
+
 fn main() -> std::io::Result<()> {
     let args: Vec<String> = env::args().collect();
     if args.len() < 3 {
         eprintln!(
             "usage: halfrate_2d_b0_sweep gen <out_dir> [--b0-values csv] [--b2-values csv]\n\
-                    halfrate_2d_b0_sweep score <out_dir>"
+                    halfrate_2d_b0_sweep score <out_dir>\n\
+                    halfrate_2d_b0_sweep dump-params <out_dir>"
         );
         std::process::exit(2);
     }
@@ -236,6 +298,7 @@ fn main() -> std::io::Result<()> {
     match sub.as_str() {
         "gen" => cmd_gen(&rest),
         "score" => cmd_score(&rest),
+        "dump-params" => cmd_dump_params(&rest),
         _ => { eprintln!("unknown subcommand"); std::process::exit(2); }
     }
 }
