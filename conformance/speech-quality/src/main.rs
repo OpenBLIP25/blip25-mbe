@@ -131,12 +131,12 @@ enum Cmd {
         /// default.
         #[arg(long)]
         pyin_pitch: bool,
-        /// Apply Boll 1979 spectral subtraction to `signal_spectrum`
-        /// output before §0.5 amplitude estimation. Per-bin noise PSD
-        /// is updated on silence-flagged frames; β=1.5, α=0.02.
-        /// Targets noisy-tone vectors. Off by default.
+        /// Disable Boll 1979 spectral subtraction on `signal_spectrum`
+        /// before §0.5 amplitude estimation. ON by default (5-vector
+        /// A/B 2026-05-14 shows 0 speech impact / +0.08 knox_1 lift).
+        /// Pass this to A/B against the spec-faithful encoder input.
         #[arg(long)]
-        spectral_subtraction: bool,
+        no_spectral_subtraction: bool,
         /// EMA weight on §0.5 spectral amplitudes. `0.0` (default) =
         /// off; `(0.0, 1.0]` enables `M̂_l(t) = α·M̂_l + (1−α)·M̂_l(t−1)`,
         /// pitch-gated. Targets the noisy-tone amp-jitter described in
@@ -146,10 +146,11 @@ enum Cmd {
         amp_ema_alpha: f64,
         /// Post-decoder enhancement chain applied to PCM before
         /// `our_enc_our_dec.wav` / `chip_enc_our_dec.wav` are written.
-        /// `none` (default) is spec-faithful synthesis. `classical`
-        /// enables the AIC33-shaped HPF + presence + compressor +
-        /// boundary-fade chain.
-        #[arg(long, value_enum, default_value_t = EnhancementCli::None)]
+        /// `classical` (default since 2026-05-14): AIC33-shaped HPF
+        /// + presence + boundary-fade chain (+0.03 to +0.09 PESQ
+        /// across the 5-vector matrix). `none` is spec-faithful
+        /// synthesis only.
+        #[arg(long, value_enum, default_value_t = EnhancementCli::Classical)]
         enhancement: EnhancementCli,
         /// Stage-isolation knobs for `--enhancement classical`. Each
         /// `--enh-no-*` flag disables the corresponding stage so the
@@ -210,14 +211,18 @@ enum Cmd {
         /// for semantics. `0.0` (default) = off.
         #[arg(long, default_value_t = 0.0)]
         amp_ema_alpha: f64,
+        /// Disable §0.5 spectral subtraction (ON by default — see
+        /// `ab-matrix` for semantics).
+        #[arg(long)]
+        no_spectral_subtraction: bool,
         /// Post-decoder enhancement chain applied to PCM before
         /// `our_enc_our_dec.wav` is written. Same chain used by the
         /// full-rate `ab-matrix` subcommand. `none` (default) is
-        /// spec-faithful synthesis only; `classical` enables the
-        /// AIC33-shaped HPF + presence + compressor + boundary-fade
-        /// chain. Identical defaults across rates — the half-rate path
-        /// reuses `ClassicalConfig::default`.
-        #[arg(long, value_enum, default_value_t = EnhancementCli::None)]
+        /// `classical` (default since 2026-05-14): AIC33-shaped HPF
+        /// + presence + boundary-fade chain. `none` is spec-faithful
+        /// synthesis only. Identical default across rates — the
+        /// half-rate path reuses `ClassicalConfig::default`.
+        #[arg(long, value_enum, default_value_t = EnhancementCli::Classical)]
         enhancement: EnhancementCli,
         /// Stage-isolation knobs for `--enhancement classical`. Same
         /// semantics as the full-rate `ab-matrix` flags.
@@ -405,7 +410,7 @@ fn main() -> Result<()> {
             vuv_override,
             repeat_reset_after,
             pyin_pitch,
-            spectral_subtraction,
+            no_spectral_subtraction,
             amp_ema_alpha,
             enhancement,
             enh_no_hpf,
@@ -427,7 +432,7 @@ fn main() -> Result<()> {
             vuv_override,
             repeat_reset_after,
             pyin_pitch,
-            spectral_subtraction,
+            !no_spectral_subtraction,
             amp_ema_alpha,
             enhancement.to_mode(EnhancementOverrides {
                 no_hpf: enh_no_hpf,
@@ -447,6 +452,7 @@ fn main() -> Result<()> {
             default_pitch_on_silence,
             tone_detection,
             amp_ema_alpha,
+            no_spectral_subtraction,
             enhancement,
             enh_no_hpf,
             enh_no_peaking,
@@ -462,6 +468,7 @@ fn main() -> Result<()> {
             default_pitch_on_silence,
             tone_detection,
             amp_ema_alpha,
+            !no_spectral_subtraction,
             enhancement.to_mode(EnhancementOverrides {
                 no_hpf: enh_no_hpf,
                 no_peaking: enh_no_peaking,
@@ -703,12 +710,12 @@ fn our_encode(
     if pyin_pitch {
         state.set_pyin_pitch(true);
     }
-    if spectral_subtraction {
-        // Note: the §0.8.4 silence detector runs every frame even when
-        // dispatch is disabled, so the noise estimator gets primed
-        // without forcing silence-dispatch on.
-        state.set_spectral_subtraction(true);
-    }
+    // Spectral subtraction is ON by default in `AnalysisState::new`;
+    // the harness forwards the CLI bool unconditionally so
+    // `--no-spectral-subtraction` can disable it. The §0.8.4 silence
+    // detector runs every frame regardless of dispatch, so the noise
+    // estimator gets primed either way.
+    state.set_spectral_subtraction(spectral_subtraction);
     if amp_ema_alpha > 0.0 {
         state.set_amp_ema_alpha(amp_ema_alpha);
     }
@@ -963,6 +970,7 @@ fn cmd_ambe_plus2_ab_matrix(
     default_pitch_on_silence: bool,
     tone_detection: bool,
     amp_ema_alpha: f64,
+    spectral_subtraction: bool,
     enhancement: EnhancementMode,
 ) -> Result<()> {
     fs::create_dir_all(out_dir)
@@ -991,6 +999,7 @@ fn cmd_ambe_plus2_ab_matrix(
         default_pitch_on_silence,
         tone_detection,
         amp_ema_alpha,
+        spectral_subtraction,
     )?;
     let enc_secs = t0.elapsed().as_secs_f64();
     eprintln!(
@@ -1025,6 +1034,7 @@ fn our_encode_ambe_plus2(
     default_pitch_on_silence: bool,
     tone_detection: bool,
     amp_ema_alpha: f64,
+    spectral_subtraction: bool,
 ) -> Result<Vec<u8>> {
     if tone_detection {
         // Use the Vocoder façade — the tone-frame dispatch lives in
@@ -1037,6 +1047,7 @@ fn our_encode_ambe_plus2(
             .default_pitch_on_silence(default_pitch_on_silence)
             .tone_detection(true)
             .amp_ema_alpha(amp_ema_alpha)
+            .spectral_subtraction(spectral_subtraction)
             .build();
         let n_frames = pcm.len() / FRAME_SAMPLES;
         let mut out = Vec::with_capacity(n_frames * HALF_BYTES_PER_FEC_FRAME);
@@ -1091,6 +1102,7 @@ fn our_encode_ambe_plus2(
     if amp_ema_alpha > 0.0 {
         state.set_amp_ema_alpha(amp_ema_alpha);
     }
+    state.set_spectral_subtraction(spectral_subtraction);
     let mut decoder_state = HalfDecoderState::new();
     let mut out = Vec::with_capacity(n_frames * HALF_BYTES_PER_FEC_FRAME);
     for f in 0..n_frames {

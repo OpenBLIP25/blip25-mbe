@@ -335,7 +335,13 @@ impl Vocoder {
             last_stats: FrameStats::default(),
             tone_detection: false,
             ambe_plus2_synth: AmbePlus2Synth::AmbePlus,
-            enhancement: EnhancementMode::default(),
+            // Enhancement: Classical-by-default since 2026-05-14. The
+            // HPF + presence + boundary-fade chain in
+            // `ClassicalConfig::default()` carries a free +0.03 to
+            // +0.09 PESQ across the 5-vector matrix; spec-faithful
+            // PCM is one `.set_enhancement(EnhancementMode::None)`
+            // call away.
+            enhancement: EnhancementMode::Classical(crate::enhancement::ClassicalConfig::default()),
             enhancement_state: EnhancementState::default(),
             prev_disposition: None,
         }
@@ -1287,7 +1293,13 @@ pub struct VocoderBuilder {
 }
 
 impl VocoderBuilder {
-    /// New builder defaulting to spec-faithful behavior at `rate`.
+    /// New builder defaulting to the same configuration as
+    /// [`Vocoder::new`] — i.e. Classical enhancement chain and §0.5
+    /// spectral subtraction are ON, since both are free PESQ wins
+    /// (see 5-vector A/B 2026-05-14). All other knobs default OFF /
+    /// spec-faithful. Use the setters to opt out (e.g.
+    /// `.enhancement(EnhancementMode::None).spectral_subtraction(false)`
+    /// for fully spec-faithful output).
     #[inline]
     pub fn new(rate: Rate) -> Self {
         Self {
@@ -1299,10 +1311,12 @@ impl VocoderBuilder {
             pitch_silence_override: false,
             default_pitch_on_silence: false,
             pyin_pitch: false,
-            spectral_subtraction: false,
+            spectral_subtraction: true,
             amp_ema_alpha: 0.0,
             ambe_plus2_synth: AmbePlus2Synth::AmbePlus,
-            enhancement: EnhancementMode::None,
+            enhancement: EnhancementMode::Classical(
+                crate::enhancement::ClassicalConfig::default(),
+            ),
         }
     }
 

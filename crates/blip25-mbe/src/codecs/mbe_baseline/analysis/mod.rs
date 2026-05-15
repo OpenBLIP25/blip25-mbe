@@ -601,7 +601,11 @@ impl AnalysisState {
             default_pitch_on_silence_enabled: false,
             pyin_pitch_enabled: false,
             pyin_hmm: PyinHmmState::new(),
-            spectral_subtraction_enabled: false,
+            // Spectral subtraction: ON by default. 5-vector A/B
+            // (2026-05-14): 0 speech impact, +0.08 knox_1, −0.01 alert.
+            // Effectively free PESQ on noisy stationary content; cleared
+            // for default-on after the §0.5 noise-sensitivity push.
+            spectral_subtraction_enabled: true,
             noise_spectrum: NoiseSpectrum::new(),
             amp_ema_alpha: 0.0,
             prev_m_hat: [0.0; L_HAT_MAX as usize + 1],

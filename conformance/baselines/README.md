@@ -3,10 +3,22 @@
 Tracked PESQ / STOI / SNR baselines for regression spotting on
 encoder/decoder changes.
 
+## our_enc_our_dec_2026-05-14.csv
+
+5-vector full-rate IMBE `our_enc_our_dec` baseline at HEAD `b369845`
+with the **new library defaults**: `spectral_subtraction` ON,
+`enhancement = Classical(default)`. Net +0.045 PESQ vs the
+2026-04-30 baseline mean. No chip cells (use 2026-04-30 CSV for the
+chip side — it hasn't moved). Speech: clean 3.221, dam 3.341,
+mark 2.737. Tones: alert 2.578, knox_1 1.647.
+
 ## chip_ab_2026-04-30.csv
 
-5-vector full-rate IMBE chip A/B baseline at HEAD `a93c996`. Wall time
-~10 min via realtime DVSI chip oracle on `pve` (see
+5-vector full-rate IMBE chip A/B baseline at HEAD `a93c996` with the
+**old defaults** (spec-faithful: no enhancement, no spectral
+subtraction). Kept as a reference for the chip cells and as a
+historical snapshot of the spec-faithful encoder. Wall time ~10 min
+via realtime DVSI chip oracle on `pve` (see
 `reference_dvsi_chip_access.md` in user memory).
 
 Columns: `vector,method,pesq_nb,stoi,snr_db,samples`. Methods cover

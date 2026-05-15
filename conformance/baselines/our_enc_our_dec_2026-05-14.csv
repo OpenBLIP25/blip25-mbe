@@ -1,0 +1,6 @@
+vector,method,pesq_nb,stoi,snr_db,samples
+clean,our_enc_our_dec,3.221,0.843,-2.89,591840
+dam,our_enc_our_dec,3.341,0.903,-2.63,203840
+mark,our_enc_our_dec,2.737,0.827,-2.49,147360
+alert,our_enc_our_dec,2.578,0.164,-3.14,77120
+knox_1,our_enc_our_dec,1.647,-0.002,-1.28,20000
