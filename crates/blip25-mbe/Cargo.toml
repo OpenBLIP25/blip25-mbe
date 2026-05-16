@@ -6,6 +6,9 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 readme = "../../README.md"
+repository = "https://github.com/openBLIP25/blip25-mbe"
+homepage = "https://github.com/openBLIP25/blip25-mbe"
+documentation = "https://docs.rs/blip25-mbe"
 keywords = ["p25", "mbe", "imbe", "ambe", "vocoder"]
 categories = ["multimedia::audio", "encoding"]
 
