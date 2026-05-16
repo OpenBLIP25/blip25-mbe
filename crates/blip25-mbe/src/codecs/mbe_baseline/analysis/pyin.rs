@@ -410,7 +410,10 @@ pub fn run_pyin_smoothed(x: &[f64], state: &mut PyinHmmState) -> (f64, f64) {
     let trans = log_trans_table();
     let mut new_alpha = [0.0f64; PYIN_GRID_LEN];
     let prior = &state.log_alpha;
-    let leaked: Vec<f64> = prior.iter().map(|v| v * (1.0 - HMM_LEAK_ALPHA)).collect();
+    let mut leaked = [0.0f64; PYIN_GRID_LEN];
+    for (dst, src) in leaked.iter_mut().zip(prior.iter()) {
+        *dst = src * (1.0 - HMM_LEAK_ALPHA);
+    }
     for i in 0..PYIN_GRID_LEN {
         let row = &trans[i];
         let mut best = f64::NEG_INFINITY;

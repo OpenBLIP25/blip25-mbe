@@ -59,33 +59,58 @@ const MATCH_TOLERANCE_HZ: f64 = 20.0;
 /// tone; emit a voice frame instead.
 const SNR_THRESHOLD: f64 = 100.0;
 
+/// Cached 256-point Hann window over the 160 PCM samples (zero past
+/// `TONE_DETECT_FRAME`). Built once on first call.
+fn hann_window() -> &'static [f64; FFT_SIZE] {
+    use std::sync::OnceLock;
+    static WINDOW: OnceLock<[f64; FFT_SIZE]> = OnceLock::new();
+    WINDOW.get_or_init(|| {
+        let two_pi = 2.0 * core::f64::consts::PI;
+        let mut w = [0.0f64; FFT_SIZE];
+        for n in 0..TONE_DETECT_FRAME {
+            w[n] = 0.5 - 0.5 * (two_pi * n as f64 / TONE_DETECT_FRAME as f64).cos();
+        }
+        w
+    })
+}
+
 /// Compute the windowed PSD for one detection frame.
 ///
 /// Returns `(psd, floor)` where `psd[k] = |X(k)|²` for `k ∈ [0, 128]`
 /// and `floor` is the 25th-percentile bin power (broadband baseline).
-/// Hann-windowed, 256-point zero-padded direct DFT.
+/// Hann-windowed, 256-point zero-padded FFT.
 fn compute_psd(pcm: &[i16; TONE_DETECT_FRAME]) -> ([f64; FFT_SIZE / 2 + 1], f64) {
-    let mut buf = [0.0f64; FFT_SIZE];
-    let two_pi = 2.0 * core::f64::consts::PI;
-    for (n, &s) in pcm.iter().enumerate() {
-        let w = 0.5 - 0.5 * (two_pi * n as f64 / TONE_DETECT_FRAME as f64).cos();
-        buf[n] = (s as f64) * w;
+    use std::sync::OnceLock;
+    use num_complex::Complex;
+    use rustfft::{Fft, FftPlanner};
+
+    static FFT: OnceLock<std::sync::Arc<dyn Fft<f64>>> = OnceLock::new();
+    let fft = FFT.get_or_init(|| {
+        let mut planner = FftPlanner::<f64>::new();
+        planner.plan_fft_forward(FFT_SIZE)
+    });
+
+    let window = hann_window();
+    let mut buf = [Complex::<f64>::new(0.0, 0.0); FFT_SIZE];
+    for n in 0..TONE_DETECT_FRAME {
+        buf[n] = Complex::new(pcm[n] as f64 * window[n], 0.0);
     }
+    fft.process(&mut buf);
+
     let mut psd = [0.0f64; FFT_SIZE / 2 + 1];
     for k in 0..=FFT_SIZE / 2 {
-        let omega = two_pi * k as f64 / FFT_SIZE as f64;
-        let mut re = 0.0;
-        let mut im = 0.0;
-        for n in 0..FFT_SIZE {
-            re += buf[n] * (omega * n as f64).cos();
-            im -= buf[n] * (omega * n as f64).sin();
-        }
-        psd[k] = re * re + im * im;
+        psd[k] = buf[k].re * buf[k].re + buf[k].im * buf[k].im;
     }
-    // 25th-percentile broadband floor, excluding DC.
-    let mut samples: Vec<f64> = psd.iter().skip(1).copied().collect();
-    samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(core::cmp::Ordering::Equal));
-    let floor = samples[samples.len() / 4];
+
+    // 25th-percentile broadband floor, excluding DC. `select_nth_unstable`
+    // is O(N) and partitions in place — no full sort, no Vec alloc.
+    let mut samples = [0.0f64; FFT_SIZE / 2];
+    samples.copy_from_slice(&psd[1..]);
+    let idx = samples.len() / 4;
+    samples.select_nth_unstable_by(idx, |a, b| {
+        a.partial_cmp(b).unwrap_or(core::cmp::Ordering::Equal)
+    });
+    let floor = samples[idx];
     (psd, floor)
 }
 
