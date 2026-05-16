@@ -3,8 +3,10 @@
 //! Reference: vocoder_analysis_encoder_addendum.md §0.1 (BABA-A §5, Eq. 3).
 //! Single-pole IIR run on the raw 16-bit PCM stream before any analysis:
 //!
+//! ```text
 //!   H(z) = (1 − z⁻¹) / (1 − 0.99·z⁻¹)
 //!   y[n] = x[n] − x[n−1] + 0.99·y[n−1]
+//! ```
 //!
 //! Pole at z = 0.99: slow-decay transient ~200 samples (25 ms) from cold
 //! start; absorbed by the pitch tracker's own preroll (§0.3.7 / §0.9).

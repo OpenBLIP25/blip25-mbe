@@ -269,7 +269,7 @@ pub struct Frame {
     pub info: [u16; 4],
     /// Per-vector FEC error count. `errors[0]` is 0–3 (or `u8::MAX`
     /// for an uncorrectable extended-Golay frame); `errors[1]` is
-    /// 0–3 (perfect [23,12] Golay never reports uncorrectable).
+    /// 0–3 (perfect `(23, 12)` Golay never reports uncorrectable).
     /// `errors[2]` and `errors[3]` are always 0 (uncoded).
     pub errors: [u8; 4],
 }

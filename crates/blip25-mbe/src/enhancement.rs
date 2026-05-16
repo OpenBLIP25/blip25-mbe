@@ -1,5 +1,5 @@
 //! Post-decoder PCM enhancement — optional classical DSP filter chain
-//! applied to decoded PCM before it leaves the [`Vocoder`].
+//! applied to decoded PCM before it leaves the [`crate::vocoder::Vocoder`].
 //!
 //! Spec-faithful synthesis emits PCM directly from the BABA-A §1.12
 //! pipeline. Real LMR audio chains add post-processing between the

@@ -379,8 +379,9 @@ pub const NOISE_INIT: u32 = 3147;
 /// That is the recurrence BABA-A §1.5 Eq. 84-85 specifies for **FEC
 /// masking**, repurposed by DVSI for the AMBE+2 unvoiced synth.
 ///
-/// Default: [`ChipLcg`] — match the de-facto industry reference. Switch
-/// to [`SpecLcg`] for BABA-A §1.12.1 spec-literal output (useful for
+/// Default: [`UnvoicedNoiseGen::ChipLcg`] — match the de-facto industry
+/// reference. Switch to [`UnvoicedNoiseGen::SpecLcg`] for BABA-A §1.12.1
+/// spec-literal output (useful for
 /// conformance testing against the spec rather than the chip).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -460,7 +461,7 @@ pub struct UnvoicedSynthState {
 
 impl UnvoicedSynthState {
     /// Cold-start state per §1.13 / Annex A: empty noise window, LCG
-    /// seeded per [`default_lcg_gen`] (chip generator by default, spec
+    /// seeded per `default_lcg_gen` (chip generator by default, spec
     /// when `BLIP25_LCG=spec`), prev IDFT all zero.
     pub fn new() -> Self {
         Self::with_gen(default_lcg_gen())

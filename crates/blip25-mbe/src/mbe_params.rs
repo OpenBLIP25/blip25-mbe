@@ -168,7 +168,7 @@ impl MbeParams {
     /// **Note on rate:** this constructor's ω₀ is full-rate-specific.
     /// 4π/39.5 ≈ 0.318 sits just above the half-rate Annex L pitch
     /// table's max (b̂₀=0 → ω₀ ≈ 0.314), so half-rate consumers must
-    /// use [`silence_ambe_plus2`] instead. Mixing them silently fails
+    /// use [`Self::silence_ambe_plus2`] instead. Mixing them silently fails
     /// at `ambe_plus2_wire::dequantize::quantize` with
     /// `DecodeError::BadPitch`.
     pub fn silence() -> Self {
@@ -182,11 +182,11 @@ impl MbeParams {
 
     /// Half-rate-compatible silent frame.
     ///
-    /// Same shape as [`silence`] (all unvoiced, amplitudes zero) but
+    /// Same shape as [`Self::silence`] (all unvoiced, amplitudes zero) but
     /// with `ω₀` taken from the largest entry in the AMBE+2 Annex L
     /// pitch table (b̂₀=0 → ω₀ ≈ 0.314, L = 9). This satisfies
     /// `ambe_plus2_wire::dequantize::encode_pitch`'s range check, which
-    /// rejects [`silence`]'s 0.318 as out of table.
+    /// rejects [`Self::silence`]'s 0.318 as out of table.
     ///
     /// Use this when the caller is feeding into the half-rate
     /// quantizer and wants a "no-content" placeholder frame

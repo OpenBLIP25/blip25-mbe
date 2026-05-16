@@ -84,16 +84,33 @@ pub enum Rate {
     /// IMBE info-only — same codec as [`Self::Imbe7200x4400`] with the
     /// Annex H Golay/Hamming/PN FEC layer stripped. 11-byte wire frame
     /// (88 prioritized info bits packed MSB-first). 4 400 bps total
-    /// (= voice). For lossless transports that already provide their
-    /// own integrity, or for diagnostic / cross-decoder tooling.
+    /// (= voice). Byte layout matches JMBE / OP25 / DVSI `p25_nofec`
+    /// convention bit-for-bit (validated against DVSI tv-rc references
+    /// at 100% bit-exact). Use this for storage when you specifically
+    /// need an info-only IMBE archive; otherwise prefer the
+    /// FEC-bearing [`Self::Imbe7200x4400`] format — see
+    /// `docs/wire_formats_and_storage.md`.
     Imbe4400x4400,
     /// P25 Phase 2 TDMA half-rate AMBE+2. 9-byte FEC frame (36 dibits).
-    /// 3 600 bps total / 2 450 bps voice + 1 150 bps FEC.
+    /// 3 600 bps total / 2 450 bps voice + 1 150 bps FEC. Also the
+    /// vocoder-layer format for DMR Tier II/III voice frames (modulo
+    /// carrier-specific burst framing).
     AmbePlus2_3600x2450,
-    /// AMBE+2 half-rate info-only — same codec as
+    /// AMBE+2 half-rate info-only — same 49 info bits as
     /// [`Self::AmbePlus2_3600x2450`] with the Golay/Hamming/PN FEC
     /// layer stripped. 7-byte wire frame (49 info bits packed
-    /// MSB-first, 7 trailing pad bits). 2 450 bps total (= voice).
+    /// MSB-first in u₀..u₃ order, 7 trailing pad bits). 2 450 bps
+    /// total (= voice).
+    ///
+    /// **Byte layout caveat.** DVSI's chip rate-index 34 emits the
+    /// same 49 info bits in a *different* (chip-internal, permuted)
+    /// byte order. This crate's layout is self-consistent (ours-to-
+    /// ours round-trip is lossless) but is not byte-equal to DVSI's
+    /// r34 stream. If you need byte-exact DVSI r34 interop, see the
+    /// future `blip25-chip-shim` crate; here this variant is for
+    /// compact ours-to-ours archival. Recommended storage format is
+    /// the FEC-bearing [`Self::AmbePlus2_3600x2450`] — see
+    /// `docs/wire_formats_and_storage.md`.
     AmbePlus2_2450x2450,
 }
 

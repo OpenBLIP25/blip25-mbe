@@ -16,7 +16,7 @@
 //!             → dequantize → MbeParams
 //! ```
 //!
-//! Bit-by-bit symmetric on the encode side via [`frame::encode`],
+//! Bit-by-bit symmetric on the encode side via [`frame::encode_frame`],
 //! [`priority::prioritize`], and [`dequantize::quantize`].
 
 pub mod frame;

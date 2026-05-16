@@ -555,7 +555,7 @@ pub fn expected_sync_bit(prev_sync: bool) -> bool {
 /// before knowing `L`. Per §1.3.1 robustness note + §1.4.2 fixed
 /// placement: `û₀[11..6] = b̂₀[7..2]`, `û₇[2..1] = b̂₀[1..0]`.
 ///
-/// The 6 MSBs of `b̂₀` are protected by `û₀`'s [23,12] Golay; the 2
+/// The 6 MSBs of `b̂₀` are protected by `û₀`'s `(23, 12)` Golay; the 2
 /// LSBs are uncoded (in `û₇`). This split lets the decoder derive `L`
 /// even when `û₇` errors are present.
 #[inline]

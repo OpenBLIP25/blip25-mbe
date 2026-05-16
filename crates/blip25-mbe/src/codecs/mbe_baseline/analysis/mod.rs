@@ -3,9 +3,9 @@
 //! The forward direction of the vocoder: 8 kHz 16-bit PCM in, one
 //! [`MbeParams`] out per 20 ms (160-sample) frame. The result is
 //! consumed by any of the wire-side `quantize` pipelines
-//! ([`crate::imbe_wire::quantize`],
-//! [`crate::ambe_plus2_wire::quantize`],
-//! [`crate::dvsi_3000::quantize`]) and is independent of wire format.
+//! (`imbe_wire::dequantize::quantize`,
+//! `ambe_plus2_wire::dequantize::quantize`,
+//! `dvsi_3000::quantize`) and is independent of wire format.
 //!
 //! # Status
 //!

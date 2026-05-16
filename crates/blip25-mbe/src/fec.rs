@@ -287,7 +287,7 @@ const CHASE_GOLAY_DEPTH: usize = 6;
 const CHASE_HAMMING_DEPTH: usize = 3;
 
 /// Soft-decision Golay(23, 12) decoder. Chase-II over the
-/// [`CHASE_GOLAY_DEPTH`] least-reliable positions.
+/// `CHASE_GOLAY_DEPTH` least-reliable positions.
 ///
 /// Flips every subset of weight ≤ 3 among those positions, hard-decodes
 /// each candidate, and returns the result with minimum soft distance
@@ -303,7 +303,7 @@ pub fn golay_23_12_decode_soft(soft: &[i8; 23]) -> FecDecoded {
 }
 
 /// Soft-decision extended Golay(24, 12) decoder. Chase-II over the
-/// [`CHASE_GOLAY_DEPTH`] least-reliable positions.
+/// `CHASE_GOLAY_DEPTH` least-reliable positions.
 ///
 /// Extended Golay corrects up to 3 errors and detects 4 (d_min = 8);
 /// the soft search flips weight-≤3 subsets. When the best candidate
@@ -324,7 +324,7 @@ pub fn golay_24_12_decode_soft(soft: &[i8; 24]) -> FecDecoded {
 }
 
 /// Soft-decision Hamming(15, 11) decoder. Tries the hard decision
-/// plus single-bit flips of each of the [`CHASE_HAMMING_DEPTH`]
+/// plus single-bit flips of each of the `CHASE_HAMMING_DEPTH`
 /// least-reliable positions; returns the result with minimum soft
 /// distance.
 ///
