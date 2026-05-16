@@ -68,6 +68,7 @@ use blip25_mbe::rate_conversion::converter::{
     FullToHalfConverter, HalfToFullConverter,
 };
 use blip25_mbe::mbe_params::MbeParams;
+use blip25_mbe::vocoder::{Rate, Transcoder};
 
 const BYTES_PER_FEC_FRAME: usize = 18;
 const BYTES_PER_NOFEC_FRAME: usize = 11;
@@ -486,6 +487,43 @@ enum Cmd {
         #[arg(long)]
         stop_on_first: bool,
     },
+    /// Run the P25-relevant cross-rate transcode lines from
+    /// `tv-rc/cmprc.txt` and bit-compare against DVSI's transcoded
+    /// reference outputs.
+    ///
+    /// Each cmprc.txt cross-rate line is of the form
+    /// `-c RC -q -rc -rd <src> -re <dst> <input.bit> -cmp <ref.bit>`.
+    /// `<src>` and `<dst>` are either chip rate indices (`33`, `34`)
+    /// or P25 RCWs (`0x0558 0x086b 0x1030 …` for full FEC,
+    /// `0x0558 0x086b 0x0000 …` for full no-FEC). Only lines where
+    /// both src and dst map to one of our four `Rate` variants
+    /// (Imbe7200x4400 / Imbe4400x4400 / AmbePlus2_3600x2450 /
+    /// AmbePlus2_2450x2450) are run; the rest are tallied and
+    /// skipped.
+    ///
+    /// For directly-supported `Transcoder` pairs the harness runs one
+    /// hop. For the six diagonal pairs (e.g. `imbe_fec → r34_nofec`)
+    /// it composes two `Transcoder`s via `r33_fec` or `imbe_fec`.
+    /// Reports per-pair frame counts and bit-exact match rate against
+    /// the DVSI reference.
+    CrossRateCompare {
+        /// Path to the rate-conversion test-command file. Defaults to
+        /// `<vectors>/tv-rc/cmprc.txt`.
+        #[arg(long)]
+        cmp: Option<PathBuf>,
+        /// Optional stem filter (substring match on input filename,
+        /// e.g. `dam`, `alltone`, `sine`). When set, only matching
+        /// lines run.
+        #[arg(long)]
+        filter: Option<String>,
+        /// If set, on the first mismatching frame of each pair print
+        /// the input/our/ref bytes and the first differing offset.
+        #[arg(long)]
+        verbose_mismatch: bool,
+        /// Optional CSV output path for per-line aggregated results.
+        #[arg(long)]
+        csv: Option<PathBuf>,
+    },
 }
 
 /// Direction argument for [`Cmd::RateConvert`] and
@@ -579,6 +617,9 @@ fn main() -> Result<()> {
         }
         Cmd::P25Sweep { cmp, filter, op, stop_on_first } => {
             cmd_p25_sweep(&args.vectors, cmp.as_deref(), filter.as_deref(), op.as_deref(), stop_on_first)
+        }
+        Cmd::CrossRateCompare { cmp, filter, verbose_mismatch, csv } => {
+            cmd_cross_rate_compare(&args.vectors, cmp.as_deref(), filter.as_deref(), verbose_mismatch, csv.as_deref())
         }
     }
 }
@@ -4458,6 +4499,479 @@ fn stratum_metrics_line(op: SweepOp, s: &SweepStratum) -> String {
             )
         }
     }
+}
+
+// ---------- cross-rate-compare ---------------------------------------
+
+const P25_FEC_RCW: [&str; 6] = [
+    "0x0558", "0x086b", "0x1030", "0x0000", "0x0000", "0x0190",
+];
+const P25_NOFEC_RCW: [&str; 6] = [
+    "0x0558", "0x086b", "0x0000", "0x0000", "0x0000", "0x0158",
+];
+
+/// Parse one `-rd <…>` or `-re <…>` selector starting at `toks[i]`.
+/// Returns the recognised P25 [`Rate`] and the number of tokens
+/// consumed (`1` for chip-index form, `6` for an RCW). Returns
+/// `(None, n)` when the selector parses syntactically but isn't one of
+/// our four P25 rates — caller skips the line in that case.
+fn parse_rate_selector(toks: &[&str], i: usize) -> Option<(Option<Rate>, usize)> {
+    let head = toks.get(i)?;
+    if head.starts_with("0x") {
+        // Six-word RCW: read tokens [i..i+6]. Compare case-insensitively
+        // since cmprc.txt mixes 0x086b and 0x086B casing.
+        let words: Vec<String> = (0..6)
+            .map(|k| toks.get(i + k).map(|s| s.to_ascii_lowercase()).unwrap_or_default())
+            .collect();
+        if words.iter().any(|w| w.is_empty()) {
+            return None;
+        }
+        let p25_fec: Vec<String> = P25_FEC_RCW.iter().map(|s| s.to_ascii_lowercase()).collect();
+        let p25_nofec: Vec<String> = P25_NOFEC_RCW.iter().map(|s| s.to_ascii_lowercase()).collect();
+        let rate = if words == p25_fec {
+            Some(Rate::Imbe7200x4400)
+        } else if words == p25_nofec {
+            Some(Rate::Imbe4400x4400)
+        } else {
+            None
+        };
+        Some((rate, 6))
+    } else {
+        let rate = match *head {
+            "33" => Some(Rate::AmbePlus2_3600x2450),
+            "34" => Some(Rate::AmbePlus2_2450x2450),
+            _ => None,
+        };
+        Some((rate, 1))
+    }
+}
+
+#[derive(Clone, Debug)]
+struct CrossRateLine {
+    src: Rate,
+    dst: Rate,
+    input: PathBuf,
+    reference: PathBuf,
+}
+
+fn parse_cross_rate_line(
+    cmp_dir: &Path,
+    line: &str,
+) -> Result<Option<Option<CrossRateLine>>> {
+    // Outer Option: None = not a cmprc cross-rate line (blank/comment/encdec).
+    // Inner Option: None = parses fine but src/dst isn't a P25 rate (skip).
+    let line = line.trim();
+    if line.is_empty() || line.starts_with('#') {
+        return Ok(None);
+    }
+    let toks: Vec<&str> = line.split_whitespace().collect();
+    if toks.first().copied() != Some("-c") || toks.get(1).copied() != Some("RC") {
+        return Ok(None);
+    }
+    let Some(rc_pos) = toks.iter().position(|&t| t == "-rc") else {
+        return Ok(None);
+    };
+    let Some(rd_pos) = toks.iter().position(|&t| t == "-rd") else {
+        return Ok(None);
+    };
+    let Some(re_pos) = toks.iter().position(|&t| t == "-re") else {
+        return Ok(None);
+    };
+    let Some(cmp_pos) = toks.iter().position(|&t| t == "-cmp") else {
+        return Ok(None);
+    };
+    let _ = rc_pos;
+
+    let Some((src_opt, n_src)) = parse_rate_selector(&toks, rd_pos + 1) else {
+        return Ok(Some(None));
+    };
+    let Some((dst_opt, n_dst)) = parse_rate_selector(&toks, re_pos + 1) else {
+        return Ok(Some(None));
+    };
+    let (Some(src), Some(dst)) = (src_opt, dst_opt) else {
+        return Ok(Some(None));
+    };
+    let _ = (n_src, n_dst);
+
+    // Input file is the token immediately before `-cmp`; reference
+    // is the token after.
+    if cmp_pos == 0 || cmp_pos + 1 >= toks.len() {
+        return Err(anyhow!("malformed cross-rate line: {line}"));
+    }
+    let input_rel = toks[cmp_pos - 1].trim_start_matches("./");
+    let ref_rel = toks[cmp_pos + 1].trim_start_matches("./");
+    Ok(Some(Some(CrossRateLine {
+        src,
+        dst,
+        input: cmp_dir.join(input_rel),
+        reference: cmp_dir.join(ref_rel),
+    })))
+}
+
+/// All four P25-relevant rates we recognise in cmprc.txt.
+const ALL_P25_RATES: [Rate; 4] = [
+    Rate::Imbe7200x4400,
+    Rate::Imbe4400x4400,
+    Rate::AmbePlus2_3600x2450,
+    Rate::AmbePlus2_2450x2450,
+];
+
+/// BFS over Transcoder-supported edges from `src` to `dst`. Returns the
+/// node chain (including both endpoints) or `None` if unreachable.
+fn find_transcode_chain(src: Rate, dst: Rate) -> Option<Vec<Rate>> {
+    if src == dst {
+        return Some(vec![src]);
+    }
+    let mut parent: std::collections::HashMap<Rate, Rate> =
+        std::collections::HashMap::new();
+    let mut queue = std::collections::VecDeque::from([src]);
+    while let Some(node) = queue.pop_front() {
+        for &cand in &ALL_P25_RATES {
+            if cand == node || parent.contains_key(&cand) || cand == src {
+                continue;
+            }
+            if Transcoder::new(node, cand).is_ok() {
+                parent.insert(cand, node);
+                if cand == dst {
+                    // Reconstruct path.
+                    let mut path = vec![cand];
+                    let mut cur = cand;
+                    while let Some(&p) = parent.get(&cur) {
+                        path.push(p);
+                        cur = p;
+                        if cur == src { break; }
+                    }
+                    path.reverse();
+                    return Some(path);
+                }
+                queue.push_back(cand);
+            }
+        }
+    }
+    None
+}
+
+/// Short human-readable label for a [`Rate`] used in pair summaries.
+fn rate_label(r: Rate) -> &'static str {
+    match r {
+        Rate::Imbe7200x4400 => "imbe_fec",
+        Rate::Imbe4400x4400 => "imbe_nofec",
+        Rate::AmbePlus2_3600x2450 => "r33_fec",
+        Rate::AmbePlus2_2450x2450 => "r34_nofec",
+        _ => "unknown",
+    }
+}
+
+/// Run one whole-file transcode by composing 1–3 [`Transcoder`] hops.
+/// Returns the concatenated dst-rate bytes.
+fn run_transcode_chain(src: Rate, dst: Rate, input: &[u8]) -> Result<Vec<u8>> {
+    // BFS over the rate graph using only Transcoder-supported edges so
+    // the diagonal pairs (e.g. imbe_nofec → r34_nofec, which needs 3
+    // hops via imbe_fec → r33_fec) compose automatically.
+    let chain = find_transcode_chain(src, dst)
+        .ok_or_else(|| anyhow!("no transcode chain {src:?} → {dst:?}"))?;
+
+    let mut current_bytes = input.to_vec();
+    let mut current_rate = chain[0];
+    for &next in &chain[1..] {
+        let frame_in = current_rate.fec_frame_bytes();
+        let frame_out = next.fec_frame_bytes();
+        if current_bytes.len() % frame_in != 0 {
+            return Err(anyhow!(
+                "{current_rate:?} buffer is {} bytes, not a multiple of {frame_in}",
+                current_bytes.len()
+            ));
+        }
+        let n_frames = current_bytes.len() / frame_in;
+        let mut tc = Transcoder::new(current_rate, next)
+            .map_err(|e| anyhow!("Transcoder::new({current_rate:?},{next:?}): {e}"))?;
+        let mut out = Vec::with_capacity(n_frames * frame_out);
+        for f in 0..n_frames {
+            let chunk = &current_bytes[f * frame_in..(f + 1) * frame_in];
+            let outbuf = tc
+                .transcode(chunk)
+                .map_err(|e| anyhow!("transcode frame {f}: {e}"))?;
+            if outbuf.len() != frame_out {
+                return Err(anyhow!(
+                    "frame {f}: {current_rate:?}→{next:?} produced {} bytes, expected {frame_out}",
+                    outbuf.len()
+                ));
+            }
+            out.extend_from_slice(&outbuf);
+        }
+        current_bytes = out;
+        current_rate = next;
+    }
+    Ok(current_bytes)
+}
+
+#[derive(Default, Clone, Debug)]
+struct CrossRateStats {
+    lines: usize,
+    frames_total: usize,
+    frames_bit_exact: usize,
+    bytes_total: usize,
+    bytes_bit_exact: usize,
+    transcode_errors: usize,
+    size_mismatches: usize,
+}
+
+impl CrossRateStats {
+    fn frame_match_pct(&self) -> f64 {
+        if self.frames_total == 0 { 0.0 } else {
+            100.0 * self.frames_bit_exact as f64 / self.frames_total as f64
+        }
+    }
+    fn byte_match_pct(&self) -> f64 {
+        if self.bytes_total == 0 { 0.0 } else {
+            100.0 * self.bytes_bit_exact as f64 / self.bytes_total as f64
+        }
+    }
+}
+
+fn cmd_cross_rate_compare(
+    root: &Path,
+    cmp_override: Option<&Path>,
+    filter: Option<&str>,
+    verbose_mismatch: bool,
+    csv_out: Option<&Path>,
+) -> Result<()> {
+    let cmp_path: PathBuf = cmp_override
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| root.join("tv-rc").join("cmprc.txt"));
+    let cmp_dir = cmp_path
+        .parent()
+        .ok_or_else(|| anyhow!("cmp path has no parent: {}", cmp_path.display()))?
+        .to_path_buf();
+    let body = fs::read_to_string(&cmp_path)
+        .with_context(|| format!("read cmp file {}", cmp_path.display()))?;
+
+    println!("cmp file:    {}", cmp_path.display());
+
+    let mut lines: Vec<CrossRateLine> = Vec::new();
+    let mut non_p25_skipped = 0usize;
+    let mut total_rc = 0usize;
+    for raw in body.lines() {
+        match parse_cross_rate_line(&cmp_dir, raw)? {
+            None => {}
+            Some(None) => {
+                if raw.contains(" -rc ") {
+                    total_rc += 1;
+                    non_p25_skipped += 1;
+                }
+            }
+            Some(Some(tl)) => {
+                total_rc += 1;
+                if let Some(f) = filter {
+                    let stem = tl
+                        .input
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("");
+                    if !stem.contains(f) { continue; }
+                }
+                lines.push(tl);
+            }
+        }
+    }
+
+    println!(
+        "total -rc lines in file:    {total_rc} ({non_p25_skipped} skipped: src or dst not a P25 rate)"
+    );
+    println!("P25 cross-rate lines to run: {}", lines.len());
+    if let Some(f) = filter { println!("filter:                     --filter {f}"); }
+    println!();
+
+    use std::collections::HashMap;
+    let mut by_pair: HashMap<(Rate, Rate), CrossRateStats> = HashMap::new();
+    let mut by_pair_first_mismatch: HashMap<(Rate, Rate), (PathBuf, usize)> = HashMap::new();
+    let mut per_line_records: Vec<(Rate, Rate, PathBuf, usize, usize, usize, usize)> = Vec::new();
+
+    for tl in &lines {
+        let input = match fs::read(&tl.input) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("warn: skip {} (read input: {e})", tl.input.display());
+                continue;
+            }
+        };
+        let reference = match fs::read(&tl.reference) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("warn: skip {} (read ref: {e})", tl.reference.display());
+                continue;
+            }
+        };
+
+        let src_frame = tl.src.fec_frame_bytes();
+        let dst_frame = tl.dst.fec_frame_bytes();
+
+        let stats = by_pair.entry((tl.src, tl.dst)).or_default();
+        stats.lines += 1;
+
+        if input.len() % src_frame != 0 {
+            stats.size_mismatches += 1;
+            eprintln!(
+                "warn: {} is {} bytes; src {} frame size = {}",
+                tl.input.display(),
+                input.len(),
+                rate_label(tl.src),
+                src_frame
+            );
+            continue;
+        }
+        let n_frames = input.len() / src_frame;
+        if reference.len() != n_frames * dst_frame {
+            stats.size_mismatches += 1;
+            eprintln!(
+                "warn: {} is {} bytes (expected {} frames × {} = {})",
+                tl.reference.display(),
+                reference.len(),
+                n_frames,
+                dst_frame,
+                n_frames * dst_frame,
+            );
+            continue;
+        }
+
+        let ours = match run_transcode_chain(tl.src, tl.dst, &input) {
+            Ok(b) => b,
+            Err(e) => {
+                stats.transcode_errors += 1;
+                eprintln!("warn: {} transcode error: {e}", tl.input.display());
+                continue;
+            }
+        };
+        if ours.len() != reference.len() {
+            stats.size_mismatches += 1;
+            eprintln!(
+                "warn: ours {} bytes != ref {} bytes for {}",
+                ours.len(),
+                reference.len(),
+                tl.input.display()
+            );
+            continue;
+        }
+
+        let mut line_frames_match = 0usize;
+        let mut line_bytes_match = 0usize;
+        let mut first_mm_frame: Option<usize> = None;
+        for f in 0..n_frames {
+            let lo = f * dst_frame;
+            let hi = lo + dst_frame;
+            let frame_match = ours[lo..hi] == reference[lo..hi];
+            if frame_match {
+                line_frames_match += 1;
+            } else if first_mm_frame.is_none() {
+                first_mm_frame = Some(f);
+            }
+            let bytes_match = ours[lo..hi]
+                .iter()
+                .zip(reference[lo..hi].iter())
+                .filter(|(a, b)| a == b)
+                .count();
+            line_bytes_match += bytes_match;
+        }
+        stats.frames_total += n_frames;
+        stats.frames_bit_exact += line_frames_match;
+        stats.bytes_total += reference.len();
+        stats.bytes_bit_exact += line_bytes_match;
+
+        per_line_records.push((
+            tl.src,
+            tl.dst,
+            tl.input.clone(),
+            n_frames,
+            line_frames_match,
+            reference.len(),
+            line_bytes_match,
+        ));
+
+        if verbose_mismatch && line_frames_match < n_frames {
+            let mm_frame = first_mm_frame.unwrap();
+            let key = (tl.src, tl.dst);
+            if !by_pair_first_mismatch.contains_key(&key) {
+                by_pair_first_mismatch.insert(key, (tl.input.clone(), mm_frame));
+                let lo = mm_frame * dst_frame;
+                let hi = lo + dst_frame;
+                println!(
+                    "  first mismatch in pair {} → {}:",
+                    rate_label(tl.src),
+                    rate_label(tl.dst)
+                );
+                println!("    file: {}  frame {mm_frame}", tl.input.display());
+                println!("    ours: {:02x?}", &ours[lo..hi]);
+                println!("    ref : {:02x?}", &reference[lo..hi]);
+            }
+        }
+    }
+
+    // ---- Summary table ----
+    println!("=== Per-pair cross-rate transcode (DVSI reference) ===");
+    println!(
+        "{:<14} {:<14} {:>5}  {:>9}  {:>9}  {:>7}  {:>9}  {:>7}  {:>5}",
+        "src", "dst", "lines", "frm_total", "frm_exact", "frm %", "byt_total", "byt %", "errs"
+    );
+    let mut pairs_sorted: Vec<(&(Rate, Rate), &CrossRateStats)> = by_pair.iter().collect();
+    pairs_sorted.sort_by_key(|((s, d), _)| (rate_label(*s), rate_label(*d)));
+    for ((src, dst), s) in pairs_sorted {
+        println!(
+            "{:<14} {:<14} {:>5}  {:>9}  {:>9}  {:>6.2}%  {:>9}  {:>6.2}%  {:>5}",
+            rate_label(*src),
+            rate_label(*dst),
+            s.lines,
+            s.frames_total,
+            s.frames_bit_exact,
+            s.frame_match_pct(),
+            s.bytes_total,
+            s.byte_match_pct(),
+            s.transcode_errors + s.size_mismatches,
+        );
+    }
+
+    let mut t = CrossRateStats::default();
+    for s in by_pair.values() {
+        t.lines += s.lines;
+        t.frames_total += s.frames_total;
+        t.frames_bit_exact += s.frames_bit_exact;
+        t.bytes_total += s.bytes_total;
+        t.bytes_bit_exact += s.bytes_bit_exact;
+        t.transcode_errors += s.transcode_errors;
+        t.size_mismatches += s.size_mismatches;
+    }
+    println!();
+    println!(
+        "TOTAL: {} lines  frames {}/{} exact ({:.2}%)  bytes {}/{} exact ({:.2}%)  errs {}",
+        t.lines,
+        t.frames_bit_exact,
+        t.frames_total,
+        t.frame_match_pct(),
+        t.bytes_bit_exact,
+        t.bytes_total,
+        t.byte_match_pct(),
+        t.transcode_errors + t.size_mismatches,
+    );
+
+    if let Some(csv_path) = csv_out {
+        let mut s = String::from("src,dst,input,frames,frames_exact,bytes,bytes_exact\n");
+        for (src, dst, input, n_f, n_fe, n_b, n_be) in &per_line_records {
+            s.push_str(&format!(
+                "{},{},{},{},{},{},{}\n",
+                rate_label(*src),
+                rate_label(*dst),
+                input.display(),
+                n_f,
+                n_fe,
+                n_b,
+                n_be,
+            ));
+        }
+        fs::write(csv_path, s)
+            .with_context(|| format!("write csv {}", csv_path.display()))?;
+        println!("\nper-line CSV: {}", csv_path.display());
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]

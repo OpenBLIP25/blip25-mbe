@@ -43,3 +43,30 @@ values in this CSV indicates an encoder regression worth investigating.
 Half-rate paths and tone-frame paths are tracked separately in
 project memory (`project_chip_ab_baseline_2026-04-30.md`,
 `project_detect_single_tone_lgt1_fix_2026-04-30.md`).
+
+## cross_rate_2026-05-15.csv
+
+First DVSI cross-rate transcode comparison baseline. Generated via the
+new harness command:
+
+```bash
+target/release/conformance-vectors cross-rate-compare \
+  --csv conformance/baselines/cross_rate_2026-05-15.csv
+```
+
+Drives the 36 P25-only `-rc -rd N -re M` lines in `tv-rc/cmprc.txt` (12
+directional pairs × 3 stems: `alltone`, `dam`, `sine0_4k`). Each pair
+is run through `Transcoder` directly when a direct hop exists; diagonal
+pairs compose 2–3 hops via BFS over Transcoder-supported edges.
+
+Headline results at HEAD:
+
+| Pair                       | Frames-exact | Bytes-exact | Notes |
+|----------------------------|-------------:|------------:|-------|
+| `imbe_fec ↔ imbe_nofec`    | **100.00%**  | **100.00%** | Annex H FEC strip/add validated against DVSI |
+| `r33_fec ↔ r34_nofec`      | 0.00%        | ~6%         | **Mismatch** — our AMBE+2 info-only packing differs from DVSI's r34 layout |
+| `imbe ↔ r33` / `imbe ↔ r34`| ~0%          | 1–10%       | Cross-codec parameter-domain conversion; quantizer rounding diverges (expected) |
+
+A drop in either `imbe_fec ↔ imbe_nofec` cell signals a regression in
+the IMBE wire layer. The `r33 ↔ r34` and cross-codec cells are tracked
+for future investigation, not as pass/fail gates.
