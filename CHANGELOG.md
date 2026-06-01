@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-05-31
+
+### Fixed
+
+- **R34 (AMBE+2 half-rate no-FEC) bit order** — `Rate::AmbePlus2_2450x2450`
+  now serializes the 49 information bits in DVSI's fixed 3-way column
+  interleave (`ambe_plus2_wire::frame::R34_BIT_ORDER`) instead of the naive
+  sequential `û₀‖û₁‖û₂‖û₃` layout. Output is now byte-exact with the DVSI
+  chip and with an NXDN/Fusion console's no-FEC stream. `r33↔r34` cross-rate
+  transcode is bit-exact against the DVSI RC vectors in both directions.
+  (IMBE no-FEC `p25_nofec` was already byte-exact and is unchanged.)
+
+### Added
+
+- `ambe_plus2_wire::frame::{R34_BIT_ORDER, pack_no_fec, unpack_no_fec}` — the
+  R34 interleave table and its pack/unpack helpers, with regression tests.
+- `examples/derive_r34_order.rs` — empirically derives the R34 order from the
+  DVSI RC vectors (used to produce the table above).
+- `examples/decode_r33_frame.rs` — decodes a single r33 frame to parameters and
+  shows the equivalent r34 serialization; useful for inspecting real captures.
+
 ## [0.1.0] - 2026-05-15
 
 Initial public release. Research-grade Rust implementation of the MBE

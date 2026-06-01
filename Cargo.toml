@@ -9,13 +9,13 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 authors = ["Chance Lindsey"]
 license = "MIT"
 
 [workspace.dependencies]
-blip25-mbe = { path = "crates/blip25-mbe", version = "0.1.0" }
+blip25-mbe = { path = "crates/blip25-mbe", version = "0.1.1" }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 hound = "3"
