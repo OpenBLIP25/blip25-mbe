@@ -86,6 +86,71 @@ pub const CODE_WIDTHS: [u8; 4] = [24, 23, 11, 14];
 /// Sum of info widths — must equal 49.
 pub const INFO_BITS_TOTAL: u16 = 49;
 
+/// R34 (half-rate no-FEC, 49-bit / 7-byte) bit serialization order.
+///
+/// Bit `j` (MSB-first) of the 7-byte no-FEC frame carries the natural
+/// info bit `R34_BIT_ORDER[j]`, where the natural order is
+/// `û₀(12)‖û₁(12)‖û₂(11)‖û₃(14)` MSB-first. This is NOT the naive
+/// sequential layout — DVSI emits a 3-way column interleave (rows of
+/// 18/18/13 bits): `0,18,36, 1,19,37, …`. Bits 49..55 of the frame are
+/// zero padding.
+///
+/// Real-world relevance: AMBE+2 no-FEC half-rate is what an NXDN/Fusion
+/// console emits, so this ordering must match the chip, not just decode
+/// cleanly. Derived empirically from the DVSI RC `r33`↔`r34` vectors and
+/// verified a bijection across alltone/clean/dam/mark/alert (see
+/// `examples/derive_r34_order.rs`).
+pub const R34_BIT_ORDER: [u8; 49] = [
+    0, 18, 36, 1, 19, 37, 2, 20, 38, 3, 21, 39,
+    4, 22, 40, 5, 23, 41, 6, 24, 42, 7, 25, 43,
+    8, 26, 44, 9, 27, 45, 10, 28, 46, 11, 29, 47,
+    12, 30, 48, 13, 31, 14, 32, 15, 33, 16, 34, 17,
+    35,
+];
+
+/// Pack the four info vectors `û₀..û₃` into a 7-byte R34 no-FEC frame,
+/// applying the [`R34_BIT_ORDER`] interleave. Bits 49..55 are zero pad.
+pub fn pack_no_fec(info: &[u16; 4]) -> [u8; 7] {
+    let natural = natural_bits(info);
+    let mut out = [0u8; 7];
+    for (j, &src) in R34_BIT_ORDER.iter().enumerate() {
+        out[j / 8] |= natural[src as usize] << (7 - (j % 8));
+    }
+    out
+}
+
+/// Inverse of [`pack_no_fec`]: recover `û₀..û₃` from a 7-byte R34 frame.
+pub fn unpack_no_fec(bytes: &[u8]) -> [u16; 4] {
+    let mut natural = [0u8; INFO_BITS_TOTAL as usize];
+    for (j, &dst) in R34_BIT_ORDER.iter().enumerate() {
+        natural[dst as usize] = (bytes[j / 8] >> (7 - (j % 8))) & 1;
+    }
+    let mut out = [0u16; 4];
+    let mut idx = 0;
+    for (oi, &w) in INFO_WIDTHS.iter().enumerate() {
+        let mut v = 0u16;
+        for _ in 0..w {
+            v = (v << 1) | u16::from(natural[idx]);
+            idx += 1;
+        }
+        out[oi] = v;
+    }
+    out
+}
+
+/// Flatten `û₀..û₃` into the 49 natural info bits, MSB-first per field.
+fn natural_bits(info: &[u16; 4]) -> [u8; INFO_BITS_TOTAL as usize] {
+    let mut natural = [0u8; INFO_BITS_TOTAL as usize];
+    let mut idx = 0;
+    for (&w, &v) in INFO_WIDTHS.iter().zip(info.iter()) {
+        for k in (0..w as usize).rev() {
+            natural[idx] = ((v >> k) & 1) as u8;
+            idx += 1;
+        }
+    }
+    natural
+}
+
 /// Length of the half-rate PN sequence: `p_r(0)` seed plus
 /// `p_r(1..=23)` for the 23-bit `m̂₁` mask.
 pub const PN_SEQ_LEN: usize = 24;
@@ -381,6 +446,47 @@ mod tests {
         assert_eq!(INFO_WIDTHS.iter().map(|&w| u16::from(w)).sum::<u16>(), 49);
         assert_eq!(CODE_WIDTHS.iter().map(|&w| u16::from(w)).sum::<u16>(), 72);
         assert_eq!(INFO_BITS_TOTAL, 49);
+    }
+
+    #[test]
+    fn r34_bit_order_is_a_bijection() {
+        let mut seen = [false; INFO_BITS_TOTAL as usize];
+        for &p in R34_BIT_ORDER.iter() {
+            assert!((p as usize) < INFO_BITS_TOTAL as usize, "index {p} out of range");
+            assert!(!seen[p as usize], "natural bit {p} mapped twice");
+            seen[p as usize] = true;
+        }
+        assert!(seen.iter().all(|&b| b), "R34_BIT_ORDER does not cover all 49 bits");
+    }
+
+    #[test]
+    fn r34_pack_unpack_roundtrip() {
+        // Exercise the full field range; the top field is 14 bits.
+        for seed in [0u16, 1, 0x555, 0xAAA, 0x1FFF, 0x3FFF] {
+            let info = [
+                seed & 0x0FFF,
+                seed.rotate_left(3) & 0x0FFF,
+                seed.rotate_left(5) & 0x07FF,
+                seed.rotate_left(7) & 0x3FFF,
+            ];
+            let bytes = pack_no_fec(&info);
+            // Pad bits 49..55 must be zero.
+            assert_eq!(bytes[6] & 0x7F, 0, "trailing pad bits not zero for {info:?}");
+            assert_eq!(unpack_no_fec(&bytes), info, "roundtrip failed for {info:?}");
+        }
+    }
+
+    #[test]
+    fn r34_matches_dvsi_first_bit_is_u0_msb() {
+        // R34 bit 0 (MSB of byte 0) is the MSB of û₀ — the start of the
+        // DVSI 3-way interleave. Guards against accidental reversion to
+        // the naive sequential layout (which also starts with û₀ MSB, so
+        // also pin bit 1 = û₁ bit 5 and bit 2 = û₃ bit 12).
+        assert_eq!(R34_BIT_ORDER[0], 0); // û₀[11]
+        assert_eq!(R34_BIT_ORDER[1], 18); // û₁[5]
+        assert_eq!(R34_BIT_ORDER[2], 36); // û₃[12]
+        let info = [0x800u16, 0, 0, 0]; // only û₀ MSB set
+        assert_eq!(pack_no_fec(&info)[0] & 0x80, 0x80);
     }
 
     #[test]

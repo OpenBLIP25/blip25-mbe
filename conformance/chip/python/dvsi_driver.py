@@ -417,6 +417,35 @@ def decode_halfrate_file(s, ambe9_path, out_path, n_frames=None, with_fec=True):
         f.write(pcm_out)
     return n_frames, errors
 
+def encode_halfrate_file(s, pcm_path, ambe_out, n_frames=None, with_fec=True):
+    """Encode a raw PCM file (LE i16, 8 kHz mono) to a P25 half-rate AMBE+2 file.
+
+    Output is concatenated 9-byte FEC frames (with_fec=True) or 7-byte
+    info-only frames. The chip must already be in the matching
+    `set_p25_halfrate(with_fec=...)` mode. Mirrors `encode_file` (full-rate).
+    """
+    fb = 9 if with_fec else 7
+    with open(pcm_path, 'rb') as f:
+        pcm = f.read()
+    samples = struct.unpack(f'<{len(pcm)//2}h', pcm[:(len(pcm)//2)*2])
+    total = len(samples) // 160
+    if n_frames is None:
+        n_frames = total
+    n_frames = min(n_frames, total)
+    bit_buf = bytearray()
+    errors = 0
+    for f_idx in range(n_frames):
+        frame_pcm = list(samples[f_idx*160:(f_idx+1)*160])
+        bits = encode_halfrate_frame(s, frame_pcm, with_fec=with_fec)
+        if bits is None:
+            errors += 1
+            bit_buf += bytes(fb)
+            continue
+        bit_buf += bits
+    with open(ambe_out, 'wb') as f:
+        f.write(bit_buf)
+    return n_frames, errors
+
 def decode_frame(s, frame_18_bytes):
     """Send one P25 full-rate FEC frame, return 160 PCM samples (i16 list)."""
     if len(frame_18_bytes) != 18:
@@ -545,6 +574,12 @@ def main():
     p_hd.add_argument('--frames', type=int, default=None)
     p_hd.add_argument('--no-fec', action='store_true', help='Treat input as 7-byte info-only frames')
 
+    p_he = sub.add_parser('encode-halfrate', help='Encode a raw PCM file (LE i16 8 kHz mono) to a P25 half-rate AMBE+2 file (9-byte frames)')
+    p_he.add_argument('pcm_path')
+    p_he.add_argument('ambe9_out')
+    p_he.add_argument('--frames', type=int, default=None)
+    p_he.add_argument('--no-fec', action='store_true', help='Emit 7-byte info-only frames')
+
     args = ap.parse_args()
     with serial.Serial(args.port, args.baud, timeout=2.0) as s:
         s.reset_input_buffer()
@@ -556,12 +591,12 @@ def main():
 
         # Encode-capable commands need both halves initialized.
         init_flags = INIT_DECODER
-        if args.cmd in ('encode', 'roundtrip'):
+        if args.cmd in ('encode', 'roundtrip', 'encode-halfrate'):
             init_flags = INIT_ENCODER | INIT_DECODER
         init_codec(s, init_flags)
         # Rate config: half-rate commands need PKT_RATET 33/34, all
         # others stay on the full-rate PKT_RATEP path.
-        if args.cmd in ('decode-halfrate',):
+        if args.cmd in ('decode-halfrate', 'encode-halfrate'):
             set_p25_halfrate(s, with_fec=not args.no_fec)
         else:
             set_p25_fullrate(s, with_fec=not args.no_fec)
@@ -573,6 +608,16 @@ def main():
                 with_fec=not args.no_fec,
             )
             print(f"decoded {n - errors}/{n} half-rate frames to {args.pcm_out}")
+            if errors:
+                print(f"errors: {errors}")
+            return
+
+        if args.cmd == 'encode-halfrate':
+            n, errors = encode_halfrate_file(
+                s, args.pcm_path, args.ambe9_out, args.frames,
+                with_fec=not args.no_fec,
+            )
+            print(f"encoded {n - errors}/{n} half-rate frames to {args.ambe9_out}")
             if errors:
                 print(f"errors: {errors}")
             return
