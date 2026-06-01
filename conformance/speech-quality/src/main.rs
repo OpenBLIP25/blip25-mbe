@@ -17,9 +17,10 @@
 //! The chip side is driven by `ssh <host> dvsi {encode,decode}` — the
 //! driver lives at `conformance/chip/python/dvsi_driver.py` and is
 //! installed as `/usr/local/bin/dvsi` on the chip host.
-//! Per-frame chip throughput is ~1.8–15 s (see
-//! `project_chip_unblock_session_2026-04-23`), so budget `--frames`
-//! to a few hundred when building baseline numbers.
+//! Per-frame chip throughput is ~33 ms/frame (realtime-capable) since
+//! the `read_response` desync fix (2026-04-30) — it had been ~2.24 s/frame
+//! when the driver waited on a phantom parity byte. Full-length vectors
+//! run in seconds, so `--frames` is for scoping coverage, not wall time.
 
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
@@ -82,8 +83,8 @@ enum Cmd {
         #[arg(long)]
         out_dir: PathBuf,
         /// Cap frames processed. Each frame is 20 ms of audio. Chip
-        /// encode throughput is ~1.8–15 s/frame, so 300 frames ≈
-        /// 9–75 min wall time on the chip side.
+        /// throughput is ~33 ms/frame (realtime) since the 2026-04-30
+        /// `read_response` desync fix, so this scopes coverage, not wall time.
         #[arg(long)]
         frames: Option<usize>,
         /// SSH user@host for the chip driver (e.g. `root@192.168.1.6`).
@@ -188,6 +189,18 @@ enum Cmd {
         /// Cap frames processed.
         #[arg(long)]
         frames: Option<usize>,
+        /// SSH user@host for the chip driver (e.g. `root@192.168.1.6`).
+        /// Must have the `dvsi` CLI installed at `/usr/local/bin/dvsi`
+        /// with the `encode-halfrate` / `decode-halfrate` subcommands.
+        /// The AMBE-3000R natively runs AMBE+2, so for half-rate the
+        /// chip is a genuine bit-faithful oracle (unlike full-rate IMBE).
+        #[arg(long, default_value = "root@192.168.1.6")]
+        chip_host: String,
+        /// Skip all chip-side cells (use when the chip is unavailable or
+        /// for a local-only dry run). Only `our_enc_our_dec.wav` and
+        /// `ref.wav` are produced.
+        #[arg(long)]
+        skip_chip: bool,
         /// Enable §0.8.4 silence detection in the analysis encoder.
         #[arg(long)]
         silence_dispatch: bool,
@@ -447,6 +460,8 @@ fn main() -> Result<()> {
             pcm,
             out_dir,
             frames,
+            chip_host,
+            skip_chip,
             silence_dispatch,
             pitch_silence_override,
             default_pitch_on_silence,
@@ -463,6 +478,8 @@ fn main() -> Result<()> {
             &pcm,
             &out_dir,
             frames,
+            &chip_host,
+            skip_chip,
             silence_dispatch,
             pitch_silence_override,
             default_pitch_on_silence,
@@ -965,6 +982,8 @@ fn cmd_ambe_plus2_ab_matrix(
     pcm_path: &Path,
     out_dir: &Path,
     frames: Option<usize>,
+    chip_host: &str,
+    skip_chip: bool,
     silence_dispatch: bool,
     pitch_silence_override: bool,
     default_pitch_on_silence: bool,
@@ -1024,6 +1043,116 @@ fn cmd_ambe_plus2_ab_matrix(
         dec_secs,
         wav_path.display()
     );
+
+    let mut meta = Meta {
+        pcm_path: pcm_path.display().to_string(),
+        frames: n_frames,
+        our_enc_secs: enc_secs,
+        our_dec_secs: dec_secs,
+        chip_enc_secs: None,
+        chip_dec_secs: None,
+        chip_host: chip_host.to_string(),
+        silence_dispatch,
+        pitch_silence_override,
+        skip_chip,
+    };
+
+    if !skip_chip {
+        // Half-rate AMBE+2: the AMBE-3000R runs this codec natively, so
+        // the chip cells here are a genuine bit-faithful oracle. Mirrors
+        // the full-rate `cmd_ab_matrix` chip block, but drives the
+        // `encode-halfrate` / `decode-halfrate` CLI paths and 9-byte frames.
+        let pid = std::process::id();
+        let remote_pcm = format!("/tmp/blip25_hr_ref_{pid}.pcm");
+        let remote_chip_bit = format!("/tmp/blip25_hr_chip_{pid}.ambe9");
+        let remote_our_bit = format!("/tmp/blip25_hr_our_{pid}.ambe9");
+        let remote_cedec_pcm = format!("/tmp/blip25_hr_cec_{pid}.pcm");
+        let remote_oedec_pcm = format!("/tmp/blip25_hr_oec_{pid}.pcm");
+
+        // Upload the reference PCM we actually analyzed (truncated to
+        // --frames) so the chip sees the same input.
+        let local_trimmed_pcm = out_dir.join("trimmed_ref.pcm");
+        write_raw_pcm(&local_trimmed_pcm, pcm)?;
+        scp_to(&local_trimmed_pcm, chip_host, &remote_pcm)?;
+
+        // ---- chip encode: PCM → chip.ambe9 (9-byte FEC frames) ----
+        let t0 = Instant::now();
+        ssh_run(
+            chip_host,
+            &format!("dvsi encode-halfrate '{remote_pcm}' '{remote_chip_bit}' --frames {n_frames}"),
+        )?;
+        let chip_enc_secs = t0.elapsed().as_secs_f64();
+        meta.chip_enc_secs = Some(chip_enc_secs);
+        eprintln!(
+            "chip encode (half-rate): {} frames in {:.1} s ({:.1} ms/frame)",
+            n_frames,
+            chip_enc_secs,
+            1000.0 * chip_enc_secs / n_frames.max(1) as f64
+        );
+
+        // Fetch chip bits so we can run them through our decoder.
+        let local_chip_bit = out_dir.join("chip.ambe9");
+        scp_from(chip_host, &remote_chip_bit, &local_chip_bit)?;
+        let chip_bits = fs::read(&local_chip_bit)?;
+
+        // ---- cell 3: chip_enc + our_dec ----
+        let chip_enc_our_dec = our_decode_ambe_plus2(&chip_bits, &enhancement);
+        let wav_path = out_dir.join("chip_enc_our_dec.wav");
+        write_wav(&wav_path, &chip_enc_our_dec)?;
+        eprintln!("chip_enc_our_dec → {}", wav_path.display());
+
+        // Upload OUR bits so the chip can decode them.
+        scp_to(&our_bit_path, chip_host, &remote_our_bit)?;
+
+        // ---- cell 4 + cell 2: chip decodes both bitstreams ----
+        let t0 = Instant::now();
+        ssh_run(
+            chip_host,
+            &format!("dvsi decode-halfrate '{remote_chip_bit}' '{remote_cedec_pcm}' --frames {n_frames}"),
+        )?;
+        ssh_run(
+            chip_host,
+            &format!("dvsi decode-halfrate '{remote_our_bit}' '{remote_oedec_pcm}' --frames {n_frames}"),
+        )?;
+        let chip_dec_secs = t0.elapsed().as_secs_f64();
+        meta.chip_dec_secs = Some(chip_dec_secs);
+
+        // Fetch chip's PCM outputs.
+        let local_cec = out_dir.join("chip_enc_chip_dec.pcm");
+        let local_oec = out_dir.join("our_enc_chip_dec.pcm");
+        scp_from(chip_host, &remote_cedec_pcm, &local_cec)?;
+        scp_from(chip_host, &remote_oedec_pcm, &local_oec)?;
+        let cec_pcm = read_pcm_i16(&local_cec)?;
+        let oec_pcm = read_pcm_i16(&local_oec)?;
+
+        // ---- cell 4: chip_enc + chip_dec ----
+        let wav_path = out_dir.join("chip_enc_chip_dec.wav");
+        write_wav(&wav_path, &cec_pcm)?;
+        eprintln!("chip_enc_chip_dec → {}", wav_path.display());
+
+        // ---- cell 2: our_enc + chip_dec ----
+        let wav_path = out_dir.join("our_enc_chip_dec.wav");
+        write_wav(&wav_path, &oec_pcm)?;
+        eprintln!("our_enc_chip_dec → {}", wav_path.display());
+
+        // Cleanup: best-effort remote and local tmp file removal.
+        let _ = ssh_run(
+            chip_host,
+            &format!(
+                "rm -f '{remote_pcm}' '{remote_chip_bit}' '{remote_our_bit}' \
+                 '{remote_cedec_pcm}' '{remote_oedec_pcm}'"
+            ),
+        );
+        let _ = fs::remove_file(&local_trimmed_pcm);
+        let _ = fs::remove_file(&local_cec);
+        let _ = fs::remove_file(&local_oec);
+    }
+
+    let meta_path = out_dir.join("meta.json");
+    fs::write(&meta_path, meta.to_json())
+        .with_context(|| format!("write meta {}", meta_path.display()))?;
+    eprintln!("wrote {}", meta_path.display());
+
     Ok(())
 }
 
