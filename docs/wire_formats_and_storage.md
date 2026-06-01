@@ -43,17 +43,22 @@ ours       (49-bit info, u₀..u₃ MSB-first):  [98 02 b9 4f a4 d3 80]
 DVSI r34   (same 49 bits, permuted):         [cd 4a c3 01 b6 e6 00]
 ```
 
-The permutation looks like a 3-row interleave — likely a chip-internal
-serialization quirk left over from how the AMBE-3000R's bit FIFOs feed the
-USB protocol. **It is not specified anywhere in BABA-A or the AMBE-3000
-protocol spec.** It's a private DVSI convention.
+The permutation is a fixed **3-way column interleave** (rows of 18/18/13
+bits): r34 bit 0,1,2 = natural bits 0,18,36; bits 3,4,5 = 1,19,37; etc.
+It is not specified in BABA-A or the AMBE-3000 protocol spec — it's a
+private DVSI convention, likely left over from how the AMBE-3000R's bit
+FIFOs feed the USB protocol. The exact table lives in
+`ambe_plus2_wire::frame::R34_BIT_ORDER`, derived empirically by
+`examples/derive_r34_order.rs` and verified an identical bijection across
+two disjoint vector sets (speech+alert vs sine/dtmf/cp/dam80).
 
-This crate's `AmbePlus2_2450x2450` packs the 49 bits in the natural
-u₀..u₃ MSB-first order, which round-trips losslessly through our own
-encoder/decoder pair but **does not byte-equal the chip's r34 output stream**.
-If you ever need to feed raw bytes into a DVSI chip configured at rate index
-34, you would need a permutation step — but you almost never need that path
-(see "Recommended storage" below).
+As of the R34-ordering fix, this crate's `AmbePlus2_2450x2450` packs the
+49 bits in the DVSI interleave, so our r34 output is **byte-exact with the
+chip's r34 stream** (`r33↔r34` transcode is 100% bit-exact vs the DVSI RC
+vectors in both directions — see `conformance-vectors cross-rate-compare`).
+This matters for real consumers: an NXDN/Fusion console emits AMBE+2
+half-rate **without** FEC, so getting this order right is required to
+interoperate, not just to round-trip internally.
 
 ## What "without FEC" means in each codec — they're not symmetric
 
@@ -64,35 +69,34 @@ packed into 11 bytes with 8 bits of pad. We round-trip this bit-exactly
 against DVSI (100% in `cross-rate-compare`). Anyone storing IMBE
 info-only is using this layout, full stop.
 
-The AMBE+2 no-FEC layout has no such consensus. JMBE doesn't decode AMBE+2
-info-only (its AMBE module consumes 9-byte FEC frames). OP25 doesn't expose
-an AMBE+2 info-only file format. The only "r34 wire format" that exists in
-the wild is DVSI's chip-internal permutation, which has no second consumer.
+The AMBE+2 no-FEC layout has no published-spec consensus the way IMBE does —
+JMBE doesn't decode AMBE+2 info-only (its AMBE module consumes 9-byte FEC
+frames) and OP25 doesn't expose an AMBE+2 info-only file format. But it is
+*not* an internal-only curiosity: an **NXDN/Fusion console emits AMBE+2
+half-rate without FEC**, so the DVSI r34 layout is a real interop target with
+a real second consumer.
 
-So our two no-FEC variants are structurally different things despite the
-parallel naming:
-- `Imbe4400x4400`: a real conventional storage format with multi-tool consensus.
-- `AmbePlus2_2450x2450`: our private convention, useful for ours-to-ours
-  archival but not for interop with anything outside this library.
+So our two no-FEC variants are now both faithful to their external authority,
+despite the structural difference:
+- `Imbe4400x4400`: matches the JMBE/OP25/DVSI `p25_nofec` consensus (sequential
+  88-bit MSB-first layout).
+- `AmbePlus2_2450x2450`: matches DVSI's r34 interleave byte-for-byte (see below).
 
-## Why we didn't pursue byte-exact DVSI r34 compatibility
+## DVSI r34 byte-exact compatibility (done)
 
 The DVSI r34 byte permutation isn't documented in BABA-A and isn't a P25
-air-interface format. It exists only as a DVSI chip-internal serialization
-choice. Replicating it byte-for-byte would require either:
+air-interface format — it's a DVSI chip-internal serialization choice. We
+derived it empirically rather than from a spec we don't have:
+`examples/derive_r34_order.rs` decodes `r33/*.bit` (validated FEC path) to the
+49 info bits, pairs them frame-for-frame with the raw `r34/*.bit` bytes, and
+solves the bit-signature correspondence. The result is a clean bijection — a
+fixed 3-way column interleave, pinned in `ambe_plus2_wire::frame::R34_BIT_ORDER`
+and regression-tested in `frame.rs`. `conformance-vectors cross-rate-compare`
+now reports `r33↔r34` 100% bit-exact vs the DVSI RC vectors in both directions.
 
-1. Reverse-engineering the permutation via single-bit b̂ probes against the
-   AMBE-3000R chip — feasible (~1 hour of probe runs), but the resulting code
-   serves exactly one consumer: another DVSI chip configured at rate 34.
-2. Finding it in a DVSI document we don't have. None of BABA-A, BABG, or
-   the AMBE-3000F manual specify it.
-
-We chose to leave this as a "deferred to chip-shim crate" item. The future
-`blip25-chip-shim` project — which emulates the AMBE-3000R serial protocol
-for drop-in Blue-DV-style compatibility — is the right place for byte-exact
-chip wire-format work. blip25-mbe itself is a codec library, not a chip
-emulator; the project memory `Chip-shim is future separate project` codifies
-this scope boundary.
+(The clean-room rule doesn't gate this: the permutation is derived from the
+DVSI test vectors — the project's designated correctness oracle — not from any
+TIA-102 PDF. r34/AMBE+2 isn't a TIA-102 air-interface format.)
 
 ## Recommended storage format (read this if you only read one section)
 
@@ -158,10 +162,10 @@ feeding the chip.
 | Store P25 Phase 1 voice for replay through anything | `Rate::Imbe7200x4400` (18 bytes/frame) |
 | Store P25 Phase 2 / DMR voice for replay through anything | `Rate::AmbePlus2_3600x2450` (9 bytes/frame) |
 | Compact archive, IMBE side, JMBE-compatible | `Rate::Imbe4400x4400` (11 bytes/frame) — matches DVSI / JMBE convention |
-| Compact archive, AMBE+2 side, ours-to-ours only | `Rate::AmbePlus2_2450x2450` (7 bytes/frame) — private layout, not byte-equal to DVSI r34 |
-| Feed bytes directly into a DVSI chip via PKT_CHANP at rate 34 | Not supported here; see future blip25-chip-shim |
+| Compact archive, AMBE+2 side, no-FEC | `Rate::AmbePlus2_2450x2450` (7 bytes/frame) — byte-exact with DVSI r34 / NXDN-Fusion no-FEC output |
+| Feed bytes directly into a DVSI chip via PKT_CHANP at rate 34 | `Rate::AmbePlus2_2450x2450` bytes are r34-faithful; the serial framing/PKT layer still lives in blip25-chip-shim |
 
-If something downstream surprises you with "I expected r34 to match DVSI's
-output and it didn't," the answer is in this article. Don't go looking for
-a bug in `ambe_plus2_wire`; the bits are right, the byte order is ours by
-design.
+r34 now matches DVSI's output byte-for-byte (`R34_BIT_ORDER` in
+`ambe_plus2_wire::frame`, validated by `cross-rate-compare`). If a stream
+ever *doesn't* match, suspect a regression in that table, not a "by design"
+divergence — the older "byte order is ours by design" caveat no longer applies.

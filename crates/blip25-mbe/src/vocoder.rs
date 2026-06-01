@@ -1611,7 +1611,7 @@ mod ambe_plus2_pipeline {
     use crate::ambe_plus2_wire::dequantize::{
         Decoded, decode_to_params, encode_tone_frame_info, quantize, tone_to_mbe_params,
     };
-    use crate::ambe_plus2_wire::frame::{INFO_WIDTHS, decode_frame, encode_frame};
+    use crate::ambe_plus2_wire::frame::{decode_frame, encode_frame, pack_no_fec, unpack_no_fec};
 
     pub(super) fn encode(
         pcm: &[i16],
@@ -1782,16 +1782,17 @@ mod ambe_plus2_pipeline {
         out
     }
 
+    // R34 (half-rate no-FEC) is NOT the naive sequential û₀‖û₁‖û₂‖û₃
+    // layout — DVSI applies a 3-way column interleave. Delegate to the
+    // wire-layer helpers that carry the empirically-derived order. (The
+    // full-rate IMBE no-FEC path stays sequential — it is already
+    // byte-exact vs DVSI `p25_nofec`.)
     fn pack_info_half(info: &[u16; 4]) -> [u8; 7] {
-        let mut out = [0u8; 7];
-        super::pack_info_bits(info, &INFO_WIDTHS, &mut out);
-        out
+        pack_no_fec(info)
     }
 
     fn unpack_info_half(bytes: &[u8]) -> [u16; 4] {
-        let mut out = [0u16; 4];
-        super::unpack_info_bits(bytes, &INFO_WIDTHS, &mut out);
-        out
+        unpack_no_fec(bytes)
     }
 
     /// Wire-layer transcode: 9-byte FEC frame → 7-byte info-only
