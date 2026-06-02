@@ -243,7 +243,19 @@ bit-exact chip oracle (`clean/dam/fambf22c/tambf22a`, ~5k voiced frames). A
   if the onset case is revisited; gated as `BLIP25_PHASE_UV_RESET` in the fork's
   `mbe_baseline.rs`. The dominant *steady*-run residual is a within-run time-shift
   τ that resists a closed form (likely fixed-point) — still inaudible, still
-  parity-only.) The only
+  parity-only. *Update 2026-06-02b (envelope→phase + V/UV boundary):* a dedicated
+  chip envelope-sweep (`ambe3000-clone/conformance/baselines/envsweep_2026-06-02/`)
+  found the AMBE-3000R's envelope→phase response **is minimum-phase** (Hilbert of
+  log-envelope; cepstral corr 0.95, scale ~0.85) **applied to ALL harmonics** —
+  whereas our regen exempts `l≤L̃/4` and uses γ=0.44 (a low scale). Matching the
+  chip = drop the exemption + raise the scale (`BLIP25_REGEN_ALL`+`REGEN_SCALE≈1.2`).
+  Inaudible in steady voicing (parity-only), BUT the chip also injects a **large
+  phase perturbation at voiced harmonics adjacent to a VOICING BOUNDARY when it
+  coincides with a formant** (synthetic formant all-voiced vs mixed-voiced: l near
+  the boundary swings 90–170°). That is squarely the **V/UV-boundary phase case**
+  this doc flags as a *quality* lever — worth A/B'ing for boundary crispness if the
+  V/UV case is revisited. The bulk real-frame "content surface" is this static,
+  envelope×voicing-dependent boundary phase, not a simple min-phase operator.) The only
   structural envelope handle left is the predictor
   coefficient — and it was **swept and confirmed near-dead**: the chip-matching
   optimum of the §2.13 `0.65` coefficient is ≈**0.68** (the ~37% undercorrection),
