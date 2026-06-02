@@ -265,6 +265,29 @@ bit-exact chip oracle (`clean/dam/fambf22c/tambf22a`, ~5k voiced frames). A
   (also shared with the analysis-encoder roundtrip). Decode quality is **phase-
   limited, not envelope-limited.**
 
+**Progress 2026-06-02 (ambe3000-clone magdyn chip campaign — CORRECTS the two
+notes above).** A constant-pitch magnitude-step chip campaign
+(`ambe3000-clone/conformance/baselines/magdyn_phase_2026-06-02/`) resolves the
+real-frame "content surface":
+- The chip's voiced phase is **MEMORYLESS in magnitude** — after a spectral step
+  it converges to the cold-destination phase in ~6–8 frames, no persistent offset.
+  So the content surface is **not** a voicing-boundary/dynamics term.
+- The content surface **IS the min-phase Hilbert operator** on the instantaneous
+  envelope (chip-validated corr 0.96 vs our `ambe_phase_regen` on the chip's
+  extracted M̄_l), applied to **ALL** harmonics — the chip does NOT use the
+  `l≤⌊L̃/4⌋` regen exemption (REGEN_ALL). This **overturns** the "not a simple
+  min-phase operator" note above.
+- **The per-harmonic envelope micro-scatter (the ≤0.10 dB residual) is the SYNTH
+  TRANSFER, not dequant/§1.10.** On cold probes (chip & ours decode the SAME
+  codeword) the realized envelope ripples 46% (chip) vs 29% (ours); dequant is
+  faithful (±0.17 log2) and §1.10 is a near no-op (ripple 0.29 enh vs 0.31 no-enh).
+  The divergence is the chip's fixed-point synthesis reconstruction (window/DFT-256/
+  OLA), partly a fixed H(ν). For perceptual quality this is the **envelope-shape +
+  phase-coherence** lever (via the min-phase operator it couples magnitude and
+  phase): matching the synth reconstruction would sharpen formant detail AND
+  improve the onset/boundary phase coherence this doc flags. For bit-exact parity
+  it is the unified decode target (the varying-pitch ψ/τ is separate).
+
 ### 2.2 (HIGH, the "exceed" win) Do NOT replicate the chip's quality-degrading artifacts
 The chip applies beyond-spec behaviors that *hurt* quality
 (`ambe3000_chip_oracle_caveats.md`): an amplitude-dependent **mute**, a hard
@@ -313,6 +336,24 @@ bandpass-filtered noise** (a long, cross-frame-coherent effective window), not t
 per-frame DFT-OLA — no window/taper/OLA knob reduces the −17.9 dB (all
 −17.4…−18.3). NB: the half-rate DEQUANTIZER (gain/PRBA/HOC/DCT/§2.13 predictor) is
 bit-faithful to the chip — the unvoiced envelope error is synthesis, not dequant.
+
+**CORRECTION (2026-06-02, ambe3000-clone `wola_validate_2026-06-02`).** The
+"continuous per-band bandpass-filtered noise / long cross-frame-coherent window"
+fix above is **overturned at the waveform level.** It was implemented two ways
+(long-window overlap-add WOLA + overlap-save OLS, both gated `BLIP25_UV_SYNTH`)
+and measured by sample-xcorr vs the chip: the original per-frame 256-DFT-OLA
+**best matches the chip's unvoiced waveform** — real-speech interior-unvoiced
+xcorr old 0.842 > WOLA 0.689 > OLS 0.352; stationary flat probe old 0.967 > WOLA
+0.907. WOLA *does* cut the −17.9 dB per-band POWER leak (notch −14.7→−27.6 dB)
+but its long window blends overlapping noise blocks → smears the time-varying
+envelope + noise phase → better power spectrum, WORSE waveform. So the inter-band
+leak is a stationary-power-spectrum artifact, **NOT the perceptual/waveform
+bottleneck** — don't chase it with a longer window. The real unvoiced lever is
+the 256-path fine structure: the exact band-edge bin assignment (round-to-nearest
+beats ceil on real speech, +0.4 dB SNR, pitch-dependent) and fixed-point
+DFT/shaping precision. (Mechanism B: on extreme envelopes our §1.10 enhancement
+hits the W_l upper clamp and boosts shoulders ×1.2 — a separate envelope lever
+shared with voiced magnitude.)
 
 ---
 
