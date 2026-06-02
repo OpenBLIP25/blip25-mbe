@@ -5,6 +5,15 @@ Emulate a DVSI vocoder chip (IMBE for P25 Phase 1; eventually AMBE+2 for Phase 2
 where possible). The reference for correctness is the DVSI chip's output on known
 test vectors, not any open-source implementation.
 
+## Audio-quality work — keep `QUALITY_FINDINGS.md` current
+`QUALITY_FINDINGS.md` is the living plan for raising perceptual quality to (and
+past) the AMBE-3000R, on both encode and decode. **Whenever you make a change
+that affects audio quality** — close one of its levers, get a PESQ delta in the
+4-cell matrix, find new evidence, or reprioritize — **update that file in the
+same change**: mark the lever done/in-progress with the measured result, add new
+findings, and revise priorities. Treat it as the quality roadmap of record, not
+a one-time report.
+
 ## Implementation Directives
 
 ### Spec-first, not source-first

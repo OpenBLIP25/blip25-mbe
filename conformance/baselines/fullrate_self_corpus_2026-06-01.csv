@@ -1,0 +1,7 @@
+dir,method,pesq_nb,pesq_wb,stoi,snr_db,samples
+/tmp/frmat/clean,our_enc_our_dec,3.096,2.718,0.928,-3.03,240000
+/tmp/frmat/dam,our_enc_our_dec,3.341,3.020,0.903,-2.63,203840
+/tmp/frmat/fambf22c,our_enc_our_dec,2.908,2.395,0.856,-2.51,240000
+/tmp/frmat/fambm22a,our_enc_our_dec,2.980,2.630,0.920,-2.58,240000
+/tmp/frmat/tambf22a,our_enc_our_dec,2.933,2.514,0.919,-1.86,240000
+/tmp/frmat/tambf32b,our_enc_our_dec,3.090,2.694,0.907,-2.63,240000

@@ -27,6 +27,10 @@ path = "examples/sine_probe.rs"
 name = "encode_pcm_to_bit"
 path = "examples/encode_pcm_to_bit.rs"
 
+[[example]]
+name = "halfrate_envelope_converge"
+path = "examples/halfrate_envelope_converge.rs"
+
 [dependencies]
 blip25-mbe.workspace = true
 anyhow.workspace = true

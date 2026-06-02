@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""PESQ (narrowband) + STOI scoring over an ab-matrix output directory.
+"""PESQ (narrowband + supplementary wideband) + STOI scoring over an
+ab-matrix output directory.
 
 Expects the layout produced by `conformance-speech-quality ab-matrix`:
 
@@ -11,11 +12,20 @@ Expects the layout produced by `conformance-speech-quality ab-matrix`:
     <dir>/meta.json
 
 Prints a CSV with columns:
-    dir,method,pesq_nb,stoi,snr_db,samples
+    dir,method,pesq_nb,pesq_wb,stoi,snr_db,samples
 
 `ref.wav` is the reference channel for PESQ/STOI; each `*.wav` that
 exists is scored against it after peak-xcorr alignment and edge-trim
 (40 ms on each side).
+
+PESQ band note: the P25 IMBE / AMBE+2 vocoder produces 8 kHz audio
+(4 kHz acoustic band), so **narrowband PESQ (ITU-T P.862) is the
+apples-to-apples metric** and `pesq_nb` is the attribution basis.
+Wideband PESQ (P.862.2) is only defined at 16 kHz, so `pesq_wb` is
+computed on audio polyphase-resampled 8 kHz -> 16 kHz. Because the
+4-8 kHz band is empty (and therefore matches the reference), `pesq_wb`
+is a *softer*, optimistic score; it is reported for completeness only,
+not used to attribute the encoder/decoder gap.
 
 Usage:
     score_ab_matrix.py <dir> [<dir> ...]
@@ -31,7 +41,7 @@ from pathlib import Path
 
 import numpy as np
 from scipy.io import wavfile
-from scipy.signal import correlate
+from scipy.signal import correlate, resample_poly
 from pesq import pesq
 from pystoi import stoi
 
@@ -92,22 +102,42 @@ def snr_db(ref: np.ndarray, cand: np.ndarray) -> float:
     return 10.0 * np.log10(num / den) if num > 0 else float("-inf")
 
 
-def score_pair(ref: np.ndarray, cand: np.ndarray, sr: int) -> tuple[float, float, float]:
+def score_pair(
+    ref: np.ndarray, cand: np.ndarray, sr: int
+) -> tuple[float, float, float, float]:
     ref_a, cand_a = align(ref, cand)
     ref_a = trim_edges(ref_a, sr)
     cand_a = trim_edges(cand_a, sr)
     # PESQ expects float32/int16 at 8k/16k.
-    try:
-        p = float(pesq(sr, ref_a.astype(np.float32), cand_a.astype(np.float32), "nb"))
-    except Exception as e:  # noqa: BLE001
-        p = float("nan")
-        print(f"# PESQ error: {e}", file=sys.stderr)
+    p_nb = float("nan")
+    p_wb = float("nan")
+    if sr == 8000:
+        try:
+            p_nb = float(pesq(8000, ref_a.astype(np.float32), cand_a.astype(np.float32), "nb"))
+        except Exception as e:  # noqa: BLE001
+            print(f"# PESQ(nb) error: {e}", file=sys.stderr)
+        # Supplementary wideband: resample 8k -> 16k and score in wb mode.
+        # 4-8 kHz band is empty so this is optimistic; reported for
+        # completeness, not attribution. See module docstring.
+        try:
+            ref16 = resample_poly(ref_a, 2, 1)
+            cand16 = resample_poly(cand_a, 2, 1)
+            p_wb = float(pesq(16000, ref16.astype(np.float32), cand16.astype(np.float32), "wb"))
+        except Exception as e:  # noqa: BLE001
+            print(f"# PESQ(wb) error: {e}", file=sys.stderr)
+    elif sr == 16000:
+        try:
+            p_wb = float(pesq(16000, ref_a.astype(np.float32), cand_a.astype(np.float32), "wb"))
+        except Exception as e:  # noqa: BLE001
+            print(f"# PESQ(wb) error: {e}", file=sys.stderr)
+    else:
+        print(f"# unsupported sample rate {sr} for PESQ", file=sys.stderr)
     try:
         s = float(stoi(ref_a, cand_a, sr, extended=False))
     except Exception as e:  # noqa: BLE001
         s = float("nan")
         print(f"# STOI error: {e}", file=sys.stderr)
-    return p, s, snr_db(ref_a, cand_a)
+    return p_nb, p_wb, s, snr_db(ref_a, cand_a)
 
 
 def score_dir(d: Path) -> list[dict]:
@@ -125,12 +155,13 @@ def score_dir(d: Path) -> list[dict]:
         if sr_c != sr:
             print(f"# {d}/{m}.wav: sample-rate mismatch {sr_c} vs {sr}", file=sys.stderr)
             continue
-        p, s, snr = score_pair(ref, cand, sr)
+        p_nb, p_wb, s, snr = score_pair(ref, cand, sr)
         rows.append(
             {
                 "dir": str(d),
                 "method": m,
-                "pesq_nb": p,
+                "pesq_nb": p_nb,
+                "pesq_wb": p_wb,
                 "stoi": s,
                 "snr_db": snr,
                 "samples": len(cand),
@@ -143,13 +174,13 @@ def main() -> None:
     if len(sys.argv) < 2:
         print(__doc__, file=sys.stderr)
         sys.exit(2)
-    print("dir,method,pesq_nb,stoi,snr_db,samples")
+    print("dir,method,pesq_nb,pesq_wb,stoi,snr_db,samples")
     for arg in sys.argv[1:]:
         rows = score_dir(Path(arg))
         for r in rows:
             print(
-                f"{r['dir']},{r['method']},{r['pesq_nb']:.3f},{r['stoi']:.3f},"
-                f"{r['snr_db']:.2f},{r['samples']}"
+                f"{r['dir']},{r['method']},{r['pesq_nb']:.3f},{r['pesq_wb']:.3f},"
+                f"{r['stoi']:.3f},{r['snr_db']:.2f},{r['samples']}"
             )
 
 
