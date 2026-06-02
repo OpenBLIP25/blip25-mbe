@@ -298,6 +298,22 @@ deficit; the half-rate Annex-T tone path bypasses MBE and should be exercised.
 Phase only matters here at the boundary and for inter-frame continuity (avoid
 clicks) — not as absolute offset.
 
+**Unvoiced inter-band leak (2026-06-02, ambe3000-clone `dequant_probe_2026-06-02`).**
+The spec's §1.12.1 per-frame DFT-256→band-shape→IDFT→OLA unvoiced synthesis has a
+fixed **−17.9 dB inter-band leak**: each unvoiced peak band smears energy into its
+neighbours (the per-frame ~160-sample effective window has ~−15 dB sinc sidelobes
+at one-band-spacing). Measured against the AMBE-3000R with direct-index codewords
+(chip and ours fed identical bits): the **chip leaks ~0** — its unvoiced spectrum
+has near-perfect band isolation (shoulder ≈ M̃), so the chip renders sharper /
+less-smeared unvoiced bands than our synthesis. Our flat→flat response is fine
+(±0.3 dB); the leak only shows on peaky spectra. This is both a parity gap and a
+**quality lever**: a sharper unvoiced spectrum (less band-to-band smear) is more
+faithful to the input envelope. Reaching it needs **continuous per-band
+bandpass-filtered noise** (a long, cross-frame-coherent effective window), not the
+per-frame DFT-OLA — no window/taper/OLA knob reduces the −17.9 dB (all
+−17.4…−18.3). NB: the half-rate DEQUANTIZER (gain/PRBA/HOC/DCT/§2.13 predictor) is
+bit-faithful to the chip — the unvoiced envelope error is synthesis, not dequant.
+
 ---
 
 ## 3. Encode-side quality levers (PCM → bits), prioritized
