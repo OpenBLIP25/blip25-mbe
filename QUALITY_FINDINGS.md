@@ -355,6 +355,23 @@ DFT/shaping precision. (Mechanism B: on extreme envelopes our §1.10 enhancement
 hits the W_l upper clamp and boosts shoulders ×1.2 — a separate envelope lever
 shared with voiced magnitude.)
 
+**Voiced/unvoiced RMS ratio diverges by pitch (2026-06-03, ambe3000-clone
+`vuv_codebook_recover_2026-06-03`).** Sweeping the V/UV pattern over a fixed base
+frame (chip vs ours, same bits): as bands flip voiced, the **chip's output RMS
+rises to a STABLE ~1.08×** the all-unvoiced level — pitch-independent (1.077 /
+1.138 / 1.077 at f0≈249/207/120 Hz). **Our decoder's voiced RMS swings with
+pitch**: 0.56–0.68× on sparse-harmonic frames (low/mid f0), ~1.01× on dense
+(high-harmonic) frames. The base-dependence is the fingerprint of **phase
+interference** in our voiced sinusoidal synthesis (few harmonics → coherent-phase
+constructive/destructive swings dominate RMS; many harmonics → averages out),
+whereas the chip's stable ratio implies its voiced harmonic phases are arranged
+(or magnitudes normalized) to keep voiced level pitch-independent. ⇒ on low-pitch
+voiced speech our output is audibly **too quiet** (down to ~0.6×), a perceptual
+level error that is a direct manifestation of the voiced-phase/synthesis wall
+(ambe3000-clone `voiced-phase-is-timeshift-tau` / onset-operator). Concrete chip
+target: voiced/unvoiced RMS ≈ 1.08, flat across pitch. Not a separable scaling
+constant — fixing it needs the chip's voiced phase/synthesis.
+
 ---
 
 ## 3. Encode-side quality levers (PCM → bits), prioritized
