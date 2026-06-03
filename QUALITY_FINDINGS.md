@@ -288,6 +288,31 @@ real-frame "content surface":
   improve the onset/boundary phase coherence this doc flags. For bit-exact parity
   it is the unified decode target (the varying-pitch ψ/τ is separate).
 
+**Progress 2026-06-03 (ambe3000-clone — §1.10 is WRONG-SIGNED vs the chip on real
+speech; dequant wordlength is chip-observable ~Q5).** Sharpening the earlier
+"§1.10 near no-op" note with the phase-invariant shape-LSD-vs-cached-chip-PCM
+instrument on the 4 real-speech vectors
+(`ambe3000-clone/conformance/baselines/enh_chip_wordlength_2026-06-03/`):
+- **§1.10 makes the chip-envelope match WORSE, consistently.** `lsd_E−lsd_D = +0.09 dB`
+  on all 4 files; per-frame the spec §1.10 hurts 72–75% of voiced frames (median
+  +0.10 dB), strengthening to 77–82% on high-energy well-voiced frames. Relaxing
+  the Eq.108 clamps to sharpen MORE degrades monotonically; the floor is at
+  enhancement OFF. A pure linear-in-l tilt null-test matches/beats the structured
+  clamp ⇒ the residual past "off" is a mild high-frequency ROLLOFF (the voiced
+  synth-H(f)), not the §1.10 law. End-to-end `BLIP25_NO_ENHANCE` improves
+  `pcm_lsd` (chip-PCM vs our-PCM) on all 4 files (~−0.05 dB).
+- **Quality implication (the "exceed" framing).** The chip applies essentially NO
+  spectral-amplitude sharpening on the half-rate path — its envelope is not
+  formant-sharpened the way spec §1.10 prescribes. For *chip parity* that means
+  turn §1.10 off. For *blip25-mbe quality* the inverse: the chip's lack of §1.10
+  sharpening is plausibly a chip **limitation**, so spec §1.10 (or a better-tuned
+  enhancement) stays a candidate "exceed" lever — do NOT remove it here on the
+  strength of the parity result; A/B §1.10 sharpening for formant clarity instead.
+- **Dequant log-mag wordlength is chip-observable at ~Q5** (≈0.19 dB log2 steps),
+  via the same instrument over a fixed-point dequant gate — composes additively
+  with §1.10-off (parity-only; envelope resolution, not a quality lever, but it
+  bounds how fine the chip's magnitude representation actually is).
+
 ### 2.2 (HIGH, the "exceed" win) Do NOT replicate the chip's quality-degrading artifacts
 The chip applies beyond-spec behaviors that *hurt* quality
 (`ambe3000_chip_oracle_caveats.md`): an amplitude-dependent **mute**, a hard
