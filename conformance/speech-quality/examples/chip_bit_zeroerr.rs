@@ -5,8 +5,8 @@
 //! still silent, the recovered params themselves are wrong.
 
 use blip25_mbe::codecs::mbe_baseline::{FrameErrorContext, GAMMA_W, SynthState, synthesize_frame};
-use blip25_mbe::imbe_wire::dequantize::{DecoderState, dequantize};
-use blip25_mbe::imbe_wire::frame::decode_frame;
+use blip25_mbe::imbe7200::dequantize::{DecoderState, dequantize};
+use blip25_mbe::imbe7200::frame::decode_frame;
 use std::fs;
 
 const FRAME_BYTES: usize = 18;

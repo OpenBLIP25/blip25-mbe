@@ -46,7 +46,7 @@
 //!   per codec generation (`mbe_baseline`, `ambe`, `ambe_plus`,
 //!   `ambe_plus2`).
 //! - **Wire formats**, one module per protocol-rate combination:
-//!   [`imbe_wire`] (P25 Phase 1 IMBE, 144-bit), [`ambe_plus2_wire`]
+//!   [`imbe7200`] (P25 Phase 1 IMBE, 144-bit), [`rate33`]
 //!   (P25 Phase 2 AMBE+2, 72-bit), and [`dvsi_3000`] (DVSI chip
 //!   protocol, r0..r63). Future protocols (DMR, D-STAR, NXDN, …)
 //!   become sibling modules.
@@ -76,8 +76,8 @@ pub mod mbe_params;
 
 pub mod codecs;
 
-pub mod imbe_wire;
-pub mod ambe_plus2_wire;
+pub mod imbe7200;
+pub mod rate33;
 pub mod dvsi_3000;
 pub mod dvsi_soft_decision;
 

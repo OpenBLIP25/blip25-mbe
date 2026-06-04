@@ -11,9 +11,9 @@
 //! Usage: amplitude_spike_probe <low_b2> <high_b2>
 //! Output: 100 × 9 bytes = 900 bytes .ambe9 stream on stdout.
 
-use blip25_mbe::ambe_plus2_wire::dequantize::{DecoderState, Decoded, decode_to_params};
-use blip25_mbe::ambe_plus2_wire::frame::{encode_frame, DIBITS_PER_FRAME};
-use blip25_mbe::ambe_plus2_wire::priority::{prioritize, AMBE_B_COUNT};
+use blip25_mbe::rate33::dequantize::{DecoderState, Decoded, decode_to_params};
+use blip25_mbe::rate33::frame::{encode_frame, DIBITS_PER_FRAME};
+use blip25_mbe::rate33::priority::{prioritize, AMBE_B_COUNT};
 
 fn pack_dibits(dibits: &[u8; DIBITS_PER_FRAME]) -> [u8; 9] {
     let mut out = [0u8; 9];

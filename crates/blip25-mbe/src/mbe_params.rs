@@ -169,7 +169,7 @@ impl MbeParams {
     /// 4π/39.5 ≈ 0.318 sits just above the half-rate Annex L pitch
     /// table's max (b̂₀=0 → ω₀ ≈ 0.314), so half-rate consumers must
     /// use [`Self::silence_ambe_plus2`] instead. Mixing them silently fails
-    /// at `ambe_plus2_wire::dequantize::quantize` with
+    /// at `rate33::dequantize::quantize` with
     /// `DecodeError::BadPitch`.
     pub fn silence() -> Self {
         Self {
@@ -185,7 +185,7 @@ impl MbeParams {
     /// Same shape as [`Self::silence`] (all unvoiced, amplitudes zero) but
     /// with `ω₀` taken from the largest entry in the AMBE+2 Annex L
     /// pitch table (b̂₀=0 → ω₀ ≈ 0.314, L = 9). This satisfies
-    /// `ambe_plus2_wire::dequantize::encode_pitch`'s range check, which
+    /// `rate33::dequantize::encode_pitch`'s range check, which
     /// rejects [`Self::silence`]'s 0.318 as out of table.
     ///
     /// Use this when the caller is feeding into the half-rate
@@ -195,7 +195,7 @@ impl MbeParams {
     pub fn silence_ambe_plus2() -> Self {
         // The b̂₀=0 row of the Annex L table gives the largest
         // half-rate ω₀ in canonical form. Hardcoded here to avoid a
-        // dependency on `ambe_plus2_wire` from this module; the value
+        // dependency on `rate33` from this module; the value
         // matches `AMBE_PITCH_TABLE[0]` exactly. If Annex L is ever
         // re-extracted with a corrected entry, update this constant
         // (and the test below) to match.
@@ -293,16 +293,16 @@ mod tests {
             assert_eq!(p.amplitude(l), 0.0);
             assert!(!p.voiced(l));
         }
-        // ω₀ must round-trip through `ambe_plus2_wire::dequantize::encode_pitch`
+        // ω₀ must round-trip through `rate33::dequantize::encode_pitch`
         // back to b̂₀ = 0 (the largest-ω₀ entry); full-rate `silence`
         // doesn't.
-        let b0 = crate::ambe_plus2_wire::dequantize::encode_pitch(p.omega_0());
+        let b0 = crate::rate33::dequantize::encode_pitch(p.omega_0());
         assert_eq!(b0, Some(0));
         // Full-rate silence does NOT round-trip through half-rate
         // encode_pitch — that's the whole reason `silence_ambe_plus2`
         // exists.
         let p_full = MbeParams::silence();
-        assert_eq!(crate::ambe_plus2_wire::dequantize::encode_pitch(p_full.omega_0()), None);
+        assert_eq!(crate::rate33::dequantize::encode_pitch(p_full.omega_0()), None);
     }
 
     #[test]

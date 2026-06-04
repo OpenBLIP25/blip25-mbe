@@ -13,11 +13,11 @@
 //!   --steady_b2    gain index of steady frames (default 16)
 //!   --spike_b2     gain index of f=49 (default 28 — louder)
 
-use blip25_mbe::ambe_plus2_wire::dequantize::{
+use blip25_mbe::rate33::dequantize::{
     DecoderState, Decoded, decode_to_params,
 };
-use blip25_mbe::ambe_plus2_wire::frame::{deinterleave, encode_frame, interleave, DIBITS_PER_FRAME};
-use blip25_mbe::ambe_plus2_wire::priority::{prioritize, AMBE_B_COUNT};
+use blip25_mbe::rate33::frame::{deinterleave, encode_frame, interleave, DIBITS_PER_FRAME};
+use blip25_mbe::rate33::priority::{prioritize, AMBE_B_COUNT};
 
 fn pack_dibits(dibits: &[u8; DIBITS_PER_FRAME]) -> [u8; 9] {
     let mut out = [0u8; 9];

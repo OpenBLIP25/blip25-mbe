@@ -270,7 +270,7 @@ pub const MAX_BLOCK_SIZE: usize = 10;
 /// holding `cos(π · k_0 · (j_0 + 0.5) / j_i)` — the kernel shared
 /// by [`forward_block_dct`] and [`inverse_block_dct`]. Same memo
 /// pattern as the half-rate equivalent in
-/// [`crate::ambe_plus2_wire::dequantize`]; without it each block does
+/// [`crate::rate33::dequantize`]; without it each block does
 /// `j_i²` `f32::cos` calls per direction in the encoder roundtrip.
 fn dct_cos(j_i: usize) -> &'static [f32] {
     use std::sync::OnceLock;
@@ -675,7 +675,7 @@ pub type FullrateDecoderState = DecoderState;
 
 /// Parsed full-rate frame — voice parameters or an erasure marker.
 ///
-/// Parallels the [`crate::ambe_plus2_wire::dequantize::Decoded`] shape
+/// Parallels the [`crate::rate33::dequantize::Decoded`] shape
 /// (minus the `Tone` variant — full-rate IMBE has no tone-frame
 /// signaling; those cases only exist in half-rate AMBE+2).
 ///
@@ -699,7 +699,7 @@ pub enum Decoded {
 /// erasure dispatch.
 ///
 /// Consumes a [`Frame`] produced by
-/// [`crate::imbe_wire::frame::decode_frame`] and the inter-frame
+/// [`crate::imbe7200::frame::decode_frame`] and the inter-frame
 /// predictor state. On successful decode, the state is advanced per
 /// §1.8. On erasure (reserved `b̂₀` or spectral reconstruction
 /// failure), the state is left unchanged and [`Decoded::Erasure`] is
@@ -707,12 +707,12 @@ pub enum Decoded {
 /// emit silence on cold start).
 ///
 /// This is the consumer-facing entry point paired with
-/// [`crate::ambe_plus2_wire::dequantize::decode_to_params`] — both return
+/// [`crate::rate33::dequantize::decode_to_params`] — both return
 /// a `Decoded` variant so the consumer can dispatch uniformly.
 ///
-/// [`Frame`]: crate::imbe_wire::frame::Frame
+/// [`Frame`]: crate::imbe7200::frame::Frame
 pub fn decode_to_params(
-    frame: &crate::imbe_wire::frame::Frame,
+    frame: &crate::imbe7200::frame::Frame,
     state: &mut FullrateDecoderState,
 ) -> Decoded {
     match dequantize(&frame.info, state) {
@@ -1517,7 +1517,7 @@ mod tests {
             let mut b = [0u16; 59];
             b[0] = u16::from(b0);
             // Other params kept zero.
-            let u = crate::imbe_wire::priority::prioritize(&b, 9);
+            let u = crate::imbe7200::priority::prioritize(&b, 9);
             assert_eq!(extract_pitch_index(&u), b0, "b̂₀ = {b0}");
         }
     }
@@ -1528,7 +1528,7 @@ mod tests {
     fn dequantize_rejects_reserved_pitch() {
         let mut b = [0u16; 59];
         b[0] = 220; // reserved
-        let u = crate::imbe_wire::priority::prioritize(&b, 9);
+        let u = crate::imbe7200::priority::prioritize(&b, 9);
         let mut state = DecoderState::new();
         assert_eq!(
             dequantize(&u, &mut state),
@@ -1544,7 +1544,7 @@ mod tests {
         //    log-amplitudes, NOT silence per se). But this is a valid
         //    decode path — the caller should not crash.
         let b = [0u16; 59];
-        let u = crate::imbe_wire::priority::prioritize(&b, 9);
+        let u = crate::imbe7200::priority::prioritize(&b, 9);
         let mut state = DecoderState::new();
         let p = dequantize(&u, &mut state).expect("decode");
         assert_eq!(p.harmonic_count(), 9);
@@ -1565,7 +1565,7 @@ mod tests {
     #[test]
     fn dequantize_advances_decoder_state() {
         let b = [0u16; 59];
-        let u = crate::imbe_wire::priority::prioritize(&b, 9);
+        let u = crate::imbe7200::priority::prioritize(&b, 9);
         let mut state = DecoderState::new();
         let p1 = dequantize(&u, &mut state).unwrap();
         let prev_l_after_first = state.previous_l();
@@ -1583,11 +1583,11 @@ mod tests {
     /// Build a synthetic full-rate [`Frame`] with a given `b̂₀` and
     /// everything else zero. Returns the frame ready for
     /// `decode_to_params`.
-    fn frame_with_pitch(b0: u8) -> crate::imbe_wire::frame::Frame {
+    fn frame_with_pitch(b0: u8) -> crate::imbe7200::frame::Frame {
         let mut b = [0u16; 59];
         b[0] = u16::from(b0);
-        let u = crate::imbe_wire::priority::prioritize(&b, 9);
-        crate::imbe_wire::frame::Frame {
+        let u = crate::imbe7200::priority::prioritize(&b, 9);
+        crate::imbe7200::frame::Frame {
             info: u,
             errors: [0u8; 8],
         }
@@ -1801,7 +1801,7 @@ mod tests {
         let mut b = [0u16; 59];
         b[0] = 0;
         b[1] = 0b101 & ((1u16 << k) - 1);
-        let u = crate::imbe_wire::priority::prioritize(&b, l);
+        let u = crate::imbe7200::priority::prioritize(&b, l);
 
         let mut state_dec = DecoderState::new();
         let params = dequantize(&u, &mut state_dec).unwrap();
@@ -1820,7 +1820,7 @@ mod tests {
         // equal what a fresh decoder reconstructs from the same bits. If
         // the encoder instead stored raw input amplitudes (the pre-2026-04-17
         // code path), states diverge after the first non-silent frame.
-        use crate::imbe_wire::priority::prioritize;
+        use crate::imbe7200::priority::prioritize;
 
         // Use an ω₀ whose decoder pairing lands at L=9 so encoder's
         // caller-supplied L matches decoder's Eq. 47 lookup — otherwise

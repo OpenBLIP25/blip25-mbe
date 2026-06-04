@@ -15,7 +15,7 @@
 
 use std::path::Path;
 
-use blip25_mbe::ambe_plus2_wire::frame::{decode_frame, INFO_WIDTHS, DIBITS_PER_FRAME};
+use blip25_mbe::rate33::frame::{decode_frame, INFO_WIDTHS, DIBITS_PER_FRAME};
 
 const FEC_BYTES: usize = 9; // r33
 const NOFEC_BYTES: usize = 7; // r34

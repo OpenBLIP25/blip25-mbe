@@ -36,10 +36,10 @@ A consumer imports only these:
 
 ```rust
 // Wire layer — bits ↔ MbeParams
-blip25_mbe::imbe_wire::Frame::decode(bits: &[u8])       -> Result<MbeParams>
-blip25_mbe::imbe_wire::Frame::decode_soft(soft: &[i8])  -> Result<MbeParams>
-blip25_mbe::ambe_plus2_wire::Frame::decode(bits: &[u8])       -> Result<(MbeParams, FrameKind)>
-blip25_mbe::ambe_plus2_wire::Frame::decode_soft(soft: &[i8])  -> Result<(MbeParams, FrameKind)>
+blip25_mbe::imbe7200::Frame::decode(bits: &[u8])       -> Result<MbeParams>
+blip25_mbe::imbe7200::Frame::decode_soft(soft: &[i8])  -> Result<MbeParams>
+blip25_mbe::rate33::Frame::decode(bits: &[u8])       -> Result<(MbeParams, FrameKind)>
+blip25_mbe::rate33::Frame::decode_soft(soft: &[i8])  -> Result<(MbeParams, FrameKind)>
 blip25_mbe::dvsi_3000::Frame::decode(bits: &[u8], rate: RateConfig) -> Result<MbeParams>
 
 // Codec layer — MbeParams ↔ PCM
@@ -147,7 +147,7 @@ Gen 2 NXDN, D-STAR's specific bit layout), drop down a layer to
 `decode-raw-mbe` (raw 9-value `b̂₀..b̂₈`) or `decode-raw-ambe-plus2`
 (post-FEC 4-vector info) — both are available as CLI subcommands of
 `conformance-speech-quality` and as direct library calls into
-`ambe_plus2_wire::dequantize` + `codecs::ambe_plus2`.
+`rate33::dequantize` + `codecs::ambe_plus2`.
 
 ## What Stays in the Consumer (p25-decoder example)
 
@@ -171,10 +171,10 @@ does not know about WACN/NAC either. The host feeds it already-descrambled
 Each consumer writes a small adapter between its legacy types and
 `MbeParams`. For p25-decoder, this is two files inside `blip25-vocoder`:
 
-- `imbe_adapter.rs` — wraps `imbe_wire::Frame` + `MbeParams` into the
+- `imbe_adapter.rs` — wraps `imbe7200::Frame` + `MbeParams` into the
   legacy `ImbeFrame`/`ImbeParams` shape, or migrates call sites to use
   `MbeParams` directly.
-- `ambe_adapter.rs` — same for `ambe_plus2_wire::Frame`, plus `FrameKind`
+- `ambe_adapter.rs` — same for `rate33::Frame`, plus `FrameKind`
   routing (voice vs. tone).
 
 Downstream orchestration (`Phase1Vocoder`, `TdmaVocoder`, per-call WAV
@@ -190,7 +190,7 @@ so future protocol consumers do not re-derive them.
 Detection is wire-layer (a specific bit pattern in the 72-bit AMBE+2
 frame). Synthesis is codec-layer (dual-sinusoid DTMF / ringback).
 
-- `ambe_plus2_wire::Frame::decode` returns `FrameKind::{Voice(MbeParams), Tone(ToneParams)}`.
+- `rate33::Frame::decode` returns `FrameKind::{Voice(MbeParams), Tone(ToneParams)}`.
 - `codecs::<gen>::synthesize_tone(&ToneParams)` renders audio.
 
 ### Spectral enhancement
@@ -201,7 +201,7 @@ in `codecs/ambe_plus` and `codecs/ambe_plus2`. They do not live in
 `mbe_params/` and they do not live in any wire submodule.
 
 A wire submodule's only contract with the codec is `bits ↔ MbeParams`.
-Pairing the `imbe_wire` wire with the `codecs::ambe_plus2` codec is a
+Pairing the `imbe7200` wire with the `codecs::ambe_plus2` codec is a
 valid combination (the SCBA-mask deployment pattern); the wire layer
 should make that combination expressible.
 

@@ -3,8 +3,8 @@
 //! The forward direction of the vocoder: 8 kHz 16-bit PCM in, one
 //! [`MbeParams`] out per 20 ms (160-sample) frame. The result is
 //! consumed by any of the wire-side `quantize` pipelines
-//! (`imbe_wire::dequantize::quantize`,
-//! `ambe_plus2_wire::dequantize::quantize`,
+//! (`imbe7200::dequantize::quantize`,
+//! `rate33::dequantize::quantize`,
 //! `dvsi_3000::quantize`) and is independent of wire format.
 //!
 //! # Status
@@ -187,8 +187,8 @@ pub enum AnalysisOutput {
     /// decides the current frame is silent.
     Silence,
     /// Voice frame with reconstructed MBE parameters. The wire-side
-    /// encoder ([`crate::imbe_wire::dequantize::quantize`] or
-    /// [`crate::ambe_plus2_wire::dequantize::quantize`]) consumes this
+    /// encoder ([`crate::imbe7200::dequantize::quantize`] or
+    /// [`crate::rate33::dequantize::quantize`]) consumes this
     /// to produce the transmitted bitstream.
     Voice(MbeParams),
 }
@@ -253,7 +253,7 @@ fn matched_decoder_roundtrip(
     vuv: &VuvResult,
     predictor: &PredictorState,
 ) -> Result<[f64; L_HAT_MAX as usize + 1], AnalysisError> {
-    use crate::imbe_wire::dequantize::{
+    use crate::imbe7200::dequantize::{
         quantize as imbe_quantize, reconstruct_amplitudes_from_bits, DecoderState,
     };
     let l_hat = refinement.l_hat;
@@ -330,7 +330,7 @@ fn matched_decoder_roundtrip_ambe_plus2(
     vuv: &VuvResult,
     predictor: &HalfratePredictorState,
 ) -> Result<HalfrateRoundtrip, AnalysisError> {
-    use crate::ambe_plus2_wire::dequantize::{
+    use crate::rate33::dequantize::{
         dequantize as ambe_plus2_dequantize, quantize as ambe_plus2_quantize,
         DecoderState as HalfrateDecoderState,
     };
@@ -1167,7 +1167,7 @@ pub fn encode_with_trace(
 }
 
 /// Half-rate analysis encoder: PCM → `MbeParams` destined for
-/// `ambe_plus2_wire::quantize`.
+/// `rate33::quantize`.
 ///
 /// Shares §0.1–§0.7 (HPF, pitch, V/UV, spectral amplitudes) with the
 /// full-rate [`encode`] path — these are rate-agnostic. Diverges at
@@ -1176,7 +1176,7 @@ pub fn encode_with_trace(
 /// `state.predictor_ambe_plus2` per addendum §0.6.10.
 ///
 /// The returned `MbeParams` carries the rate-agnostic `M̂_l` in linear
-/// form; the caller feeds it to `ambe_plus2_wire::quantize` which applies
+/// form; the caller feeds it to `rate33::quantize` which applies
 /// Eq. 150 internally. This matches the shape of `encode` — both
 /// paths return analysis-side `M̂_l`, and the wire quantizer handles
 /// any rate-specific pre-processing.
@@ -1273,7 +1273,7 @@ pub fn encode_ambe_plus2(
     let refinement_result =
         profile::time(profile::Stage::RefinePitch, || -> Result<Option<refine::PitchRefinement>, AnalysisError> {
             let mut refinement = refine_pitch(&sw, basis, p_hat_i);
-            use crate::ambe_plus2_wire::dequantize::{decode_pitch, encode_pitch};
+            use crate::rate33::dequantize::{decode_pitch, encode_pitch};
             let Some(b0) = encode_pitch(refinement.omega_hat as f32) else {
                 return Ok(None);
             };

@@ -13,11 +13,11 @@
 //!   b̂₂ = 16     mid-range Annex O gain index
 //!   b̂₃..b̂₈ = 0  lowest-index codebooks (flat M̃ where possible)
 
-use blip25_mbe::ambe_plus2_wire::dequantize::{
+use blip25_mbe::rate33::dequantize::{
     DecoderState, Decoded, decode_to_params,
 };
-use blip25_mbe::ambe_plus2_wire::frame::{encode_frame, DIBITS_PER_FRAME};
-use blip25_mbe::ambe_plus2_wire::priority::{prioritize, AMBE_B_COUNT};
+use blip25_mbe::rate33::frame::{encode_frame, DIBITS_PER_FRAME};
+use blip25_mbe::rate33::priority::{prioritize, AMBE_B_COUNT};
 
 const N_FRAMES: usize = 300;
 

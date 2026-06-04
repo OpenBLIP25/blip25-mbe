@@ -1,4 +1,4 @@
-use blip25_mbe::ambe_plus2_wire::dequantize::decode_pitch;
+use blip25_mbe::rate33::dequantize::decode_pitch;
 
 fn main() {
     println!("b0\tL\tomega_0");

@@ -5,8 +5,8 @@
 //! FEC/dequant (params would be garbage) vs synth (params look OK,
 //! output still wrong).
 
-use blip25_mbe::imbe_wire::dequantize::{DecodeError, DecoderState, dequantize};
-use blip25_mbe::imbe_wire::frame::decode_frame;
+use blip25_mbe::imbe7200::dequantize::{DecodeError, DecoderState, dequantize};
+use blip25_mbe::imbe7200::frame::decode_frame;
 use std::fs;
 
 fn unpack_dibits_msb(bytes: &[u8]) -> [u8; 72] {

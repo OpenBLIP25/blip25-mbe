@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Wire modules renamed by DVSI rate, not protocol** (breaking):
+  `imbe_wire` → `imbe7200` (full-rate IMBE, 7200 bps) and
+  `ambe_plus2_wire` → `rate33` (half-rate AMBE+2, DVSI rate index 33).
+  The rate-named modules model the codec *channel frame* — the natural
+  reuse point for other half-rate AMBE+2 protocols (DMR/NXDN/P25 Phase
+  2). Submodules (`::frame`, `::priority`, `::dequantize`) and all
+  public items are unchanged apart from the parent path; e.g.
+  `ambe_plus2_wire::frame::R34_BIT_ORDER` is now
+  `rate33::frame::R34_BIT_ORDER`. Pure rename, no behavior change
+  (full + half-rate DVSI gain vectors and all tests bit-identical).
+
 ## [0.1.1] - 2026-05-31
 
 ### Fixed

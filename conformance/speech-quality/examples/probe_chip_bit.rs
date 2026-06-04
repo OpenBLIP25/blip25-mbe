@@ -1,5 +1,5 @@
-use blip25_mbe::imbe_wire::dequantize::{DecoderState, dequantize, DecodeError};
-use blip25_mbe::imbe_wire::frame::decode_frame;
+use blip25_mbe::imbe7200::dequantize::{DecoderState, dequantize, DecodeError};
+use blip25_mbe::imbe7200::frame::decode_frame;
 use std::fs;
 use std::collections::BTreeMap;
 
@@ -87,7 +87,7 @@ fn run(path: &str, name: &str, unpacker: fn(&[u8]) -> [u8; 72]) {
 // the air interface).
 fn run_nopn(path: &str) {
     use blip25_mbe::fec::{golay_23_12_decode, hamming_15_11_decode};
-    use blip25_mbe::imbe_wire::fec::deinterleave;
+    use blip25_mbe::imbe7200::fec::deinterleave;
     let bytes = fs::read(path).unwrap();
     let mut st = DecoderState::new();
     let mut ok = 0; let mut bad_pitch = 0; let mut other_err = 0;
@@ -133,7 +133,7 @@ fn run_nopn(path: &str) {
 // directly without P25 Annex-H interleaving. Widths sum to 144 bits.
 fn run_sequential(path: &str) {
     use blip25_mbe::fec::{golay_23_12_decode, hamming_15_11_decode};
-    use blip25_mbe::imbe_wire::fec::modulation_masks;
+    use blip25_mbe::imbe7200::fec::modulation_masks;
     let widths = [23u8, 23, 23, 23, 15, 15, 15, 7];
     let bytes = fs::read(path).unwrap();
     let mut st = DecoderState::new();

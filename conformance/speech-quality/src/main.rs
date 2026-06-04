@@ -40,20 +40,20 @@ use blip25_mbe::enhancement::{
     self as enh, ClassicalConfig, EnhancementMode, EnhancementState,
 };
 use blip25_mbe::mbe_params::MbeParams;
-use blip25_mbe::imbe_wire::dequantize::{
+use blip25_mbe::imbe7200::dequantize::{
     DecoderState, dequantize as dequantize_full, quantize as quantize_full,
 };
-use blip25_mbe::imbe_wire::frame::{
+use blip25_mbe::imbe7200::frame::{
     decode_frame as decode_full_frame, encode_frame as encode_full_frame,
 };
-use blip25_mbe::imbe_wire::priority::{
+use blip25_mbe::imbe7200::priority::{
     deprioritize as deprioritize_full, prioritize as prioritize_full,
 };
-use blip25_mbe::ambe_plus2_wire::dequantize::{
+use blip25_mbe::rate33::dequantize::{
     DecoderState as HalfDecoderState, Decoded as HalfDecoded,
     decode_to_params as decode_to_params_half, quantize as quantize_half,
 };
-use blip25_mbe::ambe_plus2_wire::frame::{
+use blip25_mbe::rate33::frame::{
     DIBITS_PER_FRAME as HALF_DIBITS_PER_FRAME, encode_frame as encode_half_frame,
 };
 
@@ -177,8 +177,8 @@ enum Cmd {
     },
     /// Self-baseline our_enc → our_dec PESQ on the half-rate (AMBE+2)
     /// path. Slim version of `ab-matrix`: no chip side, just our
-    /// pipeline through `encode_ambe_plus2` + `ambe_plus2_wire::quantize` +
-    /// 9-byte FEC frames + `ambe_plus2_wire::dequantize` + AMBE+2 synth.
+    /// pipeline through `encode_ambe_plus2` + `rate33::quantize` +
+    /// 9-byte FEC frames + `rate33::dequantize` + AMBE+2 synth.
     HalfrateAbMatrix {
         /// Path to reference PCM (8 kHz mono LE i16, raw, no header).
         #[arg(long)]
@@ -258,7 +258,7 @@ enum Cmd {
     /// decode, PN demodulation). Useful for decoding voice frames from
     /// non-P25 AMBE+2 carriers — DMR, NXDN, D-STAR — once the consumer
     /// has stripped the wire-specific FEC into the same 4-vector
-    /// post-FEC info shape that `ambe_plus2_wire::dequantize::dequantize`
+    /// post-FEC info shape that `rate33::dequantize::dequantize`
     /// consumes. The 49-bit b̂₀..b̂₈ layout is shared across AMBE+2
     /// standards; the prioritization into 4 info vectors is also
     /// shared (per BABA-C / DVSI AMBE-3000 protocol). FEC and frame
@@ -304,7 +304,7 @@ enum Cmd {
     },
     /// Decode a stream of P25 Phase 2 / AMBE+2 half-rate FEC frames
     /// (9 bytes per frame = 36 dibits) into 8 kHz mono i16 PCM. Runs
-    /// the full ambe_plus2_wire decode chain: unpack dibits →
+    /// the full rate33 decode chain: unpack dibits →
     /// `decode_frame` (Annex H deinterleave + Golay/Hamming) →
     /// `dequantize` → AMBE+2 synth.
     ///
@@ -326,7 +326,7 @@ enum Cmd {
     },
     /// Decode a stream of P25 Phase 1 / IMBE full-rate FEC frames
     /// (18 bytes per frame = 72 dibits) into 8 kHz mono i16 PCM.
-    /// Runs the full imbe_wire decode chain through the chip-shaped
+    /// Runs the full imbe7200 decode chain through the chip-shaped
     /// `Vocoder::decode_bits`.
     ///
     /// Two input formats:
@@ -1386,7 +1386,7 @@ fn cmd_decode_raw_ambe_plus2(input: &Path, out_wav: &Path, binary: bool) -> Resu
 /// (b̂₀..b̂₈, one frame per line, 9 decimal values) directly into PCM.
 ///
 /// One step lower than `cmd_decode_raw_ambe_plus2`: the caller supplies
-/// the 9 b̂ values pre-prioritization. We run `ambe_plus2_wire::priority::
+/// the 9 b̂ values pre-prioritization. We run `rate33::priority::
 /// prioritize` to produce the 4 info vectors, then `dequantize` +
 /// AMBE+2 synth.
 ///
@@ -1394,7 +1394,7 @@ fn cmd_decode_raw_ambe_plus2(input: &Path, out_wav: &Path, binary: bool) -> Resu
 /// b̂₁=5 (V/UV), b̂₂=5 (gain), b̂₃=11, b̂₄=4, b̂₅=4, b̂₆=4, b̂₇=4, b̂₈=4.
 /// Total 48 bits + 1 don't-care padding = 49-bit voice payload.
 fn cmd_decode_raw_mbe(input: &Path, out_wav: &Path) -> Result<()> {
-    use blip25_mbe::ambe_plus2_wire::priority::prioritize as prioritize_half;
+    use blip25_mbe::rate33::priority::prioritize as prioritize_half;
     use std::io::Read;
     let raw: Vec<u8> = if input == Path::new("-") {
         let mut buf = Vec::new();

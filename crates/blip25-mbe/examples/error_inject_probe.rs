@@ -5,9 +5,9 @@
 //!
 //! Output: 100 × 9 bytes = 900 bytes .ambe9 stream.
 
-use blip25_mbe::ambe_plus2_wire::dequantize::{DecoderState, Decoded, decode_to_params};
-use blip25_mbe::ambe_plus2_wire::frame::{deinterleave, encode_frame, interleave, DIBITS_PER_FRAME};
-use blip25_mbe::ambe_plus2_wire::priority::{prioritize, AMBE_B_COUNT};
+use blip25_mbe::rate33::dequantize::{DecoderState, Decoded, decode_to_params};
+use blip25_mbe::rate33::frame::{deinterleave, encode_frame, interleave, DIBITS_PER_FRAME};
+use blip25_mbe::rate33::priority::{prioritize, AMBE_B_COUNT};
 
 fn pack_dibits(dibits: &[u8; DIBITS_PER_FRAME]) -> [u8; 9] {
     let mut out = [0u8; 9];

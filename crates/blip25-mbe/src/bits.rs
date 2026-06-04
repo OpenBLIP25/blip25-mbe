@@ -9,8 +9,8 @@
 /// bit `(src_param, src_bit)` is transmitted at `(dst_vec, dst_bit)`
 /// within the info-vector bundle.
 ///
-/// Used by both [`crate::imbe_wire::priority`] (BABA-A §10) and
-/// [`crate::ambe_plus2_wire::priority`] (BABA-A §16.7); the build script
+/// Used by both [`crate::imbe7200::priority`] (BABA-A §10) and
+/// [`crate::rate33::priority`] (BABA-A §16.7); the build script
 /// emits `BitMap { ... }` literals inside each rate's bit-priority
 /// table, so this type must be in scope at the include site.
 #[derive(Clone, Copy, Debug)]
