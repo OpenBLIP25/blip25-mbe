@@ -128,6 +128,42 @@ Plus several beyond-plan additions:
 Test counts: 401 with `--features serde`, 399 default. Started this
 plan at 364.
 
+## Status as of 2026-06-04 — wire rename + soft-decision follow-ups
+
+The DVSI soft-decision chip-handoff arc (driven from the carrier
+project, `~/p25-decoder`) landed two things in *this* repo:
+
+- **`dvsi_soft_decision` module** — 4-bit offset-binary SD codec, raw
+  USB-3000 `*_sd.bit` nibble stream, AMBE-2000/2020 `0x13EC` host
+  packet, verified 6-word `-r` chip rate vectors. Validated against
+  DVSI's own vectors (`tv-std/tv/p25`, `tv-rc/r33`): full-rate **and**
+  Rate-33 soft FEC strictly beat hard-sliced decode at every injected
+  BER, with ground-truth residual FEC errors = 0 (bit ordering pinned).
+  Repro: `examples/dvsi_soft_gain.rs [--rate 33]`.
+- **Wire modules renamed by DVSI rate, not protocol**: `imbe_wire →
+  imbe7200`, `ambe_plus2_wire → rate33` (CHANGELOG `[Unreleased]`).
+  `rate33` is now the codec **channel-frame** module — the intended
+  reuse point for other half-rate AMBE+2 protocols.
+
+Open follow-ups from that arc (both small, both this-repo concerns):
+
+1. **Confirm DMR/NXDN actually share DVSI rate 33 bit-for-bit.** The
+   rename's rationale assumes DMR/NXDN reuse `rate33`, and `DESIGN.md`'s
+   "wire layer naming policy" was rewritten to the rate-centric view —
+   but the reuse claim is **deliberately hedged**. Verify the
+   Golay(24,12)/Golay(23,12)/PN/Annex-S layout against the DMR and NXDN
+   AMBE+2 channel-FEC + bit-prioritization specs before treating
+   cross-protocol reuse as fact. If a protocol's channel framing
+   diverges it earns its own module (e.g. `dmr_voice/`) per the
+   out-of-scope note below, not a `rate33` sub-rate. This is the
+   concrete first step of the "NXDN/DMR future sibling crates" line.
+2. **Exercise the AMBE-2000/2020 host-packet 5-word `rate_info`** in
+   `dvsi_soft_decision`. The validated path uses the 6-word `-r` chip
+   rate vector; the host-packet `rate_info` is a *different* 5-word
+   framing, caller-supplied and currently untested. Only matters when
+   driving that specific chip host-packet path; needs DVSI's
+   rate-control doc to pin the 5 words.
+
 ## Wave 1 — codec-API hardening (small, sequenced)
 
 ### 1.1 Half-rate API gotchas (1 session)
