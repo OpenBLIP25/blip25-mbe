@@ -346,17 +346,20 @@ impl Frame {
     }
 }
 
-/// Decode a half-rate frame: 36 dibits → [`Frame`].
+/// Decode the four code vectors `c̃₀..c̃₃` of a half-rate AMBE+2 frame
+/// into the 49-bit info layer. This is the **protocol-agnostic codec
+/// FEC core** — Golay(24,12)/Golay(23,12) + û₀-seeded PN + uncoded
+/// passthrough — and carries no interleave. It is the natural reuse
+/// boundary for any half-rate AMBE+2 protocol (P25 Phase 2, DMR, NXDN):
+/// each protocol's own deinterleave lands the OTA bits in these four
+/// vectors, then calls here. See [`decode_frame`] for the P25-Phase-2
+/// adapter that prepends the Annex-S deinterleave.
 ///
-/// Pipeline (BABA-A §2.4–§2.6 compose with §2.5):
-/// 1. Deinterleave 36 dibits → `c̃₀..c̃₃`.
-/// 2. `[24, 12]` extended-Golay-decode `c̃₀` → `û₀`.
-/// 3. Generate PN masks from `û₀`; XOR into `c̃₁`.
-/// 4. `[23, 12]` Golay-decode the result → `û₁`.
-/// 5. Uncoded passthrough: `û₂ = c̃₂`, `û₃ = c̃₃`.
-pub fn decode_frame(dibits: &[u8; DIBITS_PER_FRAME]) -> Frame {
-    let c = deinterleave(dibits);
-
+/// 1. `[24, 12]` extended-Golay-decode `c̃₀` → `û₀`.
+/// 2. Generate PN masks from `û₀`; XOR into `c̃₁`.
+/// 3. `[23, 12]` Golay-decode the result → `û₁`.
+/// 4. Uncoded passthrough: `û₂ = c̃₂`, `û₃ = c̃₃`.
+pub fn decode_code_vectors(c: [u32; 4]) -> Frame {
     let d0 = golay_24_12_decode(c[0]);
     let u0 = d0.info;
     let masks = modulation_masks(u0);
@@ -370,21 +373,27 @@ pub fn decode_frame(dibits: &[u8; DIBITS_PER_FRAME]) -> Frame {
     }
 }
 
-/// Soft-decision decode of a half-rate AMBE+2 frame from 72 soft bits.
+/// Decode a half-rate frame from 36 P25-Phase-2 dibits → [`Frame`].
 ///
-/// Input convention matches the full-rate soft entry point:
-/// `[hi_dibit_0, lo_dibit_0, …]`, sign = hard decision, magnitude =
-/// confidence.
-///
-/// Pipeline mirrors [`decode_frame`]:
-/// 1. Soft-deinterleave 72 bits → `c̃₀..c̃₃` (MSB-first).
-/// 2. Soft-Golay-24 decode `c̃₀` (no PN) → `û₀`.
-/// 3. Hard-demodulate `c̃₁` by flipping soft signs per the PN mask.
-/// 4. Soft-Golay-23 decode `c̃₁` → `û₁`.
-/// 5. Project `c̃₂` / `c̃₃` to hard bits for `û₂` / `û₃` (uncoded).
-pub fn decode_frame_soft(soft: &[i8; SOFT_BITS]) -> Frame {
-    let mut c = soft_deinterleave(soft);
+/// Thin Annex-S adapter over [`decode_code_vectors`]:
+/// 1. Deinterleave 36 dibits → `c̃₀..c̃₃` (Annex S — P25-Phase-2-specific).
+/// 2. Run the shared codec FEC core ([`decode_code_vectors`]).
+pub fn decode_frame(dibits: &[u8; DIBITS_PER_FRAME]) -> Frame {
+    decode_code_vectors(deinterleave(dibits))
+}
 
+/// Soft-decision decode of the four code vectors of a half-rate AMBE+2
+/// frame → 49-bit info layer. The **protocol-agnostic soft codec FEC
+/// core**, mirroring [`decode_code_vectors`] in the soft domain and
+/// carrying no interleave. Reuse boundary for DMR/NXDN soft decode:
+/// land the OTA soft bits in a [`SoftCodeVectors`] via the protocol's
+/// own soft-deinterleave, then call here.
+///
+/// 1. Soft-Golay-24 decode `c̃₀` (no PN) → `û₀`.
+/// 2. Hard-demodulate `c̃₁` by flipping soft signs per the PN mask.
+/// 3. Soft-Golay-23 decode `c̃₁` → `û₁`.
+/// 4. Project `c̃₂` / `c̃₃` to hard bits for `û₂` / `û₃` (uncoded).
+pub fn decode_code_vectors_soft(mut c: SoftCodeVectors) -> Frame {
     let d0 = golay_24_12_decode_soft(&c.c0);
     let u0 = d0.info;
 
@@ -409,6 +418,18 @@ pub fn decode_frame_soft(soft: &[i8; SOFT_BITS]) -> Frame {
         info: [d0.info, d1.info, u2, u3],
         errors: [d0.errors, d1.errors, 0, 0],
     }
+}
+
+/// Soft-decision decode of a half-rate AMBE+2 frame from 72 P25-Phase-2
+/// soft bits.
+///
+/// Input convention matches the full-rate soft entry point:
+/// `[hi_dibit_0, lo_dibit_0, …]`, sign = hard decision, magnitude =
+/// confidence. Thin Annex-S adapter over [`decode_code_vectors_soft`]:
+/// 1. Soft-deinterleave 72 bits → `c̃₀..c̃₃` (Annex S — P25-Phase-2-specific).
+/// 2. Run the shared soft codec FEC core ([`decode_code_vectors_soft`]).
+pub fn decode_frame_soft(soft: &[i8; SOFT_BITS]) -> Frame {
+    decode_code_vectors_soft(soft_deinterleave(soft))
 }
 
 /// Encode 4 info vectors into 72 half-rate air-interface bits

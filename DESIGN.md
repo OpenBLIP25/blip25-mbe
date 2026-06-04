@@ -99,15 +99,36 @@ the rate-defined Golay/Hamming/PN/interleave layer sitting directly on
 the parameter bits, the same boundary DVSI's own chip packet draws.
 Protocol-specific over-the-air framing (burst layout, scrambling,
 sync) lives *above* mbe in each protocol's CAI/air-interface layer, not
-here. The rate-33 codec frame is therefore the natural reuse point for
-other half-rate AMBE+2 protocols (DMR, NXDN, P25 Phase 2) — *to the
-extent* their channel FEC and bit prioritization actually match DVSI
-rate 33; where a protocol's channel framing genuinely differs it earns
-its own rate/protocol module (e.g. `dmr_voice/`) rather than a sub-rate
-of these. The codec layer (`codecs/`) is shared across protocols
-regardless. (This supersedes the earlier "wire formats are strictly
-P25-protocol-specific" framing, which predated moving protocol burst
-layout up into the CAI layer.)
+here.
+
+**DMR/NXDN reuse — resolved 2026-06-04 (was hedged).** The reuse claim
+splits cleanly into two layers, and the seam is now drawn in code:
+
+- **Codec FEC core — SHARED bit-for-bit.** The 49→72-bit AMBE+2 FEC —
+  `[24,12]` extended Golay on `c₀`, `[23,12]` Golay on `c₁`, the
+  `û₀`-seeded 24-value LCG PN scramble of `c₁`, uncoded `c₂`/`c₃`, and
+  the `û₀..û₃` = `[12,12,11,14]` bit prioritization — is defined by the
+  **DVSI AMBE+2 vocoder at the 3600/2450 operating point**, not by any
+  protocol. P25 Phase 2, DMR, and NXDN (4800/"EHR") all carry exactly
+  this codec channel frame. Corroboration: open-source mbelib/DSD
+  (general-codec reference, not P25 IP) decode all three through one
+  shared `mbe_processAmbe3600x2450Frame` entry point. `rate33` exposes
+  this core as [`decode_code_vectors`] / [`decode_code_vectors_soft`]
+  (4 code vectors → `Frame`), reusable as-is by a future DMR/NXDN module.
+- **Interleave — P25-Phase-2-SPECIFIC, NOT shared.** The map from OTA
+  dibits to the four code vectors (`rate33`'s **Annex S**, 72 bits ↔ 36
+  dibits) is part of P25's air interface. DMR and NXDN each define their
+  own distinct voice-bit interleave (and their own burst layout/embedded
+  signalling), so `decode_frame` / `decode_frame_soft` — which prepend
+  Annex S — are P25-only adapters. A `dmr_voice/` / `nxdn_voice/` sibling
+  supplies its protocol's (soft-)deinterleave to land bits in
+  `[u32;4]` / `SoftCodeVectors`, then calls the shared core above.
+
+So the reuse point is the **post-deinterleave code-vector frame**, not
+the OTA-dibit entry. The codec layer (`codecs/`) is shared across
+protocols regardless. (This supersedes the earlier "wire formats are
+strictly P25-protocol-specific" framing, which predated moving protocol
+burst layout up into the CAI layer.)
 
 **Why `imbe7200` is not equivalent to "IMBE wire."** BABA-A is a
 consolidation of two independent vocoder specs: the original 1998
