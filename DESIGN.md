@@ -130,6 +130,44 @@ protocols regardless. (This supersedes the earlier "wire formats are
 strictly P25-protocol-specific" framing, which predated moving protocol
 burst layout up into the CAI layer.)
 
+**The deeper boundary is rate 34, not rate 33 — and encryption proves
+it.** There are two boundaries here, at two layers, and the *codec*
+boundary is the deeper one:
+
+- **rate-34 frame** = the bare **49-bit AMBE+2 parameter frame**
+  (`mbe_params` / a `Frame`), FEC stripped. This is the true codec
+  interface — FEC-agnostic, protocol-agnostic, and the same for P25
+  Phase 2, DMR, and NXDN.
+- **rate-33 / code vectors** (`SoftCodeVectors`) = the rate-34 frame
+  wrapped in *one specific* deterministic channel-coding profile
+  (Golay/PN). It is the input to a particular FEC decoder, not the codec
+  itself.
+
+The FEC layer is just the deterministic map between them. Three things
+follow, and they shape what belongs in mbe vs. above it:
+
+1. **Encryption sits at the rate-34 boundary**, not below it. P25/DMR/NXDN
+   encrypt the *parameter bits*, with FEC wrapping the ciphertext — so a
+   keystream XOR has a home only on the 49-bit frame. A real radio (e.g.
+   APX) therefore runs its vocoder at rate 34 and does FEC + encryption in
+   the host; the codec/chip never holds a key. mbe must expose the
+   49-bit `Frame` as a first-class seam so a consumer can inject the XOR
+   between FEC-decode and synthesis.
+2. **rate-33 FEC is a *profile*, not the codec.** Its Golay/PN is one
+   deterministic channel code chosen for the half-rate use case; rate 34
+   is the open substrate beneath it. A future protocol may wrap the same
+   49-bit frame in a different code (LDPC, none, custom UEP) — which is
+   why bit **prioritization** (`rate33::priority`) is exported as an
+   FEC-independent fact.
+3. **mbe keeps its own Golay/PN by design.** As a standalone,
+   cross-language library it cannot depend on a consumer's FEC crate, and
+   it needs the math to model DVSI chip rate-33 interop. The P25/DMR/NXDN
+   CAI layer holds its *own* shared copy (one FEC — the voice-frame FEC is
+   identical across the three — plus per-protocol interleave). The two
+   copies are generic coding theory (not P25 IP) and stay bit-exact via a
+   shared test vector. See the consumer's SPEC.md §3.4 for the full
+   two-axis (protocol × backend) model and the recorder backend.
+
 **Why `imbe7200` is not equivalent to "IMBE wire."** BABA-A is a
 consolidation of two independent vocoder specs: the original 1998
 BABA (full-rate IMBE) and the BABA-1 addendum (half-rate AMBE+2).
