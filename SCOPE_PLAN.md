@@ -147,16 +147,29 @@ project, `~/p25-decoder`) landed two things in *this* repo:
 
 Open follow-ups from that arc (both small, both this-repo concerns):
 
-1. **Confirm DMR/NXDN actually share DVSI rate 33 bit-for-bit.** The
-   rename's rationale assumes DMR/NXDN reuse `rate33`, and `DESIGN.md`'s
-   "wire layer naming policy" was rewritten to the rate-centric view —
-   but the reuse claim is **deliberately hedged**. Verify the
-   Golay(24,12)/Golay(23,12)/PN/Annex-S layout against the DMR and NXDN
-   AMBE+2 channel-FEC + bit-prioritization specs before treating
-   cross-protocol reuse as fact. If a protocol's channel framing
-   diverges it earns its own module (e.g. `dmr_voice/`) per the
-   out-of-scope note below, not a `rate33` sub-rate. This is the
-   concrete first step of the "NXDN/DMR future sibling crates" line.
+1. **Confirm DMR/NXDN actually share DVSI rate 33 bit-for-bit. —
+   ✅ RESOLVED 2026-06-04 (hedge un-hedged + code seam drawn).**
+   Answer is two-layer:
+   - **Codec FEC core SHARED bit-for-bit** — Golay(24,12)/Golay(23,12) +
+     `û₀`-seeded PN + uncoded `c₂`/`c₃` + `[12,12,11,14]` bit
+     prioritization is the DVSI AMBE+2 3600/2450 vocoder definition, not
+     protocol-specific. P25 Phase 2, DMR, and NXDN(4800) all carry it
+     (corroborated by mbelib/DSD's single shared
+     `mbe_processAmbe3600x2450Frame` for all three).
+   - **Annex-S interleave is P25-Phase-2-SPECIFIC, NOT shared** — DMR and
+     NXDN each use a different voice-bit interleave. So `decode_frame` /
+     `decode_frame_soft` (which prepend Annex S) are P25-only adapters.
+   Drawn in code: `rate33::frame` now exposes `decode_code_vectors` /
+   `decode_code_vectors_soft` (4 code vectors → `Frame`) as the
+   **protocol-agnostic reuse boundary**; the OTA-dibit entries are thin
+   Annex-S adapters over them (behavior-preserving — 469 mbe tests green,
+   `dvsi_soft_gain --rate 33` bit-identical). A future `dmr_voice/` /
+   `nxdn_voice/` sibling supplies only its own (soft-)deinterleave, then
+   calls the shared core. `DESIGN.md` "wire layer naming policy" updated
+   to match. This closes the concrete first step of "NXDN/DMR future
+   sibling crates." Still TODO before NXDN frames decode end-to-end: a
+   DMR/NXDN deinterleave table + the Gen-2 `ambe_plus` dequantize wrapper
+   (Wave 1.2 below).
 2. **Exercise the AMBE-2000/2020 host-packet 5-word `rate_info`** in
    `dvsi_soft_decision`. The validated path uses the 6-word `-r` chip
    rate vector; the host-packet `rate_info` is a *different* 5-word
