@@ -16,7 +16,7 @@
 //!   cargo run -p blip25-conformance-speech-quality \
 //!     --example halfrate_envelope_converge -- 020e 0c00 01dd 0e62 [N]
 
-use blip25_mbe::ambe_plus2_wire::dequantize::{dequantize, DecoderState};
+use blip25_mbe::rate33::dequantize::{dequantize, DecoderState};
 
 fn main() {
     let a: Vec<String> = std::env::args().skip(1).collect();

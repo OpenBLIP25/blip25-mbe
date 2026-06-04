@@ -23,7 +23,7 @@
 //! low-pass filter applied at the rate-boundary seam.
 
 use crate::mbe_params::{L_MAX, MbeParams};
-use crate::ambe_plus2_wire::frame::AMBE_PITCH_TABLE;
+use crate::rate33::frame::AMBE_PITCH_TABLE;
 
 /// Rate-converter predictor coefficient per US7634399 col. 7 line 10.
 /// Numerically equal to BABA-A Eq. 185's half-rate intra-rate ρ, but a

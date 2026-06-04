@@ -48,7 +48,7 @@ bits): r34 bit 0,1,2 = natural bits 0,18,36; bits 3,4,5 = 1,19,37; etc.
 It is not specified in BABA-A or the AMBE-3000 protocol spec — it's a
 private DVSI convention, likely left over from how the AMBE-3000R's bit
 FIFOs feed the USB protocol. The exact table lives in
-`ambe_plus2_wire::frame::R34_BIT_ORDER`, derived empirically by
+`rate33::frame::R34_BIT_ORDER`, derived empirically by
 `examples/derive_r34_order.rs` and verified an identical bijection across
 two disjoint vector sets (speech+alert vs sine/dtmf/cp/dam80).
 
@@ -90,7 +90,7 @@ derived it empirically rather than from a spec we don't have:
 `examples/derive_r34_order.rs` decodes `r33/*.bit` (validated FEC path) to the
 49 info bits, pairs them frame-for-frame with the raw `r34/*.bit` bytes, and
 solves the bit-signature correspondence. The result is a clean bijection — a
-fixed 3-way column interleave, pinned in `ambe_plus2_wire::frame::R34_BIT_ORDER`
+fixed 3-way column interleave, pinned in `rate33::frame::R34_BIT_ORDER`
 and regression-tested in `frame.rs`. `conformance-vectors cross-rate-compare`
 now reports `r33↔r34` 100% bit-exact vs the DVSI RC vectors in both directions.
 
@@ -166,6 +166,6 @@ feeding the chip.
 | Feed bytes directly into a DVSI chip via PKT_CHANP at rate 34 | `Rate::AmbePlus2_2450x2450` bytes are r34-faithful; the serial framing/PKT layer still lives in blip25-chip-shim |
 
 r34 now matches DVSI's output byte-for-byte (`R34_BIT_ORDER` in
-`ambe_plus2_wire::frame`, validated by `cross-rate-compare`). If a stream
+`rate33::frame`, validated by `cross-rate-compare`). If a stream
 ever *doesn't* match, suspect a regression in that table, not a "by design"
 divergence — the older "byte order is ours by design" caveat no longer applies.

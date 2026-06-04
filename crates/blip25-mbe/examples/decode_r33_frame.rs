@@ -6,8 +6,8 @@
 //!
 //! Run: cargo run --release --example decode_r33_frame -- cea8 fe83 acc4 5820 0a
 
-use blip25_mbe::ambe_plus2_wire::dequantize::{Decoded, DecoderState, decode_to_params};
-use blip25_mbe::ambe_plus2_wire::frame::{
+use blip25_mbe::rate33::dequantize::{Decoded, DecoderState, decode_to_params};
+use blip25_mbe::rate33::frame::{
     DIBITS_PER_FRAME, INFO_WIDTHS, decode_frame, pack_no_fec, unpack_no_fec,
 };
 

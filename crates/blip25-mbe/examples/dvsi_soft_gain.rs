@@ -15,9 +15,9 @@
 //! so the result is deterministic and unambiguous.
 //!
 //! Two rates are supported, selected with `--rate`:
-//!   * **full** (default) — full-rate IMBE (`imbe_wire`, 144 channel bits,
+//!   * **full** (default) — full-rate IMBE (`imbe7200`, 144 channel bits,
 //!     8 info vectors). Ground truth `clean.bit`, vectors `clean_eN_sd.bit`.
-//!   * **33** — half-rate AMBE+2 / DVSI Rate 33 (`ambe_plus2_wire`, 72
+//!   * **33** — half-rate AMBE+2 / DVSI Rate 33 (`rate33`, 72
 //!     channel bits, 4 info vectors). This is the P25 Phase 2 path, shared
 //!     bit-for-bit with DMR and NXDN. Ground truth `dam.bit`, vectors
 //!     `dam_eN_sd.bit`.
@@ -75,7 +75,7 @@ struct RateOps {
 }
 
 fn full_rate_ops() -> RateOps {
-    use blip25_mbe::imbe_wire::frame::{decode_frame, decode_frame_soft};
+    use blip25_mbe::imbe7200::frame::{decode_frame, decode_frame_soft};
     fn hard(chunk: &[u8]) -> (Vec<u16>, u16) {
         let dibits: [u8; 72] = hard_bytes_to_dibits(chunk).try_into().unwrap();
         let f = decode_frame(&dibits);
@@ -99,7 +99,7 @@ fn full_rate_ops() -> RateOps {
 }
 
 fn rate33_ops() -> RateOps {
-    use blip25_mbe::ambe_plus2_wire::frame::{decode_frame, decode_frame_soft};
+    use blip25_mbe::rate33::frame::{decode_frame, decode_frame_soft};
     fn hard(chunk: &[u8]) -> (Vec<u16>, u16) {
         let dibits: [u8; 36] = hard_bytes_to_dibits(chunk).try_into().unwrap();
         let f = decode_frame(&dibits);

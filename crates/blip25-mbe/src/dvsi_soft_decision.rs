@@ -8,8 +8,8 @@
 //! channel bit as a **4-bit soft-decision (SD) value** instead of a hard
 //! bit. This module converts between our native `i8` soft bits (sign =
 //! hard decision, magnitude = confidence — the convention used by
-//! [`crate::imbe_wire::frame::decode_frame_soft`] and
-//! [`crate::ambe_plus2_wire::frame::decode_frame_soft`]) and the DVSI
+//! [`crate::imbe7200::frame::decode_frame_soft`] and
+//! [`crate::rate33::frame::decode_frame_soft`]) and the DVSI
 //! SD format / packet.
 //!
 //! ## The 4-bit soft value (offset-binary)
@@ -59,7 +59,7 @@
 //! * **Nibble order** — `SD0` is the high nibble of each byte, confirmed
 //!   by the same sweep ([`pack_nibble_stream`]).
 //! * **Channel-bit ordering** — sequential and identical between DVSI's
-//!   soft and hard files. Our `imbe_wire` bit order was already validated
+//!   soft and hard files. Our `imbe7200` bit order was already validated
 //!   against these same `tv/p25` vectors, so a 144-bit soft frame maps
 //!   straight to `SD0..SD143`.
 //! * **Rate-control words** — taken from the reference command file

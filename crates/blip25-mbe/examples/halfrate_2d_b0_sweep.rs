@@ -19,11 +19,11 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 
-use blip25_mbe::ambe_plus2_wire::dequantize::{
+use blip25_mbe::rate33::dequantize::{
     DecoderState, Decoded, decode_to_params, dequantize,
 };
-use blip25_mbe::ambe_plus2_wire::frame::{decode_frame, encode_frame, DIBITS_PER_FRAME};
-use blip25_mbe::ambe_plus2_wire::priority::{prioritize, AMBE_B_COUNT};
+use blip25_mbe::rate33::frame::{decode_frame, encode_frame, DIBITS_PER_FRAME};
+use blip25_mbe::rate33::priority::{prioritize, AMBE_B_COUNT};
 use blip25_mbe::mbe_params::MbeParams;
 use blip25_mbe::vocoder::{Rate, Vocoder};
 

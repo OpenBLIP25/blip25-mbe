@@ -15,13 +15,13 @@
 //! Corresponds to the AMBE-3000 `PKT_RPT_MODE = 0x01` configuration
 //! with identical decoder and encoder rate parameters.
 
-use crate::imbe_wire::dequantize::{DecoderState, dequantize, quantize};
-use crate::imbe_wire::frame::{decode_frame as decode_full, encode_frame as encode_full};
-use crate::imbe_wire::priority::prioritize as prioritize_full;
-use crate::ambe_plus2_wire::dequantize::{
+use crate::imbe7200::dequantize::{DecoderState, dequantize, quantize};
+use crate::imbe7200::frame::{decode_frame as decode_full, encode_frame as encode_full};
+use crate::imbe7200::priority::prioritize as prioritize_full;
+use crate::rate33::dequantize::{
     DecoderState as HalfDecoderState, dequantize as dequantize_half, quantize as quantize_half,
 };
-use crate::ambe_plus2_wire::frame::{
+use crate::rate33::frame::{
     DIBITS_PER_FRAME, decode_frame as decode_half, encode_frame as encode_half,
 };
 

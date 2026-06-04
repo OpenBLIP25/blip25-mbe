@@ -27,7 +27,7 @@
 //! shows up in the test corpus, this module gains a `detect_dtmf`
 //! sibling.
 
-use crate::ambe_plus2_wire::frame::ANNEX_T;
+use crate::rate33::frame::ANNEX_T;
 
 /// What the tone detector returns on a hit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

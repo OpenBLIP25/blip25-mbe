@@ -28,11 +28,11 @@
 //!   scp /tmp/probe.ambe9 root@192.168.1.6:/tmp/probe.ambe9
 //!   ssh root@192.168.1.6 'dvsi decode-halfrate /tmp/probe.ambe9 /tmp/probe_chip.pcm'
 
-use blip25_mbe::ambe_plus2_wire::dequantize::{
+use blip25_mbe::rate33::dequantize::{
     DecoderState, Decoded, decode_to_params,
 };
-use blip25_mbe::ambe_plus2_wire::frame::{encode_frame, DIBITS_PER_FRAME};
-use blip25_mbe::ambe_plus2_wire::priority::{prioritize, AMBE_B_COUNT};
+use blip25_mbe::rate33::frame::{encode_frame, DIBITS_PER_FRAME};
+use blip25_mbe::rate33::priority::{prioritize, AMBE_B_COUNT};
 
 const N_FRAMES: usize = 300;
 

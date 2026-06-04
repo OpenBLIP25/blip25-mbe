@@ -8,7 +8,7 @@
 //! decoder, synth) and dispatches uniformly across rates selected at
 //! runtime via the [`Rate`] enum.
 //!
-//! The low-level modules ([`crate::imbe_wire`], [`crate::ambe_plus2_wire`],
+//! The low-level modules ([`crate::imbe7200`], [`crate::rate33`],
 //! [`crate::codecs::mbe_baseline`]) stay public for advanced consumers
 //! that need to drive the pipeline frame-by-frame at the parameter
 //! layer; this module is the recommended entry point for everything else.
@@ -57,8 +57,8 @@ use crate::codecs::mbe_baseline::{
 };
 use crate::enhancement::{self, EnhancementMode, EnhancementState};
 use crate::mbe_params::MbeParams;
-use crate::imbe_wire;
-use crate::ambe_plus2_wire;
+use crate::imbe7200;
+use crate::rate33;
 
 /// 8 kHz mono — the only sample rate the vocoder produces.
 const SAMPLE_RATE_HZ: f32 = 8_000.0;
@@ -317,8 +317,8 @@ impl std::error::Error for VocoderError {}
 pub struct Vocoder {
     rate: Rate,
     analysis: AnalysisState,
-    imbe_dec: imbe_wire::dequantize::DecoderState,
-    ambe_plus2_dec: ambe_plus2_wire::dequantize::DecoderState,
+    imbe_dec: imbe7200::dequantize::DecoderState,
+    ambe_plus2_dec: rate33::dequantize::DecoderState,
     synth: SynthState,
     last_stats: FrameStats,
     tone_detection: bool,
@@ -346,8 +346,8 @@ impl Vocoder {
         Self {
             rate,
             analysis: AnalysisState::new(),
-            imbe_dec: imbe_wire::dequantize::DecoderState::new(),
-            ambe_plus2_dec: ambe_plus2_wire::dequantize::DecoderState::new(),
+            imbe_dec: imbe7200::dequantize::DecoderState::new(),
+            ambe_plus2_dec: rate33::dequantize::DecoderState::new(),
             synth: SynthState::with_unvoiced_gen(noise_gen),
             last_stats: FrameStats::default(),
             tone_detection: false,
@@ -647,8 +647,8 @@ impl Vocoder {
     /// configuration knobs (tone detection) stay the same.
     pub fn reset(&mut self) {
         self.analysis = AnalysisState::new();
-        self.imbe_dec = imbe_wire::dequantize::DecoderState::new();
-        self.ambe_plus2_dec = ambe_plus2_wire::dequantize::DecoderState::new();
+        self.imbe_dec = imbe7200::dequantize::DecoderState::new();
+        self.ambe_plus2_dec = rate33::dequantize::DecoderState::new();
         self.synth = SynthState::new();
         self.last_stats = FrameStats::default();
         self.enhancement_state = EnhancementState::default();
@@ -782,7 +782,7 @@ impl Vocoder {
     /// [`Self::decode_bits`] call).
     ///
     /// Useful for playing back tone-frame params from
-    /// [`crate::ambe_plus2_wire::dequantize::tone_to_mbe_params`], replaying
+    /// [`crate::rate33::dequantize::tone_to_mbe_params`], replaying
     /// captured params in test harnesses, or driving synth from any
     /// upstream that produces `MbeParams` without going through wire
     /// bits.
@@ -1457,9 +1457,9 @@ impl core::fmt::Debug for Vocoder {
 
 mod imbe_pipeline {
     use super::*;
-    use crate::imbe_wire::dequantize::{dequantize, quantize};
-    use crate::imbe_wire::frame::{INFO_WIDTHS, decode_frame, encode_frame};
-    use crate::imbe_wire::priority::{deprioritize, prioritize};
+    use crate::imbe7200::dequantize::{dequantize, quantize};
+    use crate::imbe7200::frame::{INFO_WIDTHS, decode_frame, encode_frame};
+    use crate::imbe7200::priority::{deprioritize, prioritize};
 
     pub(super) fn encode(
         pcm: &[i16],
@@ -1608,10 +1608,10 @@ mod imbe_pipeline {
 
 mod ambe_plus2_pipeline {
     use super::*;
-    use crate::ambe_plus2_wire::dequantize::{
+    use crate::rate33::dequantize::{
         Decoded, decode_to_params, encode_tone_frame_info, quantize, tone_to_mbe_params,
     };
-    use crate::ambe_plus2_wire::frame::{decode_frame, encode_frame, pack_no_fec, unpack_no_fec};
+    use crate::rate33::frame::{decode_frame, encode_frame, pack_no_fec, unpack_no_fec};
 
     pub(super) fn encode(
         pcm: &[i16],
@@ -2154,8 +2154,8 @@ mod tests {
         // Decoder side: parse the bits and confirm it classifies as
         // a tone frame (FrameKind::Tone via the §2.10.1 signature
         // dispatch).
-        use crate::ambe_plus2_wire::dequantize::{FrameKind, classify_ambe_plus2_frame};
-        use crate::ambe_plus2_wire::frame::decode_frame;
+        use crate::rate33::dequantize::{FrameKind, classify_ambe_plus2_frame};
+        use crate::rate33::frame::decode_frame;
         let mut dibits = [0u8; 36];
         let mut bit = 0;
         for slot in &mut dibits {

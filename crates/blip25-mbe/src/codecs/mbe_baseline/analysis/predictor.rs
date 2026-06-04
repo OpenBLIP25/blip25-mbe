@@ -67,7 +67,7 @@ impl PredictorState {
     /// 0-indexed slice of the past-frame amplitudes for `l = 1..=l_tilde_prev`.
     /// Entry `i` is `M̃_{i+1}(−1)`. Length equals `l_tilde_prev`.
     /// Used by the §0.10 matched-decoder roundtrip to seed a
-    /// `DecoderState` via [`crate::imbe_wire::dequantize::DecoderState::from_amplitudes`].
+    /// `DecoderState` via [`crate::imbe7200::dequantize::DecoderState::from_amplitudes`].
     pub fn m_tilde_prev_slice(&self) -> Vec<f32> {
         let n = self.l_tilde_prev as usize;
         (1..=n).map(|i| self.m_tilde_prev[i] as f32).collect()
@@ -106,12 +106,12 @@ impl Default for PredictorState {
 
 /// Full-rate prediction coefficient `ρ` per BABA-A Eq. 55.
 ///
-/// Promoted from [`crate::imbe_wire::dequantize::imbe_rho`]'s
+/// Promoted from [`crate::imbe7200::dequantize::imbe_rho`]'s
 /// `f32` helper into `f64` for the analysis pipeline. Values are
 /// identical; the `as f64` cast is lossless for these schedule points.
 #[inline]
 pub fn imbe_rho_f64(l_hat: u8) -> f64 {
-    f64::from(crate::imbe_wire::dequantize::imbe_rho(l_hat))
+    f64::from(crate::imbe7200::dequantize::imbe_rho(l_hat))
 }
 
 /// Compute the log₂-domain prediction residual `T̂_l` per Eq. 54 in
@@ -437,7 +437,7 @@ impl HalfratePredictorState {
     /// Commit `Λ̃_l(0)`, `L̃(0)`, `γ̃(0)` from the matched-decoder
     /// roundtrip as next frame's state. Called by the §0.10
     /// half-rate pipeline after
-    /// [`crate::ambe_plus2_wire::dequantize::dequantize`] advances the
+    /// [`crate::rate33::dequantize::dequantize`] advances the
     /// wire decoder's own `DecoderState`.
     ///
     /// `lambda_tilde_curr` is 1-indexed with `[0]` ignored; the

@@ -14,7 +14,7 @@
 //! * **`p25/<name>.bit`** (full-FEC) — 18 bytes per 20 ms frame = 144
 //!   bits packed MSB-first. The 144 bits are 72 dibits in transmission
 //!   order, each dibit's high bit transmitted first. Feeds directly
-//!   into [`blip25_mbe::imbe_wire::frame::decode_frame`].
+//!   into [`blip25_mbe::imbe7200::frame::decode_frame`].
 //!
 //! * **`p25_nofec/<name>.bit`** (info-only) — 11 bytes per 20 ms frame
 //!   = 88 bits packed MSB-first. The 88 bits are the eight info
@@ -43,25 +43,25 @@ use blip25_mbe::codecs::mbe_baseline::analysis::{
     encode_with_trace as analysis_encode_with_trace,
 };
 use blip25_mbe::fec::{golay_23_12_encode, hamming_15_11_encode};
-use blip25_mbe::imbe_wire::dequantize::{
+use blip25_mbe::imbe7200::dequantize::{
     DecodeError, DecoderState, dequantize as dequantize_full, quantize as quantize_full,
 };
-use blip25_mbe::imbe_wire::fec::{deinterleave as deinterleave_full, modulation_masks};
-use blip25_mbe::imbe_wire::frame::{
+use blip25_mbe::imbe7200::fec::{deinterleave as deinterleave_full, modulation_masks};
+use blip25_mbe::imbe7200::frame::{
     Frame as FullFrame, INFO_WIDTHS,
     decode_frame as decode_full_frame, encode_frame as encode_full_frame,
 };
-use blip25_mbe::imbe_wire::priority::{
+use blip25_mbe::imbe7200::priority::{
     deprioritize as deprioritize_full, prioritize as prioritize_full,
 };
-use blip25_mbe::ambe_plus2_wire::dequantize::{
+use blip25_mbe::rate33::dequantize::{
     Decoded, DecoderState as HalfDecoderState, decode_to_params,
     dequantize as dequantize_half, quantize as quantize_half,
 };
-use blip25_mbe::ambe_plus2_wire::frame::{
+use blip25_mbe::rate33::frame::{
     decode_frame as decode_half_frame, deinterleave as deinterleave_half,
 };
-use blip25_mbe::ambe_plus2_wire::priority::{
+use blip25_mbe::rate33::priority::{
     deprioritize as deprioritize_half,
 };
 use blip25_mbe::rate_conversion::converter::{
@@ -321,7 +321,7 @@ enum Cmd {
     /// `DVSI/Vectors/.../r33/<name>.pcm` through
     /// `codecs::mbe_baseline::analysis::encode_ambe_plus2` in 20 ms frames,
     /// dequantizes the parallel `<name>.bit` chip bitstream via
-    /// `ambe_plus2_wire::dequantize` for the reference `MbeParams`, and
+    /// `rate33::dequantize` for the reference `MbeParams`, and
     /// reports parameter-level distortion (pitch cents, L mismatch %,
     /// voicing %, amplitude dB RMSE). Analogous to `analysis-encode`
     /// but for the half-rate wire format. Preroll frames (first two)
@@ -367,7 +367,7 @@ enum Cmd {
     /// `DVSI/Vectors/.../p25/<name>.pcm` through
     /// [`blip25_mbe::codecs::mbe_baseline::analysis::encode`] in 20 ms
     /// frames, dequantizes the parallel `<name>.bit` chip bitstream
-    /// via `imbe_wire::dequantize` to get the reference per-frame
+    /// via `imbe7200::dequantize` to get the reference per-frame
     /// `MbeParams`, and reports parameter-level distortion
     /// (pitch cents, L mismatch %, voicing %, amplitude dB RMSE).
     /// Preroll frames (first two) are tallied as non-comparable.
@@ -2363,7 +2363,7 @@ fn cmd_rate_convert_full_to_half(root: &Path, name: &str, rc: bool) -> Result<()
                 // Full-rate reserved pitch — converter should emit a
                 // half-rate erasure signal.
                 let dst_frame = decode_half_frame(&dst_dibits);
-                use blip25_mbe::ambe_plus2_wire::dequantize::{FrameKind, classify_ambe_plus2_frame};
+                use blip25_mbe::rate33::dequantize::{FrameKind, classify_ambe_plus2_frame};
                 match classify_ambe_plus2_frame(&dst_frame.info) {
                     FrameKind::Erasure => skips.erasure_passthrough += 1,
                     _ => skips.erasure_mismatch += 1,

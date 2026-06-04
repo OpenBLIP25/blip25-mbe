@@ -69,22 +69,22 @@
 use core::f32::consts::PI;
 
 use crate::mbe_params::MbeParams;
-use crate::imbe_wire::dequantize::{
+use crate::imbe7200::dequantize::{
     DecodeError, DecoderState, EncodeError, PITCH_INDEX_MAX, dequantize, encode_pitch as full_encode_pitch,
     pitch_decode as full_pitch_decode, quantize,
 };
-use crate::imbe_wire::frame::{decode_frame as decode_full, encode_frame as encode_full};
-use crate::imbe_wire::priority::{
+use crate::imbe7200::frame::{decode_frame as decode_full, encode_frame as encode_full};
+use crate::imbe7200::priority::{
     IMBE_B_MAX, L_MIN as FULL_L_MIN, prioritize as prioritize_full,
 };
-use crate::ambe_plus2_wire::dequantize::{
+use crate::rate33::dequantize::{
     Decoded, DecoderState as HalfDecoderState, decode_to_params, encode_pitch as half_encode_pitch,
     quantize as quantize_half,
 };
-use crate::ambe_plus2_wire::frame::{
+use crate::rate33::frame::{
     AMBE_PITCH_TABLE, DIBITS_PER_FRAME, decode_frame as decode_half, encode_frame as encode_half,
 };
-use crate::ambe_plus2_wire::priority::{AMBE_B_COUNT, prioritize as prioritize_half};
+use crate::rate33::priority::{AMBE_B_COUNT, prioritize as prioritize_half};
 use crate::rate_conversion::predictor::{CrossRatePredictorState, blend as cross_rate_blend};
 
 /// Lowest ω̃₀ in the half-rate Annex L table (entry 119, L = 56).
@@ -142,7 +142,7 @@ const FULLRATE_ERASURE_B0: u16 = PITCH_INDEX_MAX as u16 + 1;
 /// Emit a half-rate erasure frame: 36 dibits whose deprioritized
 /// `b̂₀ = 120` (other parameters zero). After the channel codec pass
 /// these will round-trip through `classify_ambe_plus2_frame` as
-/// [`crate::ambe_plus2_wire::dequantize::FrameKind::Erasure`].
+/// [`crate::rate33::dequantize::FrameKind::Erasure`].
 fn ambe_plus2_erasure_dibits() -> [u8; DIBITS_PER_FRAME] {
     let mut b = [0u16; AMBE_B_COUNT];
     b[0] = HALFRATE_ERASURE_B0;
@@ -530,7 +530,7 @@ mod tests {
 
     // ---- Tone / silence / erasure handling -----------------------------
 
-    use crate::ambe_plus2_wire::dequantize::{FrameKind, classify_ambe_plus2_frame};
+    use crate::rate33::dequantize::{FrameKind, classify_ambe_plus2_frame};
 
     /// Build a half-rate erasure frame's 36 dibits by deliberately
     /// prioritizing `b̂₀ = 120` with everything else zero — same path
@@ -654,7 +654,7 @@ mod tests {
     #[test]
     fn cross_rate_predictor_state_tracks_target_across_frames() {
         // Analogue of quantize_multi_frame_predictor_state_tracks_decoder
-        // in imbe_wire::dequantize::tests, but for the rate-converter
+        // in imbe7200::dequantize::tests, but for the rate-converter
         // predictor. After each frame, the converter's predictor state
         // should hold exactly the post-§4.5 magnitudes and the
         // target-committed (ω̂₀_B, L̂_B). Feeding a varying-pitch voice

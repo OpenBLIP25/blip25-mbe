@@ -147,7 +147,7 @@ These are mechanical fixes surfaced by this session's
 `codecs::ambe_plus::synthesize_frame` exists but consumers of legacy
 NXDN/DMR voice (Gen 2) currently have no path from raw 4-vector
 post-FEC info bits to PCM through the AMBE+ encoder layout. Add a
-`ambe_plus2_wire::dequantize` sibling targeting AMBE+'s parameter
+`rate33::dequantize` sibling targeting AMBE+'s parameter
 encoding so `decode-raw-ambe-plus2 --gen ambe-plus` works. The synth
 side stays untouched.
 

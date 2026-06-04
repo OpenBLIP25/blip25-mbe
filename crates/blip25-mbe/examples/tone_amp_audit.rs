@@ -11,7 +11,7 @@
 //!
 //! Reads no inputs; emits a CSV table to stdout.
 
-use blip25_mbe::ambe_plus2_wire::dequantize::{
+use blip25_mbe::rate33::dequantize::{
     tone_to_mbe_params, TONE_AMPLITUDE_EXPONENT_STEP, TONE_AMPLITUDE_PEAK,
 };
 use blip25_mbe::codecs::ambe_plus2::{synthesize_frame, SynthState, SAMPLES_PER_FRAME};

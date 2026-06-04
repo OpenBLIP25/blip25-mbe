@@ -77,8 +77,8 @@ codecs/           — analysis/synthesis, one submodule per generation.
   ambe/           — AMBE-1000, Generation 1.
   ambe_plus/      — AMBE-2000, Generation 2. US5701390 phase regeneration.
   ambe_plus2/     — AMBE-3000, Generation 3. US8595002, US8315860.
-imbe_wire/     — P25 Phase 1 FDMA: 144-bit IMBE wire (BABA-A §1–§12).
-ambe_plus2_wire/     — P25 Phase 2 TDMA: 72-bit AMBE+2 wire (BABA-A §13–§17 +
+imbe7200/     — P25 Phase 1 FDMA: 144-bit IMBE wire (BABA-A §1–§12).
+rate33/     — P25 Phase 2 TDMA: 72-bit AMBE+2 wire (BABA-A §13–§17 +
                     Annexes L–T; renamed "Half-Rate Vocoder" in the spec
                     to dodge DVSI's trademark, but the wire is AMBE+2).
 dvsi_3000/        — DVSI AMBE-3000 chip protocol (r0..r63 rate configurations).
@@ -92,20 +92,29 @@ bits/             — shared bit-packing primitives.
 
 Three concerns, three top-level axes, one interchange type.
 
-**Wire layer naming policy.** Wire formats are P25-protocol-specific
-because non-P25 protocols (DMR, D-STAR, NXDN, …) share codecs from the
-MBE family but use entirely different over-the-air bit containers,
-FEC, and prioritization. When DMR voice support is added it becomes
-`dmr_voice/` as a sibling of `imbe_wire/` and `ambe_plus2_wire/`, not
-a sub-rate of either. The codec layer (`codecs/`) remains shared
-across protocols.
+**Wire layer naming policy.** These modules are named by DVSI *rate*
+(`imbe7200` = full-rate IMBE at 7200 bps; `rate33` = half-rate AMBE+2,
+DVSI rate index 33) because they model the **codec channel frame** —
+the rate-defined Golay/Hamming/PN/interleave layer sitting directly on
+the parameter bits, the same boundary DVSI's own chip packet draws.
+Protocol-specific over-the-air framing (burst layout, scrambling,
+sync) lives *above* mbe in each protocol's CAI/air-interface layer, not
+here. The rate-33 codec frame is therefore the natural reuse point for
+other half-rate AMBE+2 protocols (DMR, NXDN, P25 Phase 2) — *to the
+extent* their channel FEC and bit prioritization actually match DVSI
+rate 33; where a protocol's channel framing genuinely differs it earns
+its own rate/protocol module (e.g. `dmr_voice/`) rather than a sub-rate
+of these. The codec layer (`codecs/`) is shared across protocols
+regardless. (This supersedes the earlier "wire formats are strictly
+P25-protocol-specific" framing, which predated moving protocol burst
+layout up into the CAI layer.)
 
-**Why `imbe_wire` is not equivalent to "IMBE wire."** BABA-A is a
+**Why `imbe7200` is not equivalent to "IMBE wire."** BABA-A is a
 consolidation of two independent vocoder specs: the original 1998
 BABA (full-rate IMBE) and the BABA-1 addendum (half-rate AMBE+2).
 The two wires are governed by the same document but they are not the
 same vocoder. P25 Phase 1 fire-channel deployments in particular
-sometimes pair the `imbe_wire` wire with the `codecs::ambe_plus2`
+sometimes pair the `imbe7200` wire with the `codecs::ambe_plus2`
 codec for SCBA-mask noise immunity — a valid combination because the
 wire layer's only contract with the codec is `bits ↔ MbeParams`.
 

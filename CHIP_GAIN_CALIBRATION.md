@@ -50,7 +50,7 @@ The same SDRTrunk decision applies: half-rate consumers wanting
 JMBE-equivalent loudness should layer a constant gain in the rendering
 pipeline (the `BLIP25_VOICE_GAIN_DB=+9` consumer default brings us
 partway; +17 dB would match JMBE on average), **not** modify
-`compute_m_tilde` or `decode_gain` in `ambe_plus2_wire/dequantize.rs`.
+`compute_m_tilde` or `decode_gain` in `rate33/dequantize.rs`.
 
 Gap report `~/blip25-specs/gap_reports/0024_*.md` documents the JMBE
 adjustment table as a JMBE-side UX choice, not chip-emulation.

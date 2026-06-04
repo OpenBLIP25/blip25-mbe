@@ -26,18 +26,18 @@
 //! the boundary behaviour on real speech.
 
 use blip25_mbe::mbe_params::MbeParams;
-use blip25_mbe::imbe_wire::dequantize::{
+use blip25_mbe::imbe7200::dequantize::{
     DecoderState, dequantize as dequantize_full, quantize as quantize_full,
 };
-use blip25_mbe::imbe_wire::frame::{
+use blip25_mbe::imbe7200::frame::{
     decode_frame as decode_full_frame, encode_frame as encode_full_frame,
 };
-use blip25_mbe::imbe_wire::priority::prioritize as prioritize_full;
-use blip25_mbe::ambe_plus2_wire::dequantize::{
+use blip25_mbe::imbe7200::priority::prioritize as prioritize_full;
+use blip25_mbe::rate33::dequantize::{
     DecoderState as HalfDecoderState, dequantize as dequantize_half,
     quantize as quantize_half,
 };
-use blip25_mbe::ambe_plus2_wire::frame::{
+use blip25_mbe::rate33::frame::{
     decode_frame as decode_half_frame, encode_frame as encode_half_frame,
 };
 use blip25_mbe::rate_conversion::{FullToHalfConverter, HalfToFullConverter};

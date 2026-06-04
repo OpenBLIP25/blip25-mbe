@@ -8,9 +8,9 @@
 //!   low_b0 / high_b0: pitch index 0-119 (60 ≈ pitch 100 Hz)
 //!   b2 (default 20): gain index 0-31 (held same on both)
 
-use blip25_mbe::ambe_plus2_wire::dequantize::{DecoderState, Decoded, decode_to_params};
-use blip25_mbe::ambe_plus2_wire::frame::{encode_frame, DIBITS_PER_FRAME};
-use blip25_mbe::ambe_plus2_wire::priority::{prioritize, AMBE_B_COUNT};
+use blip25_mbe::rate33::dequantize::{DecoderState, Decoded, decode_to_params};
+use blip25_mbe::rate33::frame::{encode_frame, DIBITS_PER_FRAME};
+use blip25_mbe::rate33::priority::{prioritize, AMBE_B_COUNT};
 
 fn pack_dibits(dibits: &[u8; DIBITS_PER_FRAME]) -> [u8; 9] {
     let mut out = [0u8; 9];
