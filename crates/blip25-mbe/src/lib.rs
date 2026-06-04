@@ -79,6 +79,7 @@ pub mod codecs;
 pub mod imbe_wire;
 pub mod ambe_plus2_wire;
 pub mod dvsi_3000;
+pub mod dvsi_soft_decision;
 
 pub mod rate_conversion;
 
