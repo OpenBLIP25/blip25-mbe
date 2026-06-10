@@ -29,9 +29,32 @@ short of — and could ultimately exceed — the AMBE-3000R, on both **encode**
 offline-capable code can beat several of them — but today blip25-mbe is **not
 yet at parity**, so parity comes first.
 
+> **Which chip-vs-spec deviations are actually quality levers** (and which are
+> fixed-point artifacts to ignore) is distilled in
+> `DVSI_DEVIATIONS_QUALITY_LEVERS.md` — read it before acting on any
+> "the chip does X differently" note, so precision quirks don't get mistaken
+> for quality work.
+
 ---
 
 ## 0. Measure before optimizing — the attribution method
+
+> **Why "great on vectors, not as great in the wild" (the origin symptom).**
+> Verified on the chip (ambe3000-clone, 2026-06-04, `conformance/baselines/
+> encode_robustness_2026-06-04/` + `encode_ns_test_2026-06-04/`): the AMBE-3000
+> is a **faithful "dumb" codec — NO AGC, NO low-level mute on real speech, NO
+> noise suppression, NO activity gating** (output RMS tracks input 1.03× over a
+> 200× level range; added noise passes straight through at 0.94×). So the wild
+> gap is **not** a missing front-end DSP stage we forgot to build. It is the
+> **same steady-state encoder/decoder quality gap** measured here (amplitude
+> estimator, pitch corr ~0.55, voicing, a persistent ~1.5–2 dB level deficit,
+> decode phase/synth) — just **more exposed on diverse real speech than on the
+> few favorable tuning vectors. The encoder is somewhat OVERFIT to the test
+> vectors.** Practical consequence: validate every change on a *diverse real
+> corpus*, not on `clean`/`dam`; the tuning vectors flatter us and will keep
+> hiding the gap. (Conditioning like AGC lives in the radio audio path, not the
+> vocoder — so it's out of scope for matching the chip, though see §3.4 for the
+> NS *exceed* opportunity.)
 
 Quality work fails when you can't tell whether a deficit is in the **encoder**
 or the **decoder**. We already have the instrument: the 4-cell matrix in
@@ -313,6 +336,62 @@ instrument on the 4 real-speech vectors
   with §1.10-off (parity-only; envelope resolution, not a quality lever, but it
   bounds how fine the chip's magnitude representation actually is).
 
+**Progress 2026-06-03b (ambe3000-clone — voiced phase-regen RE-TUNED + the
+"min-phase operator explains ~half the voiced scatter" claim CORRECTED as
+~⅔ overfitting).** Re-tuned the US5701390 regen against the 4 cached r33 vectors
+(`phase_operator.rs` + `phase_divergence`, no live chip):
+- **The chip's *effective* regen scale is BELOW the patent's γ=0.44, not above
+  it.** Operator-fit on the chip's own phase gives s≈0.33–0.48 (nominal s=1.0 ⇔
+  γ=0.44) ⇒ effective γ≈0.15–0.21, robust on all 4 vectors. End-to-end
+  `phase_divergence` agrees: scale 0.4 **Pareto-dominates** the patent γ on all 4
+  vectors on both the τ-removed per-harmonic phase residual (avg 71.65°→70.80°)
+  and aligned voiced SNR (0.54→0.57 dB). **This OVERTURNS the 2026-06-01/-06-02
+  note above that recommended `REGEN_SCALE≈1.2` + `REGEN_ALL`.** Wired
+  `REGEN_SCALE_DEFAULT=0.4` as the AMBE+2 voiced default (regression test added);
+  `REGEN_ALL` is a measured **NEGATIVE** (raises the residual) and stays OFF.
+- **The "operator explains ~half the voiced scatter" (corr 0.96 / 53%) was ~⅔
+  per-frame OVERFITTING.** A scrambled operator (same per-frame value
+  distribution, harmonic alignment destroyed by reversal/roll) STILL scores
+  31–36% under the free per-frame (s,τ,c) fit. The genuine reachable operator
+  headroom is only ~8° (47°→39°), and most of *that* lives in the per-frame
+  DC/φ₀ subspace the synth can't exploit without a free per-frame fundamental
+  phase — hence turning the operator from OFF to full patent strength moves the
+  end-to-end synth residual only ~0.3°. **§1.10-enhanced M̄_l as the operator
+  input makes zero difference** (39.1°→39.2°), consistent with §1.10 being
+  wrong-signed for this chip.
+- **Net:** decode voiced quality is **NOT** regen-limited. The dominant reachable
+  voiced lever is the **per-frame fundamental phase φ₀ + the within-run time-shift
+  τ** (the content-dependent onset surface; `voiced-tau-is-onset-perrun-scalar`,
+  `onset-formant-tau-content-not-minphase`), which the τ-only ceiling caps at
+  ~+0.5 dB aligned SNR / ~70° residual. The regen retune is a small parity
+  refinement, not a quality unlock.
+
+**Progress 2026-06-03c (ambe3000-clone — voiced fundamental phase φ₀ pinned to a
+chip-calibrated pitch law; first positive realized voiced-phase lever since
+regen).** New tool `phase_phi0.rs` (per voiced frame, splits the chip-vs-our
+phase error into a time-shift τ slope and an l-independent DC = φ₀; difference
+and absolute fits; 4 cached r33 vectors, no live chip):
+- **φ₀ IS content-determined** (scramble controls ≈0): a clean monotone
+  **pitch-linear** component, `φ₀(ω₀) ≈ +22.6·ω₀ − 2.19 rad` (circular-linear
+  r≈0.46 to ω₀), PLUS a genuine **per-run memory** (prev-φ₀ circ-circ r≈0.55 raw,
+  0.46 after removing the ω₀ law — not a pitch-smoothness confound). It is **not**
+  a free-running fundamental-phase accumulator (Δφ₀ vs ω₀·160 r≈0).
+- **Realized** via a new `BLIP25_PHASE_CW` handle (φ₀=C+CW·ω₀ on the voiced
+  harmonics; constants `PHI0_CW_VALIDATED=−22.6`, `PHI0_C_VALIDATED=2.19`,
+  applied with the synth's internal sign, regression-guarded). Cross-validated
+  (fit clean+dam / test famb+tamb — same optimum ridge). End-to-end
+  `phase_divergence`: **beats the τ-only ceiling** — mean oracle-τ-aligned voiced
+  SNR **+0.57→+1.09 dB**, per-harmonic resid **70.8°→68.8°**, raw SNR
+  −2.41→−2.21 (never regresses). Kept env-gated/off by default (like N0/B).
+- **Caveat / lever status:** the full φ₀ prize (≈12° per-harmonic given oracle τ)
+  is **entangled with τ** — the DC helps raw bit-exact parity only modestly
+  (+0.2 dB) because most of the gain is conditional on a correct per-frame τ, and
+  the φ₀ memory is the same firmware-bound onset surface as τ. So φ₀ is a real
+  *partial* quality lever (use the `BLIP25_PHASE_CW`/`_C` law if you want the
+  voiced phase closer to the chip), but the voiced wall is still the τ + φ₀-memory
+  onset content surface. Campaign:
+  `conformance/baselines/voiced_phi0_2026-06-03/`.
+
 ### 2.2 (HIGH, the "exceed" win) Do NOT replicate the chip's quality-degrading artifacts
 The chip applies beyond-spec behaviors that *hurt* quality
 (`ambe3000_chip_oracle_caveats.md`): an amplitude-dependent **mute**, a hard
@@ -397,6 +476,42 @@ level error that is a direct manifestation of the voiced-phase/synthesis wall
 target: voiced/unvoiced RMS ≈ 1.08, flat across pitch. Not a separable scaling
 constant — fixing it needs the chip's voiced phase/synthesis.
 
+### 2.6 Handoff (APX firmware) deviations — quality relevance (2026-06-06)
+
+A reverse-engineering hand-off surfaced bit-exact codebooks extracted from the
+**Motorola APX `R39.15.00` DSP image** (DVSI *software* IMBE/AMBE+2 on a
+TMS320C55x — a different target from the AMBE-3000R hardware chip). Most of its
+deviations are **bucket B** (sub-LSB fixed-point artifacts → do NOT copy into the
+float path, no quality value). Two are genuinely quality/interop relevant and are
+**not currently reflected here or, likely, in open MBE decoders (mbelib/JMBE)**:
+
+- **(FULL-RATE IMBE) DVSI extends the overall-gain ladder ("MONO65"), not plain
+  Annex-E.** Decode-reachable part: the **low 8 levels are shifted DOWN** by
+  `−0.25·(8−k)` (bottom level −4.842 dB vs Annex-E's −2.842). A decoder using the
+  standard 64-level Annex-E renders DVSI/APX-encoded *quiet* frames (gain index
+  0..7) **too loud by up to ~2 dB** — an audible level/interop error on low-energy
+  speech. (The advertised "65th level" at +9.9199 is NOT decode-reachable — `b̂₂`
+  is a 6-bit field, 0..63 — so it is an *encoder gain-search clamp ceiling*, not a
+  decode entry; relevant only to encoder gain clamping, see §3.1.) **Action for
+  blip25-mbe full-rate:** A/B Annex-E vs the APX low-8 downshift on quiet
+  full-rate frames; the downshift is the likely-correct DVSI behaviour. Half-rate
+  (Annex-O) gain is **un-extended** — no change there.
+
+- **(ENCODE) DVSI's analysis window is a ~250-pt Hann-class window** (α≈0.501,
+  reaches a true 0 at the edge) that differs from **all three** TIA windows
+  (Annex B/C/I). This is an independent encode spectral-estimation lever — see
+  §3.1/§3.2. Pairs with the ambe3000-clone finding that our refinement window is
+  **mis-centred ~45 samples** (clips the left tail) — a likely real blip25-mbe
+  analysis bug worth fixing regardless of the DVSI window shape.
+
+- **Explicitly NOT quality levers (bucket B, confirmed):** the APX HOC books'
+  truncate-toward-zero / ~2045 build scale (≤1 LSB Q11). An ambe3000-clone chip
+  A/B (2026-06-06, b5 sweep) measured the entire HOC table effect at 0.07 dB
+  band-power LSD — **~3× below the chip's 0.19 dB observability floor** and a
+  15/17 coin-flip on which table the chip prefers. The same applies to the
+  fixed-point dequant wordlength (~Q5) and the unvoiced fixed-point FFT residual:
+  parity-only, no perceptual headroom.
+
 ---
 
 ## 3. Encode-side quality levers (PCM → bits), prioritized
@@ -412,6 +527,136 @@ amplitudes with limited windows/precision; a modern multi-resolution or
 reassigned-spectrum estimate can place harmonic energy more accurately. The
 *encoder is where modern DSP most cleanly beats 1990s silicon.*
 
+> **Chip-parity decomposition (ambe3000-clone, 2026-06-04).** Differential
+> r34 measurement vs the chip's own bits localizes this deficit precisely.
+> The voicing-agreed realized-envelope SHAPE divergence (~3.2 dB) is **uniform
+> per-harmonic scatter** — NOT a systematic spectral tilt (linear tilt explains
+> only 18%), NOT a fixed pre-emphasis curve (1.2%), NOT concentrated in
+> low-amplitude valleys (flat ~3 dB even on harmonics within 6 dB of the frame
+> peak). Reconstructing our CONTINUOUS pre-VQ PRBA vector shows the chip's
+> chosen quantization cell sits at mean distance-rank 41/512 and 3.18× the cell
+> radius away — i.e. a **genuine continuous-estimator divergence**, not a
+> quantization cell-crossing artifact (so finer fixed-point precision will not
+> close it). It is also uniform across stationary vs transient frames, ruling
+> out analysis-window position/alignment. ⇒ the deficit is a fixed
+> per-harmonic estimation-RULE difference; the within-frame suspects are the
+> energy-INTEGRATION/band-edge rule and DFT/window resolution. For chip parity,
+> measure candidate estimator changes by the PRBA distance-RANK (does the chip's
+> cell move toward rank 1?), not the post-VQ envelope SHAPE, which overstates
+> the true divergence ~3× via VQ granularity. (A modern *better-than-chip*
+> estimate is still the §3.1 exceed play; this note is about matching the chip.)
+>
+> **Refinement (ambe3000-clone, 2026-06-04, forced-pitch isolation).** The
+> "uniform stationary vs transient" claim above held only *before* pitch was
+> neutralized. Forcing the chip's exact quantized `(ω̂₀, L̂)` into the amplitude
+> estimator (so the harmonic grid is placed identically) drops the PRBA cell
+> distance-rank only 41→35 and the d-ratio 3.18→2.99 — **not toward 1** — so a
+> genuine fixed amplitude-RULE divergence *survives correct pitch* (pitch
+> placement was ~40% of the apparent gap; a real ~rank-35 residual remains). And
+> with pitch removed a **stationary-vs-transient split emerges that was masked
+> before**: stationary (|ΔL|≤1) rank 27.5 vs transient (|ΔL|≥3) rank 49.5 — the
+> residual roughly doubles on spectral-transition frames, pointing at
+> analysis-**window length/position/response on transients** (partially reversing
+> the "rules out window position" line above). A single-bin peak-pick variant
+> (vs the spec's band-energy integration) is a clean negative (rank 35→40). So
+> two levers: a core fixed-rule divergence on all frames (stationary floor
+> rank 27.5, likely the chip's fixed-point spectral-magnitude arithmetic) plus a
+> transient-specific window-response excess (the more reachable of the two for
+> a *better-than-chip* encoder — attack/transition amplitude tracking, ties to
+> §2.4 onset clarity).
+>
+> **Window-alignment lever found (ambe3000-clone, 2026-06-04).** Chasing that
+> transient excess located a concrete, likely-shared bug: the analysis amplitude
+> window (`extract_refinement_window`, ±110 Annex C) is centered at the frame
+> midpoint in a lookahead buffer that keeps **no past frame**, so its left 30
+> samples are zero-filled — an asymmetric, mistimed window. Shifting the window
+> center +45 samples (gated `BLIP25_WIN_OFFSET`) improves the chip-bit match on
+> **two** vectors (clean +2.5 pp, alert +2.9 pp emitted bit-match) and collapses
+> the voiced PRBA amplitude divergence on clean speech (forced-pitch cell rank
+> 35→14). For chip *parity* this is a frame-phase alignment to emulate; for
+> blip25-mbe *quality* the takeaway is that the windowing currently clips its
+> left tail and is mistimed on transients — worth auditing/fixing in the float
+> path (retain a past frame so the window centers symmetrically), independent of
+> the chip. Likely helps attack/transition timbre (§2.4). Empirical offset, not
+> yet a derived constant.
+>
+> **Resolved (ambe3000-clone, 2026-06-04).** Wired a past-frame retain
+> (`BLIP25_WIN_PAST`) to test the "center symmetrically" idea above against the
+> chip directly: **un-clipping at the same instant does essentially nothing**
+> (forced-pitch PRBA rank 35.1→34.0, bit-match 70.7→70.6). The chip's win is a
+> genuine **~+48-sample forward shift** of the amplitude analysis instant, broad
+> flat basin +44…+50, now validated across **four** natural-speech vectors
+> (clean/alert/mark/dam, +1.9…+3.2 pp). Per-field it is specifically an
+> **amplitude-window** correction — gain/PRBA/HOC all improve (gain exact-match
+> clean 50→59, mark 21→32; this is the −1.5 dB level gap), while **pitch is
+> flat-to-slightly-worse** (it is set by the separate §0.3 LPF tracker, not this
+> window). Quality guidance: the asymmetric **left-clip is still a real float
+> bug** to fix on its own merits, but do **not** blindly copy +48 — that is a
+> chip-parity frame-phase convention (Bucket A), not necessarily a quality win;
+> the chip's late amplitude instant may be a compromise. For *exceeding* the
+> chip, the cleaner play is a properly-centered, possibly multi-resolution
+> amplitude window evaluated by PESQ on transient/attack frames (§2.4), not
+> a fixed +48 shift.
+
+> **Window LENGTH/shape resolved — NEGATIVE (ambe3000-clone, 2026-06-04,
+> `encode_win_length_2026-06-04`).** Chased the remaining "transient-specific
+> window-response excess" from the note above. With the +48 position pinned and
+> pitch forced, transient frames still sit ~2.2× the stationary PRBA cell rank
+> (clean 21.5 vs 9.8) — but **window length/shape does not close it.** Gated a
+> self-consistent `effective_window` (narrowing via Hann half-width, or flattening
+> toward rectangular = more freq resolution): **both directions monotonically
+> worsen the chip match**, and a shorter window worsens transients *faster*. So
+> the chip's amplitude window is essentially Annex-C-shaped at ±110 — it is NOT
+> shorter on transients, NOT flatter/higher-resolution. For chip parity the
+> window family (position ✓, band-edge ✗, peak-vs-energy ✗, length/shape ✗) is
+> exhausted; the residual is the chip's fixed-point spectral magnitude (firmware,
+> Bucket C). **Quality takeaway: do NOT chase amplitude-window length/shape for
+> blip25-mbe either — Annex C ±110 is at the matching optimum in both directions.**
+> The *better-than-chip* play stays a properly-centered window + PESQ-judged
+> multi-resolution at onsets (§2.4); a uniform length/taper change is a dead end.
+> (The transient excess is also partly content-specific — mark's transient/
+> stationary ratio is only 1.2 vs clean's 2.2.)
+
+> **"Extra processing step" suspects RULED OUT (ambe3000-clone, 2026-06-06,
+> `encode_amp_extrastep_2026-06-06`).** Final adversarial check before accepting
+> the residual as firmware: is the ~3.2 dB amplitude SHAPE caused by an extra
+> input-side step *we* run that the chip skips (the pattern that won §3.2 pitch)?
+> Tested the three candidates via PRBA distance-rank (forced chip pitch): **all
+> negative.** (1) Boll **spectral subtraction is default-ON in the ambe3000-clone
+> `AnalysisState` but a complete NO-OP on natural studio speech** — byte-identical
+> chip-cell rank on vs off across 1460 frames, because its strict spectral-
+> stationarity + low-energy gate only fires on near-silent frames (learns a ≈zero
+> noise floor). Note for **blip25-mbe**: the chip runs no NS on real speech
+> (§3.4), so input-side spectral subtraction is at best inert here and should not
+> be relied on as a quality lever on clean/voiced material. (2) An amplitude EMA
+> smoother makes the chip match ~3× worse (cross-frame magnitude smoothing is
+> wrong). (3) §0.5 is already raw Eq.43/44 with no extra step (band-edge/peak/
+> coherent-projection variants all negative). ⇒ Unlike pitch, the amplitude
+> deficit is **not a removable extra step** — it is the fixed per-harmonic
+> estimation rule / fixed-point spectral arithmetic. For *exceeding* the chip the
+> lever is therefore a genuinely better estimator (multi-resolution / reassigned
+> spectrum, §3.1 top), not toggling a preprocessing stage.
+
+> **LEVEL deficit RESOLVED + REALIZED (ambe3000-clone, 2026-06-10,
+> `encode_b1_gain_2026-06-10/`).** The persistent encode **−1.4 dB level
+> deficit** (the "~1.5–2 dB" in §0) is now decomposed and closed for chip
+> parity, and the old "energy-dependent" characterization is **REFUTED**
+> (clean-vector contamination; the bias is FLAT in energy on 12/14 vectors).
+> Two separable parts: (1) the §0.5 band-edge integration rule — fractional
+> boundary-bin coverage weighting (`BLIP25_BIN_EDGE=frac`) is the only rule
+> that holds the gain bias L-flat; (2) a remaining FLAT ≈+0.9 dB broadband
+> scale (constant normalization difference, exact chip mechanism unpinned).
+> With both promoted (ambe3000-clone defaults; `ceil`/`0` recover spec) the
+> gain-field median bias goes −1.0 → −0.03 dB pooled, b2 exact 49.6→55.1%,
+> and the **end-to-end roundtrip RMS ratio goes 0.874 → 0.993** on clean —
+> the level deficit is gone. SHAPE scatter (~3.2 dB per-harmonic) remains
+> firmware-adjudicated and is NOT addressed by this. **Quality consequence
+> for blip25-mbe**: reproducing decoded speech ~1 dB quiet is a direct
+> loudness/level-fidelity loss; port the frac edge rule + flat scale (or
+> equivalently fix the Eq.43/44 boundary-bin energy loss) and re-PESQ.
+> Bucket A for the edge rule; the +0.9 dB constant is empirical-but-flat
+> (treat as calibration until the chip's normalization term is pinned).
+
 ### 3.2 (HIGH) Pitch estimation robustness
 Pitch doubling/halving is among the most audible MBE failures (octave jumps,
 roughness). The encoder uses a pYIN-style tracker; harden against
@@ -420,22 +665,163 @@ pitch tracker (CREPE-class, or robust autocorrelation+HMM smoothing) can beat
 the chip's tracker — keep a classical fallback for determinism. **Measure:**
 gross-pitch-error rate vs a reference tracker on voiced speech; then PESQ.
 
+> **Empirical correction (2026-06-04, ambe3000-clone
+> `encode_pitch_win_2026-06-04`).** The "encode pitch corr ~0.55, ≥40% of the
+> gap" framing is a *pooling artifact*. Restricting the chip-vs-§0.3 comparison to
+> genuinely-voiced frames (chip voiced-fraction ≥ 0.5 via `expand_vuv`): ω₀
+> correlation = **0.99** (clean & mark), median error **~1.5 %** (0.022 oct), and
+> **zero octave errors** — the §0.3 tracker is *already chip-grade on voiced
+> speech*. The apparent 0.55 corr came entirely from unvoiced/silence frames where
+> the chip's pitch is a perceptual don't-care (it drives b0 to the table floor,
+> ω₀≈0.05/L=56, for noise-shaping resolution; parity-only, Bucket C). So pitch is
+> **not** a high-priority quality lever for matching the chip — §0.3 already tracks
+> voiced pitch tightly. The residual is a ±1 quantization cloud (bit-parity, not
+> audible) and the unvoiced floor-b0 convention (parity-only). The CREPE-class
+> *exceed* opportunity still stands for robustness on hard field audio, but
+> "octave-error hardening to reach chip parity" is largely already met. Pitch-
+> tracker *window timing* is correct (a +48-sample shift, the §0.5 amplitude
+> analog, is a clean NEGATIVE for §0.3 — it only hurts).
+>
+> **§0.4 refinement walks pitch AWAY from the chip (2026-06-06, ambe3000-clone
+> `encode_pitch_refine_2026-06-06`).** Quantizing the raw §0.3 estimate `P̂_I`
+> directly (no §0.4 E_R refinement) matches the chip's `b0` *better* than the
+> refined pitch on all 3 voiced vectors: exact +11pp (clean), +6 (mark), +16
+> (dam); |Δb0|≤1 and the |Δb0|≥3 tail both improve; no PRBA/bit-match regression.
+> The E_R argmin (±9/8 quarter-sample, P̂_I excluded) is *displaced* from the
+> chip's pitch — even with offset 0 admissible it rarely picks it. **Mechanism
+> that matters for blip25-mbe:** `refine_pitch`'s E_R DFT reuses the
+> amplitude analysis window, so the mis-centred / +48-shifted window (see §3.1
+> window note) *also degrades pitch refinement* (clean b0 exact 34.9→27.8 going
+> WIN0→WIN48). Two takeaways: (1) for chip parity, emit pitch from the §0.3
+> estimate, not the E_R-refined ω̂₀; (2) regardless of the chip, our E_R pitch
+> refinement on a left-clipped / mis-aligned window is a **likely real
+> blip25-mbe analysis bug** — fixing the window centring should be done *before*
+> trusting §0.4 refinement. Gate `BLIP25_PITCH_REFINE=off`.
+>
+> **Validated on a 4th fresh live-chip vector + decode cross-check (2026-06-06,
+> ambe3000-clone `encode_amp_extrastep_2026-06-06`).** `t01.pcm` (a TIA natural-
+> speech vector outside the tuning set), fresh cold-session chip r34 encode:
+> OFF b0-exact 51.9% vs SPEC 39.3% on 206 voiced frames (+12.6pp), refinement
+> hurts 35% / helps 15%. Decode roundtrip (our_enc→our_dec) off vs spec shows NO
+> perceptual regression (phase-invariant LSD vs input 14.69 vs 14.64 dB, level
+> ratio 0.992). So `BLIP25_PITCH_REFINE=off` is safe to carry as a quality
+> default, but the *principled* fix remains correcting the window centring so
+> refinement operates on an aligned spectrum.
+>
+> **High-pitch tracking trap (ambe3000-clone, 2026-06-07, `pitch_probe_2026-06-07`).**
+> A synthetic clean-tone probe (known periods 22–120, fed to the chip and our
+> encoder) exposed a real §0.3 robustness bug masked by the tuning vectors: for
+> short periods **P < 34 (F0 > ~235 Hz)** our tracker traps at a long harmonic
+> (period-22 tone → period ~95) while the chip tracks it perfectly (period err
+> 0.285 samples). `ep_minima` diagnosis: look-ahead finds the correct short period
+> but `decide_initial_pitch`'s `ce_b ≤ 0.48` absolute gate takes the trapped
+> look-back (4th-harmonic) pick; and forcing best-CE / look-ahead does NOT escape
+> it in steady state, so the trap is also in the E(P) landscape + look-ahead
+> failing to escape on sustained high-pitch tones. Natural-speech parity payoff is
+> low (speech is mostly P ≥ 40), but this **mistracks high-pitch (female/child)
+> voices** — a genuine quality/robustness fix for blip25-mbe: rework the look-back
+> continuity window + cold-start P̂=100 trap and the look-ahead octave escape so
+> sustained high-F0 input isn't pulled to a sub-harmonic. The chip is the proof it
+> is fixable. Also note: on clean tones P ≥ 34 our §0.3 already matches the chip
+> ~80% within a ±1 fixed-point cloud — that residual is the chip's unreadable
+> fixed-point quantization (chip-parity firmware wall, not a quality lever).
+>
+> **REALIZED & VALIDATED (2026-06-07, ambe3000-clone
+> `encode_pitch_escape_2026-06-07`).** Fixed via a targeted sub-harmonic escape in
+> `decide_initial_pitch`: override the look-back pick **only** when `P̂_B / P̂_F` is
+> within ±0.12 of an integer `N ≥ 2` (look-back is an octave/harmonic of
+> look-ahead) AND `CE_F < CE_B` (look-ahead is genuinely better). On normal voiced
+> speech `P̂_B ≈ P̂_F` (ratio ≈ 1) so it never fires. **Results:** synthetic
+> clean-tone probe vs the live chip — mean |period err| 7.42 → 0.51 samples
+> (chip 0.285), chip==our 64 % → 74 %; decode roundtrip pitch error on P<34 input
+> **14.2 → 0.0 samples** (the audible win — a ~360 Hz tone was rendered 2+ octaves
+> low, now exact). **Zero regression** on clean/mark/dam/t01 + every DVSI female
+> vector (engages on 0 frames there; adult-female F0 stays in-grid), and on the
+> one chip-checkable natural frame (t01 #479, ratio 2.02) the chip AGREES with the
+> shorter pick. Earlier "decision gates don't fix it" was a stale example binary.
+> Default-ON (strict bug fix); `BLIP25_PITCH_DECIDE=noescape` for A/B. General DSP
+> (classic octave guard), not P25 IP. The P≥34 ±1 fixed-point cloud is untouched
+> (firmware wall, as before).
+>
+> **REALIZED — sub-sample pitch refinement (2026-06-07, ambe3000-clone
+> `encode_pitch_subsample_2026-06-07`).** The §0.3 tracker snapped its final pitch
+> to a 0.5-sample grid (`PITCH_GRID_STEP`) with NO sub-sample step, but the chip's
+> clean-tone period accuracy (0.285 samples) is finer than that grid. Added a
+> **parabolic interpolation of the E(P) minimum** (vertex of the 3 grid neighbours)
+> — classic sub-sample autocorrelation-peak refinement, general DSP. Validated vs
+> the live chip on 10 r34 vectors: chip-voiced `b0`-exact **+1.4 pp pooled, never
+> negative per-vector**, held-out **t02 +8.1 pp / tambf32b +3.4 pp**, with
+> neutral/better mean|Δb0| and gross-tail on 9/10. A *dense* sub-grid argmin
+> (`fine`) is NET NEUTRAL — it chases spurious E(P) dips; the 3-point curvature fit
+> is the robust form. This is a genuine pitch-accuracy quality win (finer ω̂₀ → more
+> accurate harmonic placement), not just bit-parity. ambe3000-clone promoted it as
+> the half-rate default (`DEFAULT_HALFRATE_SUBSAMPLE = Parabolic`,
+> `BLIP25_PITCH_SUBSAMPLE=off` recovers grid); **carry the same parabolic E(P)
+> refinement into blip25-mbe's §0.3 for both rates.** NB whole-frame encode parity
+> is unmoved (amplitude firmware wall dominates) — this is a pitch-field/quality
+> lever, not a route to bit-exact frames.
+
 ### 3.3 (HIGH) Voicing (V/UV) decision
 Wrong voicing → buzzy (false-voiced) or noisy (false-unvoiced) artifacts,
 very audible. Audit `analysis::vuv` band decisions against the chip on borderline
 (breathy / fricative) frames. **Measure:** per-band V/UV agreement vs chip on
 labelled speech; PESQ on breathy/fricative-heavy clips.
 
+> **Chip-parity finding + REALIZED lever (ambe3000-clone, 2026-06-10,
+> `encode_b1_gain_2026-06-10/`).** Measured on 14 cached + 2 fresh live-chip
+> vectors: the spec encoder systematically **UNDER-VOICES HIGH BANDS** vs the
+> chip — 7.4:1 under- vs over-voicing on pitch-agreed voiced frames, rising
+> monotonically with band (slot0 2.9% → slot7 30.5% chip-voices-we-not). Not
+> pitch-, energy- or transient-driven. The cause is Eq. 37's pitch/band Θ
+> rolloff (coefficient 0.3096): the chip behaves as if it is absent. Dropping
+> it (`BLIP25_VUV_PITCH_COEF=0.0`, now the ambe3000-clone default; `=spec`
+> recovers) lifted chip-voiced-frame b1 agreement +6.7pp pooled and +4.4/+2.3pp
+> on fresh held-out live-chip vectors, with zero effect on pitch or spectral
+> shape. **Quality consequence for blip25-mbe**: the spec rolloff renders
+> high-band harmonics as noise that the chip renders as tone — duller/noisier
+> highs. Bucket A (genuine algorithmic deviation, not fixed-point). Try
+> coef≈0 here and PESQ on fricative/breathy clips; caveat: adversarial
+> cpvbad-class content regressed slightly (−2.7pp, one-sided), and the spec's
+> E_P>0.5 force-unvoice rule is doing REAL work (disabling it is a measured
+> negative) — keep it.
+
 ### 3.4 (HIGH, biggest "exceed" lever) Front-end noise suppression / preprocessing
-On *real-world noisy* input the chip runs ~15 dB spectral subtraction
-(US8315860) plus HPF/AGC. Without a comparable front end blip25-mbe will sound
-worse on field audio — and a modern denoiser (RNNoise-class spectral gating, or
+> **Empirical correction (2026-06-04).** DVSI markets in-chip NS (US8315860),
+> but the AMBE-3000R **as driven on the bench does NOT run it** — additive
+> broadband noise passes through the chip's encode→decode unchanged (gap noise
+> floor 0.94×, i.e. not suppressed; `encode_ns_test_2026-06-04/`). It also does
+> no AGC/HPF-leveling at the vocoder. So NS is **purely an EXCEED lever, not a
+> parity gap** — the chip sets a *low* bar here. (NS may be a config bit the
+> chip exposes but the driver doesn't set; either way the deployed comparison
+> point has none.)
+
+A modern denoiser (RNNoise-class spectral gating, or
 a learned suppressor with a classical fallback) can **substantially exceed** the
-chip's 1990s noise suppression. This is likely the largest single
+chip on noisy field audio (the chip does nothing there). This is likely the largest single
 quality-over-chip opportunity for operational P25 traffic. Keep it a
 **pre-analysis** stage so the codec core stays clean. **Measure:** PESQ/POLQA on
 clean speech + added babble/vehicle noise at several SNRs, `ours→chip` vs
 `chip→chip`.
+
+> **MEASURED — GO (2026-06-07).** First data on this lever, run from the
+> ambe3000-clone fork (`conformance/baselines/ns_headroom_2026-06-07/`). Corpus:
+> clean + dam, each mixed with {white, babble} at {20, 10} dB SNR (8 conditions);
+> scored PESQ-nb vs the clean reference. A *crude, untuned* STFT spectral-
+> subtraction front-end (alpha=2.0, static lowest-15%-energy noise estimate),
+> bolted ahead of an **unchanged** r34 encode→decode, **beats the chip roundtrip
+> on 7/8 conditions, mean +0.217 PESQ-nb**. Per-condition exceed margin
+> (ours+dn − chip_rt): white20 +0.03, white10 +0.22, dam_white10 **+0.51**,
+> dam_white20 +0.36, dam_babble{10,20} +0.35/+0.23, clean_babble10 +0.08; the
+> lone loss is clean_babble20 (−0.03). The front-end also lifts our *own*
+> roundtrip on all 8 (+0.006..+0.576). Takeaways: (1) the exceed headroom is
+> **real and grows as SNR worsens** — biggest on the hardest (low-SNR, vehicle-
+> like) cases that dominate real P25 traffic; (2) **babble (non-stationary) is
+> the weak spot** of static spectral subtraction — a learned/adaptive suppressor
+> (RNNoise, log-MMSE with noise tracking) should widen it; (3) confirms §3.4 as a
+> genuine top exceed lever, *not* a parity lever — it leaves the codec core
+> untouched. The earlier "input-side spectral subtraction is at best inert"
+> remark (near §0.5) was about the *parity/clean* path; on *noisy* input it is
+> decisively positive.
 
 ### 3.5 (LOW–MED) Encode-side tone detection
 Encode-side tone dispatch exists for single/DTMF; verify it matches the chip's
