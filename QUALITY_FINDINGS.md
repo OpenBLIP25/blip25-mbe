@@ -662,15 +662,38 @@ reassigned-spectrum estimate can place harmonic energy more accurately. The
 > "HIGH-family" vectors is a separate content-dependent estimator effect
 > (the §3.1 SHAPE work-stream), not a level law.
 >
-> **Chip gain ARTIFACTS — do NOT replicate for quality** (round-2 probes,
-> 2026-06-10, `probes2/`): the chip's encoder gain has three measured
-> quirks that are quality DEFECTS, not levers — (1) a tone-only high-L
-> deduction (−1.08 dB/octave above L≈40 on static tones; absent on real
-> speech); (2) a ~0.5 dB gain drop under any pitch modulation (its sub-1%
-> stationarity detector switching modes — would make vibrato/inflected
-> speech quieter); (3) a single-codeword −0.26 dB dip at pitch index
-> b0=17. blip25-mbe should keep its level law flat; these belong only in
-> the bit-exact clone.
+> **Chip gain ARTIFACTS — do NOT replicate for quality** (rounds 2-3,
+> 2026-06-10, `probes2/`+`probes3/`): the chip's encoder gain has measured
+> quirks that are quality DEFECTS, not levers — (1) a content-gated high-L
+> deduction (−1.08 dB/octave above a hard L=41 step on dense-harmonic
+> tones; absent on real speech); (2) a single-codeword −0.277 dB dip at
+> pitch index b0=17; (3) early devoicing of noisy tonal content (from
+> −20 dB valley floors). blip25-mbe should keep its level law flat.
+> ~~A round-2 claim that the chip drops gain 0.5 dB under pitch
+> modulation~~ is **RETRACTED** — see the next note: that was OUR encoder.
+>
+> **OUR encoder γ (gain) DYNAMICS DEFECTS — HIGH-value quality levers**
+> (round-3 reattribution, 2026-06-10, `probes3/` — chip-pure instrument,
+> three independent datasets): the chip is a faithful near-memoryless
+> level reader (γ̃-vs-RMS slope 0.96–0.99 under AM, level steps, content
+> switches, vibrato, ±8% sweeps). OUR encoder is NOT — four pinned
+> defects, all reproducible locally with the probes3 inputs, no chip
+> needed:
+> 1. **Level-overshoot**: our γ tracks input level with slope 1.04–1.30,
+>    growing with AM depth (chip ≈1.0) — pumping on modulated speech.
+> 2. **Content-context sag**: −0.9..−2.6 dB γ̃ sag on alternating spectral
+>    content at constant level — a stateless encoder should not do this;
+>    cause unknown (window/pitch-tracker/denoiser interplay suspects).
+> 3. **Binary pitch-motion jump**: sustained per-frame pitch delta above
+>    ~0.6%/frame (threshold bracketed (0.565,0.677]%/fr) flips our γ̃ up
+>    +0.43..+0.49 dB as a mode — inflected/vibrato speech reads louder.
+> 4. **Sweep×level coupling**: under deep pitch sweeps near L≈41 our γ̃
+>    over-tracks the level envelope (slope 1.13, 1.6 dB V-residual).
+> These match the "worse in the wild" symptom shape (γ mis-tracking on
+> dynamic, content-varying speech) far better than any front-end story —
+> root-causing them is now arguably the top encode quality work item,
+> ahead of the SHAPE estimator. Lesson recorded: never read chip behavior
+> through a chip−ours delta alone; use chip-absolute (γ̃ − input RMS).
 
 ### 3.2 (HIGH) Pitch estimation robustness
 Pitch doubling/halving is among the most audible MBE failures (octave jumps,
