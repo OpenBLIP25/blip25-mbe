@@ -654,8 +654,13 @@ reassigned-spectrum estimate can place harmonic energy more accurately. The
 > for blip25-mbe**: reproducing decoded speech ~1 dB quiet is a direct
 > loudness/level-fidelity loss; port the frac edge rule + flat scale (or
 > equivalently fix the Eq.43/44 boundary-bin energy loss) and re-PESQ.
-> Bucket A for the edge rule; the +0.9 dB constant is empirical-but-flat
-> (treat as calibration until the chip's normalization term is pinned).
+> Bucket A for the edge rule; the +0.9 dB constant is now PINNED as the
+> chip's measured flat normalization (same-day live-chip tone ladder:
+> chip−ours = +0.900 dB exactly on P=21..70, level-flat over 11 dB; γ law
+> confirmed mean(Λ)+½log2 L — Parseval/window/L-cap mechanisms all refuted).
+> Safe to port as a constant. The remaining +1.0 dB on the breathy/female
+> "HIGH-family" vectors is a separate content-dependent estimator effect
+> (the §3.1 SHAPE work-stream), not a level law.
 
 ### 3.2 (HIGH) Pitch estimation robustness
 Pitch doubling/halving is among the most audible MBE failures (octave jumps,
