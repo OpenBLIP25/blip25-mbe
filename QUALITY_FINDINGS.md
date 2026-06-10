@@ -661,6 +661,16 @@ reassigned-spectrum estimate can place harmonic energy more accurately. The
 > Safe to port as a constant. The remaining +1.0 dB on the breathy/female
 > "HIGH-family" vectors is a separate content-dependent estimator effect
 > (the §3.1 SHAPE work-stream), not a level law.
+>
+> **Chip gain ARTIFACTS — do NOT replicate for quality** (round-2 probes,
+> 2026-06-10, `probes2/`): the chip's encoder gain has three measured
+> quirks that are quality DEFECTS, not levers — (1) a tone-only high-L
+> deduction (−1.08 dB/octave above L≈40 on static tones; absent on real
+> speech); (2) a ~0.5 dB gain drop under any pitch modulation (its sub-1%
+> stationarity detector switching modes — would make vibrato/inflected
+> speech quieter); (3) a single-codeword −0.26 dB dip at pitch index
+> b0=17. blip25-mbe should keep its level law flat; these belong only in
+> the bit-exact clone.
 
 ### 3.2 (HIGH) Pitch estimation robustness
 Pitch doubling/halving is among the most audible MBE failures (octave jumps,
