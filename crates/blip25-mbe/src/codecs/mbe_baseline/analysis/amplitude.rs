@@ -44,6 +44,7 @@ pub fn estimate_spectral_amplitudes(
     basis: &HarmonicBasis,
     refinement: &PitchRefinement,
     vuv: &VuvResult,
+    frac_edges: bool,
 ) -> SpectralAmplitudes {
     let mut out = [0.0f64; L_HAT_MAX as usize + 1];
     let l_hat = refinement.l_hat;
@@ -59,25 +60,46 @@ pub fn estimate_spectral_amplitudes(
     for l in 1..=u32::from(l_hat) {
         let k = band_for_harmonic(l, k_hat);
         let (m_lo, m_hi) = HarmonicBasis::bin_endpoints(l, omega_hat);
-        if m_hi <= m_lo {
+        // Integration range + per-bin coverage weight. `frac_edges`
+        // (BLIP25_BIN_EDGE=frac) weights boundary bins by their overlap
+        // with the continuous band `[a_l, b_l)` (each DFT bin m owns
+        // `[m−0.5, m+0.5)`), recovering the band energy the spec's
+        // ceil-to-ceil integer rule loses unevenly across `l` (the
+        // L-dependent gain bias). `frac_edges = false` is byte-identical
+        // to the spec: weight 1.0 over `[m_lo, m_hi)`.
+        let (a_f, b_f) = HarmonicBasis::bin_edges_frac(l, omega_hat);
+        let (m_first, m_last) = if frac_edges {
+            ((a_f - 0.5).floor() as i32, (b_f + 0.5).ceil() as i32)
+        } else {
+            (m_lo, m_hi)
+        };
+        if m_last <= m_first {
             continue;
         }
+        let bin_w = |m: i32| -> f64 {
+            if !frac_edges {
+                return 1.0;
+            }
+            let lo = (f64::from(m) - 0.5).max(a_f);
+            let hi = (f64::from(m) + 0.5).min(b_f);
+            (hi - lo).clamp(0.0, 1.0)
+        };
 
-        // Numerator Σ |S_w(m)|² — shared between Eq. 43 and Eq. 44.
+        // Numerator Σ w(m)·|S_w(m)|² — shared between Eq. 43 and Eq. 44.
         let mut s_energy = 0.0;
-        for m in m_lo..m_hi {
-            s_energy += sw[packed_index(m)].norm_sqr();
+        for m in m_first..m_last {
+            s_energy += bin_w(m) * sw[packed_index(m)].norm_sqr();
         }
 
         let is_voiced = k >= 1 && vuv.vuv[k as usize] == 1;
         let m_l = if is_voiced {
-            // Eq. 43: M̂_l = sqrt(Σ|S_w(m)|² / Σ|W_R(k_m)|²).
+            // Eq. 43: M̂_l = sqrt(Σ w(m)|S_w(m)|² / Σ w(m)|W_R(k_m)|²).
             let l_offset = bin_scale_16384 * f64::from(l) * omega_hat;
             let mut window_energy = 0.0;
-            for m in m_lo..m_hi {
+            for m in m_first..m_last {
                 let k_bin = floor_i32(64.0 * f64::from(m) - l_offset + 0.5);
                 let wr = basis.w_r(k_bin);
-                window_energy += wr * wr;
+                window_energy += bin_w(m) * wr * wr;
             }
             if window_energy > 0.0 {
                 (s_energy / window_energy).sqrt()
@@ -85,8 +107,14 @@ pub fn estimate_spectral_amplitudes(
                 0.0
             }
         } else {
-            // Eq. 44: M̂_l = (1/Σw_R) · sqrt(Σ|S_w(m)|² / bins).
-            let bins = (m_hi - m_lo) as f64;
+            // Eq. 44: M̂_l = (1/Σw_R) · sqrt(Σ w(m)|S_w(m)|² / bins),
+            // where `bins` is the coverage sum (= m_hi − m_lo in the
+            // spec/integer path).
+            let bins: f64 = if frac_edges {
+                (m_first..m_last).map(bin_w).sum()
+            } else {
+                (m_hi - m_lo) as f64
+            };
             if bins > 0.0 && wr_sum != 0.0 {
                 (s_energy / bins).sqrt() / wr_sum
             } else {
@@ -184,7 +212,7 @@ mod tests {
             e_r: 0.0,
         };
         let vuv = vuv_all_voiced(band_count_for(refinement.l_hat));
-        let amps = estimate_spectral_amplitudes(&sw, &basis, &refinement, &vuv);
+        let amps = estimate_spectral_amplitudes(&sw, &basis, &refinement, &vuv, false);
         for l in 1..=refinement.l_hat {
             assert!(
                 amps[l as usize].abs() < 1e-12,
@@ -213,7 +241,7 @@ mod tests {
         let sw = signal_spectrum(&signal);
         let refinement = refine_pitch(&sw, &basis, period);
         let vuv = vuv_all_voiced(band_count_for(refinement.l_hat));
-        let amps = estimate_spectral_amplitudes(&sw, &basis, &refinement, &vuv);
+        let amps = estimate_spectral_amplitudes(&sw, &basis, &refinement, &vuv, false);
         // Expected: M̂_1 ≈ A/2 = 0.5. Allow 10% slack for quarter-sample
         // refinement offset and window sidelobe spillover.
         let m1 = amps[1];
@@ -243,8 +271,8 @@ mod tests {
         let k_hat = band_count_for(refinement.l_hat);
         let v = vuv_all_voiced(k_hat);
         let u = vuv_all_unvoiced(k_hat);
-        let amps_v = estimate_spectral_amplitudes(&sw, &basis, &refinement, &v);
-        let amps_u = estimate_spectral_amplitudes(&sw, &basis, &refinement, &u);
+        let amps_v = estimate_spectral_amplitudes(&sw, &basis, &refinement, &v, false);
+        let amps_u = estimate_spectral_amplitudes(&sw, &basis, &refinement, &u, false);
         let mut any_diff = false;
         for l in 1..=refinement.l_hat {
             if (amps_v[l as usize] - amps_u[l as usize]).abs() > 1e-6 {
@@ -264,7 +292,7 @@ mod tests {
         let refinement = refine_pitch(&sw, &basis, 50.0);
         let mut state = VuvState::cold_start();
         let vuv = determine_vuv(&sw, &basis, &refinement, 0.1, &mut state);
-        let amps = estimate_spectral_amplitudes(&sw, &basis, &refinement, &vuv);
+        let amps = estimate_spectral_amplitudes(&sw, &basis, &refinement, &vuv, false);
         for l in 1..=refinement.l_hat {
             let a = amps[l as usize];
             assert!(a.is_finite() && a >= 0.0, "M̂_{l} = {a}");
@@ -307,10 +335,10 @@ mod tests {
             xi_0: 0.0,
             xi_max_after: XI_MAX_FLOOR,
         };
-        let amps_split = estimate_spectral_amplitudes(&sw, &basis, &refinement, &vuv);
+        let amps_split = estimate_spectral_amplitudes(&sw, &basis, &refinement, &vuv, false);
         // Redo with all voiced — highest-band amplitudes should differ.
         let amps_all_v =
-            estimate_spectral_amplitudes(&sw, &basis, &refinement, &vuv_all_voiced(k_hat));
+            estimate_spectral_amplitudes(&sw, &basis, &refinement, &vuv_all_voiced(k_hat), false);
         // Harmonics in the highest band: l ∈ [3·(K̂−1)+1, L̂].
         let l_hi_lo = 3 * u32::from(k_hat - 1) + 1;
         for l in l_hi_lo..=u32::from(refinement.l_hat) {

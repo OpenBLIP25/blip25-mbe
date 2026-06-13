@@ -641,6 +641,66 @@ pub fn decide_initial_pitch(p_b: f64, ce_b: f64, p_f: f64, ce_f: f64) -> f64 {
     }
 }
 
+/// Ratio tolerance for treating `P̂_B` as an integer harmonic of `P̂_F`
+/// in [`decide_initial_pitch_escape`].
+pub const OCTAVE_ESCAPE_TOL: f64 = 0.12;
+
+/// §0.3 decision with a sub-harmonic octave escape (`BLIP25_PITCH_DECIDE`;
+/// a classic octave-error guard, general DSP). Overrides the look-back
+/// pick **only** when the look-back period is an integer multiple `N ≥ 2`
+/// of the look-ahead period (`P̂_B / P̂_F` within `±OCTAVE_ESCAPE_TOL` of
+/// `N`) **and** look-ahead is genuinely better (`CE_F < CE_B`): the
+/// tracker is trapped on a sub-harmonic that look-ahead escaped (high-F0
+/// female/child voices rendered 1–2 octaves low). On normal voiced
+/// speech `P̂_B ≈ P̂_F` (ratio ≈ 1, never ≥ 2) so this never fires; the
+/// worst case picks `P̂_F`, already an admissible §0.3 output.
+#[inline]
+pub fn decide_initial_pitch_escape(p_b: f64, ce_b: f64, p_f: f64, ce_f: f64) -> f64 {
+    if p_f > 0.0 && ce_f < ce_b {
+        let ratio = p_b / p_f;
+        if ratio >= 2.0 - OCTAVE_ESCAPE_TOL {
+            let n = ratio.round();
+            if n >= 2.0 && (ratio - n).abs() <= OCTAVE_ESCAPE_TOL {
+                return p_f;
+            }
+        }
+    }
+    decide_initial_pitch(p_b, ce_b, p_f, ce_f)
+}
+
+/// Parabolic (3-point) sub-sample refinement of the `E(P)` minimum around
+/// grid pitch `p` (`BLIP25_PITCH_SUBSAMPLE`; classic sub-sample
+/// autocorrelation-peak refinement, general DSP). Fits a parabola through
+/// `E(p−step)`, `E(p)`, `E(p+step)` (same `E(P)` the tracker minimized)
+/// and returns the vertex, clamped to ±½ a grid step of `p`. Falls back
+/// to `p` when the three points are not convex (`p` is not a local min)
+/// or the vertex lands outside `[−½, ½]` step. A *dense* sub-grid argmin
+/// is a known negative (chases spurious `E(P)` dips) — the 3-point
+/// curvature fit is the robust form. Safe on silence: `e_of_p` returns
+/// `1.0` there, so all three neighbours tie (`denom = 0`) → fallback.
+#[inline]
+pub fn parabolic_refine_pitch(search: &PitchSearch, p: f64) -> f64 {
+    let step = PITCH_GRID_STEP;
+    let pm = p - step;
+    let pp = p + step;
+    if pm < PITCH_GRID_MIN || pp > PITCH_GRID_MAX {
+        return p;
+    }
+    let e0 = search.e_of_p(pm);
+    let e1 = search.e_of_p(p);
+    let e2 = search.e_of_p(pp);
+    let denom = e0 - 2.0 * e1 + e2;
+    if denom <= 0.0 {
+        // Non-convex (p not a local min) → keep the grid pick.
+        return p;
+    }
+    let delta = 0.5 * (e0 - e2) / denom; // vertex offset in grid steps
+    if delta.abs() > 0.5 {
+        return p;
+    }
+    (p + delta * step).clamp(PITCH_GRID_MIN, PITCH_GRID_MAX)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

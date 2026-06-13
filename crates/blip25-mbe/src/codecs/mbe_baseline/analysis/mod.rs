@@ -86,10 +86,11 @@ pub use basis::{
 
 pub mod pitch;
 pub use pitch::{
-    H_LPF_HALF, LookBackContext, PITCH_COLD_START, PITCH_GRID_LEN, PITCH_GRID_MAX,
-    PITCH_GRID_MIN, PITCH_GRID_STEP, PITCH_INPUT_HALF, PITCH_INPUT_LEN, PitchSearch,
-    SHARED_LPF_LEN, W_I_HALF, compute_s_lpf, compute_s_lpf_shared, decide_initial_pitch,
-    look_ahead, look_back, slot_s_lpf, snap_to_pitch_grid,
+    H_LPF_HALF, LookBackContext, OCTAVE_ESCAPE_TOL, PITCH_COLD_START, PITCH_GRID_LEN,
+    PITCH_GRID_MAX, PITCH_GRID_MIN, PITCH_GRID_STEP, PITCH_INPUT_HALF, PITCH_INPUT_LEN,
+    PitchSearch, SHARED_LPF_LEN, W_I_HALF, compute_s_lpf, compute_s_lpf_shared,
+    decide_initial_pitch, decide_initial_pitch_escape, look_ahead, look_back,
+    parabolic_refine_pitch, slot_s_lpf, snap_to_pitch_grid,
 };
 
 // ---------------------------------------------------------------------------
@@ -100,6 +101,7 @@ pub mod refine;
 pub use refine::{
     B0_MAX, L_HAT_MAX, L_HAT_MIN, N_REFINE_CANDIDATES, PitchRefinement,
     REFINE_OFFSETS, harmonic_count_for, quantize_pitch_index, refine_pitch,
+    refine_pitch_raw,
 };
 
 // ---------------------------------------------------------------------------
@@ -526,7 +528,44 @@ pub struct AnalysisState {
     /// Companion to `prev_m_hat`: K̂ from the last frame, used to
     /// bound the per-band V/UV match check.
     prev_k_hat: u8,
+    /// `BLIP25_PITCH_DECIDE`: enable the sub-harmonic octave escape in
+    /// the §0.3 pitch decision (general-DSP octave guard). Fixes high-F0
+    /// (female/child) voices trapped on a sub-harmonic. Default off.
+    pitch_decide_escape: bool,
+    /// `BLIP25_PITCH_SUBSAMPLE`: enable parabolic (3-point) sub-sample
+    /// refinement of the §0.3 `E(P)` minimum (general DSP). Finer ω̂_0 →
+    /// more accurate harmonic placement. Default off.
+    pitch_subsample: bool,
+    /// `BLIP25_PITCH_REFINE`: when `true` (default, spec-faithful) run
+    /// the §0.4 `E_R` quarter-sample refinement; when `false` emit the
+    /// raw §0.3 estimate (bypass refinement on a mis-aligned window).
+    pitch_refine_enabled: bool,
+    /// `BLIP25_BIN_EDGE=frac`: weight §0.5 band-edge bins by fractional
+    /// coverage (removes the L-dependent encode level bias). Default off
+    /// (spec ceil-to-ceil integer rule).
+    amp_frac_band_edges: bool,
+    /// `BLIP25_LEVEL_SCALE`: apply the chip-measured flat +0.9 dB
+    /// broadband level normalization to `M̂_l` (AMBE+2 only). Default off.
+    level_scale_enabled: bool,
+    /// `BLIP25_SILENCE_SHAPE_ZERO`: on silent analysis windows flatten
+    /// the per-harmonic envelope SHAPE to its geometric mean (preserving
+    /// gain + V/UV) so silence quantizes to the near-zero PRBA cells the
+    /// chip parks in, instead of rendering noise-floor timbre. Default off.
+    silence_shape_zero_enabled: bool,
 }
+
+/// `BLIP25_LEVEL_SCALE` flat broadband level normalization, applied to
+/// `M̂_l` when [`AnalysisState::set_level_scale`] is on (AMBE+2 only).
+/// PINNED at the chip-measured +0.900 dB (live-chip tone ladder,
+/// P = 21..70, level-flat over 11 dB; `QUALITY_FINDINGS.md` §3.1
+/// "LEVEL deficit RESOLVED"). Linear gain `10^(0.9/20) = 1.1091748`.
+/// Bucket A (chip-observed constant), opt-in only.
+pub const LEVEL_SCALE_LINEAR: f64 = 1.109_174_815_262_401;
+
+/// `BLIP25_SILENCE_SHAPE_ZERO` window-RMS threshold (≈ 3 dB re 1 LSB):
+/// frames whose post-HPF RMS is below this have their envelope SHAPE
+/// flattened to its geometric mean. `10^(3/20) ≈ 1.413` counts RMS.
+pub const SILENCE_SHAPE_RMS_LSB: f64 = 1.413;
 
 /// `E(P̂_I)` threshold for the joint-signal silence override. Frames
 /// with `E(P̂_I)` at or above this are considered pitch-unreliable.
@@ -613,6 +652,15 @@ impl AnalysisState {
             prev_omega_hat: 0.0,
             prev_vuv_bits: [0; (vuv::K_HAT_MAX + 1) as usize],
             prev_k_hat: 0,
+            // Encode-quality levers (QUALITY_FINDINGS.md §3): all
+            // default to the current/spec behavior so `new()` is
+            // byte-identical. Opt in via the setters below.
+            pitch_decide_escape: false,
+            pitch_subsample: false,
+            pitch_refine_enabled: true,
+            amp_frac_band_edges: false,
+            level_scale_enabled: false,
+            silence_shape_zero_enabled: false,
         }
     }
 
@@ -711,6 +759,110 @@ impl AnalysisState {
     #[inline]
     pub fn amp_ema_alpha(&self) -> f64 {
         self.amp_ema_alpha
+    }
+
+    /// `BLIP25_PITCH_DECIDE`: enable/disable the §0.3 sub-harmonic octave
+    /// escape (general-DSP octave guard). Default off.
+    pub fn set_pitch_decide_escape(&mut self, enabled: bool) {
+        self.pitch_decide_escape = enabled;
+    }
+
+    /// Whether the §0.3 octave escape is enabled.
+    #[inline]
+    pub fn pitch_decide_escape(&self) -> bool {
+        self.pitch_decide_escape
+    }
+
+    /// `BLIP25_PITCH_SUBSAMPLE`: enable/disable parabolic sub-sample
+    /// refinement of the §0.3 `E(P)` minimum (general DSP). Default off.
+    pub fn set_pitch_subsample(&mut self, enabled: bool) {
+        self.pitch_subsample = enabled;
+    }
+
+    /// Whether parabolic sub-sample pitch refinement is enabled.
+    #[inline]
+    pub fn pitch_subsample(&self) -> bool {
+        self.pitch_subsample
+    }
+
+    /// `BLIP25_PITCH_REFINE`: enable (`true`, default, spec-faithful) the
+    /// §0.4 `E_R` quarter-sample refinement, or bypass it (`false`) and
+    /// emit the raw §0.3 estimate.
+    pub fn set_pitch_refine(&mut self, enabled: bool) {
+        self.pitch_refine_enabled = enabled;
+    }
+
+    /// Whether the §0.4 `E_R` pitch refinement is enabled.
+    #[inline]
+    pub fn pitch_refine_enabled(&self) -> bool {
+        self.pitch_refine_enabled
+    }
+
+    /// `BLIP25_BIN_EDGE=frac`: enable/disable fractional band-edge
+    /// coverage weighting in §0.5 (removes the L-dependent encode level
+    /// bias). Default off (spec ceil-to-ceil integer rule).
+    pub fn set_amp_frac_band_edges(&mut self, enabled: bool) {
+        self.amp_frac_band_edges = enabled;
+    }
+
+    /// Whether fractional band-edge weighting is enabled.
+    #[inline]
+    pub fn amp_frac_band_edges(&self) -> bool {
+        self.amp_frac_band_edges
+    }
+
+    /// `BLIP25_LEVEL_SCALE`: enable/disable the chip-measured flat
+    /// +0.9 dB broadband level normalization on `M̂_l` (AMBE+2 only).
+    /// Default off.
+    pub fn set_level_scale(&mut self, enabled: bool) {
+        self.level_scale_enabled = enabled;
+    }
+
+    /// Whether the +0.9 dB level normalization is enabled.
+    #[inline]
+    pub fn level_scale_enabled(&self) -> bool {
+        self.level_scale_enabled
+    }
+
+    /// `BLIP25_SILENCE_SHAPE_ZERO`: enable/disable flattening the
+    /// per-harmonic envelope SHAPE to its geometric mean on silent
+    /// analysis windows (preserves gain + V/UV). Default off.
+    pub fn set_silence_shape_zero(&mut self, enabled: bool) {
+        self.silence_shape_zero_enabled = enabled;
+    }
+
+    /// Whether silence shape-zeroing is enabled.
+    #[inline]
+    pub fn silence_shape_zero_enabled(&self) -> bool {
+        self.silence_shape_zero_enabled
+    }
+
+    /// `BLIP25_VUV_PITCH_COEF`: override the Eq. 37 pitch/band Θ rolloff
+    /// coefficient. Default 0.3096 (spec); 0.0 = chip-observed (lifts
+    /// high-band voicing). Forwards into the [`VuvState`]. The
+    /// `E(P̂_I) > 0.5` force-unvoice rule is retained regardless.
+    pub fn set_vuv_pitch_coef(&mut self, c: f64) {
+        self.vuv.set_pitch_band_coef(c);
+    }
+
+    /// `BLIP25_VUV_MXI_GRADE` (default off, measure-first): enable the
+    /// hard-bounded loudness-graded Θ relaxation on confident-pitch loud
+    /// frames. Forwards into the [`VuvState`]; can only add voicing,
+    /// never mutes.
+    pub fn set_vuv_mxi_grade(&mut self, on: bool) {
+        self.vuv.set_mxi_grade(on);
+    }
+
+    /// Whether the M(ξ) graded Θ relaxation is enabled.
+    #[inline]
+    pub fn vuv_mxi_grade_enabled(&self) -> bool {
+        self.vuv.mxi_grade_enabled()
+    }
+
+    /// The current Eq. 37 V/UV pitch/band Θ rolloff coefficient.
+    #[inline]
+    pub fn vuv_pitch_coef(&self) -> f64 {
+        self.vuv.pitch_band_coef()
     }
 
     /// Read-only access to the silence detector state (for inspection
@@ -1025,7 +1177,17 @@ pub fn encode_with_trace(
                 let (p, e) = pyin::run_pyin_smoothed(&buf, &mut state.pyin_hmm);
                 (p_b, ce_b, p_f, ce_f, p, e)
             } else {
-                let p_hat_i = decide_initial_pitch(p_b, ce_b, p_f, ce_f);
+                // BLIP25_PITCH_DECIDE / _SUBSAMPLE (general DSP).
+                let p_grid = if state.pitch_decide_escape {
+                    decide_initial_pitch_escape(p_b, ce_b, p_f, ce_f)
+                } else {
+                    decide_initial_pitch(p_b, ce_b, p_f, ce_f)
+                };
+                let p_hat_i = if state.pitch_subsample {
+                    parabolic_refine_pitch(&search_cur, p_grid)
+                } else {
+                    p_grid
+                };
                 let e_p_hat_i = search_cur.e_of_p(p_hat_i);
                 (p_b, ce_b, p_f, ce_f, p_hat_i, e_p_hat_i)
             }
@@ -1076,13 +1238,14 @@ pub fn encode_with_trace(
     // enabled, §0.5 sees a denoised spectrum; refinement (§0.4) and
     // V/UV (§0.7) stay on the original `sw` so denoising can't corrupt
     // pitch / voicing decisions.
+    let frac_edges = state.amp_frac_band_edges;
     let sw_for_amplitude = if state.spectral_subtraction_enabled {
         apply_subtraction(&sw, &mut state.noise_spectrum)
     } else {
         sw
     };
     let mut m_hat = profile::time(profile::Stage::Amplitude, || {
-        estimate_spectral_amplitudes(&sw_for_amplitude, basis, &refinement, &vuv_result)
+        estimate_spectral_amplitudes(&sw_for_amplitude, basis, &refinement, &vuv_result, frac_edges)
     });
     state.apply_amp_ema(&mut m_hat, refinement.l_hat, refinement.omega_hat, &vuv_result);
 
@@ -1228,7 +1391,18 @@ pub fn encode_ambe_plus2(
         } else {
             let (p_b, ce_b) = look_back(&search_cur, state.pitch_history);
             let (p_f, ce_f) = look_ahead(&search_cur, &search_f1, &search_f2);
-            let p_hat_i = decide_initial_pitch(p_b, ce_b, p_f, ce_f);
+            // BLIP25_PITCH_DECIDE: sub-harmonic octave escape (general DSP).
+            let p_grid = if state.pitch_decide_escape {
+                decide_initial_pitch_escape(p_b, ce_b, p_f, ce_f)
+            } else {
+                decide_initial_pitch(p_b, ce_b, p_f, ce_f)
+            };
+            // BLIP25_PITCH_SUBSAMPLE: parabolic E(P) vertex (general DSP).
+            let p_hat_i = if state.pitch_subsample {
+                parabolic_refine_pitch(&search_cur, p_grid)
+            } else {
+                p_grid
+            };
             let e_p_hat_i = search_cur.e_of_p(p_hat_i);
             (p_hat_i, e_p_hat_i)
         }
@@ -1270,9 +1444,16 @@ pub fn encode_ambe_plus2(
     // §0.8 silence gate would apply to a frame whose pitch we can't
     // represent at half-rate. Predictor history isn't committed
     // (matches the §0.8 silence path below).
+    // BLIP25_PITCH_REFINE: spec §0.4 E_R refinement (default) vs the raw
+    // §0.3 estimate (bypass on a mis-aligned window).
+    let pitch_refine = state.pitch_refine_enabled;
     let refinement_result =
         profile::time(profile::Stage::RefinePitch, || -> Result<Option<refine::PitchRefinement>, AnalysisError> {
-            let mut refinement = refine_pitch(&sw, basis, p_hat_i);
+            let mut refinement = if pitch_refine {
+                refine_pitch(&sw, basis, p_hat_i)
+            } else {
+                refine::refine_pitch_raw(&sw, basis, p_hat_i)
+            };
             use crate::rate33::dequantize::{decode_pitch, encode_pitch};
             let Some(b0) = encode_pitch(refinement.omega_hat as f32) else {
                 return Ok(None);
@@ -1292,15 +1473,58 @@ pub fn encode_ambe_plus2(
     let vuv_result = profile::time(profile::Stage::Vuv, || {
         determine_vuv(&sw, basis, &refinement, e_p_hat_i, &mut state.vuv)
     });
+    let frac_edges = state.amp_frac_band_edges;
     let sw_for_amplitude = if state.spectral_subtraction_enabled {
         apply_subtraction(&sw, &mut state.noise_spectrum)
     } else {
         sw
     };
     let mut m_hat = profile::time(profile::Stage::Amplitude, || {
-        estimate_spectral_amplitudes(&sw_for_amplitude, basis, &refinement, &vuv_result)
+        estimate_spectral_amplitudes(&sw_for_amplitude, basis, &refinement, &vuv_result, frac_edges)
     });
     state.apply_amp_ema(&mut m_hat, refinement.l_hat, refinement.omega_hat, &vuv_result);
+
+    // BLIP25_SILENCE_SHAPE_ZERO: on silent analysis windows flatten the
+    // per-harmonic envelope SHAPE to its geometric mean (preserving the
+    // gain γ̃ = mean(Λ̃)+½·log₂L̃ and V/UV), so silence quantizes to the
+    // near-zero PRBA cells the chip parks in instead of rendering
+    // noise-floor timbre. Gain preservation is exact over the nonzero M̂_l
+    // (cnt·log₂(gmean) = Σ log₂(M̂_l)); it relies on the predictor flooring
+    // M̂_l ≤ 0 to log₂ = 0 (predictor.rs `lambda_hat_from_m_hat`), so the
+    // zero-harmonic terms are invariant under the flatten.
+    if state.silence_shape_zero_enabled {
+        let n = SAMPLES_PER_FRAME as f64;
+        if (frame_energy / n).sqrt() < SILENCE_SHAPE_RMS_LSB {
+            let l_hat = u32::from(refinement.l_hat);
+            let mut logsum = 0.0;
+            let mut cnt = 0.0;
+            for l in 1..=l_hat {
+                let v = m_hat[l as usize];
+                if v > 0.0 {
+                    logsum += v.ln();
+                    cnt += 1.0;
+                }
+            }
+            if cnt > 0.0 {
+                let gmean = (logsum / cnt).exp();
+                for l in 1..=l_hat {
+                    if m_hat[l as usize] > 0.0 {
+                        m_hat[l as usize] = gmean;
+                    }
+                }
+            }
+        }
+    }
+
+    // BLIP25_LEVEL_SCALE: chip-measured flat +0.9 dB broadband level
+    // normalization (AMBE+2 only). Applied to M̂_l before the
+    // matched-decoder roundtrip so the predictor feedback sees the same
+    // realized level the wire encoder will produce.
+    if state.level_scale_enabled {
+        for l in 1..=u32::from(refinement.l_hat) {
+            m_hat[l as usize] *= LEVEL_SCALE_LINEAR;
+        }
+    }
 
     // §0.8 silence gate — half-rate silence dispatch would emit
     // `b̂_0 ∈ [124, 125]` per §13.1 Table 14, but the addendum §0.8

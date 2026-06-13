@@ -117,6 +117,22 @@ impl HarmonicBasis {
         (ceil_i32(a_l), ceil_i32(b_l))
     }
 
+    /// Fractional (continuous) band edges `a_l`, `b_l` in DFT-bin units
+    /// for harmonic `l` at fundamental `ω₀` — the un-rounded inputs to
+    /// [`bin_endpoints`]. Used by the `BLIP25_BIN_EDGE=frac` amplitude
+    /// integration to weight boundary bins by their coverage of the
+    /// band `[a_l, b_l)` instead of the ceil-to-ceil integer rule (which
+    /// drops the partial low-edge bin and loses band energy unevenly
+    /// across `l` — the L-dependent gain bias).
+    #[inline]
+    pub fn bin_edges_frac(l: u32, omega0: f64) -> (f64, f64) {
+        let scale = DFT_SIZE as f64 / (2.0 * core::f64::consts::PI);
+        (
+            scale * (f64::from(l) - 0.5) * omega0,
+            scale * (f64::from(l) + 0.5) * omega0,
+        )
+    }
+
     /// Harmonic amplitude `A_l(ω₀)` per Eq. 28. The numerator is
     /// complex (it inherits the phase of `S_w(m)`); the denominator is
     /// real (sum of squared window-spectrum magnitudes over the

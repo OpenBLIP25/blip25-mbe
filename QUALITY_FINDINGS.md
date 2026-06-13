@@ -84,6 +84,20 @@ relevant cell, not by ear alone.
 
 ---
 
+> **2026-06-11 re-measurement at the fork's round-9 promoted defaults**
+> (`ambe3000-clone/conformance/baselines/pesq_hr_matrix_2026-06-11/`, rate 33,
+> live chip, 6 vectors incl. t03/ucarm15a, P.862 NB, RMS-sanity-gated cells):
+> chip_enc+chip_dec **2.573**, our encode isolated **−0.204**, our decode
+> isolated **−0.263**, end-to-end **−0.189**. The chip still wins every
+> vector; the remaining gap is ~0.2 MOS per side (edge of audibility —
+> clean speech worst at −0.27..−0.37, degraded material nil). Notable:
+> DECODE now contributes at least as much as encode — the voiced τ/phase
+> + unvoiced fine-structure walls carry real PESQ mass (with the caveat
+> that P.862 penalizes time-varying delay, which may over-weight τ vs
+> human ears). The "exceed" headroom for blip25-mbe is therefore on BOTH
+> sides, and §2.2 (don't replicate chip artifacts) remains the cheapest
+> route past the chip.
+
 ## 0a. Measured attribution — 2026-06-01 (clean-speech corpus, AMBE+2 half-rate)
 
 Scorer stood up and confirmed running: `conformance/scripts/score_ab_matrix.py`
@@ -152,6 +166,51 @@ decoder, so any divergence is pure decode-path (dequantize → §1.10 enhancemen
 - **Encoder, per inherited `analysis-encode` conformance:** pitch and voicing
   track the chip reasonably, but **spectral-amplitude RMSE is large**. That is
   a direct encoder timbre deficit.
+
+> **Voicing: TWO chip-anchored encoder levers pinned (ambe3000-clone round 6,
+> 2026-06-11, `encode_b1_gain_2026-06-10/b1{speech,mech,lad}_r6/`).**
+> (1) **The spec Θ is too strict on loud confident-pitch frames** — the chip
+> voices marginal bands (D_k up to ~2Θ) when frame loudness M(ξ) (Eq. 42) is
+> high and pitch is confident (E_P < 0.5); M(ξ) separates chip-voiced-we-not
+> misses at AUC 0.94. The fork promoted Θ ×= 1 + 1.25·clip(2(M(ξ)−0.5),0,1)
+> on E_P<0.5 frames: pooled b1 idx +8.3pp, chip-voiced recall +23.9pp, costs
+> only cpvbad/dam80 ≈−2.3pp (noisy speech). QUALITY lever for blip25-mbe:
+> under-voicing loud voiced high bands renders them as noise — buzzy/breathy
+> high end on exactly the frames that matter most perceptually; the same
+> graded relaxation (gate `BLIP25_VUV_MXI_GRADE`) is a direct PESQ candidate.
+> (2) **The chip ALSO devoices temporally-diffuse bands our spec rule cannot
+> see** (per-band within-period envelope concentration "tloc"; phase-blindness
+> proven — |S| identical, D_k flat, chip flips): noise-filled or
+> phase-incoherent bands get devoiced high-band-first, graded, pitch-dependent
+> (P54/L24 immune). Wired as `BLIP25_VUV_TCONC` (default OFF; speech-negative
+> standalone — speech errors run the OTHER way — but correct on degraded
+> content). For blip25-mbe: a tloc-style FA-side gate is the principled
+> "don't voice noise" complement when tuning voicing for quality.
+> ⚠ Composition caveat (fork round 8, 2026-06-11): composing tloc WITH the
+> graded relaxation (1) was measured chip-side and is strictly negative on
+> speech at every threshold (chip-voiced speech high bands' tloc overlaps
+> the noise regime — no separating threshold exists), while tone-side
+> devoicing composes cleanly. If used as a quality gate, expect the same
+> trade: it suppresses noise-band voicing at the cost of devoicing real
+> loud high-band voicing; gate it on content class, not tloc alone.
+>
+> (3) **The chip ramps voicing EXTENT at voiced-run onsets/offsets**
+> (fork round 9, 2026-06-11, `encode_b1_gain_2026-06-10/b1feat_r9/`):
+> row 15 (`11100000`) at 82% of 400 run onsets, voiced-band count ramping
+> 3.05→5.02→6.49 over the first frames, mirrored at offsets; loud bursts
+> get a full 16→15→…→16 envelope. A two-sided onset rule keyed on M(ξ)
+> (sparse onset rows → 15/16; quiet onsets suppressed) is now the fork's
+> promoted default (+4.91pp pooled b1 parity; decode roundtrip LSD to the
+> chip's own audio IMPROVES at onset frames). QUALITY lever for
+> blip25-mbe: instant full-band voicing at onsets is a spec-faithful but
+> chip-divergent behavior — a 1–2-frame voicing-extent ramp at onsets is
+> a plausible attack-smoothness/PESQ candidate (the chip, presumably
+> tuned by listening, chose it). Also from round 9: tloc-style speech
+> devoicing essentially does not exist in the chip (the tone devoice law
+> is content-gated, like the gain L-law) — don't port tloc to speech;
+> and the strongest NEW speech voicing feature is lag-P band-envelope
+> correlation ("epcorr", C-FA AUC 0.84, D_k-orthogonal) — a candidate
+> "is this band really periodic" quality gate, untested in blip25-mbe.
 
 Caveat: the probe input is synthetic flat-amplitude voicing; **reproduce the
 envelope-divergence measurement on real chip-encoded speech** (decode the same
@@ -637,6 +696,40 @@ reassigned-spectrum estimate can place harmonic energy more accurately. The
 > lever is therefore a genuinely better estimator (multi-resolution / reassigned
 > spectrum, §3.1 top), not toggling a preprocessing stage.
 
+> **Denoiser SELF-PRIMING defect pinned (ambe3000-clone, 2026-06-10, defect
+> (h)(ii), `encode_b1_gain_2026-06-10/probes3/highfam2`).** The same default-ON
+> Boll spectral subtraction that is a no-op on natural speech is **actively
+> harmful on sustained constant-level tonal/stationary content**: the noise
+> estimator's permissive energy gate (`E_f < 4·η`, with η slow-releasing up to
+> the running frame energy in ~29 frames) plus the SCALE-INVARIANT cos-sim
+> stationarity test primes the noise model **on the voiced signal itself**.
+> Static tones then get a flat ≈−0.5 dB γ̃ suppression, and **alternating
+> spectral content at constant level gets a sustained −2.0..−2.5 dB sag**
+> (the model holds the stale previous-content PSD; the α-floor takes
+> cross-content bins down −17 dB). Chip-pure reads show the chip does none of
+> this. Gate `BLIP25_SPECSUB=0` (analysis/mod.rs; the fork DEFAULT is now OFF) removes the sag exactly
+> (content offsets then match the chip to ≤0.15 dB); speech output is
+> bit-identical on/off (t03, ucarm15a, 480 fr). Quality lever for blip25-mbe:
+> the denoiser's eligibility gate needs a voicing/absolute-level guard (or
+> default-off for chip parity) — on hum/alarm/tone-like field audio it eats
+> real signal.
+>
+> **Same root cause also pins defect (h)(i) LEVEL OVERSHOOT (2026-06-10,
+> highfam2 AM probes).** Because the cos-sim gate is scale-invariant, the
+> self-primed noise PSD sits at the signal's *average* power; under amplitude
+> modulation the trough frames fall below `β·n_psd` and the Boll gain slams
+> to the `√α ≈ −17 dB` floor — γ̃-vs-input-RMS slope expands 1.06 (3 dB AM)
+> → 1.28 (2 Hz/8 dB AM) with trough frames squashed up to −12 dB (worst
+> single frames), while the chip stays 0.96–0.99 (faithful memoryless level
+> reader). `BLIP25_SPECSUB=0` (now the fork default) restores slope to 0.91–0.99 ≈ chip on all 9
+> AM/cadence/step/stair/cswitch probes. The binary ~0.6 %/frame pitch-delta
+> +0.45 dB jump (defect (h)(iii)) is the same cos≥0.999 threshold crossing
+> (denoiser drops out under pitch motion); denoise-off flattens the
+> stationarity ladder spread 0.67→0.14 dB (chip 0.19). Perceptual
+> implication for blip25-mbe: the denoiser COMPRESSES syllable/AM dynamics
+> on tonal content (squashes pulse troughs), an artifact class PESQ on the
+> 5-vector set never saw.
+
 > **LEVEL deficit RESOLVED + REALIZED (ambe3000-clone, 2026-06-10,
 > `encode_b1_gain_2026-06-10/`).** The persistent encode **−1.4 dB level
 > deficit** (the "~1.5–2 dB" in §0) is now decomposed and closed for chip
@@ -694,6 +787,32 @@ reassigned-spectrum estimate can place harmonic energy more accurately. The
 > root-causing them is now arguably the top encode quality work item,
 > ahead of the SHAPE estimator. Lesson recorded: never read chip behavior
 > through a chip−ours delta alone; use chip-absolute (γ̃ − input RMS).
+>
+> **Round-10 chip probes (ambe3000-clone, 2026-06-11) — three quality-relevant
+> facts.** (1) **Silence frames**: the chip parks the whole envelope SHAPE near
+> zero on silent analysis windows (window RMS < ~3 dB re 1 LSB) — b̂₃ lands in
+> the near-zero PRBA cells {86,87,90,91} ~40% of the time, b̂₄ likewise — while
+> gain and V/UV track content normally. Our estimator was quantizing the
+> noise-floor spectrum shape into content cells, i.e. spending shape bits
+> rendering spurious timbre on silence. Adopting the same "attenuate the pre-VQ
+> shape residual to zero below a silence threshold" rule is a cheap, chip-
+> validated cleanliness lever for blip25-mbe's encoder too (in the clone:
+> +1.12pp b3 exact-match, +15.8pp on the silence-heavy dam80 vector, audio
+> guard clean). (2) **Pitch smoothing**: the chip applies a short FIR-like
+> (~1-frame memory, NO step bypass) smoother to its pitch estimate — ±1%
+> alternating-frame pitch jitter is attenuated ×0.53, while steps settle in 2
+> frames and stationary input stays exact. A 2-tap FIR (w≈0.2–0.3) on the
+> continuous pitch estimate is a quality-relevant stability lever — BUT only
+> after the estimator itself is unbiased: in the clone the FIR is blocked by a
+> +0.3-sample estimator bias at P≈28–36 (high-pitch voices), where smoothing a
+> biased track adds cell-crossing errors. Fix estimator bias first, then
+> smooth. (3) **Classifier-fragility lesson (cautionary)**: a voicing-
+> suppression rule conditioned on a spectral statistic (our M(ξ)<0.5 onset
+> suppress branch) full-file MUTED sustained flat-envelope voiced content —
+> an unbounded failure invisible on every speech battery (speech cost of the
+> fix: 0.00pp). The chip itself has NO such conditioning. Any
+> classifier-driven suppression in blip25-mbe must be hard-bounded in duration
+> (the clone now caps at 2 frames per onset).
 
 ### 3.2 (HIGH) Pitch estimation robustness
 Pitch doubling/halving is among the most audible MBE failures (octave jumps,
@@ -861,9 +980,125 @@ clean speech + added babble/vehicle noise at several SNRs, `ours→chip` vs
 > remark (near §0.5) was about the *parity/clean* path; on *noisy* input it is
 > decisively positive.
 
+> **DEFECT PINNED — the built-in §0.5 spectral-subtraction's stationary-tone
+> priming creates a binary, motion-dependent −0.46 dB encode-gain bias
+> (2026-06-10, ambe3000-clone probes3/stationarity (h)(iii)).** The legacy
+> input-side denoiser (Boll β=0.1, ON by default in `Vocoder::new`) primes its
+> noise estimate on ANY spectrum that stays cos-sim ≥ 0.999 stationary — by
+> design (the knox_1 +0.585 PESQ win deliberately treats stationary tones as
+> noise). Once primed (a one-way latch within a session) every harmonic bin
+> with S≈N gets gain √(1−β) = −0.458 dB. Sustained pitch motion ≳0.6 %/frame
+> keeps the cos-sim gate failing so the estimator never primes ⇒ tone probes
+> split binarily: still/slow-vibrato arms read −0.46 dB vs fast-vibrato arms
+> (measured +0.45..+0.52 dB jump; `primed` flag partitions the arms exactly).
+> Real speech rarely primes (13/14 chip-A/B vectors byte-identical with the
+> denoiser off), but on noisy speech it engages and HURTS chip parity badly
+> (cpvbad: gain bias +1.58→+0.42 dB, b2 exact 32.3→48.9% with it off — the
+> chip does not denoise, see the 2026-06-04 correction above). QUALITY
+> implications: (1) any tone/vibrato-based gain measurement made with the
+> default encoder carries this −0.46 dB / binary-motion artifact — the
+> ambe3000-clone tone-ladder gain numerology is partially contaminated; (2) if
+> the §3.4 exceed-denoiser is rebuilt, do NOT let it prime on voiced/tonal
+> content — gate on true noise, or the codec's own gain field inherits the
+> bias. Chip-parity fork DEFAULTS it OFF as of 2026-06-10 (`BLIP25_SPECSUB=1` recovers it)
+> (`spectral_subtraction_effective`, analysis/mod.rs).
+
 ### 3.5 (LOW–MED) Encode-side tone detection
 Encode-side tone dispatch exists for single/DTMF; verify it matches the chip's
 tone handling so alert/Knox/DTMF traffic encodes as tones, not buzzy voice.
+
+---
+
+## 3.6 (DONE 2026-06-13) Encode chip-loop campaign — levers landed + measured stack
+
+First in-repo (blip25-mbe, not the fork) implementation + live-chip A/B of the
+chip-validated encode levers above. **Eight levers landed as opt-in flags**
+(`AnalysisState` setters + `halfrate-ab-matrix` CLI flags); every one defaults to
+the spec/current path so `AnalysisState::new()` is **byte-identical** to before
+(verified on clean/dam/fambf22c/tambf22a; 469 lib tests green). Measured in the
+`ours→chip` cell on the live AMBE-3000R via `conformance/scripts/lever_sweep.sh`
++ `analyze_levers.py` (chip BAR `chip_enc_chip_dec` was bit-identical across all
+configs — oracle is stable).
+
+**Levers (flag · setter · class · per-lever 4-vector Δ vs spec, 600 fr):**
+
+| lever | `halfrate-ab-matrix` flag | `AnalysisState` setter | class | Δmean |
+|---|---|---|---|---|
+| octave escape | `--pitch-escape` | `set_pitch_decide_escape` | general-DSP | 0 (0 frames on speech; high-F0 guard) |
+| parabolic sub-sample | `--pitch-subsample` | `set_pitch_subsample` | general-DSP | −0.037 alone* |
+| §0.4 refine off | `--no-pitch-refine` | `set_pitch_refine` | spec-toggle | **+0.056** |
+| frac band-edge | `--amp-frac-edges` | `set_amp_frac_band_edges` | general-DSP | +0.031 |
+| +0.9 dB level | `--level-scale` | `set_level_scale` | chip-const | −0.013 PESQ / RMS→1.0 |
+| silence shape-zero | `--silence-shape-zero` | `set_silence_shape_zero` | spec-toggle | 0 (rarely fires) |
+| V/UV Θ rolloff→0 | `--vuv-pitch-coef 0.0` | `set_vuv_pitch_coef` | chip-observed | +0.001 |
+| M(ξ) Θ grade | `--vuv-mxi-grade` | `set_vuv_mxi_grade` | chip-observed | +0.001 alone* |
+
+\* sub-sample is **net-negative alone** because §0.4 `refine_pitch` then re-searches
+±9/8 around it and overwrites the gain (the documented mis-aligned-window E_R walk);
+it only helps **paired with refine-off**, which lets the finer §0.3 pitch reach the
+wire. M(ξ)-grade is ~neutral alone but compounds with the pitch stack.
+
+**Winning stack: `no_refine + subsample + vuv_mxi` (+ `pitch_escape` guard).**
+7-vector confirmation (800 fr; encoder-cell Δ PESQ-nb vs spec default):
+
+| stack | clean | dam | mark | fambf22c | fambm22a | tambf22a | tambf32b | mean |
+|---|---|---|---|---|---|---|---|---|
+| no_refine | −0.022 | −0.047 | +0.103 | +0.152 | +0.066 | +0.098 | −0.035 | +0.045 |
+| +subsample (nr_ss) | +0.061 | −0.039 | +0.102 | +0.154 | +0.027 | +0.046 | −0.045 | +0.044 |
+| **+vuv_mxi (nrss_mxi)** | **+0.078** | −0.050 | **+0.122** | **+0.172** | +0.050 | +0.070 | −0.018 | **+0.060** |
+
+Absolute encoder-cell PESQ-nb: head **2.750** → nrss_mxi **2.810** (BAR
+`chip_enc_chip_dec` = 3.018; the stack closes **22%** of the −0.268 encoder gap,
+~31% on female content where it was worst). The hard-bounded (multiply-only, ≤2.25×,
+**cannot mute**) M(ξ) grade lifts clean/mark/female and never collapsed PESQ on any
+vector incl. degraded `dam`. Only cost: `dam` −0.050, `tambf32b` −0.018.
+
+**Interference robustness (the stack tracks the chip better under noise).** head vs
+nr_ss `ours→chip` cell, scored vs the *noisy* input (chip does no NS, so matching it
+is the target), 400 fr:
+
+| condition | head Δ-to-chip | nr_ss Δ-to-chip |
+|---|---|---|
+| clean white-10 dB | −0.124 | **−0.008** |
+| clean hum-20 dB | −0.160 | −0.024 |
+| clean babble-15 dB | +0.020 | **+0.127** |
+| fambf22c babble-15 | −0.259 | −0.101 |
+| fambf22c white-10 | −0.280 | −0.131 |
+
+The pitch stack makes our encoder track the chip **much** closer under white/babble/hum
+(7/8 conditions improved), confirming the win is not clean-speech-overfit.
+
+**Loudness (`--level-scale`).** PESQ normalizes level, so the +0.9 dB lever is
+PESQ-neutral (−0.013) but drives `our_enc/chip_enc` RMS **0.905 → 1.001** = chip
+loudness parity. Kept opt-in (loudness is a consumer-layer concern per §0; it slightly
+overshoots female and costs a hair of gain-quantization-trajectory PESQ).
+
+**Levers neutral on this corpus (kept opt-in):** `vuv_pitch_coef=0`, `silence_shape`,
+`specsub_off` are ~0 on clean speech (their value is on fricative / silence-heavy /
+tonal-noisy content, per the §3.3/§3.1/§3.4 notes). `specsub` on/off is a literal
+no-op on clean studio speech here (±0.000), consistent with the fork's "denoiser only
+primes on near-silent frames."
+
+**Root-cause note / follow-up.** The `no_refine` win is a *mitigation* of our §0.4 E_R
+search walking pitch on the **left-clipped §0.5 analysis window** (`extract_refinement_window`
+zero-fills the left 30 samples — confirmed). The principled fix is the deferred
+`retain_past_frame` window-centering lever, but the fork measured un-clipping alone as
+~neutral vs the chip, so it is unlikely to recover the `dam`/`tambf32b` regressions
+(those are the genuine cost of forgoing quarter-sample resolution where it was correct).
+Left as a future investigation; `no_refine` captures the realized win today.
+
+**Spec-faithful note + promotion (2026-06-13).** `no_refine` bypasses spec §0.4 and
+`vuv_mxi` relaxes spec Eq.37 Θ on confident-loud frames — both chip-validated. Per the
+user decision, the stack is **promoted to the production default in `Vocoder::new()` /
+`reset()`** (`Vocoder::production_analysis_state()`, vocoder.rs) — escape + sub-sample +
+refine-off + M(ξ)-grade ON — while **`AnalysisState::new()` itself stays spec-faithful**
+(the clean-room baseline + 469 lib tests rely on it). Each lever is individually opt-out
+via `Vocoder::set_*` (regression test `vocoder_new_enables_production_encode_stack`).
+The harness `our_encode_ambe_plus2` non-tone path still constructs the bare spec
+`AnalysisState` + explicit CLI flags, so `halfrate-ab-matrix` (no flags) = spec baseline
+for future A/Bs. `--level-scale` (loudness parity, RMS→1.0), `--amp-frac-edges`,
+`--vuv-pitch-coef 0.0`, `--silence-shape-zero` stay opt-in. Reusable sweep tooling:
+`conformance/scripts/{lever_sweep.sh,analyze_levers.py,make_noisy.py}`.
 
 ---
 

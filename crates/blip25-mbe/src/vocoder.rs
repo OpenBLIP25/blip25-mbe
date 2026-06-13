@@ -345,7 +345,7 @@ impl Vocoder {
         };
         Self {
             rate,
-            analysis: AnalysisState::new(),
+            analysis: Self::production_analysis_state(rate),
             imbe_dec: imbe7200::dequantize::DecoderState::new(),
             ambe_plus2_dec: rate33::dequantize::DecoderState::new(),
             synth: SynthState::with_unvoiced_gen(noise_gen),
@@ -362,6 +362,42 @@ impl Vocoder {
             enhancement_state: EnhancementState::default(),
             prev_disposition: None,
         }
+    }
+
+    /// Build the production analysis state: spec-faithful
+    /// [`AnalysisState::new()`] **plus** the chip-validated encode-quality
+    /// stack (2026-06-13; `QUALITY_FINDINGS.md` §3.6). `AnalysisState::new()`
+    /// itself stays spec-faithful (the clean-room baseline + unit tests rely
+    /// on it); the tuned stack is applied at the production façade only.
+    /// +0.060 PESQ-nb in the ours→chip cell (clean +0.078, male `mark`
+    /// +0.122, female up to +0.172) and markedly better chip-tracking under
+    /// interference. Opt out per-lever via the `set_*` methods.
+    ///   - octave escape — general-DSP high-F0 guard (0 frames on normal
+    ///     speech; protects child voices / high tones).
+    ///   - parabolic sub-sample — finer §0.3 ω̂_0 (general DSP).
+    ///   - §0.4 refine OFF — emit the §0.3 estimate; our E_R search walks
+    ///     pitch on the left-clipped §0.5 window (mitigation).
+    ///   - M(ξ) Θ grade — hard-bounded (≤2.25×, cannot mute) voicing
+    ///     relaxation on confident-loud frames (chip-observed).
+    ///
+    /// **AMBE+2 only.** The stack was chip-validated on the half-rate
+    /// (AMBE+2) path — the sole chip-orackable codec; there is no IMBE
+    /// chip oracle (`reference_chip_is_ambe_plus_2_only`). Full-rate IMBE
+    /// stays bit-for-bit spec-faithful (`refine-off` would be a silent
+    /// no-op there anyway — `encode_with_trace` doesn't read it), so the
+    /// façade's reported config matches what actually executes.
+    fn production_analysis_state(rate: Rate) -> AnalysisState {
+        let mut analysis = AnalysisState::new();
+        if matches!(
+            rate,
+            Rate::AmbePlus2_3600x2450 | Rate::AmbePlus2_2450x2450
+        ) {
+            analysis.set_pitch_decide_escape(true);
+            analysis.set_pitch_subsample(true);
+            analysis.set_pitch_refine(false);
+            analysis.set_vuv_mxi_grade(true);
+        }
+        analysis
     }
 
     /// Configure which half-rate synth flavor [`Self::decode_bits`] +
@@ -567,6 +603,81 @@ impl Vocoder {
         self.analysis.set_amp_ema_alpha(alpha);
     }
 
+    // ---- Encode-quality stack (QUALITY_FINDINGS.md §3.6) -----------------
+    // Defaulted ON in `Vocoder::new()`/`reset()` for AMBE+2 production;
+    // each is individually opt-out here. `AnalysisState::new()` stays spec.
+
+    /// Sub-harmonic octave escape in the §0.3 pitch decision (default ON).
+    pub fn set_pitch_decide_escape(&mut self, on: bool) {
+        self.analysis.set_pitch_decide_escape(on);
+    }
+
+    /// Parabolic sub-sample refinement of the §0.3 `E(P)` minimum
+    /// (default ON).
+    pub fn set_pitch_subsample(&mut self, on: bool) {
+        self.analysis.set_pitch_subsample(on);
+    }
+
+    /// §0.4 `E_R` quarter-sample refinement: `true` runs it (spec),
+    /// `false` emits the raw §0.3 estimate. Default `false` (the stack).
+    pub fn set_pitch_refine(&mut self, on: bool) {
+        self.analysis.set_pitch_refine(on);
+    }
+
+    /// Fractional §0.5 band-edge coverage weighting (default OFF; opt-in
+    /// loudness/shape lever).
+    pub fn set_amp_frac_band_edges(&mut self, on: bool) {
+        self.analysis.set_amp_frac_band_edges(on);
+    }
+
+    /// Flat +0.9 dB chip-measured level normalization (default OFF; opt-in
+    /// loudness-parity lever, AMBE+2 only).
+    pub fn set_level_scale(&mut self, on: bool) {
+        self.analysis.set_level_scale(on);
+    }
+
+    /// Silence shape-zeroing on silent analysis windows (default OFF).
+    pub fn set_silence_shape_zero(&mut self, on: bool) {
+        self.analysis.set_silence_shape_zero(on);
+    }
+
+    /// Eq. 37 V/UV pitch/band Θ rolloff coefficient (default spec 0.3096;
+    /// 0.0 = chip-observed no-rolloff).
+    pub fn set_vuv_pitch_coef(&mut self, c: f64) {
+        self.analysis.set_vuv_pitch_coef(c);
+    }
+
+    /// Hard-bounded M(ξ) loudness-graded Θ relaxation on confident-loud
+    /// frames (default ON in the stack; cannot mute).
+    pub fn set_vuv_mxi_grade(&mut self, on: bool) {
+        self.analysis.set_vuv_mxi_grade(on);
+    }
+
+    /// Whether the §0.3 octave escape is enabled.
+    #[inline]
+    pub fn pitch_decide_escape(&self) -> bool {
+        self.analysis.pitch_decide_escape()
+    }
+
+    /// Whether parabolic sub-sample pitch refinement is enabled.
+    #[inline]
+    pub fn pitch_subsample(&self) -> bool {
+        self.analysis.pitch_subsample()
+    }
+
+    /// Whether the §0.4 `E_R` pitch refinement is enabled (spec) vs
+    /// bypassed.
+    #[inline]
+    pub fn pitch_refine_enabled(&self) -> bool {
+        self.analysis.pitch_refine_enabled()
+    }
+
+    /// Whether the hard-bounded M(ξ) Θ relaxation is enabled.
+    #[inline]
+    pub fn vuv_mxi_grade_enabled(&self) -> bool {
+        self.analysis.vuv_mxi_grade_enabled()
+    }
+
     /// Current §0.5 amplitude EMA weight; `0.0` means the smoother is
     /// off.
     #[inline]
@@ -646,7 +757,10 @@ impl Vocoder {
     /// synth substates, smoothed error rate, last-stats. Rate and
     /// configuration knobs (tone detection) stay the same.
     pub fn reset(&mut self) {
-        self.analysis = AnalysisState::new();
+        // Restore the production stack (matches `Vocoder::new`), not the
+        // bare spec `AnalysisState::new()`, so a reset doesn't silently
+        // disable the encode-quality levers. Rate-gated to AMBE+2.
+        self.analysis = Self::production_analysis_state(self.rate);
         self.imbe_dec = imbe7200::dequantize::DecoderState::new();
         self.ambe_plus2_dec = rate33::dequantize::DecoderState::new();
         self.synth = SynthState::new();
@@ -1894,6 +2008,47 @@ mod tests {
             let out = rx.decode_bits(&bits).expect("decode");
             assert_eq!(out.len(), FRAME_SAMPLES);
         }
+    }
+
+    #[test]
+    fn vocoder_new_enables_production_encode_stack() {
+        // The production façade ships the chip-validated encode stack
+        // (QUALITY_FINDINGS.md §3.6) while the spec `AnalysisState::new()`
+        // baseline stays untouched (clean-room reference).
+        let v = Vocoder::new(Rate::AmbePlus2_3600x2450);
+        assert!(v.pitch_decide_escape(), "octave escape ON in production");
+        assert!(v.pitch_subsample(), "parabolic sub-sample ON in production");
+        assert!(!v.pitch_refine_enabled(), "§0.4 refine OFF in production");
+        assert!(v.vuv_mxi_grade_enabled(), "M(ξ) Θ grade ON in production");
+
+        // Spec baseline is the opposite (refine on, the rest off).
+        let spec = AnalysisState::new();
+        assert!(!spec.pitch_decide_escape());
+        assert!(!spec.pitch_subsample());
+        assert!(spec.pitch_refine_enabled());
+        assert!(!spec.vuv_mxi_grade_enabled());
+
+        // A reset must NOT silently drop the stack.
+        let mut v2 = Vocoder::new(Rate::AmbePlus2_3600x2450);
+        v2.reset();
+        assert!(!v2.pitch_refine_enabled(), "reset preserves §0.4-off");
+        assert!(v2.vuv_mxi_grade_enabled(), "reset preserves M(ξ) grade");
+
+        // And opt-out works.
+        let mut v3 = Vocoder::new(Rate::AmbePlus2_3600x2450);
+        v3.set_pitch_refine(true);
+        v3.set_vuv_mxi_grade(false);
+        assert!(v3.pitch_refine_enabled());
+        assert!(!v3.vuv_mxi_grade_enabled());
+
+        // Full-rate IMBE has NO chip oracle and was never validated for
+        // the stack — it must stay spec-faithful (escape/sub-sample/grade
+        // off, refine on), matching `AnalysisState::new()`.
+        let imbe = Vocoder::new(Rate::Imbe7200x4400);
+        assert!(!imbe.pitch_decide_escape(), "IMBE stays spec (no escape)");
+        assert!(!imbe.pitch_subsample(), "IMBE stays spec (no sub-sample)");
+        assert!(imbe.pitch_refine_enabled(), "IMBE stays spec (refine on)");
+        assert!(!imbe.vuv_mxi_grade_enabled(), "IMBE stays spec (no grade)");
     }
 
     /// FEC and no-FEC variants should reach the same MbeParams (same

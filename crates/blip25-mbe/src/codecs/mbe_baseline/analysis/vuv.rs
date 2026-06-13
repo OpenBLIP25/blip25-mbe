@@ -26,6 +26,15 @@ const THETA_BASE_UNVOICED_HISTORY: f64 = 0.45;
 /// Coefficient of `(k−1)·ω̂_0` in the `Θ_ξ` pitch/band modulation.
 const THETA_PITCH_BAND_COEF: f64 = 0.3096;
 
+/// Maximum extra Θ gain for the `BLIP25_VUV_MXI_GRADE` lever (loudness-
+/// graded relaxation on confident-pitch loud frames). HARD BOUND: Θ can
+/// grow by at most `1 + VUV_MXI_GRADE_MAX_GAIN` (= 2.25×). The boost is
+/// multiply-only and never zeroes Θ, so it can only ADD voiced bands —
+/// it can never mute (the fork's unbounded variant full-file muted
+/// flat-envelope voicing; this bound is the mitigation). See
+/// `QUALITY_FINDINGS.md` §3.3.
+const VUV_MXI_GRADE_MAX_GAIN: f64 = 1.25;
+
 /// Cross-frame V/UV encoder state per §0.7.8. `v̂_k(−1)` is stored
 /// 1-indexed in `vuv_prev[1..=K_HAT_MAX]`; slot 0 is unused.
 #[derive(Clone, Debug)]
@@ -37,6 +46,15 @@ pub struct VuvState {
     /// `K̂(−1)` — previous frame's band count (unused slots past this
     /// index are 0).
     k_prev: u8,
+    /// Eq. 37 pitch/band Θ rolloff coefficient (`BLIP25_VUV_PITCH_COEF`).
+    /// Spec value [`THETA_PITCH_BAND_COEF`] (0.3096); the chip behaves as
+    /// if this is 0.0 (high bands voiced as tone, not noise — the spec
+    /// rolloff systematically under-voices high bands). Opt-in override.
+    pitch_band_coef: f64,
+    /// Enable the `BLIP25_VUV_MXI_GRADE` loudness-graded Θ relaxation on
+    /// confident-pitch (`E(P̂_I) < 0.5`) loud frames. Hard-bounded, never
+    /// mutes (see [`VUV_MXI_GRADE_MAX_GAIN`]). Opt-in, default false.
+    mxi_grade_enabled: bool,
 }
 
 impl VuvState {
@@ -47,7 +65,37 @@ impl VuvState {
             xi_max: XI_MAX_FLOOR,
             vuv_prev: [0; (K_HAT_MAX + 1) as usize],
             k_prev: 0,
+            pitch_band_coef: THETA_PITCH_BAND_COEF,
+            mxi_grade_enabled: false,
         }
+    }
+
+    /// Override the Eq. 37 pitch/band Θ rolloff coefficient
+    /// (`BLIP25_VUV_PITCH_COEF`). Default is the spec value 0.3096; 0.0
+    /// disables the high-band rolloff (chip-observed). Non-finite or
+    /// negative inputs clamp to 0.0. The `E(P̂_I) > 0.5` force-unvoice
+    /// rule is independent and unaffected.
+    pub fn set_pitch_band_coef(&mut self, c: f64) {
+        self.pitch_band_coef = if c.is_finite() && c >= 0.0 { c } else { 0.0 };
+    }
+
+    /// Current Eq. 37 pitch/band Θ rolloff coefficient.
+    #[inline]
+    pub fn pitch_band_coef(&self) -> f64 {
+        self.pitch_band_coef
+    }
+
+    /// Enable/disable the `BLIP25_VUV_MXI_GRADE` loudness-graded Θ
+    /// relaxation (opt-in, default off). Hard-bounded — can only add
+    /// voiced bands on confident loud frames, never mutes.
+    pub fn set_mxi_grade(&mut self, on: bool) {
+        self.mxi_grade_enabled = on;
+    }
+
+    /// Whether the M(ξ) graded Θ relaxation is enabled.
+    #[inline]
+    pub fn mxi_grade_enabled(&self) -> bool {
+        self.mxi_grade_enabled
     }
 
     /// Current tracked peak-envelope value (for inspection / tests).
@@ -214,7 +262,9 @@ pub fn determine_vuv(
         let d = if den > 0.0 { num / den } else { 1.0 };
         d_k[k as usize] = d;
 
-        // Eq. 37: Θ_ξ(k, ω̂_0).
+        // Eq. 37: Θ_ξ(k, ω̂_0). The `E(P̂_I) > 0.5` force-unvoice rule
+        // (Case 1) is spec-faithful and kept verbatim — disabling it is
+        // a measured negative (QUALITY_FINDINGS §3.3).
         let theta = if e_p_hat_i > E_P_POOR_MATCH_THRESHOLD && k >= 2 {
             0.0
         } else {
@@ -223,8 +273,20 @@ pub fn determine_vuv(
             } else {
                 THETA_BASE_UNVOICED_HISTORY
             };
-            let modulation = 1.0 - THETA_PITCH_BAND_COEF * f64::from(k - 1) * omega_hat;
-            (base * modulation * m_xi).max(0.0)
+            // BLIP25_VUV_PITCH_COEF: spec rolloff coefficient 0.3096;
+            // 0.0 = chip-observed (no high-band under-voicing).
+            let modulation = 1.0 - state.pitch_band_coef * f64::from(k - 1) * omega_hat;
+            let theta_base = (base * modulation * m_xi).max(0.0);
+            // BLIP25_VUV_MXI_GRADE: on confident-pitch (E(P̂_I) < 0.5)
+            // loud (high M(ξ)) frames, relax Θ by up to 2.25× so marginal
+            // high bands voice as the chip does. Multiply-only and
+            // hard-bounded — never mutes.
+            if state.mxi_grade_enabled && e_p_hat_i < E_P_POOR_MATCH_THRESHOLD {
+                let grade = (2.0 * (m_xi - 0.5)).clamp(0.0, 1.0);
+                theta_base * (1.0 + VUV_MXI_GRADE_MAX_GAIN * grade)
+            } else {
+                theta_base
+            }
         };
 
         theta_k[k as usize] = theta;

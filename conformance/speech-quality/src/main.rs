@@ -228,6 +228,39 @@ enum Cmd {
         /// `ab-matrix` for semantics).
         #[arg(long)]
         no_spectral_subtraction: bool,
+        /// BLIP25_PITCH_DECIDE: enable the §0.3 sub-harmonic octave
+        /// escape (general-DSP guard; fixes high-F0 octave traps).
+        #[arg(long)]
+        pitch_escape: bool,
+        /// BLIP25_PITCH_SUBSAMPLE: enable parabolic sub-sample
+        /// refinement of the §0.3 E(P) minimum (general DSP).
+        #[arg(long)]
+        pitch_subsample: bool,
+        /// BLIP25_PITCH_REFINE=off: bypass the §0.4 E_R quarter-sample
+        /// refinement and emit the raw §0.3 estimate.
+        #[arg(long)]
+        no_pitch_refine: bool,
+        /// BLIP25_BIN_EDGE=frac: fractional band-edge coverage weighting
+        /// in §0.5 (removes the L-dependent encode level bias).
+        #[arg(long)]
+        amp_frac_edges: bool,
+        /// BLIP25_LEVEL_SCALE: apply the chip-measured flat +0.9 dB
+        /// broadband level normalization (AMBE+2 only).
+        #[arg(long)]
+        level_scale: bool,
+        /// BLIP25_SILENCE_SHAPE_ZERO: flatten the envelope SHAPE to its
+        /// geometric mean on silent analysis windows (preserves gain).
+        #[arg(long)]
+        silence_shape_zero: bool,
+        /// BLIP25_VUV_PITCH_COEF: Eq.37 Θ pitch/band rolloff coefficient.
+        /// Omit = spec 0.3096; pass 0.0 for chip-observed no-rolloff
+        /// (lifts high-band voicing).
+        #[arg(long)]
+        vuv_pitch_coef: Option<f64>,
+        /// BLIP25_VUV_MXI_GRADE: hard-bounded loudness-graded Θ
+        /// relaxation on confident-pitch loud frames (measure-first).
+        #[arg(long)]
+        vuv_mxi_grade: bool,
         /// Post-decoder enhancement chain applied to PCM before
         /// `our_enc_our_dec.wav` is written. Same chain used by the
         /// full-rate `ab-matrix` subcommand. `none` (default) is
@@ -474,6 +507,14 @@ fn main() -> Result<()> {
             enh_no_compressor,
             enh_no_fade,
             enh_hpf_cutoff,
+            pitch_escape,
+            pitch_subsample,
+            no_pitch_refine,
+            amp_frac_edges,
+            level_scale,
+            silence_shape_zero,
+            vuv_pitch_coef,
+            vuv_mxi_grade,
         } => cmd_ambe_plus2_ab_matrix(
             &pcm,
             &out_dir,
@@ -493,6 +534,16 @@ fn main() -> Result<()> {
                 no_fade: enh_no_fade,
                 hpf_cutoff_hz: enh_hpf_cutoff,
             }),
+            LeverFlags {
+                pitch_escape,
+                pitch_subsample,
+                no_pitch_refine,
+                amp_frac_edges,
+                level_scale,
+                silence_shape_zero,
+                vuv_pitch_coef,
+                vuv_mxi_grade,
+            },
         ),
         Cmd::DecodeRawHalfrate { input, out_wav, binary } => {
             cmd_decode_raw_ambe_plus2(&input, &out_wav, binary)
@@ -978,6 +1029,21 @@ fn rms_sigma(window: &std::collections::VecDeque<f32>) -> f32 {
 // Half-rate (AMBE+2) self-baseline.
 // ----------------------------------------------------------------------------
 
+/// Opt-in encode-quality levers (QUALITY_FINDINGS.md §3), threaded from
+/// the `halfrate-ab-matrix` CLI into the half-rate analysis encoder.
+/// `Default` = current/spec behavior (every field off / `None`).
+#[derive(Clone, Copy, Debug, Default)]
+struct LeverFlags {
+    pitch_escape: bool,
+    pitch_subsample: bool,
+    no_pitch_refine: bool,
+    amp_frac_edges: bool,
+    level_scale: bool,
+    silence_shape_zero: bool,
+    vuv_pitch_coef: Option<f64>,
+    vuv_mxi_grade: bool,
+}
+
 fn cmd_ambe_plus2_ab_matrix(
     pcm_path: &Path,
     out_dir: &Path,
@@ -991,6 +1057,7 @@ fn cmd_ambe_plus2_ab_matrix(
     amp_ema_alpha: f64,
     spectral_subtraction: bool,
     enhancement: EnhancementMode,
+    levers: LeverFlags,
 ) -> Result<()> {
     fs::create_dir_all(out_dir)
         .with_context(|| format!("create out_dir {}", out_dir.display()))?;
@@ -1019,6 +1086,7 @@ fn cmd_ambe_plus2_ab_matrix(
         tone_detection,
         amp_ema_alpha,
         spectral_subtraction,
+        levers,
     )?;
     let enc_secs = t0.elapsed().as_secs_f64();
     eprintln!(
@@ -1164,6 +1232,7 @@ fn our_encode_ambe_plus2(
     tone_detection: bool,
     amp_ema_alpha: f64,
     spectral_subtraction: bool,
+    levers: LeverFlags,
 ) -> Result<Vec<u8>> {
     if tone_detection {
         // Use the Vocoder façade — the tone-frame dispatch lives in
@@ -1232,6 +1301,19 @@ fn our_encode_ambe_plus2(
         state.set_amp_ema_alpha(amp_ema_alpha);
     }
     state.set_spectral_subtraction(spectral_subtraction);
+    // Encode-quality levers (QUALITY_FINDINGS.md §3). The tone-detection
+    // path above goes through Vocoder::builder and does not honor these;
+    // they apply to the voice (non-tone) path the PESQ cells exercise.
+    state.set_pitch_decide_escape(levers.pitch_escape);
+    state.set_pitch_subsample(levers.pitch_subsample);
+    state.set_pitch_refine(!levers.no_pitch_refine);
+    state.set_amp_frac_band_edges(levers.amp_frac_edges);
+    state.set_level_scale(levers.level_scale);
+    state.set_silence_shape_zero(levers.silence_shape_zero);
+    if let Some(c) = levers.vuv_pitch_coef {
+        state.set_vuv_pitch_coef(c);
+    }
+    state.set_vuv_mxi_grade(levers.vuv_mxi_grade);
     let mut decoder_state = HalfDecoderState::new();
     let mut out = Vec::with_capacity(n_frames * HALF_BYTES_PER_FEC_FRAME);
     for f in 0..n_frames {

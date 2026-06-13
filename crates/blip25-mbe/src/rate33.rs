@@ -11,7 +11,7 @@
 //! Pipeline:
 //!
 //! ```text
-//!   36 dibits → frame::decode → AmbeFrame { info: [u16; 4], errors }
+//!   36 dibits → frame::decode_frame → Frame { info: [u16; 4], errors }
 //!             → priority::deprioritize → b̂₀..b̂₈
 //!             → dequantize → MbeParams
 //! ```

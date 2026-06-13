@@ -133,6 +133,28 @@ pub(super) fn residual_e_r(
     e_r
 }
 
+/// Build a [`PitchRefinement`] from the raw §0.3 pitch **without** the
+/// §0.4 `E_R` refinement (`BLIP25_PITCH_REFINE=off`). `ω̂_0 = 2π/p_hat_i`;
+/// `L̂` (Eq. 31) and `b̂_0` (Eq. 45) derive from that ω̂_0 directly. Use
+/// when the `E_R` argmin — which reuses the §0.5 amplitude analysis
+/// window — walks pitch away from the true estimate on a mis-centred /
+/// left-clipped window. Output shape is identical to [`refine_pitch`], so
+/// the downstream Annex-L `L̂` override and `PitchOutOfRange → Silence`
+/// disposition are unchanged.
+pub fn refine_pitch_raw(
+    sw: &[Complex64; DFT_SIZE],
+    basis: &HarmonicBasis,
+    p_hat_i: f64,
+) -> PitchRefinement {
+    let omega = 2.0 * core::f64::consts::PI / p_hat_i;
+    PitchRefinement {
+        omega_hat: omega,
+        l_hat: harmonic_count_for(omega),
+        b0: quantize_pitch_index(omega).unwrap_or(B0_MAX),
+        e_r: residual_e_r(sw, basis, omega),
+    }
+}
+
 /// Refine `P̂_I` to quarter-sample resolution.
 ///
 /// `sw` is the pre-computed Eq. 29 signal DFT for the current frame

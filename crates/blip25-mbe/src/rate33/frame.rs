@@ -326,7 +326,7 @@ pub fn demodulate(codewords: [u32; 4], u0: u16) -> [u32; 4] {
 // Frame-level encode / decode
 // ---------------------------------------------------------------------------
 
-/// Decoded 49-bit information layer of a half-rate AMBE frame.
+/// Decoded 49-bit information layer of a half-rate (rate-33) frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Frame {
     /// Decoded info vectors `û₀..û₃`, LSB-aligned. Widths per
