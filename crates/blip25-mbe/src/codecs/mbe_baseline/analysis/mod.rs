@@ -164,6 +164,12 @@ pub use pyin::{PyinHmmState, run_pyin, run_pyin_smoothed};
 pub mod denoise;
 pub use denoise::{NoiseSpectrum, apply_subtraction};
 
+// Pre-analysis denoiser front-end (§3.4 exceed lever). Separable pre-PCM
+// stage; deliberately NOT a field on `AnalysisState` (kept off the spec
+// baseline). Held by the production `Vocoder` / constructed by the harness.
+pub mod predenoise;
+pub use predenoise::{DenoiseKind, PreDenoise};
+
 /// Errors reported by the analysis encoder.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AnalysisError {

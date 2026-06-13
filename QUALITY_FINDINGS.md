@@ -1003,6 +1003,50 @@ clean speech + added babble/vehicle noise at several SNRs, `ours→chip` vs
 > bias. Chip-parity fork DEFAULTS it OFF as of 2026-06-10 (`BLIP25_SPECSUB=1` recovers it)
 > (`spectral_subtraction_effective`, analysis/mod.rs).
 
+> **IMPLEMENTED + MEASURED (2026-06-13) — `predenoise.rs` log-MMSE front-end,
+> a broadband-noise exceed lever.** Built the §3.4 stage for real (not the
+> crude fork probe): a **separable pre-PCM** streaming denoiser
+> (`analysis/predenoise.rs`, `PreDenoise`) — 256-pt √-Hann WOLA STFT (128 hop)
+> → minimum-statistics / MCRA per-bin noise PSD → **log-MMSE (Ephraim-Malah)**
+> gain with decision-directed a-priori SNR → ISTFT/OLA. All **general DSP**
+> (outside clean-room). Runs on the input frame *before* the codec; the core is
+> untouched. Opt-in: `Vocoder::set_denoise(true)` / `--denoise[ --denoise-mode
+> logmmse|wiener|specsub]`; **default OFF**. Self-priming (the legacy Boll
+> defect) is structurally avoided: a **windowed-median peak guard** never learns
+> a spectral peak (tone/harmonic) as noise, a **spectral-flatness bypass**
+> (`SFM < 0.02`) protects near-pure tones, and a **global input-SNR gate**
+> (speech-peak / noise-floor ≥ 33 dB) keeps clean *input* transparent. Unit
+> tests pin clean-tone pass-through, no sustained-tone drift, white-noise
+> attenuation, COLA reconstruction, reset.
+>
+> **Live-chip exceed (ours+denoise→chip vs chip→chip, PESQ-nb vs CLEAN ref,
+> `--ref-pcm`; `conformance/scripts/{make_noisy,denoise_sweep,analyze_denoise}`):**
+>
+> | condition | chip BAR | head→chip | +denoise→chip | dn−head | EXCEED |
+> |---|---|---|---|---|---|
+> | clean (ctrl) | 2.917 | 3.004 | 2.924 | −0.080 | +0.007 |
+> | clean white-10 | 2.329 | 2.262 | 2.330 | +0.068 | +0.001 |
+> | clean white-5 | 1.797 | 1.774 | **2.205** | **+0.431** | **+0.408** |
+> | clean babble-10 | 2.125 | 2.055 | 2.089 | +0.034 | −0.036 |
+> | clean hum-15 | 2.964 | 2.576 | 2.419 | −0.157 | −0.545 |
+> | famb white-10 | 1.451 | 1.385 | **1.645** | **+0.260** | **+0.194** |
+> | famb babble-10 | 1.904 | 1.750 | 1.815 | +0.065 | −0.089 |
+> | famb white-5 | 1.297 | 1.267 | 1.369 | +0.102 | +0.072 |
+>
+> **Verdict:** a real **broadband-noise** win — on white/hiss/vehicle-class noise
+> the denoiser **beats the chip by up to +0.41 PESQ** (mean +0.17 on the four
+> white cases) and **helps our own encoder on 6/7 noisy conditions** (+0.115
+> mean). **Babble** (non-stationary): helps our encoder modestly (+0.03..+0.07)
+> but ~ties the chip — min-statistics under-tracks it; an IMCRA/learned tracker
+> is the next step (fork §3.4 note). **Hum** (narrowband): a loss, but that is
+> our **encoder's** pre-existing weakness (head is already −0.39 vs the chip on
+> hum *without* denoise) — not fixable by the front-end; route hum via a HPF and
+> fix the low-band encoder separately. **Clean** input loses −0.08 through the
+> chip (it engages on the DVSI vector's residual room tone), irrelevant for an
+> opt-in noisy-audio tool. **Shipped opt-in**, recommended for broadband field
+> noise; not for narrowband hum. Default-on is deferred pending babble (IMCRA)
+> and the low-band/hum encoder fix.
+
 ### 3.5 (LOW–MED) Encode-side tone detection
 Encode-side tone dispatch exists for single/DTMF; verify it matches the chip's
 tone handling so alert/Knox/DTMF traffic encodes as tones, not buzzy voice.

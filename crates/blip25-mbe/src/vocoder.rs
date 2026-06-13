@@ -47,7 +47,7 @@
 
 use crate::codecs::ambe_plus2;
 use crate::codecs::mbe_baseline::analysis::{
-    AnalysisError, AnalysisOutput, AnalysisState, ToneDetection,
+    AnalysisError, AnalysisOutput, AnalysisState, DenoiseKind, PreDenoise, ToneDetection,
     detect_tone, encode as analysis_encode,
     encode_ambe_plus2 as analysis_encode_ambe_plus2,
     profile as analysis_profile,
@@ -326,6 +326,10 @@ pub struct Vocoder {
     enhancement: EnhancementMode,
     enhancement_state: EnhancementState,
     prev_disposition: Option<FrameDisposition>,
+    /// Opt-in pre-analysis denoiser front-end (§3.4 exceed lever). `None`
+    /// = disabled (default). Runs on the input PCM before encode; the
+    /// codec core is untouched.
+    denoise: Option<PreDenoise>,
 }
 
 impl Vocoder {
@@ -361,6 +365,7 @@ impl Vocoder {
             enhancement: EnhancementMode::Classical(crate::enhancement::ClassicalConfig::default()),
             enhancement_state: EnhancementState::default(),
             prev_disposition: None,
+            denoise: None,
         }
     }
 
@@ -593,6 +598,31 @@ impl Vocoder {
         self.analysis.spectral_subtraction_enabled()
     }
 
+    /// Enable/disable the §3.4 pre-analysis denoiser front-end (opt-in,
+    /// default OFF). A separable general-DSP STFT/log-MMSE stage on the
+    /// input PCM ahead of the codec; transparent on clean speech, exceeds
+    /// the (NS-free) chip on noisy field audio. Enabling constructs a
+    /// fresh [`PreDenoise`]; disabling drops it.
+    pub fn set_denoise(&mut self, on: bool) {
+        self.denoise = if on {
+            Some(PreDenoise::new(DenoiseKind::LogMmse))
+        } else {
+            None
+        };
+    }
+
+    /// Select the denoiser gain rule (`LogMmse` default / `Wiener` /
+    /// `SpecSub`) and enable it. For A/B sweeps.
+    pub fn set_denoise_kind(&mut self, kind: DenoiseKind) {
+        self.denoise = Some(PreDenoise::new(kind));
+    }
+
+    /// Whether the pre-analysis denoiser front-end is enabled.
+    #[inline]
+    pub fn denoise(&self) -> bool {
+        self.denoise.is_some()
+    }
+
     /// Set the §0.5 amplitude EMA weight `α`. `0.0` disables the
     /// smoother (default); `(0.0, 1.0]` enables
     /// `M̂_l(t) = α · M̂_l + (1−α) · M̂_l(t−1)` per harmonic, gated by
@@ -767,6 +797,11 @@ impl Vocoder {
         self.last_stats = FrameStats::default();
         self.enhancement_state = EnhancementState::default();
         self.prev_disposition = None;
+        // Denoiser: clear its streaming/noise state but keep it enabled
+        // (config, like tone_detection/enhancement).
+        if let Some(d) = self.denoise.as_mut() {
+            d.reset();
+        }
         // tone_detection / enhancement: preserved (config, not state)
     }
 
@@ -781,6 +816,16 @@ impl Vocoder {
                 got: pcm.len(),
             });
         }
+        // §3.4 pre-analysis denoiser front-end (opt-in, default off). A
+        // separable general-DSP stage on the input PCM, ahead of the codec.
+        let denoised: Vec<i16>;
+        let pcm: &[i16] = match self.denoise.as_mut() {
+            Some(d) => {
+                denoised = d.process_frame(pcm);
+                &denoised
+            }
+            None => pcm,
+        };
         let (bytes, stats) = match self.rate {
             Rate::Imbe7200x4400 => imbe_pipeline::encode(pcm, self, true)?,
             Rate::Imbe4400x4400 => imbe_pipeline::encode(pcm, self, false)?,

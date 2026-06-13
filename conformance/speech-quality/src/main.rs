@@ -31,7 +31,8 @@ use std::time::Instant;
 
 use blip25_mbe::codecs::ambe_plus2;
 use blip25_mbe::codecs::mbe_baseline::analysis::{
-    AnalysisOutput, AnalysisState, encode as analysis_encode, encode_ambe_plus2 as analysis_encode_ambe_plus2,
+    AnalysisOutput, AnalysisState, DenoiseKind, PreDenoise, encode as analysis_encode,
+    encode_ambe_plus2 as analysis_encode_ambe_plus2,
 };
 use blip25_mbe::codecs::mbe_baseline::{
     FrameDisposition, FrameErrorContext, GAMMA_W, SynthState, synthesize_frame,
@@ -261,6 +262,19 @@ enum Cmd {
         /// relaxation on confident-pitch loud frames (measure-first).
         #[arg(long)]
         vuv_mxi_grade: bool,
+        /// §3.4 EXCEED lever: enable the pre-analysis denoiser front-end
+        /// (STFT log-MMSE + minimum-statistics noise tracking). For noisy
+        /// input, pair with `--ref-pcm <clean>` so cells score vs clean.
+        #[arg(long)]
+        denoise: bool,
+        /// Denoiser gain rule (with `--denoise`). Default logmmse.
+        #[arg(long, value_enum)]
+        denoise_mode: Option<DenoiseModeCli>,
+        /// Score every cell against THIS clean reference PCM instead of
+        /// the (noisy) input `--pcm`. Required to measure the §3.4 exceed
+        /// lever (denoised noisy input judged against clean speech).
+        #[arg(long)]
+        ref_pcm: Option<PathBuf>,
         /// Post-decoder enhancement chain applied to PCM before
         /// `our_enc_our_dec.wav` is written. Same chain used by the
         /// full-rate `ab-matrix` subcommand. `none` (default) is
@@ -515,8 +529,12 @@ fn main() -> Result<()> {
             silence_shape_zero,
             vuv_pitch_coef,
             vuv_mxi_grade,
+            denoise,
+            denoise_mode,
+            ref_pcm,
         } => cmd_ambe_plus2_ab_matrix(
             &pcm,
+            ref_pcm.as_deref(),
             &out_dir,
             frames,
             &chip_host,
@@ -543,6 +561,8 @@ fn main() -> Result<()> {
                 silence_shape_zero,
                 vuv_pitch_coef,
                 vuv_mxi_grade,
+                denoise,
+                denoise_mode: denoise_mode.map(DenoiseModeCli::to_kind),
             },
         ),
         Cmd::DecodeRawHalfrate { input, out_wav, binary } => {
@@ -1042,10 +1062,33 @@ struct LeverFlags {
     silence_shape_zero: bool,
     vuv_pitch_coef: Option<f64>,
     vuv_mxi_grade: bool,
+    /// §3.4 pre-analysis denoiser front-end (exceed lever).
+    denoise: bool,
+    /// Gain rule when `denoise` is on; `None` = LogMmse default.
+    denoise_mode: Option<DenoiseKind>,
+}
+
+/// CLI selector for the denoiser gain rule.
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum DenoiseModeCli {
+    Logmmse,
+    Wiener,
+    Specsub,
+}
+
+impl DenoiseModeCli {
+    fn to_kind(self) -> DenoiseKind {
+        match self {
+            DenoiseModeCli::Logmmse => DenoiseKind::LogMmse,
+            DenoiseModeCli::Wiener => DenoiseKind::Wiener,
+            DenoiseModeCli::Specsub => DenoiseKind::SpecSub,
+        }
+    }
 }
 
 fn cmd_ambe_plus2_ab_matrix(
     pcm_path: &Path,
+    ref_pcm_path: Option<&Path>,
     out_dir: &Path,
     frames: Option<usize>,
     chip_host: &str,
@@ -1074,8 +1117,18 @@ fn cmd_ambe_plus2_ab_matrix(
         pcm.len() as f64 / f64::from(SAMPLE_RATE)
     );
 
+    // Scoring reference: the CLEAN PCM when `--ref-pcm` is given (so a
+    // noisy `--pcm` denoise run is judged against clean speech — the §3.4
+    // exceed metric), otherwise the input itself (self-baseline).
     let ref_wav = out_dir.join("ref.wav");
-    write_wav(&ref_wav, pcm)?;
+    match ref_pcm_path {
+        Some(rp) => {
+            let ref_pcm = read_pcm_i16(rp)?;
+            let n = ref_pcm.len().min(pcm.len());
+            write_wav(&ref_wav, &ref_pcm[..n])?;
+        }
+        None => write_wav(&ref_wav, pcm)?,
+    }
 
     let t0 = Instant::now();
     let our_bits = our_encode_ambe_plus2(
@@ -1314,10 +1367,23 @@ fn our_encode_ambe_plus2(
         state.set_vuv_pitch_coef(c);
     }
     state.set_vuv_mxi_grade(levers.vuv_mxi_grade);
+    // §3.4 pre-analysis denoiser front-end (opt-in). Mirrors the
+    // production Vocoder hook: denoise each input frame before analysis.
+    let mut denoiser = levers
+        .denoise
+        .then(|| PreDenoise::new(levers.denoise_mode.unwrap_or(DenoiseKind::LogMmse)));
     let mut decoder_state = HalfDecoderState::new();
     let mut out = Vec::with_capacity(n_frames * HALF_BYTES_PER_FEC_FRAME);
     for f in 0..n_frames {
-        let frame = &pcm[f * FRAME_SAMPLES..(f + 1) * FRAME_SAMPLES];
+        let raw = &pcm[f * FRAME_SAMPLES..(f + 1) * FRAME_SAMPLES];
+        let cleaned: Vec<i16>;
+        let frame: &[i16] = match denoiser.as_mut() {
+            Some(d) => {
+                cleaned = d.process_frame(raw);
+                &cleaned
+            }
+            None => raw,
+        };
         // `encode_ambe_plus2` now dispatches PitchOutOfRange as Silence
         // internally (blip25-mbe Wave 1.1 fix). `MbeParams::silence_ambe_plus2`
         // gives a half-rate-table-compatible placeholder. Only treat
