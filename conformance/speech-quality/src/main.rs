@@ -31,7 +31,7 @@ use std::time::Instant;
 
 use blip25_mbe::codecs::ambe_plus2;
 use blip25_mbe::codecs::mbe_baseline::analysis::{
-    AnalysisOutput, AnalysisState, DenoiseKind, PreDenoise, encode as analysis_encode,
+    AnalysisOutput, AnalysisState, DenoiseKind, HumNotch, PreDenoise, encode as analysis_encode,
     encode_ambe_plus2 as analysis_encode_ambe_plus2,
 };
 use blip25_mbe::codecs::mbe_baseline::{
@@ -270,6 +270,10 @@ enum Cmd {
         /// Denoiser gain rule (with `--denoise`). Default logmmse.
         #[arg(long, value_enum)]
         denoise_mode: Option<DenoiseModeCli>,
+        /// §3.4 mains-hum fix: notch 60/120 Hz before the codec (kills the
+        /// line that pulls §0.3 pitch). Runs before `--denoise`.
+        #[arg(long)]
+        hum_notch: bool,
         /// Score every cell against THIS clean reference PCM instead of
         /// the (noisy) input `--pcm`. Required to measure the §3.4 exceed
         /// lever (denoised noisy input judged against clean speech).
@@ -531,6 +535,7 @@ fn main() -> Result<()> {
             vuv_mxi_grade,
             denoise,
             denoise_mode,
+            hum_notch,
             ref_pcm,
         } => cmd_ambe_plus2_ab_matrix(
             &pcm,
@@ -563,6 +568,7 @@ fn main() -> Result<()> {
                 vuv_mxi_grade,
                 denoise,
                 denoise_mode: denoise_mode.map(DenoiseModeCli::to_kind),
+                hum_notch,
             },
         ),
         Cmd::DecodeRawHalfrate { input, out_wav, binary } => {
@@ -1066,6 +1072,8 @@ struct LeverFlags {
     denoise: bool,
     /// Gain rule when `denoise` is on; `None` = LogMmse default.
     denoise_mode: Option<DenoiseKind>,
+    /// §3.4 mains-hum notch front-end (60/120 Hz), runs before the denoiser.
+    hum_notch: bool,
 }
 
 /// CLI selector for the denoiser gain rule.
@@ -1367,8 +1375,9 @@ fn our_encode_ambe_plus2(
         state.set_vuv_pitch_coef(c);
     }
     state.set_vuv_mxi_grade(levers.vuv_mxi_grade);
-    // §3.4 pre-analysis denoiser front-end (opt-in). Mirrors the
-    // production Vocoder hook: denoise each input frame before analysis.
+    // §3.4 pre-analysis front-ends (opt-in). Mirrors the production Vocoder
+    // hook: mains-hum notch first, then the denoiser, before analysis.
+    let mut humnotch = levers.hum_notch.then(HumNotch::new_60_120);
     let mut denoiser = levers
         .denoise
         .then(|| PreDenoise::new(levers.denoise_mode.unwrap_or(DenoiseKind::LogMmse)));
@@ -1376,6 +1385,14 @@ fn our_encode_ambe_plus2(
     let mut out = Vec::with_capacity(n_frames * HALF_BYTES_PER_FEC_FRAME);
     for f in 0..n_frames {
         let raw = &pcm[f * FRAME_SAMPLES..(f + 1) * FRAME_SAMPLES];
+        let notched: Vec<i16>;
+        let raw: &[i16] = match humnotch.as_mut() {
+            Some(h) => {
+                notched = h.process_frame(raw);
+                &notched
+            }
+            None => raw,
+        };
         let cleaned: Vec<i16>;
         let frame: &[i16] = match denoiser.as_mut() {
             Some(d) => {

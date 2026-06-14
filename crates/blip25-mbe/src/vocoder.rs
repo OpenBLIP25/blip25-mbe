@@ -47,7 +47,7 @@
 
 use crate::codecs::ambe_plus2;
 use crate::codecs::mbe_baseline::analysis::{
-    AnalysisError, AnalysisOutput, AnalysisState, DenoiseKind, PreDenoise, ToneDetection,
+    AnalysisError, AnalysisOutput, AnalysisState, DenoiseKind, HumNotch, PreDenoise, ToneDetection,
     detect_tone, encode as analysis_encode,
     encode_ambe_plus2 as analysis_encode_ambe_plus2,
     profile as analysis_profile,
@@ -330,6 +330,9 @@ pub struct Vocoder {
     /// = disabled (default). Runs on the input PCM before encode; the
     /// codec core is untouched.
     denoise: Option<PreDenoise>,
+    /// Opt-in mains-hum notch front-end (60/120 Hz). `None` = disabled
+    /// (default). Runs on the input PCM *before* the denoiser and the codec.
+    hum_notch: Option<HumNotch>,
 }
 
 impl Vocoder {
@@ -366,6 +369,7 @@ impl Vocoder {
             enhancement_state: EnhancementState::default(),
             prev_disposition: None,
             denoise: None,
+            hum_notch: None,
         }
     }
 
@@ -623,6 +627,26 @@ impl Vocoder {
         self.denoise.is_some()
     }
 
+    /// Enable/disable the mains-hum notch front-end (opt-in, default OFF).
+    /// `true` installs a 60/120 Hz (US) notch; use [`Self::set_hum_notch_mains`]
+    /// for 50/100 Hz (EU). Runs before the denoiser and the codec; surgically
+    /// nulls the mains line that otherwise pulls the §0.3 pitch tracker.
+    pub fn set_hum_notch(&mut self, on: bool) {
+        self.hum_notch = on.then(HumNotch::new_60_120);
+    }
+
+    /// Enable the hum notch at a specific mains fundamental (e.g. 50.0 for
+    /// EU); also nulls `2·mains_hz`.
+    pub fn set_hum_notch_mains(&mut self, mains_hz: f64) {
+        self.hum_notch = Some(HumNotch::new(mains_hz));
+    }
+
+    /// Whether the mains-hum notch is enabled.
+    #[inline]
+    pub fn hum_notch(&self) -> bool {
+        self.hum_notch.is_some()
+    }
+
     /// Set the §0.5 amplitude EMA weight `α`. `0.0` disables the
     /// smoother (default); `(0.0, 1.0]` enables
     /// `M̂_l(t) = α · M̂_l + (1−α) · M̂_l(t−1)` per harmonic, gated by
@@ -797,10 +821,13 @@ impl Vocoder {
         self.last_stats = FrameStats::default();
         self.enhancement_state = EnhancementState::default();
         self.prev_disposition = None;
-        // Denoiser: clear its streaming/noise state but keep it enabled
-        // (config, like tone_detection/enhancement).
+        // Denoiser + hum notch: clear streaming/filter state but keep them
+        // enabled (config, like tone_detection/enhancement).
         if let Some(d) = self.denoise.as_mut() {
             d.reset();
+        }
+        if let Some(h) = self.hum_notch.as_mut() {
+            h.reset();
         }
         // tone_detection / enhancement: preserved (config, not state)
     }
@@ -816,8 +843,18 @@ impl Vocoder {
                 got: pcm.len(),
             });
         }
-        // §3.4 pre-analysis denoiser front-end (opt-in, default off). A
-        // separable general-DSP stage on the input PCM, ahead of the codec.
+        // §3.4 pre-analysis front-ends (opt-in, default off): mains-hum
+        // notch FIRST (null the 60/120 Hz line that pulls §0.3 pitch), then
+        // the broadband denoiser. Both are separable general-DSP stages on
+        // the input PCM, ahead of the codec core.
+        let notched: Vec<i16>;
+        let pcm: &[i16] = match self.hum_notch.as_mut() {
+            Some(h) => {
+                notched = h.process_frame(pcm);
+                &notched
+            }
+            None => pcm,
+        };
         let denoised: Vec<i16>;
         let pcm: &[i16] = match self.denoise.as_mut() {
             Some(d) => {

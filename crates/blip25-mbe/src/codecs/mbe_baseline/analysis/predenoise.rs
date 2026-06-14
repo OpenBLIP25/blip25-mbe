@@ -34,14 +34,24 @@ const FFT_SIZE: usize = 256;
 const HOP: usize = 128; // 50 % overlap
 const N_BINS: usize = FFT_SIZE / 2 + 1; // 129 one-sided bins
 
-// --- Noise tracking (minimum-statistics / MCRA, Cohen/Martin) ---------------
-const ALPHA_S: f64 = 0.9; // periodogram time-smoothing
+// --- Noise tracking (IMCRA two-iteration min-controlled recursive avg,
+//     Cohen 2003 Table-I @ 8 kHz / 256-FFT / 62.5 hop·s⁻¹) -------------------
+const ALPHA_S: f64 = 0.9; // 1st-pass periodogram time-smoothing
+const ALPHA_S2: f64 = 0.9; // 2nd-pass (speech-excluded) smoothing
 const ALPHA_D: f64 = 0.85; // base noise-PSD update smoothing
-const BETA_BIAS: f64 = 1.47; // minimum-tracking bias compensation
-const GAMMA0: f64 = 4.6; // rough speech-absence threshold on S/Smin
-const GAMMA1: f64 = 3.0; // refined threshold on Y²/(β·Smin)
+const ALPHA_P: f64 = 0.2; // speech-presence-probability smoothing (Cohen α_p)
+const GAMMA0: f64 = 4.6; // rough speech indicator threshold on γ_min (1st min)
+const GAMMA1: f64 = 3.0; // soft p(k) ramp ceiling on γ_min (2nd min)
+const ZETA0: f64 = 1.67; // smoothed (ζ) indicator threshold
+/// Minimum-tracking bias `Bmin` (Martin 2001 / Cohen 2003): the running
+/// minimum of a smoothed periodogram under-estimates the mean; for the
+/// `α_s=0.9` smoother over `D = U_SUB·V_LEN = 120` hops, Cohen's Table-I
+/// gives ≈1.66. Applied ONLY where the minimum is a noise-floor *reference*
+/// in a ratio test (γ_min, ζ) — never to `n_psd` itself (it is already
+/// recursively unbiased; double-correcting would over-suppress).
+const B_MIN: f64 = 1.66;
 const U_SUB: usize = 8; // sub-windows
-const V_LEN: usize = 15; // frames per sub-window ⇒ D = 120 frames ≈ 2.4 s
+const V_LEN: usize = 15; // hops per sub-window ⇒ D = 120 hops ≈ 1.9 s
 const PEAK_GUARD_DB: f64 = 6.0; // bin > this above its neighbourhood ⇒ tone/harmonic, freeze
 const BOOTSTRAP_FRAMES: u32 = 6; // seed the noise floor, pass-through until primed
 
@@ -119,14 +129,20 @@ pub struct PreDenoise {
     out_buf: Vec<f64>, // cleaned samples ready to emit
     ola: [f64; FFT_SIZE],
 
-    // Noise tracking (per bin).
-    s_smooth: [f64; N_BINS], // time-smoothed periodogram
-    run_min: [f64; N_BINS],  // running min within current sub-window
+    // Noise tracking (per bin). IMCRA runs TWO smoothing/minimum chains that
+    // share the sub-window phase (`sub_idx`/`frame_in_sub`): the first feeds
+    // the rough speech indicator, the second (speech-excluded) tracks the
+    // true noise floor through continuous/babble speech.
+    s_smooth: [f64; N_BINS], // 1st-pass time-smoothed periodogram
+    run_min: [f64; N_BINS],  // running min of s_smooth in current sub-window
     sub_min: [[f64; N_BINS]; U_SUB],
+    sf_tilde: [f64; N_BINS], // 2nd-pass smoothed power (speech bins held out)
+    run_min_t: [f64; N_BINS], // running min of sf_tilde
+    sub_min_t: [[f64; N_BINS]; U_SUB],
     sub_idx: usize,
     frame_in_sub: usize,
     n_psd: [f64; N_BINS], // noise power estimate
-    p_speech: [f64; N_BINS],
+    p_speech: [f64; N_BINS], // IMCRA speech-presence probability p(k)
 
     // Decision-directed SNR memory.
     prev_g: [f64; N_BINS],
@@ -134,7 +150,8 @@ pub struct PreDenoise {
 
     primed: bool,
     boot_count: u32,
-    sig_peak: f64, // fast-attack / slow-decay speech-level tracker
+    sig_peak: f64,      // fast-attack / slow-decay speech-level tracker
+    input_snr_ema: f64, // slow EMA of long-term input SNR for the engage gate
 }
 
 impl std::fmt::Debug for PreDenoise {
@@ -157,6 +174,9 @@ impl Clone for PreDenoise {
         c.s_smooth = self.s_smooth;
         c.run_min = self.run_min;
         c.sub_min = self.sub_min;
+        c.sf_tilde = self.sf_tilde;
+        c.run_min_t = self.run_min_t;
+        c.sub_min_t = self.sub_min_t;
         c.sub_idx = self.sub_idx;
         c.frame_in_sub = self.frame_in_sub;
         c.n_psd = self.n_psd;
@@ -166,6 +186,7 @@ impl Clone for PreDenoise {
         c.primed = self.primed;
         c.boot_count = self.boot_count;
         c.sig_peak = self.sig_peak;
+        c.input_snr_ema = self.input_snr_ema;
         c
     }
 }
@@ -189,6 +210,9 @@ impl PreDenoise {
             s_smooth: [0.0; N_BINS],
             run_min: [f64::INFINITY; N_BINS],
             sub_min: [[f64::INFINITY; N_BINS]; U_SUB],
+            sf_tilde: [0.0; N_BINS],
+            run_min_t: [f64::INFINITY; N_BINS],
+            sub_min_t: [[f64::INFINITY; N_BINS]; U_SUB],
             sub_idx: 0,
             frame_in_sub: 0,
             n_psd: [0.0; N_BINS],
@@ -198,6 +222,7 @@ impl PreDenoise {
             primed: false,
             boot_count: 0,
             sig_peak: 0.0,
+            input_snr_ema: f64::NAN, // set on the first primed frame
         }
     }
 
@@ -303,9 +328,13 @@ impl PreDenoise {
                     if seed[m] > exp2(PEAK_GUARD_DB) * nb {
                         self.n_psd[m] = nb;
                     }
+                    // Seed BOTH IMCRA minimum chains from the smoothed power.
+                    self.sf_tilde[m] = self.s_smooth[m];
                     self.run_min[m] = self.s_smooth[m];
+                    self.run_min_t[m] = self.s_smooth[m];
                     for u in 0..U_SUB {
                         self.sub_min[u][m] = self.s_smooth[m];
+                        self.sub_min_t[u][m] = self.s_smooth[m];
                     }
                 }
                 self.primed = true;
@@ -324,6 +353,15 @@ impl PreDenoise {
             self.sig_peak = 0.999 * self.sig_peak + 0.001 * frame_pow; // slow decay
         }
         let input_snr_db = 10.0 * (self.sig_peak / noise_pow).log10();
+        // Slow EMA of the input SNR drives the engage gate: a clean stream
+        // stays well above the bypass threshold even through quiet dips, so a
+        // few low-energy frames can't trip suppression on otherwise-clean
+        // input (IMCRA's sharper floor makes the instantaneous value dip).
+        self.input_snr_ema = if self.input_snr_ema.is_nan() {
+            input_snr_db
+        } else {
+            0.95 * self.input_snr_ema + 0.05 * input_snr_db
+        };
         let snr_db = 10.0 * (frame_pow / noise_pow).log10();
 
         // Spectral flatness (geo/arith mean of power): ~0 for a pure tone,
@@ -342,7 +380,7 @@ impl PreDenoise {
 
         // GLOBAL ENGAGE GATE — clean input or a near-pure tone is fully
         // transparent; only genuinely noisy broadband input is suppressed.
-        if input_snr_db >= GLOBAL_BYPASS_DB || sfm < SFM_BYPASS {
+        if self.input_snr_ema >= GLOBAL_BYPASS_DB || sfm < SFM_BYPASS {
             for m in 0..N_BINS {
                 self.prev_g[m] = 1.0;
                 self.prev_gamma[m] = (power[m] / self.n_psd[m].max(1e-12)).max(1e-6);
@@ -382,8 +420,13 @@ impl PreDenoise {
         g
     }
 
+    /// IMCRA (Cohen 2003) two-iteration minimum-controlled recursive average.
+    /// The first chain feeds a rough speech indicator; the second smooths the
+    /// power with strong-speech bins **excluded**, so its minimum tracks the
+    /// true noise floor *through* continuous/babble speech (where a single
+    /// minimum sits above the floor and under-estimates the noise).
     fn update_noise(&mut self, power: &[f64; N_BINS]) {
-        // 1) frequency-smooth (1-2-1) then time-smooth the periodogram.
+        // 1) frequency-smooth (1-2-1) then time-smooth (FIRST pass).
         let mut sf = [0.0f64; N_BINS];
         for m in 0..N_BINS {
             let lo = if m == 0 { 0 } else { m - 1 };
@@ -392,50 +435,80 @@ impl PreDenoise {
         }
         for m in 0..N_BINS {
             self.s_smooth[m] = ALPHA_S * self.s_smooth[m] + (1.0 - ALPHA_S) * sf[m];
-        }
-
-        // 2) running minimum over D = U_SUB·V_LEN frames (sub-window swap).
-        for m in 0..N_BINS {
             if self.s_smooth[m] < self.run_min[m] {
                 self.run_min[m] = self.s_smooth[m];
             }
         }
+
+        // 2b) ROUGH speech indicator I(k) from the FIRST minimum (+ Bmin).
+        //     A bin is strong-speech if Y²/(Bmin·Smin) or Sf/(Bmin·Smin) is high.
+        let mut indicator = [false; N_BINS];
+        for m in 0..N_BINS {
+            let mut smin1 = self.run_min[m];
+            for u in 0..U_SUB {
+                if self.sub_min[u][m] < smin1 {
+                    smin1 = self.sub_min[u][m];
+                }
+            }
+            let smin1 = (B_MIN * smin1).max(1e-12);
+            indicator[m] = power[m] / smin1 > GAMMA0 || self.s_smooth[m] / smin1 > ZETA0;
+        }
+
+        // 2c) SECOND smoothing EXCLUDING strong-speech bins (Cohen Eq.14-15):
+        //     speech bins FREEZE sf_tilde (speech can't leak into the floor),
+        //     noise bins track — so the second minimum follows the noise.
+        for m in 0..N_BINS {
+            if !indicator[m] {
+                self.sf_tilde[m] = ALPHA_S2 * self.sf_tilde[m] + (1.0 - ALPHA_S2) * sf[m];
+            }
+            if self.sf_tilde[m] < self.run_min_t[m] {
+                self.run_min_t[m] = self.sf_tilde[m];
+            }
+        }
+
+        // 2d) sub-window swap drives BOTH minima together (shared phase).
         self.frame_in_sub += 1;
         if self.frame_in_sub >= V_LEN {
             for m in 0..N_BINS {
                 self.sub_min[self.sub_idx][m] = self.run_min[m];
+                self.sub_min_t[self.sub_idx][m] = self.run_min_t[m];
                 self.run_min[m] = self.s_smooth[m];
+                self.run_min_t[m] = self.sf_tilde[m];
             }
             self.sub_idx = (self.sub_idx + 1) % U_SUB;
             self.frame_in_sub = 0;
         }
 
-        // 3) per-bin noise update, frozen on speech / tonal / harmonic bins.
+        // 3) SOFT speech-presence probability p(k) from the SECOND minimum,
+        //    + median peak guard, + the conditional alpha_tilde noise update.
         for m in 0..N_BINS {
-            let mut s_min = self.run_min[m];
+            let mut smin2 = self.run_min_t[m];
             for u in 0..U_SUB {
-                if self.sub_min[u][m] < s_min {
-                    s_min = self.sub_min[u][m];
+                if self.sub_min_t[u][m] < smin2 {
+                    smin2 = self.sub_min_t[u][m];
                 }
             }
-            let s_min = s_min.max(1e-12);
+            let smin2 = (B_MIN * smin2).max(1e-12);
 
-            let sr = self.s_smooth[m] / s_min;
-            let gamma_min = power[m] / (BETA_BIAS * s_min);
-            let mut speech_absent = sr < GAMMA0 && gamma_min < GAMMA1;
+            let gamma_min_t = power[m] / smin2;
+            let zeta_t = self.s_smooth[m] / smin2;
+            let mut p_target = if gamma_min_t <= 1.0 && zeta_t < ZETA0 {
+                0.0
+            } else {
+                ((gamma_min_t - 1.0) / (GAMMA1 - 1.0)).clamp(0.0, 1.0)
+            };
 
-            // PEAK GUARD — a bin > PEAK_GUARD_DB above its neighbourhood is a
-            // tone / voiced harmonic; never learn it as noise (anti-priming).
+            // PEAK GUARD (anti-self-priming): a tone / voiced harmonic bin is
+            // ALWAYS speech — never learn it as noise.
             let nb = local_floor(power, m);
             if power[m] > exp2(PEAK_GUARD_DB) * nb {
-                speech_absent = false;
+                p_target = 1.0;
             }
 
-            // 4) speech-presence probability with hysteresis.
-            let target = if speech_absent { 0.0 } else { 1.0 };
-            self.p_speech[m] = 0.7 * self.p_speech[m] + 0.3 * target;
+            self.p_speech[m] = ALPHA_P * self.p_speech[m] + (1.0 - ALPHA_P) * p_target;
 
-            // 5) conditional smoothing: noise frozen as p_speech → 1.
+            // Conditional noise smoothing, frozen as p → 1. Bmin is NOT applied
+            // here — n_psd is already recursively unbiased.
             let alpha_tilde = ALPHA_D + (1.0 - ALPHA_D) * self.p_speech[m];
             self.n_psd[m] = alpha_tilde * self.n_psd[m] + (1.0 - alpha_tilde) * power[m];
         }
@@ -574,4 +647,5 @@ mod tests {
         assert_eq!(d.boot_count, 0);
     }
 }
+
 

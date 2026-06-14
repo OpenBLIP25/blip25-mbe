@@ -170,6 +170,11 @@ pub use denoise::{NoiseSpectrum, apply_subtraction};
 pub mod predenoise;
 pub use predenoise::{DenoiseKind, PreDenoise};
 
+// Mains-hum notch front-end (§3.4/§3.6 follow-up). Separable pre-PCM stage,
+// like `predenoise`; kept off `AnalysisState`.
+pub mod humnotch;
+pub use humnotch::HumNotch;
+
 /// Errors reported by the analysis encoder.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AnalysisError {

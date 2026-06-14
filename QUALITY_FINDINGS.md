@@ -1047,6 +1047,43 @@ clean speech + added babble/vehicle noise at several SNRs, `ours→chip` vs
 > noise; not for narrowband hum. Default-on is deferred pending babble (IMCRA)
 > and the low-band/hum encoder fix.
 
+> **FOLLOW-UPS LANDED (2026-06-13b) — hum notch (BIG win) + IMCRA babble upgrade.**
+>
+> **(A) HUM — root cause found + fixed (`humnotch.rs`).** Chip-probe diagnosis
+> (`examples/hum_diag_probe.rs`): the −0.39 hum deficit is the **§0.3 pitch tracker
+> locking onto the 60/120 Hz mains line** — on clean+hum-15 dB the voiced f0
+> collapses to ~65 Hz on 30 % of voiced frames (the §0.5 amplitude blow-up ×22 and
+> §0.7 voicing flips are *downstream* of the wrong pitch). The §0.1 single-pole HPF
+> (corner ~13 Hz) passes hum untouched, and a broadband HPF fails (pitch re-locks to
+> 120 Hz, a valid male f0). Fix: **two narrow RBJ biquad notches at 60+120 Hz (Q≈10)**
+> as a separable, **zero-latency** general-DSP pre-PCM front-end (`HumNotch`,
+> `Vocoder::set_hum_notch` / `--hum-notch`, default OFF). Runs *before* the denoiser.
+> Live-chip (encoder cell vs clean ref): hum-15 dB **2.576→2.999 (+0.423, beats chip
+> +0.035)**, hum-10 dB **2.429→3.021 (+0.592, beats chip +0.212)**; clean control
+> +0.022 (safe), white-10 −0.008 (neutral), male `mark`+hum +0.116. Clean damage ≈0
+> (the Q=10 ~12 Hz notch spares a male f0 grazing 120 Hz via its untouched harmonic
+> comb; validated on `mark.pcm`). The −0.39 deficit becomes a +0.04..+0.21 exceed.
+> **A clear, low-risk win.**
+>
+> **(B) BABBLE — IMCRA two-iteration tracker (`predenoise.rs`).** Replaced the
+> single-minimum MCRA noise tracker with Cohen-2003 IMCRA (a second speech-excluded
+> smoothing/minimum chain that tracks the floor *through* continuous speech), plus a
+> Bmin bias and a slow-EMA engage gate. Anti-self-priming guards (median peak guard,
+> SFM bypass, global gate) kept; all 5 unit tests + 479 lib tests green. Live-chip:
+> **the bigger win is on WHITE/broadband** — exceed cl_w10 +0.001→**+0.143**,
+> cl_w5 +0.408→**+0.549**, fa_w10 +0.194→**+0.468** (the speech-excluded minimum
+> estimates the floor far better, so log-MMSE suppresses more accurately). **Babble**
+> improved modestly as predicted (the classical ceiling): exceed cl_b10 −0.036→−0.027,
+> fa_b10 −0.089→−0.078; dn−head +0.043/+0.076 (helps our encoder). **Caveat:** IMCRA
+> engages slightly on the DVSI *clean* control's residual room tone (−0.24 dB) which,
+> with the STFT's inherent 128-sample (16 ms) group delay, costs ~−0.26 through the
+> *chip* decoder (our decoder shows +0.18). So clean transparency is worse than MCRA
+> (−0.26 vs −0.08) — **enable only on noisy audio** (it is opt-in, default OFF). Net:
+> IMCRA is strictly better on the broadband/babble targets; the clean caveat is moot
+> for a noisy-audio tool. A learned suppressor (RNNoise-class) remains the next step
+> for non-stationary babble beyond the classical ceiling; eliminating the group delay
+> (zero-latency reconstruction) would restore clean transparency.
+
 ### 3.5 (LOW–MED) Encode-side tone detection
 Encode-side tone dispatch exists for single/DTMF; verify it matches the chip's
 tone handling so alert/Knox/DTMF traffic encodes as tones, not buzzy voice.
