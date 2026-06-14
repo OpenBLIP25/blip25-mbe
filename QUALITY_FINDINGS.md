@@ -1084,6 +1084,40 @@ clean speech + added babble/vehicle noise at several SNRs, `ours→chip` vs
 > for non-stationary babble beyond the classical ceiling; eliminating the group delay
 > (zero-latency reconstruction) would restore clean transparency.
 
+> **FOLLOW-UP ATTEMPTS — BOTH REVERTED (2026-06-13c), do not re-try as designed.**
+> Chased the two next-steps above; both are measured NET-NEGATIVES on real content
+> and were reverted (the committed IMCRA + smoothed-gate denoiser, above, stands as
+> the best version). Recorded so they aren't re-attempted:
+> - **OM-LSA gain** `G = G_LSA^p · G_MIN^(1−p)` (Cohen's IMCRA companion, p = the
+>   IMCRA speech-presence prob). It only ever suppresses *more* (`G ≤ G_LSA`), and the
+>   `p_speech` estimate is not reliable enough on this content: mid-`p` voiced tails
+>   and mis-classified clean segments get slammed to the −20 dB `G_MIN` floor. Live
+>   chip: clean **−0.85** (was −0.26), babble **−0.48 / −0.31** (was −0.03 / −0.08),
+>   white unchanged. Reverted. (A safer variant would need a much higher `G_MIN`
+>   and/or a far more reliable `p` — likely the learned route, not classical.)
+> - **Zero-latency direct-pass bypass** (output the raw input frame, zero delay, when
+>   the gate is in BYPASS; OLA only when ENGAGE, with a Schmitt-trigger latch). A
+>   `clean_input_bypass_is_lossless` unit test confirms it IS byte-identical on a
+>   *consistently*-clean stream — but on REAL content that toggles the gate
+>   (clean-with-pauses, babble: the DVSI clean engages ~61% of frames as IMCRA's floor
+>   rises in pauses), mixing 0-delay (bypass) and 128-delay (engage) frames chops the
+>   audio with 128-sample discontinuities. Live chip: clean **−0.85**, babble
+>   **−0.44 / −0.29**, white unchanged. The committed always-OLA path (consistent
+>   128-delay, no toggling) is strictly better. Reverted. **Lesson:** any per-frame
+>   dual-latency scheme glitches when the gate toggles; the STFT group delay is
+>   effectively unavoidable for a bypass-toggling denoiser. The genuine fix for clean
+>   transparency is to NOT engage on clean at all (a noise-vs-clean *input* classifier
+>   that doesn't rise on speech pauses), or to accept the −0.26 caveat (opt-in tool).
+> - **RNNoise-class learned suppressor: DEFERRED** (design-verified, not built). A
+>   pre-trained ~85k-param GRU band-gain net is mechanically portable to deterministic
+>   pure Rust, BUT it needs an 8 kHz-retrained model + a committed weights artifact +
+>   a training recipe + (ideally) a `tract`/`candle`-class dep — none exist in-repo and
+>   all violate the repo's pure-Rust/no-ML-dep/determinism discipline. It belongs in a
+>   SEPARATE experimental crate behind a non-default feature, never in the codec path.
+>   This is the real ceiling-breaker for non-stationary babble; it is a project, not a
+>   patch. The shipped classical ceiling is **IMCRA + log-MMSE** (broadband win,
+>   modest babble); OM-LSA and zero-latency do not improve it.
+
 ### 3.5 (LOW–MED) Encode-side tone detection
 Encode-side tone dispatch exists for single/DTMF; verify it matches the chip's
 tone handling so alert/Knox/DTMF traffic encodes as tones, not buzzy voice.
