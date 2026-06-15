@@ -194,7 +194,7 @@ impl Clone for PreDenoise {
 impl PreDenoise {
     /// New denoiser with the given gain rule. Cold-start: passes input
     /// through unchanged until the noise floor is bootstrapped
-    /// ([`BOOTSTRAP_FRAMES`] hops).
+    /// (`BOOTSTRAP_FRAMES` hops).
     pub fn new(kind: DenoiseKind) -> Self {
         let mut planner = FftPlanner::<f64>::new();
         let fft = planner.plan_fft_forward(FFT_SIZE);

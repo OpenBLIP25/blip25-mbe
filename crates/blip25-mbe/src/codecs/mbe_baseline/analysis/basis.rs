@@ -119,7 +119,7 @@ impl HarmonicBasis {
 
     /// Fractional (continuous) band edges `a_l`, `b_l` in DFT-bin units
     /// for harmonic `l` at fundamental `ω₀` — the un-rounded inputs to
-    /// [`bin_endpoints`]. Used by the `BLIP25_BIN_EDGE=frac` amplitude
+    /// [`Self::bin_endpoints`]. Used by the `BLIP25_BIN_EDGE=frac` amplitude
     /// integration to weight boundary bins by their coverage of the
     /// band `[a_l, b_l)` instead of the ceil-to-ceil integer rule (which
     /// drops the partial low-edge bin and loses band energy unevenly
