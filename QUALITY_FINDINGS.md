@@ -1003,6 +1003,21 @@ clean speech + added babble/vehicle noise at several SNRs, `ours→chip` vs
 > bias. Chip-parity fork DEFAULTS it OFF as of 2026-06-10 (`BLIP25_SPECSUB=1` recovers it)
 > (`spectral_subtraction_effective`, analysis/mod.rs).
 
+> **RESOLVED for blip25-mbe (2026-06-14, v0.2.0).** `spectral_subtraction` is
+> now **default OFF** here too — flipped in both `AnalysisState::new()`
+> (`analysis/mod.rs`) and `VocoderBuilder::new()` (`vocoder.rs`), opt-in via
+> `set_spectral_subtraction(true)`. Rationale: on the clean-speech corpus it is
+> a documented no-op (13/14 chip-A/B vectors byte-identical with it off) so the
+> headline speech PESQ matrix is unchanged; its only measured win is +0.08 on
+> one stationary tone (knox_1), against the pinned −0.46 dB self-priming
+> encode-gain bias above and the fact that it modified the **full-rate IMBE**
+> encode spectrum with no chip oracle and no per-path measurement. Defaulting
+> it off keeps the encoder closer to the no-suppression emulation target and
+> makes `AnalysisState::new()` fully spec-faithful (consistent with the other
+> encode-quality levers in that block, all default-spec). The post-decode
+> Classical enhancement chain stays default-ON (separate, measured +0.052 PESQ
+> win). If you want the knox_1 tone behavior back, opt in explicitly.
+
 > **IMPLEMENTED + MEASURED (2026-06-13) — `predenoise.rs` log-MMSE front-end,
 > a broadband-noise exceed lever.** Built the §3.4 stage for real (not the
 > crude fork probe): a **separable pre-PCM** streaming denoiser
@@ -1214,6 +1229,86 @@ The harness `our_encode_ambe_plus2` non-tone path still constructs the bare spec
 for future A/Bs. `--level-scale` (loudness parity, RMS→1.0), `--amp-frac-edges`,
 `--vuv-pitch-coef 0.0`, `--silence-shape-zero` stay opt-in. Reusable sweep tooling:
 `conformance/scripts/{lever_sweep.sh,analyze_levers.py,make_noisy.py}`.
+
+---
+
+## 3.7 (AUDIT 2026-06-14) Fork rounds 9–10 + APX handoff — disposition
+
+Audited everything the sister fork `ambe3000-clone` produced **after** the
+2026-06-13 §3.6 port — its campaign rounds 9–10 (commits `4c72a72`, `f2eb99d`,
+`8527dda`) and the `handoff/` APX-firmware RE package — against blip25-mbe's
+current code (adversarially verified, both repos). **Headline: nothing
+high-value remains unported.** The fork's later wins are *chip-bit-parity*
+wins on the fork's own goal; its own round-10 half-rate PESQ matrix
+(`pesq_hr_matrix_2026-06-11/results_r10.txt`) moved the encode side only
+−0.204 → −0.196 MOS across all of rounds 9–10 (flat, ~noise). For blip25-mbe's
+PESQ goal the leftovers are cheap alignments, blocked items, or untested
+hypotheses — none promises a measured PESQ delta. Disposition:
+
+**SKIP — bit-parity-only or blocked (do not port):**
+- **Onset voicing-extent ramp + cascade cap** (r9/r10, fork-PROMOTED, +4.91pp
+  b1-idx). Pure chip-bit-parity; the fork's own PESQ shows ~+0.008 MOS (flat).
+  The actionable lesson (hard-bound any classifier-driven suppression — the
+  fork's unbounded `M(ξ)<0.5` branch full-file-MUTED sustained voiced content)
+  is already in §3.6 note (3). The *perceptual* "attack-smoothness extent ramp"
+  is a **different, untested** hypothesis from what the fork shipped (a
+  parity-restoring devoice/sparsify rule) — see untested list below.
+- **MONO65 full-rate gain ladder** (§2.6) — **double-blocked.** (1) Provenance:
+  the −0.25·(8−k) low-8 downshift is reverse-engineered from the Motorola APX
+  firmware binary (`porcvn_HFWS_DFWA_1.bin`), the forbidden source class, and is
+  **not** re-derivable from Annex-E (whose published low-8 deltas are non-uniform
+  `[0.148,0.136,0.175,0.162,0.126,0.115,0.145]`, so a uniform −0.25 ramp
+  contradicts the spec). (2) No oracle: full-rate IMBE isn't chip-orackable
+  (AMBE-3000R is AMBE+2 only). Even the fork that owns the RE never wired MONO65
+  into its own decoder (`imbe_wire/dequantize.rs` still uses plain Annex-E). Only
+  legitimate route is a spec-author derivation into a TIA spec — a user/spec
+  decision, not an implementer port. Leave documented in §2.6, not actionable here.
+- **epcorr voicing feature** — round 10 *tested it as a lever and it FAILED*
+  (pooled b1-idx z −4.3…−7.8, LOVO picks "none" 14/14, and it **regresses tones**
+  — our known weak spot). Not "untested" (the §1 note's wording is stale); it's a
+  measured negative. Skip.
+- **PITCH_FIR 2-tap pitch smoother** — fork-WIRED-not-promoted, **blocked** on a
+  prerequisite (+0.3-sample §0.3 estimator bias at P≈28–36) *and* aimed at a
+  non-problem for us (§3.2: our §0.3 is already chip-grade on voiced speech, the
+  residual is an inaudible ±1 cloud). Skip until/unless §3.2 P≈28–36 bias is fixed.
+
+**CHEAP ALIGNMENT — clean provenance, ~zero cost, but expected PESQ ≈ 0 (do only
+if a PESQ A/B shows a delta; do NOT promote on the fork's parity numbers):**
+- **Analysis-window left-clip un-clip** (`retain_past_frame`). `extract_refinement_window`
+  (analysis/mod.rs ~924–936) zero-fills the left 30 samples — a genuine
+  asymmetric-window float bug (a 221-sample symmetric §0.2 window over a 160-sample
+  frame legitimately needs 30 past samples). It feeds the §0.5 amplitude and §0.7
+  V/UV legs that `no_refine` does **not** mitigate, so a small attack/transition
+  effect is plausible-but-unmeasured. ~10 lines, textbook DSP. **Do NOT** also port
+  the fork's `+48` forward shift — that's a half-rate-only, un-derived chip-parity
+  frame-phase convention (Bucket A) that hurts pitch refinement and adds level loss.
+- **Decode regen scale → 0.4** (keep the `l≤L̃/4` exemption; do **not** add
+  `REGEN_ALL`). We currently run the full patent γ=0.44 (effective scale 1.0); the
+  chip's measured effective scale is ~0.4× (γ≈0.18). One-line const, chip-observed
+  provenance. Fork verdict: "a small parity refinement, not a quality unlock"
+  (OFF→full-patent moves the synth residual only ~0.3°). Note this *would* change
+  the production AMBE+2 decode default, so gate/measure before promoting.
+- **Silence-envelope b3 "residual" mode** — a genuine refinement over our cruder
+  `silence_shape_zero`: we shipped the inferior *lam* variant (geometric-mean
+  flatten of M̂ pre-prediction, PRBA-only, full-160 RMS gate), which the fork's
+  LOVO found strictly worse than the *residual* mode (scale the post-prediction
+  log-residual T̃→0, covering **both** PRBA and HOC, gated on the 221-sample
+  amplitude-window RMS). Fork ships it default-ON; ours is opt-in/off. Audio delta
+  measured inaudible (0.74% energy). Port only if a half-rate PESQ A/B vs our
+  existing `silence_shape_zero` on a silence-gap corpus shows a non-trivial delta.
+
+**UNTESTED QUALITY HYPOTHESES — worth a fresh PESQ/STOI A/B (not a port of fork
+parity work); nobody has run these:**
+- **Onset voicing-EXTENT ramp as attack-smoothness** (distinct from the fork's
+  parity devoice rule): a 1–2-frame voiced-band ramp at voiced-run onsets, judged
+  by PESQ+STOI on plosive-rich speech (§2.4 tie-in).
+- **Onset voiced-phase reset** (`PHASE_UV_RESET`): the chip cold-starts its
+  voiced-phase synth at every voiced frame following an unvoiced frame (chip probe:
+  onset phase == cold start to 2.3°, history-independent). This is the one phase
+  lever that changes phase exactly where the ear is sensitive (onsets/transients),
+  unlike steady-voiced φ₀/regen which are inaudible (§Framing). A/B for onset
+  crispness. The φ₀ pitch law (`PHASE_CW`, CW=−22.6/C=+2.19) is a weaker companion
+  (parity +0.5 dB SNR, but mostly steady-voiced = inaudible).
 
 ---
 

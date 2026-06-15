@@ -651,11 +651,17 @@ impl AnalysisState {
             default_pitch_on_silence_enabled: false,
             pyin_pitch_enabled: false,
             pyin_hmm: PyinHmmState::new(),
-            // Spectral subtraction: ON by default. 5-vector A/B
-            // (2026-05-14): 0 speech impact, +0.08 knox_1, −0.01 alert.
-            // Effectively free PESQ on noisy stationary content; cleared
-            // for default-on after the §0.5 noise-sensitivity push.
-            spectral_subtraction_enabled: true,
+            // Spectral subtraction: OFF by default (opt-in via
+            // `set_spectral_subtraction(true)`). It is a documented no-op on
+            // clean speech (13/14 chip-A/B vectors byte-identical with it
+            // off) and its only measured win is +0.08 PESQ on one stationary
+            // tone (knox_1). Meanwhile its noise estimator self-primes on
+            // sustained tonal/stationary content, latching a −0.46 dB
+            // motion-dependent encode-gain bias the DVSI chip never applies
+            // (QUALITY_FINDINGS.md §3, "DEFECT PINNED"). Kept opt-in like the
+            // §3.4 denoiser / hum-notch; this also makes `new()` fully
+            // spec-faithful, matching the rest of this block.
+            spectral_subtraction_enabled: false,
             noise_spectrum: NoiseSpectrum::new(),
             amp_ema_alpha: 0.0,
             prev_m_hat: [0.0; L_HAT_MAX as usize + 1],

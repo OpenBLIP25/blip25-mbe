@@ -1507,12 +1507,13 @@ pub struct VocoderBuilder {
 
 impl VocoderBuilder {
     /// New builder defaulting to the same configuration as
-    /// [`Vocoder::new`] — i.e. Classical enhancement chain and §0.5
-    /// spectral subtraction are ON, since both are free PESQ wins
-    /// (see 5-vector A/B 2026-05-14). All other knobs default OFF /
-    /// spec-faithful. Use the setters to opt out (e.g.
-    /// `.enhancement(EnhancementMode::None).spectral_subtraction(false)`
-    /// for fully spec-faithful output).
+    /// [`Vocoder::new`] — i.e. the Classical post-decode enhancement chain
+    /// is ON (a measured +0.052 PESQ avg win). §0.5 spectral subtraction is
+    /// OFF / opt-in (it is a no-op on clean speech and carries a pinned
+    /// encode-gain-bias defect — see [`Vocoder::set_spectral_subtraction`]).
+    /// All other knobs default OFF / spec-faithful. Opt out of enhancement
+    /// with `.enhancement(EnhancementMode::None)` for fully spec-faithful
+    /// PCM, or opt INTO subtraction with `.spectral_subtraction(true)`.
     #[inline]
     pub fn new(rate: Rate) -> Self {
         Self {
@@ -1524,7 +1525,7 @@ impl VocoderBuilder {
             pitch_silence_override: false,
             default_pitch_on_silence: false,
             pyin_pitch: false,
-            spectral_subtraction: true,
+            spectral_subtraction: false,
             amp_ema_alpha: 0.0,
             ambe_plus2_synth: AmbePlus2Synth::AmbePlus,
             enhancement: EnhancementMode::Classical(

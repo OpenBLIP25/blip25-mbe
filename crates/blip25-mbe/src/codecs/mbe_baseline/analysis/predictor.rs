@@ -410,8 +410,10 @@ impl HalfratePredictorState {
     pub(super) fn read(&self, l: u32) -> f64 {
         let l_prev = self.l_tilde_prev as usize;
         if l == 0 {
-            // Eq. 156: Λ̃_0 tracks Λ̃_1.
-            return self.lambda_tilde_prev[1.min(l_prev.max(1))];
+            // Eq. 156: Λ̃_0 tracks Λ̃_1. Index 1 is always in range (the
+            // array holds L_HAT_MAX+1 ≥ 2 entries) and is the spec target
+            // regardless of L̃(−1), so read it directly.
+            return self.lambda_tilde_prev[1];
         }
         let clamped = (l as usize).min(l_prev.max(1));
         self.lambda_tilde_prev[clamped]

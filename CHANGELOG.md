@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-06-14
+
 ### Changed
 
 - **Wire modules renamed by DVSI rate, not protocol** (breaking):
@@ -19,6 +21,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ambe_plus2_wire::frame::R34_BIT_ORDER` is now
   `rate33::frame::R34_BIT_ORDER`. Pure rename, no behavior change
   (full + half-rate DVSI gain vectors and all tests bit-identical).
+- **Production AMBE+2 encode stack is now the half-rate default** (encode
+  behavior change). `Vocoder::new(AmbePlus2_*)` enables a chip-validated
+  encode-quality stack — octave-escape pitch guard, parabolic sub-sample
+  pitch, §0.4 refine-off, and a hard-bounded M(ξ) voicing relaxation
+  (cannot mute) — for a measured **+0.060 PESQ-nb** in the ours→chip cell.
+  Gated to AMBE+2 only (the sole chip-orackable codec); full-rate IMBE
+  stays bit-for-bit spec-faithful. Opt out per-lever via the `set_*`
+  methods. `AnalysisState::new()` itself remains the spec-faithful
+  clean-room baseline.
+- **`spectral_subtraction` now defaults OFF** (encode behavior change).
+  The §0.5 Boll input-side noise subtraction is now opt-in
+  (`set_spectral_subtraction(true)` / `VocoderBuilder::spectral_subtraction`),
+  matching the §3.4 denoiser and hum-notch. It is a no-op on clean speech
+  and its noise estimator self-primes on sustained tonal content (a pinned
+  −0.46 dB motion-dependent encode-gain bias the DVSI chip never applies);
+  defaulting it off keeps the encoder closer to the emulation target and
+  makes `AnalysisState::new()` fully spec-faithful. The post-decode
+  Classical enhancement chain remains ON by default (a measured PESQ win;
+  opt out with `set_enhancement(EnhancementMode::None)`).
+
+### Added
+
+- **`dvsi_soft_decision` module** — DVSI soft-decision chip handoff: the
+  4-bit soft-decision (LLR) packet format, `pack_channel_bits` /
+  `unpack_packet`, nibble-stream helpers, and the `SdPacketHeader` /
+  `SoftDecisionError` types, for soft-FEC interchange with DVSI hardware.
+- **Opt-in pre-analysis denoiser front-ends** (§3.4, all default OFF):
+  - log-MMSE STFT denoiser with an IMCRA babble-noise tracker
+    (`PreDenoise`, `DenoiseKind`; `Vocoder::set_denoise` /
+    `set_denoise_kind`) — a broadband-noise *exceed* lever (up to
+    +0.41 PESQ vs chip on white noise) for noisy field audio.
+  - 60/120 Hz mains-hum notch (`HumNotch`; `Vocoder::set_hum_notch` /
+    `set_hum_notch_mains`) — chip-beating on hum-contaminated input.
+- **Encode-quality setters on `Vocoder`** — `set_pitch_decide_escape`,
+  `set_pitch_subsample`, `set_pitch_refine`, `set_vuv_mxi_grade`,
+  `set_vuv_pitch_coef`, `set_amp_frac_band_edges`, `set_level_scale`,
+  `set_silence_shape_zero`, plus matching getters, for per-lever control
+  of the encode stack above.
+- **Protocol-agnostic codec FEC core** — the `rate33` codec/FEC layer is
+  now exposed as a reuse boundary for other half-rate AMBE+2 carriers
+  (DMR/NXDN/P25 Phase 2); see `docs/wire_formats_and_storage.md`.
+
+### Fixed
+
+- **`predictor::read(0)` index arithmetic** — simplified a `min`/`max`
+  combination that always evaluated to a constant (clippy `min_max`
+  correctness lint) to the equivalent direct index; no behavior change.
 
 ## [0.1.1] - 2026-05-31
 
@@ -99,5 +148,7 @@ patent caveat (US8359197 active until 2028-05-20).
   DVSI AMBE-3000R hardware. No code or algorithms imported from
   existing open-source MBE projects.
 
-[Unreleased]: https://github.com/openBLIP25/blip25-mbe/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/openBLIP25/blip25-mbe/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/openBLIP25/blip25-mbe/compare/v0.1.1...v0.2.0
+[0.1.1]: https://github.com/openBLIP25/blip25-mbe/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/openBLIP25/blip25-mbe/releases/tag/v0.1.0
