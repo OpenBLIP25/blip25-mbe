@@ -32,31 +32,40 @@ codec and wire layers, not a sub-concern of either.
 
 ## Public API Surface
 
-A consumer imports only these:
+Most consumers should use the [`Vocoder`](#chip-shaped-façade-vocoder)
+façade below — it owns the per-rate state and wraps everything here behind
+one handle. The layered free-function API it is built on (rustdoc has the
+exact signatures) is:
 
-```rust
-// Wire layer — bits ↔ MbeParams
-blip25_mbe::imbe7200::Frame::decode(bits: &[u8])       -> Result<MbeParams>
-blip25_mbe::imbe7200::Frame::decode_soft(soft: &[i8])  -> Result<MbeParams>
-blip25_mbe::rate33::Frame::decode(bits: &[u8])       -> Result<(MbeParams, FrameKind)>
-blip25_mbe::rate33::Frame::decode_soft(soft: &[i8])  -> Result<(MbeParams, FrameKind)>
-blip25_mbe::dvsi_3000::Frame::decode(bits: &[u8], rate: RateConfig) -> Result<MbeParams>
+```text
+// Wire layer — channel bits → Frame (FEC) → MbeParams (dequantize, carries
+// per-stream decoder state). Two steps, one per rate module.
+imbe7200::frame::decode_frame(&[u8; 72]) -> Frame                  // full-rate IMBE, 7200 bps
+imbe7200::frame::decode_frame_soft(&[i8; SOFT_BITS]) -> Frame
+imbe7200::dequantize::dequantize(&frame.info, &mut DecoderState) -> Result<MbeParams>
+rate33::frame::decode_frame(&[u8; DIBITS_PER_FRAME]) -> Frame      // half-rate AMBE+2, DVSI rate 33
+rate33::frame::decode_frame_soft(&[i8; SOFT_BITS]) -> Frame
+rate33::dequantize::dequantize(&frame.info, &mut DecoderState) -> Result<MbeParams>
 
-// Codec layer — MbeParams ↔ PCM
-blip25_mbe::codecs::<gen>::Synthesizer::synthesize(&params, &prev) -> Vec<f32>
-blip25_mbe::codecs::<gen>::Analyzer::analyze(&pcm)                 -> MbeParams
+// Codec layer — MbeParams ↔ PCM. <gen> ∈ { mbe_baseline, ambe, ambe_plus, ambe_plus2 }.
+codecs::<gen>::synthesize_frame(&MbeParams, &mut SynthState) -> [i16; SAMPLES_PER_FRAME]
+codecs::mbe_baseline::analysis::{encode, encode_with_trace, encode_ambe_plus2}  // PCM → params/bits
 
-// Parameter layer — the common type
-blip25_mbe::mbe_params::MbeParams
+// Parameter layer — the common interchange type
+mbe_params::MbeParams
 
-// Rate conversion — no codec, no PCM
-blip25_mbe::rate_conversion::transcode(&params, target: RateConfig) -> Vec<u8>
+// Rate conversion — parameter-domain bits → bits, no PCM
+rate_conversion::{FullToHalfConverter, HalfToFullConverter}  // ::new(); .convert(&[u8; N]) -> Result<[u8; M]>
 
-// Shared FEC (re-exported, consumers may use directly)
-blip25_mbe::fec::{golay, hamming, soft_golay, soft_hamming}
+// Shared FEC primitives (consumers may use directly)
+fec::{golay_23_12_decode, golay_24_12_decode, hamming_15_11_decode,
+      golay_23_12_decode_soft, golay_24_12_decode_soft, hamming_15_11_decode_soft, FecDecoded}
 ```
 
-Wire `Frame::decode` is authoritative for its wire. Consumers should not
+(`dvsi_3000::frame`, a generic r0..r63 rate-configured wire parser, is a
+planned module — currently a stub, not yet a usable entry point.)
+
+`decode_frame` is authoritative for its wire. Consumers should not
 re-implement interleave patterns, FEC polynomial application, or priority
 bit ordering — those are the chip's job.
 
@@ -190,8 +199,11 @@ so future protocol consumers do not re-derive them.
 Detection is wire-layer (a specific bit pattern in the 72-bit AMBE+2
 frame). Synthesis is codec-layer (dual-sinusoid DTMF / ringback).
 
-- `rate33::Frame::decode` returns `FrameKind::{Voice(MbeParams), Tone(ToneParams)}`.
-- `codecs::<gen>::synthesize_tone(&ToneParams)` renders audio.
+- `rate33::dequantize::classify_ambe_plus2_frame(&[u16; 4]) -> FrameKind`
+  classifies a frame as `Voice`, `Tone`, or `Erasure`; `parse_tone_frame`
+  extracts the `ToneFrameFields` and `tone_to_mbe_params(id, amplitude)`
+  converts a detected tone into synthesizable `MbeParams`.
+- `codecs::<gen>::synthesize_tone(&MbeParams, &mut SynthState)` renders audio.
 
 ### Spectral enhancement
 
