@@ -2,8 +2,8 @@
 //! `frame_disposition` directly with the per-frame ε_t / ε_0 from
 //! `decode_frame`, mirroring the smoothed ε_R update the synth applies.
 
-use blip25_mbe::codecs::mbe_baseline::{FrameDisposition, FrameErrorContext, frame_disposition};
-use blip25_mbe::imbe7200::dequantize::{DecodeError, DecoderState, dequantize};
+use blip25_mbe::codecs::mbe_baseline::{frame_disposition, FrameDisposition, FrameErrorContext};
+use blip25_mbe::imbe7200::dequantize::{dequantize, DecodeError, DecoderState};
 use blip25_mbe::imbe7200::frame::decode_frame;
 use std::fs;
 

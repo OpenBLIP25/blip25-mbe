@@ -139,7 +139,9 @@ mod tests {
 
     fn tone(freq: f64, n: usize, amp: f64) -> Vec<i16> {
         (0..n)
-            .map(|i| (amp * (2.0 * core::f64::consts::PI * freq * i as f64 / SAMPLE_RATE).sin()) as i16)
+            .map(|i| {
+                (amp * (2.0 * core::f64::consts::PI * freq * i as f64 / SAMPLE_RATE).sin()) as i16
+            })
             .collect()
     }
 

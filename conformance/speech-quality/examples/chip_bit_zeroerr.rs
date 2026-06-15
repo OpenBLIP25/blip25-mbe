@@ -4,8 +4,8 @@
 //! reporting triggering spurious MUTE/REPEAT disposition; if it's
 //! still silent, the recovered params themselves are wrong.
 
-use blip25_mbe::codecs::mbe_baseline::{FrameErrorContext, GAMMA_W, SynthState, synthesize_frame};
-use blip25_mbe::imbe7200::dequantize::{DecoderState, dequantize};
+use blip25_mbe::codecs::mbe_baseline::{synthesize_frame, FrameErrorContext, SynthState, GAMMA_W};
+use blip25_mbe::imbe7200::dequantize::{dequantize, DecoderState};
 use blip25_mbe::imbe7200::frame::decode_frame;
 use std::fs;
 
@@ -55,9 +55,7 @@ fn write_wav(path: &str, samples: &[i16]) {
 
 fn main() {
     let path = std::env::args().nth(1).expect("bit file arg");
-    let out_path = std::env::args()
-        .nth(2)
-        .expect("out wav arg");
+    let out_path = std::env::args().nth(2).expect("out wav arg");
     let bytes = fs::read(&path).unwrap();
     let n = bytes.len() / FRAME_BYTES;
     let mut dec_state = DecoderState::new();

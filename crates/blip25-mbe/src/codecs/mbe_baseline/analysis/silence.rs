@@ -155,9 +155,15 @@ mod tests {
         assert!(!d.is_silent(), "loud frames should not be silent");
         // Now feed silent frames.
         for i in 0..SILENCE_ENTER_FRAMES {
-            assert!(!d.is_silent(), "should not be silent before {i} silent frames");
+            assert!(
+                !d.is_silent(),
+                "should not be silent before {i} silent frames"
+            );
             d.update(0.0);
         }
-        assert!(d.is_silent(), "should have entered silence after enter-hysteresis");
+        assert!(
+            d.is_silent(),
+            "should have entered silence after enter-hysteresis"
+        );
     }
 }

@@ -21,8 +21,8 @@ fn main() {
     let samples_per_frame = 160;
     let n_frames = 100;
     let jump_frame = 50;
-    let f_low = 200.0f32;  // steady-state pitch
-    let f_high = 80.0f32;  // jump-frame pitch (lower freq → more harmonics, larger L)
+    let f_low = 200.0f32; // steady-state pitch
+    let f_high = 80.0f32; // jump-frame pitch (lower freq → more harmonics, larger L)
     let amp = 4000.0f32;
 
     // Build PCM: continuous phase across the jump to avoid click that
@@ -35,7 +35,9 @@ fn main() {
         for _ in 0..samples_per_frame {
             pcm.push((amp * phase.sin()).round() as i16);
             phase += dphase;
-            while phase >= 2.0 * PI { phase -= 2.0 * PI; }
+            while phase >= 2.0 * PI {
+                phase -= 2.0 * PI;
+            }
         }
     }
 
@@ -47,7 +49,12 @@ fn main() {
         let b = v.encode_pcm(chunk).expect("encode");
         all_bits.extend(b);
     }
-    eprintln!("Wrote {} frames ({} bytes/frame, {} total bytes); jump at f={} (200 Hz → 80 Hz)",
-              n_frames, frame_bytes, all_bits.len(), jump_frame);
+    eprintln!(
+        "Wrote {} frames ({} bytes/frame, {} total bytes); jump at f={} (200 Hz → 80 Hz)",
+        n_frames,
+        frame_bytes,
+        all_bits.len(),
+        jump_frame
+    );
     std::io::stdout().write_all(&all_bits).unwrap();
 }

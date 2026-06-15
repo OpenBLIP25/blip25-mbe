@@ -12,7 +12,11 @@ fn main() {
         .nth(2)
         .map(|s| s.parse().expect("max-dist"))
         .unwrap_or(3);
-    println!("target 0x{:07x} (binary {:023b})", target & 0x7f_ffff, target & 0x7f_ffff);
+    println!(
+        "target 0x{:07x} (binary {:023b})",
+        target & 0x7f_ffff,
+        target & 0x7f_ffff
+    );
     let mut hist = [0u32; 24];
     for info in 0u16..=0xFFF {
         let cw = golay_23_12_encode(info);

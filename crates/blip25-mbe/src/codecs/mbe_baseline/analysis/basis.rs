@@ -142,12 +142,7 @@ impl HarmonicBasis {
     /// (empty support — e.g. a degenerate `ω₀` that collapses
     /// `⌈a_l⌉ = ⌈b_l⌉`). This is a numerical guard, not an expected
     /// condition for admissible `ω₀ ∈ [2π/123.125, 2π/19.875]`.
-    pub fn harmonic_amplitude(
-        &self,
-        sw: &[Complex64; DFT_SIZE],
-        l: u32,
-        omega0: f64,
-    ) -> Complex64 {
+    pub fn harmonic_amplitude(&self, sw: &[Complex64; DFT_SIZE], l: u32, omega0: f64) -> Complex64 {
         let (m_lo, m_hi) = Self::bin_endpoints(l, omega0);
         let bin_scale = WINDOW_DFT_SIZE as f64 / (2.0 * core::f64::consts::PI);
         let l_offset = bin_scale * f64::from(l) * omega0;
@@ -207,10 +202,12 @@ impl Default for HarmonicBasis {
 /// preserved as the spec-correctness reference in the test below.
 /// FFT is general DSP, not P25 IP, so the swap is allowed under the
 /// clean-room rule.
-pub fn signal_spectrum(signal_centered: &[f64; (2 * W_R_HALF + 1) as usize]) -> [Complex64; DFT_SIZE] {
-    use std::sync::OnceLock;
+pub fn signal_spectrum(
+    signal_centered: &[f64; (2 * W_R_HALF + 1) as usize],
+) -> [Complex64; DFT_SIZE] {
     use num_complex::Complex;
     use rustfft::{Fft, FftPlanner};
+    use std::sync::OnceLock;
 
     static FFT: OnceLock<std::sync::Arc<dyn Fft<f64>>> = OnceLock::new();
     let fft = FFT.get_or_init(|| {
@@ -393,8 +390,7 @@ mod tests {
         let two_pi = 2.0 * core::f64::consts::PI;
         for (i, slot) in signal.iter_mut().enumerate() {
             let n = i as f64 - W_R_HALF as f64;
-            *slot = 100.0 + 1000.0 * (two_pi * n / 50.0).sin()
-                + 500.0 * (two_pi * n / 23.5).cos();
+            *slot = 100.0 + 1000.0 * (two_pi * n / 50.0).sin() + 500.0 * (two_pi * n / 23.5).cos();
         }
         let fft = signal_spectrum(&signal);
         let dir = signal_spectrum_direct_reference(&signal);

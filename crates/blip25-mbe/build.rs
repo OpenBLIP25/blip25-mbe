@@ -44,8 +44,8 @@ fn gen_annex_h(out_dir: &PathBuf) {
     let csv_path = "spec_tables/annex_h_interleave.csv";
     println!("cargo:rerun-if-changed={csv_path}");
 
-    let content = fs::read_to_string(csv_path)
-        .unwrap_or_else(|e| panic!("failed to read {csv_path}: {e}"));
+    let content =
+        fs::read_to_string(csv_path).unwrap_or_else(|e| panic!("failed to read {csv_path}: {e}"));
 
     let mut entries: Vec<(u8, u8, u8, u8)> = Vec::with_capacity(72);
     for (lineno, raw) in content.lines().enumerate() {
@@ -130,8 +130,8 @@ fn gen_annex_e(out_dir: &PathBuf) {
     let csv_path = "spec_tables/annex_e_gain_quantizer.csv";
     println!("cargo:rerun-if-changed={csv_path}");
 
-    let content = fs::read_to_string(csv_path)
-        .unwrap_or_else(|e| panic!("failed to read {csv_path}: {e}"));
+    let content =
+        fs::read_to_string(csv_path).unwrap_or_else(|e| panic!("failed to read {csv_path}: {e}"));
 
     let mut levels: Vec<f32> = Vec::with_capacity(64);
     for (lineno, raw) in content.lines().enumerate() {
@@ -182,8 +182,8 @@ fn gen_annex_f(out_dir: &PathBuf) {
     let csv_path = "spec_tables/annex_f_gain_allocation.csv";
     println!("cargo:rerun-if-changed={csv_path}");
 
-    let content = fs::read_to_string(csv_path)
-        .unwrap_or_else(|e| panic!("failed to read {csv_path}: {e}"));
+    let content =
+        fs::read_to_string(csv_path).unwrap_or_else(|e| panic!("failed to read {csv_path}: {e}"));
 
     // [L_idx][m_idx] = (B_m, Delta_m)
     let mut table: Vec<Vec<(u8, f32)>> = (0..48).map(|_| Vec::with_capacity(5)).collect();
@@ -250,8 +250,8 @@ fn gen_annex_g(out_dir: &PathBuf) {
     let csv_path = "spec_tables/annex_g_hoc_allocation.csv";
     println!("cargo:rerun-if-changed={csv_path}");
 
-    let content = fs::read_to_string(csv_path)
-        .unwrap_or_else(|e| panic!("failed to read {csv_path}: {e}"));
+    let content =
+        fs::read_to_string(csv_path).unwrap_or_else(|e| panic!("failed to read {csv_path}: {e}"));
 
     let mut per_l: Vec<Vec<(u8, u8, u8, u8)>> = (0..48).map(|_| Vec::new()).collect();
 
@@ -344,8 +344,8 @@ fn gen_annex_b(out_dir: &PathBuf) {
     let csv_path = "spec_tables/annex_b_analysis_window.csv";
     println!("cargo:rerun-if-changed={csv_path}");
 
-    let content = fs::read_to_string(csv_path)
-        .unwrap_or_else(|e| panic!("failed to read {csv_path}: {e}"));
+    let content =
+        fs::read_to_string(csv_path).unwrap_or_else(|e| panic!("failed to read {csv_path}: {e}"));
 
     let mut samples: Vec<(i32, f32)> = Vec::with_capacity(301);
     for (lineno, raw) in content.lines().enumerate() {
@@ -415,8 +415,8 @@ fn gen_annex_c(out_dir: &PathBuf) {
     let csv_path = "spec_tables/annex_c_pitch_refinement_window.csv";
     println!("cargo:rerun-if-changed={csv_path}");
 
-    let content = fs::read_to_string(csv_path)
-        .unwrap_or_else(|e| panic!("failed to read {csv_path}: {e}"));
+    let content =
+        fs::read_to_string(csv_path).unwrap_or_else(|e| panic!("failed to read {csv_path}: {e}"));
 
     let mut samples: Vec<(i32, f32)> = Vec::with_capacity(221);
     for (lineno, raw) in content.lines().enumerate() {
@@ -539,8 +539,7 @@ fn gen_annex_d(out_dir: &PathBuf) {
     }
     out.push_str("];\n");
 
-    fs::write(out_dir.join("annex_d_lpf.rs"), out)
-        .expect("write annex_d_lpf.rs");
+    fs::write(out_dir.join("annex_d_lpf.rs"), out).expect("write annex_d_lpf.rs");
 }
 
 /// `$OUT_DIR/annex_i_synth_window.rs`, emitting `IMBE_SYNTH_WINDOW`
@@ -552,8 +551,8 @@ fn gen_annex_i(out_dir: &PathBuf) {
     let csv_path = "spec_tables/annex_i_synthesis_window.csv";
     println!("cargo:rerun-if-changed={csv_path}");
 
-    let content = fs::read_to_string(csv_path)
-        .unwrap_or_else(|e| panic!("failed to read {csv_path}: {e}"));
+    let content =
+        fs::read_to_string(csv_path).unwrap_or_else(|e| panic!("failed to read {csv_path}: {e}"));
 
     let mut samples: Vec<(i32, f32)> = Vec::with_capacity(211);
     for (lineno, raw) in content.lines().enumerate() {
@@ -610,8 +609,7 @@ fn gen_annex_i(out_dir: &PathBuf) {
     }
     out.push_str("];\n");
 
-    fs::write(out_dir.join("annex_i_synth_window.rs"), out)
-        .expect("write annex_i_synth_window.rs");
+    fs::write(out_dir.join("annex_i_synth_window.rs"), out).expect("write annex_i_synth_window.rs");
 }
 
 /// Parse `spec_tables/annex_j_block_lengths.csv` into
@@ -622,8 +620,8 @@ fn gen_annex_j(out_dir: &PathBuf) {
     let csv_path = "spec_tables/annex_j_block_lengths.csv";
     println!("cargo:rerun-if-changed={csv_path}");
 
-    let content = fs::read_to_string(csv_path)
-        .unwrap_or_else(|e| panic!("failed to read {csv_path}: {e}"));
+    let content =
+        fs::read_to_string(csv_path).unwrap_or_else(|e| panic!("failed to read {csv_path}: {e}"));
 
     let mut blocks: Vec<[u8; 6]> = Vec::with_capacity(48);
 
@@ -642,7 +640,11 @@ fn gen_annex_j(out_dir: &PathBuf) {
         );
         let l: u8 = cols[0].parse().expect("L");
         assert!((9..=56).contains(&l));
-        assert_eq!((l - 9) as usize, blocks.len(), "annex J rows must be sequential");
+        assert_eq!(
+            (l - 9) as usize,
+            blocks.len(),
+            "annex J rows must be sequential"
+        );
         let mut row = [0u8; 6];
         for i in 0..6 {
             row[i] = cols[i + 1].parse().expect("J_i");
@@ -657,7 +659,10 @@ fn gen_annex_j(out_dir: &PathBuf) {
             assert!(j >= lo && j <= hi, "annex J: L={l}, J̃ out of range");
         }
         for i in 0..5 {
-            assert!(row[i] <= row[i + 1], "annex J: L={l} blocks not non-decreasing");
+            assert!(
+                row[i] <= row[i + 1],
+                "annex J: L={l} blocks not non-decreasing"
+            );
         }
         blocks.push(row);
     }
@@ -670,7 +675,13 @@ fn gen_annex_j(out_dir: &PathBuf) {
     for (l_idx, row) in blocks.iter().enumerate() {
         out.push_str(&format!(
             "    [{}, {}, {}, {}, {}, {}], // L = {}\n",
-            row[0], row[1], row[2], row[3], row[4], row[5], l_idx + 9
+            row[0],
+            row[1],
+            row[2],
+            row[3],
+            row[4],
+            row[5],
+            l_idx + 9
         ));
     }
     out.push_str("];\n");
@@ -690,8 +701,8 @@ fn gen_annex_s(out_dir: &PathBuf) {
     let csv_path = "spec_tables/annex_s_interleave.csv";
     println!("cargo:rerun-if-changed={csv_path}");
 
-    let content = fs::read_to_string(csv_path)
-        .unwrap_or_else(|e| panic!("failed to read {csv_path}: {e}"));
+    let content =
+        fs::read_to_string(csv_path).unwrap_or_else(|e| panic!("failed to read {csv_path}: {e}"));
 
     let mut entries: Vec<(u8, u8, u8, u8)> = Vec::with_capacity(36);
     for (lineno, raw) in content.lines().enumerate() {
@@ -715,7 +726,11 @@ fn gen_annex_s(out_dir: &PathBuf) {
         let bit1_idx: u8 = cols[2].parse().expect("bit1_index");
         let bit0_vec: u8 = cols[3].parse().expect("bit0_vector");
         let bit0_idx: u8 = cols[4].parse().expect("bit0_index");
-        assert_eq!(symbol, entries.len(), "Annex S symbols must be sequential 0..36");
+        assert_eq!(
+            symbol,
+            entries.len(),
+            "Annex S symbols must be sequential 0..36"
+        );
         assert!(bit1_vec < 4 && bit0_vec < 4, "vector index out of range");
         entries.push((bit1_vec, bit1_idx, bit0_vec, bit0_idx));
     }
@@ -770,8 +785,8 @@ fn parse_csv_rows(
     mut row_fn: impl FnMut(usize, &[&str]),
 ) -> usize {
     println!("cargo:rerun-if-changed={csv_path}");
-    let content = fs::read_to_string(csv_path)
-        .unwrap_or_else(|e| panic!("failed to read {csv_path}: {e}"));
+    let content =
+        fs::read_to_string(csv_path).unwrap_or_else(|e| panic!("failed to read {csv_path}: {e}"));
     let mut count = 0;
     let mut saw_header = false;
     for (lineno, raw) in content.lines().enumerate() {
@@ -779,7 +794,12 @@ fn parse_csv_rows(
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        if !saw_header && line.chars().next().map_or(false, |c| c.is_ascii_alphabetic()) {
+        if !saw_header
+            && line
+                .chars()
+                .next()
+                .map_or(false, |c| c.is_ascii_alphabetic())
+        {
             saw_header = true;
             continue;
         }
@@ -809,19 +829,15 @@ fn parse_csv_rows(
 fn gen_annex_l(out_dir: &PathBuf) {
     let two_pi = 2.0 * std::f32::consts::PI;
     let mut entries: Vec<(u8, u8, f32)> = Vec::with_capacity(120);
-    parse_csv_rows(
-        "spec_tables/annex_l_pitch_table.csv",
-        3,
-        |row_idx, cols| {
-            let b0: u8 = cols[0].parse().expect("b0");
-            let l: u8 = cols[1].parse().expect("L");
-            let w_cycles: f32 = cols[2].parse().expect("omega_0");
-            assert_eq!(b0 as usize, row_idx, "Annex L must be sequential");
-            assert!((9..=56).contains(&l), "Annex L L={l} out of range");
-            assert!(w_cycles > 0.0, "Annex L omega_0 must be positive");
-            entries.push((b0, l, w_cycles * two_pi));
-        },
-    );
+    parse_csv_rows("spec_tables/annex_l_pitch_table.csv", 3, |row_idx, cols| {
+        let b0: u8 = cols[0].parse().expect("b0");
+        let l: u8 = cols[1].parse().expect("L");
+        let w_cycles: f32 = cols[2].parse().expect("omega_0");
+        assert_eq!(b0 as usize, row_idx, "Annex L must be sequential");
+        assert!((9..=56).contains(&l), "Annex L L={l} out of range");
+        assert!(w_cycles > 0.0, "Annex L omega_0 must be positive");
+        entries.push((b0, l, w_cycles * two_pi));
+    });
     assert_eq!(entries.len(), 120, "Annex L must have 120 entries");
     // ω₀ strictly decreases with b̂₀.
     for w in entries.windows(2) {
@@ -831,7 +847,9 @@ fn gen_annex_l(out_dir: &PathBuf) {
     let mut out = String::new();
     out.push_str("// Auto-generated from spec_tables/annex_l_pitch_table.csv\n");
     out.push_str("// CSV stores cycles/sample; values converted to rad/sample at load.\n");
-    out.push_str("/// AMBE+2 half-rate Annex L pitch quantization table (120 entries indexed by `b̂₀`).\n");
+    out.push_str(
+        "/// AMBE+2 half-rate Annex L pitch quantization table (120 entries indexed by `b̂₀`).\n",
+    );
     out.push_str("pub const AMBE_PITCH_TABLE: [PitchEntry; 120] = [\n");
     for (_, l, w) in &entries {
         out.push_str(&format!("    PitchEntry {{ l: {l}, omega_0: {w:.6} }},\n"));
@@ -867,8 +885,14 @@ fn gen_annex_m(out_dir: &PathBuf) {
     for row in &rows {
         out.push_str(&format!(
             "    [{}, {}, {}, {}, {}, {}, {}, {}],\n",
-            row[0] == 1, row[1] == 1, row[2] == 1, row[3] == 1,
-            row[4] == 1, row[5] == 1, row[6] == 1, row[7] == 1,
+            row[0] == 1,
+            row[1] == 1,
+            row[2] == 1,
+            row[3] == 1,
+            row[4] == 1,
+            row[5] == 1,
+            row[6] == 1,
+            row[7] == 1,
         ));
     }
     out.push_str("];\n");
@@ -902,7 +926,11 @@ fn gen_annex_n(out_dir: &PathBuf) {
     for (l_idx, r) in rows.iter().enumerate() {
         out.push_str(&format!(
             "    [{}, {}, {}, {}], // L = {}\n",
-            r[0], r[1], r[2], r[3], l_idx + 9
+            r[0],
+            r[1],
+            r[2],
+            r[3],
+            l_idx + 9
         ));
     }
     out.push_str("];\n");
@@ -929,7 +957,9 @@ fn gen_annex_o(out_dir: &PathBuf) {
 
     let mut out = String::new();
     out.push_str("// Auto-generated from spec_tables/annex_o_gain_quantizer.csv\n");
-    out.push_str("/// AMBE+2 half-rate Annex O differential-gain levels (32 entries indexed by `b̂₂`).\n");
+    out.push_str(
+        "/// AMBE+2 half-rate Annex O differential-gain levels (32 entries indexed by `b̂₂`).\n",
+    );
     out.push_str("pub const AMBE_GAIN_LEVELS: [f32; 32] = [\n");
     for (i, lvl) in levels.iter().enumerate() {
         out.push_str(&format!("    {lvl:.6}, // b̂₂ = {i}\n"));
@@ -958,7 +988,9 @@ fn gen_annex_p(out_dir: &PathBuf) {
 
     let mut out = String::new();
     out.push_str("// Auto-generated from spec_tables/annex_p_prba24_codebook.csv\n");
-    out.push_str("/// AMBE+2 half-rate Annex P PRBA[2..4] codebook (512 entries × 3 components).\n");
+    out.push_str(
+        "/// AMBE+2 half-rate Annex P PRBA[2..4] codebook (512 entries × 3 components).\n",
+    );
     out.push_str("pub const AMBE_PRBA24: [[f32; 3]; 512] = [\n");
     for r in &rows {
         out.push_str(&format!("    [{:.6}, {:.6}, {:.6}],\n", r[0], r[1], r[2]));
@@ -988,7 +1020,9 @@ fn gen_annex_q(out_dir: &PathBuf) {
 
     let mut out = String::new();
     out.push_str("// Auto-generated from spec_tables/annex_q_prba58_codebook.csv\n");
-    out.push_str("/// AMBE+2 half-rate Annex Q PRBA[5..8] codebook (128 entries × 4 components).\n");
+    out.push_str(
+        "/// AMBE+2 half-rate Annex Q PRBA[5..8] codebook (128 entries × 4 components).\n",
+    );
     out.push_str("pub const AMBE_PRBA58: [[f32; 4]; 128] = [\n");
     for r in &rows {
         out.push_str(&format!(
@@ -1004,10 +1038,15 @@ fn gen_annex_q(out_dir: &PathBuf) {
 /// Emits four const arrays: `AMBE_HOC_B5` … `AMBE_HOC_B8`.
 fn gen_annex_r(out_dir: &PathBuf) {
     let specs = [
-        ("spec_tables/annex_r_hoc_b5.csv", 32usize, "AMBE_HOC_B5", "b5"),
+        (
+            "spec_tables/annex_r_hoc_b5.csv",
+            32usize,
+            "AMBE_HOC_B5",
+            "b5",
+        ),
         ("spec_tables/annex_r_hoc_b6.csv", 16, "AMBE_HOC_B6", "b6"),
         ("spec_tables/annex_r_hoc_b7.csv", 16, "AMBE_HOC_B7", "b7"),
-        ("spec_tables/annex_r_hoc_b8.csv", 8,  "AMBE_HOC_B8", "b8"),
+        ("spec_tables/annex_r_hoc_b8.csv", 8, "AMBE_HOC_B8", "b8"),
     ];
 
     let mut out = String::new();
@@ -1101,8 +1140,8 @@ fn gen_imbe_bit_prioritization(out_dir: &PathBuf) {
     let csv_path = "spec_tables/imbe_bit_prioritization.csv";
     println!("cargo:rerun-if-changed={csv_path}");
 
-    let content = fs::read_to_string(csv_path)
-        .unwrap_or_else(|e| panic!("failed to read {csv_path}: {e}"));
+    let content =
+        fs::read_to_string(csv_path).unwrap_or_else(|e| panic!("failed to read {csv_path}: {e}"));
 
     // Group rows by L. Each L in [9, 56] must contain exactly 88 rows.
     let mut per_l: Vec<Vec<(u8, u8, u8, u8)>> = (0..48).map(|_| Vec::with_capacity(88)).collect();
@@ -1128,24 +1167,39 @@ fn gen_imbe_bit_prioritization(out_dir: &PathBuf) {
         assert!((9..=56).contains(&l), "L={l} out of range");
         assert!(dst_vec < 8, "dst_vec out of range");
         let dst_width = [12u8, 12, 12, 12, 11, 11, 11, 7][dst_vec as usize];
-        assert!(dst_bit < dst_width, "dst_bit {dst_bit} exceeds vec {dst_vec} width");
+        assert!(
+            dst_bit < dst_width,
+            "dst_bit {dst_bit} exceeds vec {dst_vec} width"
+        );
         per_l[(l - 9) as usize].push((src_param, src_bit, dst_vec, dst_bit));
     }
 
     for (i, rows) in per_l.iter().enumerate() {
-        assert_eq!(rows.len(), 88, "L={}: expected 88 rows, got {}", i + 9, rows.len());
+        assert_eq!(
+            rows.len(),
+            88,
+            "L={}: expected 88 rows, got {}",
+            i + 9,
+            rows.len()
+        );
         // Destination coverage: every (dst_vec, dst_bit) appears exactly once.
         let mut seen = [[false; 12]; 8];
         for (_, _, v, b) in rows {
-            assert!(!seen[*v as usize][*b as usize],
-                "L={}: (dst_vec={v}, dst_bit={b}) appears twice", i + 9);
+            assert!(
+                !seen[*v as usize][*b as usize],
+                "L={}: (dst_vec={v}, dst_bit={b}) appears twice",
+                i + 9
+            );
             seen[*v as usize][*b as usize] = true;
         }
         let widths = [12u8, 12, 12, 12, 11, 11, 11, 7];
         for (v, w) in widths.iter().enumerate() {
             for b in 0..*w {
-                assert!(seen[v][b as usize],
-                    "L={}: (dst_vec={v}, dst_bit={b}) never appears", i + 9);
+                assert!(
+                    seen[v][b as usize],
+                    "L={}: (dst_vec={v}, dst_bit={b}) never appears",
+                    i + 9
+                );
             }
         }
     }
@@ -1175,8 +1229,8 @@ fn gen_ambe_bit_prioritization(out_dir: &PathBuf) {
     let csv_path = "spec_tables/ambe_bit_prioritization.csv";
     println!("cargo:rerun-if-changed={csv_path}");
 
-    let content = fs::read_to_string(csv_path)
-        .unwrap_or_else(|e| panic!("failed to read {csv_path}: {e}"));
+    let content =
+        fs::read_to_string(csv_path).unwrap_or_else(|e| panic!("failed to read {csv_path}: {e}"));
 
     let mut rows: Vec<(u8, u8, u8, u8)> = Vec::with_capacity(49);
     for (lineno, raw) in content.lines().enumerate() {
@@ -1199,7 +1253,10 @@ fn gen_ambe_bit_prioritization(out_dir: &PathBuf) {
         assert!(dst_vec < 4, "half-rate dst_vec out of range");
         // Half-rate vector widths per the CSV's header: û₀=12, û₁=12, û₂=11, û₃=14.
         let dst_width = [12u8, 12, 11, 14][dst_vec as usize];
-        assert!(dst_bit < dst_width, "dst_bit {dst_bit} exceeds vec {dst_vec} width");
+        assert!(
+            dst_bit < dst_width,
+            "dst_bit {dst_bit} exceeds vec {dst_vec} width"
+        );
         rows.push((src_param, src_bit, dst_vec, dst_bit));
     }
     assert_eq!(rows.len(), 49, "ambe prioritization must have 49 entries");
@@ -1208,14 +1265,18 @@ fn gen_ambe_bit_prioritization(out_dir: &PathBuf) {
     let widths = [12u8, 12, 11, 14];
     let mut seen = [[false; 14]; 4];
     for (_, _, v, b) in &rows {
-        assert!(!seen[*v as usize][*b as usize],
-            "ambe: (dst_vec={v}, dst_bit={b}) appears twice");
+        assert!(
+            !seen[*v as usize][*b as usize],
+            "ambe: (dst_vec={v}, dst_bit={b}) appears twice"
+        );
         seen[*v as usize][*b as usize] = true;
     }
     for (v, w) in widths.iter().enumerate() {
         for b in 0..*w {
-            assert!(seen[v][b as usize],
-                "ambe: (dst_vec={v}, dst_bit={b}) never appears");
+            assert!(
+                seen[v][b as usize],
+                "ambe: (dst_vec={v}, dst_bit={b}) never appears"
+            );
         }
     }
 

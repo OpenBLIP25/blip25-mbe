@@ -39,8 +39,7 @@ pub const PYIN_WINDOW: usize = 160;
 /// Sub-sample resolution comes from parabolic interpolation around the
 /// argmax — same approach as YIN. Output period is in samples directly,
 /// not in `PITCH_GRID_STEP` units.
-pub const PYIN_GRID_LEN: usize =
-    (PITCH_GRID_MAX as usize) - (PITCH_GRID_MIN as usize) + 1;
+pub const PYIN_GRID_LEN: usize = (PITCH_GRID_MAX as usize) - (PITCH_GRID_MIN as usize) + 1;
 
 /// Threshold array `s_k` (PYIN paper §2.3). 100 evenly spaced values
 /// over `(0, 1]`. Mauch & Dixon use `(0, 1]` with `K=100`.
@@ -168,10 +167,7 @@ fn first_local_min_below(d_prime: &[f64], threshold: f64) -> Option<usize> {
         return Some(0);
     }
     for i in 1..d_prime.len() - 1 {
-        if d_prime[i] < threshold
-            && d_prime[i] < d_prime[i - 1]
-            && d_prime[i] <= d_prime[i + 1]
-        {
+        if d_prime[i] < threshold && d_prime[i] < d_prime[i - 1] && d_prime[i] <= d_prime[i + 1] {
             return Some(i);
         }
     }
@@ -228,8 +224,11 @@ fn pyin_frame(x: &[f64]) -> PyinFrame {
     let tau_min = PITCH_GRID_MIN as usize; // 21
     let tau_max = PITCH_GRID_MAX as usize; // 122
     let w = PYIN_WINDOW;
-    debug_assert!(x.len() >= w + tau_max,
-        "pyin input must cover W + τ_max samples ({})", w + tau_max);
+    debug_assert!(
+        x.len() >= w + tau_max,
+        "pyin input must cover W + τ_max samples ({})",
+        w + tau_max
+    );
 
     // Step 1 — difference function `d(τ)` for τ ∈ [0, τ_max] (we need
     // the whole prefix for the cumulative mean denominator). Slot τ=0
@@ -276,8 +275,7 @@ fn pyin_frame(x: &[f64]) -> PyinFrame {
 /// the `(p_hat_i, e_p_hat_i)` shape the §0.3 contract expects.
 fn frame_to_pitch(frame: &PyinFrame, best: usize) -> (f64, f64) {
     let off = parabolic_offset(&frame.d_prime, best);
-    let p_hat_i = grid_index_to_period(best as f64 + off)
-        .clamp(PITCH_GRID_MIN, PITCH_GRID_MAX);
+    let p_hat_i = grid_index_to_period(best as f64 + off).clamp(PITCH_GRID_MIN, PITCH_GRID_MAX);
     let e_p_hat_i = frame.d_prime[best].clamp(E_OF_P_FLOOR, E_OF_P_CEIL);
     (p_hat_i, e_p_hat_i)
 }
@@ -428,10 +426,7 @@ pub fn run_pyin_smoothed(x: &[f64], state: &mut PyinHmmState) -> (f64, f64) {
 
     // Re-normalize so log α stays bounded across long streams. Subtract
     // the max (no effect on argmax / future transitions).
-    let max_val = new_alpha
-        .iter()
-        .copied()
-        .fold(f64::NEG_INFINITY, f64::max);
+    let max_val = new_alpha.iter().copied().fold(f64::NEG_INFINITY, f64::max);
     if max_val.is_finite() {
         for v in &mut new_alpha {
             *v -= max_val;
@@ -532,7 +527,10 @@ mod tests {
             start += hop;
             frames += 1;
         }
-        assert!(frames >= 2, "need at least 2 frames to exercise the HMM step");
+        assert!(
+            frames >= 2,
+            "need at least 2 frames to exercise the HMM step"
+        );
         assert!((last_p - 40.0).abs() <= 0.5);
     }
 

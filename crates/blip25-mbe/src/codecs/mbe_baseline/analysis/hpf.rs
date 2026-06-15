@@ -120,7 +120,11 @@ mod tests {
             .map(|(xi, yi)| 2.0 * xi + 3.0 * yi)
             .collect();
         HpfState::new().run_in_place(&mut combined);
-        for (i, (&c, (&a, &b))) in combined.iter().zip(a_buf.iter().zip(b_buf.iter())).enumerate() {
+        for (i, (&c, (&a, &b))) in combined
+            .iter()
+            .zip(a_buf.iter().zip(b_buf.iter()))
+            .enumerate()
+        {
             let expected = 2.0 * a + 3.0 * b;
             assert!(
                 (c - expected).abs() < 1e-9,

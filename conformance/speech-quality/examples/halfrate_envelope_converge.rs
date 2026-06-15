@@ -44,9 +44,8 @@ fn main() {
             }
         };
         let amps = params.amplitudes_slice().to_vec();
-        let env_rms = (amps.iter().map(|&m| (m as f64) * (m as f64)).sum::<f64>()
-            / amps.len() as f64)
-            .sqrt();
+        let env_rms =
+            (amps.iter().map(|&m| (m as f64) * (m as f64)).sum::<f64>() / amps.len() as f64).sqrt();
         // Per-harmonic log delta vs previous frame (mean abs dB), over the
         // common harmonic count.
         let d_db = match &prev {
@@ -63,8 +62,15 @@ fn main() {
             }
             None => f64::NAN,
         };
-        let note = if f > 0 && d_db < 0.01 { "converged" } else { "" };
-        println!("{f:3}  {:3}  {env_rms:10.2}   {d_db:8.4}   {note}", amps.len());
+        let note = if f > 0 && d_db < 0.01 {
+            "converged"
+        } else {
+            ""
+        };
+        println!(
+            "{f:3}  {:3}  {env_rms:10.2}   {d_db:8.4}   {note}",
+            amps.len()
+        );
         prev = Some(amps);
     }
 }

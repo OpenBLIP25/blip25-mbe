@@ -309,13 +309,7 @@ mod tests {
         let mut pcm = vec![1234i16; 160];
         let snapshot = pcm.clone();
         let mut state = EnhancementState::default();
-        apply(
-            &EnhancementMode::None,
-            &mut state,
-            &mut pcm,
-            8_000.0,
-            true,
-        );
+        apply(&EnhancementMode::None, &mut state, &mut pcm, 8_000.0, true);
         assert_eq!(pcm, snapshot);
     }
 

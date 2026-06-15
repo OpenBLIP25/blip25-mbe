@@ -28,9 +28,7 @@
 //!   scp /tmp/probe.ambe9 root@192.168.1.6:/tmp/probe.ambe9
 //!   ssh root@192.168.1.6 'dvsi decode-halfrate /tmp/probe.ambe9 /tmp/probe_chip.pcm'
 
-use blip25_mbe::rate33::dequantize::{
-    DecoderState, Decoded, decode_to_params,
-};
+use blip25_mbe::rate33::dequantize::{decode_to_params, Decoded, DecoderState};
 use blip25_mbe::rate33::frame::{encode_frame, DIBITS_PER_FRAME};
 use blip25_mbe::rate33::priority::{prioritize, AMBE_B_COUNT};
 
@@ -54,15 +52,15 @@ fn main() {
 
     // Construct b̂₀..b̂₈ for an all-unvoiced, flat-spectrum frame.
     let mut b = [0u16; AMBE_B_COUNT];
-    b[0] = 60;  // pitch index — mid range
-    b[1] = 16;  // V/UV codebook → all-unvoiced
-    b[2] = 16;  // gain index — mid range
-    b[3] = 0;   // PRBA24 = 0
-    b[4] = 0;   // PRBA58 = 0
-    b[5] = 0;   // HOC_B5 = 0
-    b[6] = 0;   // HOC_B6 = 0
-    b[7] = 0;   // HOC_B7 = 0
-    b[8] = 0;   // HOC_B8 = 0
+    b[0] = 60; // pitch index — mid range
+    b[1] = 16; // V/UV codebook → all-unvoiced
+    b[2] = 16; // gain index — mid range
+    b[3] = 0; // PRBA24 = 0
+    b[4] = 0; // PRBA58 = 0
+    b[5] = 0; // HOC_B5 = 0
+    b[6] = 0; // HOC_B6 = 0
+    b[7] = 0; // HOC_B7 = 0
+    b[8] = 0; // HOC_B8 = 0
 
     // Sanity-check what the decoder will see.
     let info = prioritize(&b);

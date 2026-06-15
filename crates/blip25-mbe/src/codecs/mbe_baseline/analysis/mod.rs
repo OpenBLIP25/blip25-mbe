@@ -77,7 +77,7 @@ pub fn lpf_tap(n: i32) -> f32 {
 
 pub mod basis;
 pub use basis::{
-    Complex64, DFT_SIZE, HarmonicBasis, WINDOW_DFT_SIZE, W_R_HALF, packed_index, signal_spectrum,
+    packed_index, signal_spectrum, Complex64, HarmonicBasis, DFT_SIZE, WINDOW_DFT_SIZE, W_R_HALF,
 };
 
 // ---------------------------------------------------------------------------
@@ -86,11 +86,10 @@ pub use basis::{
 
 pub mod pitch;
 pub use pitch::{
-    H_LPF_HALF, LookBackContext, OCTAVE_ESCAPE_TOL, PITCH_COLD_START, PITCH_GRID_LEN,
-    PITCH_GRID_MAX, PITCH_GRID_MIN, PITCH_GRID_STEP, PITCH_INPUT_HALF, PITCH_INPUT_LEN,
-    PitchSearch, SHARED_LPF_LEN, W_I_HALF, compute_s_lpf, compute_s_lpf_shared,
-    decide_initial_pitch, decide_initial_pitch_escape, look_ahead, look_back,
-    parabolic_refine_pitch, slot_s_lpf, snap_to_pitch_grid,
+    compute_s_lpf, compute_s_lpf_shared, decide_initial_pitch, decide_initial_pitch_escape,
+    look_ahead, look_back, parabolic_refine_pitch, slot_s_lpf, snap_to_pitch_grid, LookBackContext,
+    PitchSearch, H_LPF_HALF, OCTAVE_ESCAPE_TOL, PITCH_COLD_START, PITCH_GRID_LEN, PITCH_GRID_MAX,
+    PITCH_GRID_MIN, PITCH_GRID_STEP, PITCH_INPUT_HALF, PITCH_INPUT_LEN, SHARED_LPF_LEN, W_I_HALF,
 };
 
 // ---------------------------------------------------------------------------
@@ -99,9 +98,8 @@ pub use pitch::{
 
 pub mod refine;
 pub use refine::{
-    B0_MAX, L_HAT_MAX, L_HAT_MIN, N_REFINE_CANDIDATES, PitchRefinement,
-    REFINE_OFFSETS, harmonic_count_for, quantize_pitch_index, refine_pitch,
-    refine_pitch_raw,
+    harmonic_count_for, quantize_pitch_index, refine_pitch, refine_pitch_raw, PitchRefinement,
+    B0_MAX, L_HAT_MAX, L_HAT_MIN, N_REFINE_CANDIDATES, REFINE_OFFSETS,
 };
 
 // ---------------------------------------------------------------------------
@@ -109,15 +107,14 @@ pub use refine::{
 // ---------------------------------------------------------------------------
 
 pub mod vuv;
-pub use vuv::{K_HAT_MAX, VuvResult, VuvState, XI_MAX_FLOOR, band_count_for, determine_vuv};
-
+pub use vuv::{band_count_for, determine_vuv, VuvResult, VuvState, K_HAT_MAX, XI_MAX_FLOOR};
 
 // ---------------------------------------------------------------------------
 // §0.5 — Spectral amplitude estimation lives in the `amplitude` submodule.
 // ---------------------------------------------------------------------------
 
 pub mod amplitude;
-pub use amplitude::{SpectralAmplitudes, band_for_harmonic, estimate_spectral_amplitudes};
+pub use amplitude::{band_for_harmonic, estimate_spectral_amplitudes, SpectralAmplitudes};
 
 // ---------------------------------------------------------------------------
 // §0.6 — Predictor lives in the `predictor` submodule.
@@ -125,10 +122,9 @@ pub use amplitude::{SpectralAmplitudes, band_for_harmonic, estimate_spectral_amp
 
 pub mod predictor;
 pub use predictor::{
-    HalfratePredictorState, L_TILDE_COLD_START, L_TILDE_COLD_START_HALFRATE,
-    LAMBDA_HAT_UNVOICED_BIAS, PredictionResidual, PredictorState, RHO_HALFRATE,
     compute_prediction_residual, compute_prediction_residual_ambe_plus2, imbe_rho_f64,
-    lambda_hat_from_m_hat,
+    lambda_hat_from_m_hat, HalfratePredictorState, PredictionResidual, PredictorState,
+    LAMBDA_HAT_UNVOICED_BIAS, L_TILDE_COLD_START, L_TILDE_COLD_START_HALFRATE, RHO_HALFRATE,
 };
 
 // ---------------------------------------------------------------------------
@@ -136,7 +132,7 @@ pub use predictor::{
 // ---------------------------------------------------------------------------
 
 pub mod hpf;
-pub use hpf::{HPF_POLE, HpfState};
+pub use hpf::{HpfState, HPF_POLE};
 
 // ---------------------------------------------------------------------------
 // §0.8 — Silence detection lives in the `silence` submodule.
@@ -146,7 +142,7 @@ pub mod silence;
 pub use silence::SilenceDetector;
 
 pub mod tone_detect;
-pub use tone_detect::{ToneDetection, detect_dtmf, detect_single_tone, detect_tone};
+pub use tone_detect::{detect_dtmf, detect_single_tone, detect_tone, ToneDetection};
 
 pub mod profile;
 
@@ -155,14 +151,14 @@ pub mod profile;
 // ---------------------------------------------------------------------------
 
 pub mod pyin;
-pub use pyin::{PyinHmmState, run_pyin, run_pyin_smoothed};
+pub use pyin::{run_pyin, run_pyin_smoothed, PyinHmmState};
 
 // ---------------------------------------------------------------------------
 // Spectral subtraction — opt-in input-side denoiser (post-2002 DSP).
 // ---------------------------------------------------------------------------
 
 pub mod denoise;
-pub use denoise::{NoiseSpectrum, apply_subtraction};
+pub use denoise::{apply_subtraction, NoiseSpectrum};
 
 // Pre-analysis denoiser front-end (§3.4 exceed lever). Separable pre-PCM
 // stage; deliberately NOT a field on `AnalysisState` (kept off the spec
@@ -295,8 +291,8 @@ fn matched_decoder_roundtrip(
     let ds_snapshot = DecoderState::from_amplitudes(&prev_slice, predictor.l_tilde_prev());
 
     let mut ds_for_quantize = ds_snapshot.clone();
-    let bits = imbe_quantize(&params, &mut ds_for_quantize)
-        .map_err(|_| AnalysisError::PitchOutOfRange)?;
+    let bits =
+        imbe_quantize(&params, &mut ds_for_quantize).map_err(|_| AnalysisError::PitchOutOfRange)?;
 
     // Reconstruct `M̃_l(0)` using the unmutated snapshot — matches
     // what a compliant receiver computes from the same bits.
@@ -762,7 +758,11 @@ impl AnalysisState {
     /// `M̂_l(t) = α · M̂_l + (1−α) · M̂_l(t−1)`. Out-of-range or
     /// non-finite inputs are clamped to `[0, 1]`.
     pub fn set_amp_ema_alpha(&mut self, alpha: f64) {
-        let a = if alpha.is_finite() { alpha.clamp(0.0, 1.0) } else { 0.0 };
+        let a = if alpha.is_finite() {
+            alpha.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
         self.amp_ema_alpha = a;
         // Drop carry-over history when the smoother is reconfigured —
         // avoids leaking stale amplitudes from a prior session into
@@ -1115,10 +1115,7 @@ impl Default for AnalysisState {
 ///
 /// §0.8 frame-type dispatch (silence detection, tone pass-through)
 /// is not yet wired — all non-preroll frames emit voice.
-pub fn encode(
-    pcm: &[i16],
-    state: &mut AnalysisState,
-) -> Result<AnalysisOutput, AnalysisError> {
+pub fn encode(pcm: &[i16], state: &mut AnalysisState) -> Result<AnalysisOutput, AnalysisError> {
     encode_with_trace(pcm, state).map(|(out, _)| out)
 }
 
@@ -1172,19 +1169,18 @@ pub fn encode_with_trace(
     // slot's local s_LPF — replaces 3 separate FIR passes with one
     // wider pass (30% fewer mults; same outputs by zero-extension
     // identity, see `compute_s_lpf_shared` doc).
-    let (search_cur, search_f1, search_f2) =
-        profile::time(profile::Stage::PitchSearch, || {
-            let shared = compute_s_lpf_shared(state.lookahead_buf());
-            let mut search_f1 = PitchSearch::from_lpf_slice(slot_s_lpf(&shared, 1));
-            let mut search_f2 = PitchSearch::from_lpf_slice(slot_s_lpf(&shared, 2));
-            search_f1.enable_argmin_fast();
-            search_f2.enable_argmin_fast();
-            (
-                PitchSearch::from_lpf_slice(slot_s_lpf(&shared, 0)),
-                search_f1,
-                search_f2,
-            )
-        });
+    let (search_cur, search_f1, search_f2) = profile::time(profile::Stage::PitchSearch, || {
+        let shared = compute_s_lpf_shared(state.lookahead_buf());
+        let mut search_f1 = PitchSearch::from_lpf_slice(slot_s_lpf(&shared, 1));
+        let mut search_f2 = PitchSearch::from_lpf_slice(slot_s_lpf(&shared, 2));
+        search_f1.enable_argmin_fast();
+        search_f2.enable_argmin_fast();
+        (
+            PitchSearch::from_lpf_slice(slot_s_lpf(&shared, 0)),
+            search_f1,
+            search_f2,
+        )
+    });
     let (p_b, ce_b, p_f, ce_f, p_hat_i, e_p_hat_i) =
         profile::time(profile::Stage::PitchTrack, || {
             let (p_b, ce_b) = look_back(&search_cur, state.pitch_history);
@@ -1262,9 +1258,20 @@ pub fn encode_with_trace(
         sw
     };
     let mut m_hat = profile::time(profile::Stage::Amplitude, || {
-        estimate_spectral_amplitudes(&sw_for_amplitude, basis, &refinement, &vuv_result, frac_edges)
+        estimate_spectral_amplitudes(
+            &sw_for_amplitude,
+            basis,
+            &refinement,
+            &vuv_result,
+            frac_edges,
+        )
     });
-    state.apply_amp_ema(&mut m_hat, refinement.l_hat, refinement.omega_hat, &vuv_result);
+    state.apply_amp_ema(
+        &mut m_hat,
+        refinement.l_hat,
+        refinement.omega_hat,
+        &vuv_result,
+    );
 
     // §0.8 silence gate. Per §13.3 prose: silence / tone / erasure
     // frames do NOT update the matched-decoder predictor state, but
@@ -1299,9 +1306,7 @@ pub fn encode_with_trace(
     // `project_onset_attack_flag_landed_2026-04-27.md`.
     let phantom_pitch =
         p_hat_i > DEFAULT_PITCH_PHANTOM_THRESHOLD && e_p_hat_i >= PITCH_SILENCE_EPI_THRESH;
-    let (commit_p, commit_e) = if state.default_pitch_on_silence_enabled
-        && silent
-        && phantom_pitch
+    let (commit_p, commit_e) = if state.default_pitch_on_silence_enabled && silent && phantom_pitch
     {
         (DEFAULT_PITCH_ON_SILENCE_PERIOD, DEFAULT_PITCH_ON_SILENCE_E)
     } else {
@@ -1387,20 +1392,19 @@ pub fn encode_ambe_plus2(
         return Ok(AnalysisOutput::Silence);
     }
 
-    let (search_cur, search_f1, search_f2) =
-        profile::time(profile::Stage::PitchSearch, || {
-            // Shared-LPF fast path — see encode_with_trace for context.
-            let shared = compute_s_lpf_shared(state.lookahead_buf());
-            let mut search_f1 = PitchSearch::from_lpf_slice(slot_s_lpf(&shared, 1));
-            let mut search_f2 = PitchSearch::from_lpf_slice(slot_s_lpf(&shared, 2));
-            search_f1.enable_argmin_fast();
-            search_f2.enable_argmin_fast();
-            (
-                PitchSearch::from_lpf_slice(slot_s_lpf(&shared, 0)),
-                search_f1,
-                search_f2,
-            )
-        });
+    let (search_cur, search_f1, search_f2) = profile::time(profile::Stage::PitchSearch, || {
+        // Shared-LPF fast path — see encode_with_trace for context.
+        let shared = compute_s_lpf_shared(state.lookahead_buf());
+        let mut search_f1 = PitchSearch::from_lpf_slice(slot_s_lpf(&shared, 1));
+        let mut search_f2 = PitchSearch::from_lpf_slice(slot_s_lpf(&shared, 2));
+        search_f1.enable_argmin_fast();
+        search_f2.enable_argmin_fast();
+        (
+            PitchSearch::from_lpf_slice(slot_s_lpf(&shared, 0)),
+            search_f1,
+            search_f2,
+        )
+    });
     let (p_hat_i, e_p_hat_i) = profile::time(profile::Stage::PitchTrack, || {
         if state.pyin_pitch_enabled {
             let buf = *state.lookahead_buf();
@@ -1428,9 +1432,7 @@ pub fn encode_ambe_plus2(
     // Onset-attack mitigation — see encode_with_trace for rationale.
     let phantom_pitch =
         p_hat_i > DEFAULT_PITCH_PHANTOM_THRESHOLD && e_p_hat_i >= PITCH_SILENCE_EPI_THRESH;
-    let (commit_p, commit_e) = if state.default_pitch_on_silence_enabled
-        && silent
-        && phantom_pitch
+    let (commit_p, commit_e) = if state.default_pitch_on_silence_enabled && silent && phantom_pitch
     {
         (DEFAULT_PITCH_ON_SILENCE_PERIOD, DEFAULT_PITCH_ON_SILENCE_E)
     } else {
@@ -1464,8 +1466,9 @@ pub fn encode_ambe_plus2(
     // BLIP25_PITCH_REFINE: spec §0.4 E_R refinement (default) vs the raw
     // §0.3 estimate (bypass on a mis-aligned window).
     let pitch_refine = state.pitch_refine_enabled;
-    let refinement_result =
-        profile::time(profile::Stage::RefinePitch, || -> Result<Option<refine::PitchRefinement>, AnalysisError> {
+    let refinement_result = profile::time(
+        profile::Stage::RefinePitch,
+        || -> Result<Option<refine::PitchRefinement>, AnalysisError> {
             let mut refinement = if pitch_refine {
                 refine_pitch(&sw, basis, p_hat_i)
             } else {
@@ -1477,7 +1480,8 @@ pub fn encode_ambe_plus2(
             };
             refinement.l_hat = decode_pitch(b0).ok_or(AnalysisError::PitchOutOfRange)?.l;
             Ok(Some(refinement))
-        });
+        },
+    );
     let refinement = match refinement_result? {
         Some(r) => r,
         None => {
@@ -1497,9 +1501,20 @@ pub fn encode_ambe_plus2(
         sw
     };
     let mut m_hat = profile::time(profile::Stage::Amplitude, || {
-        estimate_spectral_amplitudes(&sw_for_amplitude, basis, &refinement, &vuv_result, frac_edges)
+        estimate_spectral_amplitudes(
+            &sw_for_amplitude,
+            basis,
+            &refinement,
+            &vuv_result,
+            frac_edges,
+        )
     });
-    state.apply_amp_ema(&mut m_hat, refinement.l_hat, refinement.omega_hat, &vuv_result);
+    state.apply_amp_ema(
+        &mut m_hat,
+        refinement.l_hat,
+        refinement.omega_hat,
+        &vuv_result,
+    );
 
     // BLIP25_SILENCE_SHAPE_ZERO: on silent analysis windows flatten the
     // per-harmonic envelope SHAPE to its geometric mean (preserving the
@@ -1576,29 +1591,32 @@ pub fn encode_ambe_plus2(
     // Step 11–12: commit predictor + pitch state, build the rate-agnostic
     // MbeParams. All three half-rate predictor fields advance together
     // per §0.6.10 — Λ̃, L̃, γ̃ are not independent.
-    let params = profile::time(profile::Stage::Tail, || -> Result<MbeParams, AnalysisError> {
-        state.predictor_ambe_plus2.commit(
-            &rt.lambda_tilde_zero,
-            rt.l_tilde_zero,
-            rt.gamma_tilde_zero,
-        );
-        state.commit_pitch(commit_p, commit_e);
+    let params = profile::time(
+        profile::Stage::Tail,
+        || -> Result<MbeParams, AnalysisError> {
+            state.predictor_ambe_plus2.commit(
+                &rt.lambda_tilde_zero,
+                rt.l_tilde_zero,
+                rt.gamma_tilde_zero,
+            );
+            state.commit_pitch(commit_p, commit_e);
 
-        let mut amplitudes = Vec::with_capacity(refinement.l_hat as usize);
-        let mut voiced = Vec::with_capacity(refinement.l_hat as usize);
-        for l in 1..=u32::from(refinement.l_hat) {
-            amplitudes.push(m_hat[l as usize] as f32);
-            let k = band_for_harmonic(l, vuv_result.k_hat);
-            voiced.push(k >= 1 && vuv_result.vuv[k as usize] == 1);
-        }
-        MbeParams::new(
-            refinement.omega_hat as f32,
-            refinement.l_hat,
-            &voiced,
-            &amplitudes,
-        )
-        .map_err(|_| AnalysisError::PitchOutOfRange)
-    })?;
+            let mut amplitudes = Vec::with_capacity(refinement.l_hat as usize);
+            let mut voiced = Vec::with_capacity(refinement.l_hat as usize);
+            for l in 1..=u32::from(refinement.l_hat) {
+                amplitudes.push(m_hat[l as usize] as f32);
+                let k = band_for_harmonic(l, vuv_result.k_hat);
+                voiced.push(k >= 1 && vuv_result.vuv[k as usize] == 1);
+            }
+            MbeParams::new(
+                refinement.omega_hat as f32,
+                refinement.l_hat,
+                &voiced,
+                &amplitudes,
+            )
+            .map_err(|_| AnalysisError::PitchOutOfRange)
+        },
+    )?;
     state.advance_preroll();
     Ok(AnalysisOutput::Voice(params))
 }
@@ -1640,7 +1658,10 @@ mod tests {
     fn lpf_symmetry_and_support() {
         assert_eq!(ANNEX_D_LPF_LEN, 21);
         for n in 1..=10 {
-            assert!((lpf_tap(-n) - lpf_tap(n)).abs() < 1e-6, "h_LPF(-{n}) != h_LPF({n})");
+            assert!(
+                (lpf_tap(-n) - lpf_tap(n)).abs() < 1e-6,
+                "h_LPF(-{n}) != h_LPF({n})"
+            );
         }
         assert_eq!(lpf_tap(-11), 0.0);
         assert_eq!(lpf_tap(11), 0.0);
@@ -1671,7 +1692,11 @@ mod tests {
     /// Generate a broadband harmonic PCM frame at a given period
     /// (similar to `broadband_periodic` above but producing 160-sample
     /// `i16` slices for the end-to-end encode path).
-    fn periodic_pcm_frame(period: f64, max_h: u32, phase_offset: f64) -> [i16; SAMPLES_PER_FRAME as usize] {
+    fn periodic_pcm_frame(
+        period: f64,
+        max_h: u32,
+        phase_offset: f64,
+    ) -> [i16; SAMPLES_PER_FRAME as usize] {
         let mut out = [0i16; SAMPLES_PER_FRAME as usize];
         let omega = 2.0 * core::f64::consts::PI / period;
         for (idx, slot) in out.iter_mut().enumerate() {
@@ -1717,8 +1742,8 @@ mod tests {
                 assert!((L_HAT_MIN..=L_HAT_MAX).contains(&l));
                 // At least one harmonic has nonzero amplitude (signal
                 // is not silence).
-                let any_nonzero = (0..l as usize)
-                    .any(|i| params.amplitudes_slice()[i].abs() > 1e-6);
+                let any_nonzero =
+                    (0..l as usize).any(|i| params.amplitudes_slice()[i].abs() > 1e-6);
                 assert!(any_nonzero, "all amplitudes zero on periodic input");
             }
             other => panic!("expected Voice, got {other:?}"),
@@ -1743,8 +1768,8 @@ mod tests {
                 assert!(omega.is_finite() && omega > 0.0);
                 let l = params.harmonic_count();
                 assert!((L_HAT_MIN..=L_HAT_MAX).contains(&l));
-                let any_nonzero = (0..l as usize)
-                    .any(|i| params.amplitudes_slice()[i].abs() > 1e-6);
+                let any_nonzero =
+                    (0..l as usize).any(|i| params.amplitudes_slice()[i].abs() > 1e-6);
                 assert!(any_nonzero, "all amplitudes zero on periodic input");
             }
             other => panic!("expected Voice, got {other:?}"),
@@ -1771,7 +1796,10 @@ mod tests {
         let advanced = s.predictor_ambe_plus2.l_tilde_prev() != 15
             || s.predictor_ambe_plus2.gamma_tilde_prev() != 0.0
             || s.predictor_ambe_plus2.lambda_tilde_prev()[1] != 1.0;
-        assert!(advanced, "half-rate predictor did not advance past cold-start");
+        assert!(
+            advanced,
+            "half-rate predictor did not advance past cold-start"
+        );
     }
 
     /// Full-rate and half-rate encoders share the analysis frontend;
@@ -1842,7 +1870,10 @@ mod tests {
         // periodic content).
         let any_moved = (1..=s.predictor().l_tilde_prev())
             .any(|l| (s.predictor().read(u32::from(l)) - 1.0).abs() > 1e-3);
-        assert!(any_moved, "predictor state did not evolve after voice emission");
+        assert!(
+            any_moved,
+            "predictor state did not evolve after voice emission"
+        );
         assert_eq!(s.predictor().read(0), cold_m_tilde_0); // Eq. 56 invariant.
     }
 
@@ -1873,7 +1904,6 @@ mod tests {
             Ok(AnalysisOutput::Voice(_)) | Ok(AnalysisOutput::Silence) | Err(_) => {}
         }
     }
-
 
     /// When silence detection is disabled (default), the detector's
     /// decision does not gate `encode`'s output.
@@ -2137,7 +2167,7 @@ mod tests {
         assert_eq!(h1.prev_pitch, 55.0);
         assert_eq!(h1.prev_err_1, 0.25);
         assert_eq!(h1.prev_err_2, 0.0); // was prev_err_1 = 0.0 before
-        // Second commit: the old err_1 (0.25) shifts into err_2.
+                                        // Second commit: the old err_1 (0.25) shifts into err_2.
         s.commit_pitch(60.0, 0.30);
         let h2 = s.pitch_history();
         assert_eq!(h2.prev_pitch, 60.0);

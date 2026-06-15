@@ -130,8 +130,8 @@ pub fn sd_nibble_to_llr(n: u8) -> i8 {
     let n = n & 0xF;
     if n >= 8 {
         let level = i16::from(n - 8); // 0..=7 → least..most confident 1
-        // max(1,..) so the least-confident-1 value stays strictly > 0
-        // (hard `1`); level*127/7 gives 0,18,..,127 — distinct >>4 buckets.
+                                      // max(1,..) so the least-confident-1 value stays strictly > 0
+                                      // (hard `1`); level*127/7 gives 0,18,..,127 — distinct >>4 buckets.
         (level * 127 / 7).max(1) as i8
     } else {
         let level = i16::from(7 - n); // 0..=7 → least..most confident 0
@@ -171,7 +171,10 @@ impl SdPacketHeader {
     /// select the codec configuration (e.g. Rate 33) and nothing else
     /// is needed for a plain decode packet.
     pub fn new(rate_info: [u16; 5]) -> Self {
-        Self { rate_info, ..Self::default() }
+        Self {
+            rate_info,
+            ..Self::default()
+        }
     }
 }
 
@@ -188,9 +191,15 @@ impl core::fmt::Display for SoftDecisionError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::TooManyChannelBits(n) => {
-                write!(f, "{n} channel bits exceeds the {SD_SLOTS}-slot DVSI SD packet")
+                write!(
+                    f,
+                    "{n} channel bits exceeds the {SD_SLOTS}-slot DVSI SD packet"
+                )
             }
-            Self::BadHeader(w) => write!(f, "bad SD packet header 0x{w:04X}, expected 0x{SD_HEADER:04X}"),
+            Self::BadHeader(w) => write!(
+                f,
+                "bad SD packet header 0x{w:04X}, expected 0x{SD_HEADER:04X}"
+            ),
         }
     }
 }
@@ -339,12 +348,10 @@ pub fn unpack_nibble_stream(bytes: &[u8]) -> Vec<i8> {
 // USB-3000 / AMBE-3000-series chip for P25 full-rate.
 
 /// P25 full-rate (7200 bps IMBE) **with FEC** — DVSI `-r` rate control.
-pub const DVSI_P25_FULLRATE_FEC: [u16; 6] =
-    [0x0558, 0x086B, 0x1030, 0x0000, 0x0000, 0x0190];
+pub const DVSI_P25_FULLRATE_FEC: [u16; 6] = [0x0558, 0x086B, 0x1030, 0x0000, 0x0000, 0x0190];
 
 /// P25 full-rate (7200 bps IMBE) **without FEC** — DVSI `-r` rate control.
-pub const DVSI_P25_FULLRATE_NOFEC: [u16; 6] =
-    [0x0558, 0x086B, 0x0000, 0x0000, 0x0000, 0x0158];
+pub const DVSI_P25_FULLRATE_NOFEC: [u16; 6] = [0x0558, 0x086B, 0x0000, 0x0000, 0x0000, 0x0158];
 
 #[cfg(test)]
 mod tests {
@@ -354,7 +361,11 @@ mod tests {
     fn doc_truth_table_anchors() {
         // The four anchor rows from the app note's table.
         assert_eq!(llr_to_sd_nibble(-127), 0b0000, "most confident 0");
-        assert_eq!(llr_to_sd_nibble(0), 0b0111, "least confident 0 (llr 0 is hard-0)");
+        assert_eq!(
+            llr_to_sd_nibble(0),
+            0b0111,
+            "least confident 0 (llr 0 is hard-0)"
+        );
         assert_eq!(llr_to_sd_nibble(1), 0b1000, "least confident 1");
         assert_eq!(llr_to_sd_nibble(127), 0b1111, "most confident 1");
     }
@@ -387,7 +398,11 @@ mod tests {
     fn nibble_llr_roundtrips_every_value() {
         for n in 0u8..=15 {
             let llr = sd_nibble_to_llr(n);
-            assert_eq!(llr_to_sd_nibble(llr), n, "sd {n} -> llr {llr} -> sd mismatch");
+            assert_eq!(
+                llr_to_sd_nibble(llr),
+                n,
+                "sd {n} -> llr {llr} -> sd mismatch"
+            );
         }
     }
 
@@ -410,7 +425,10 @@ mod tests {
         // SD0 = most-confident-1 (0xF), SD1..3 = most-confident-0 (0x0).
         let llrs = [127i8, -127, -127, -127];
         let pkt = pack_channel_bits(&llrs, &SdPacketHeader::default()).unwrap();
-        assert_eq!(pkt[SD_OVERHEAD_WORDS], 0xF000, "SD0 must be the high nibble");
+        assert_eq!(
+            pkt[SD_OVERHEAD_WORDS], 0xF000,
+            "SD0 must be the high nibble"
+        );
     }
 
     #[test]
@@ -423,7 +441,11 @@ mod tests {
             if i < RATE_33_CHANNEL_BITS {
                 assert!(s > 0, "active slot {i} should be hard-1");
             } else {
-                assert_eq!(llr_to_sd_nibble(s), 0, "unused slot {i} must be most-conf-0");
+                assert_eq!(
+                    llr_to_sd_nibble(s),
+                    0,
+                    "unused slot {i} must be most-conf-0"
+                );
             }
         }
     }
@@ -471,7 +493,10 @@ mod tests {
     fn bad_header_rejected_on_unpack() {
         let mut pkt = pack_channel_bits(&[], &SdPacketHeader::default()).unwrap();
         pkt[0] = 0x0000;
-        assert_eq!(unpack_packet(&pkt), Err(SoftDecisionError::BadHeader(0x0000)));
+        assert_eq!(
+            unpack_packet(&pkt),
+            Err(SoftDecisionError::BadHeader(0x0000))
+        );
     }
 
     #[test]
@@ -499,7 +524,11 @@ mod tests {
             *s = (state >> 24) as i8;
         }
         let bytes = pack_nibble_stream(&llrs);
-        assert_eq!(bytes.len(), IMBE_FULL_RATE_CHANNEL_BITS / 2, "2 nibbles/byte");
+        assert_eq!(
+            bytes.len(),
+            IMBE_FULL_RATE_CHANNEL_BITS / 2,
+            "2 nibbles/byte"
+        );
         let back = unpack_nibble_stream(&bytes);
         for (i, &orig) in llrs.iter().enumerate() {
             assert_eq!(
@@ -531,7 +560,13 @@ mod tests {
 
     #[test]
     fn verified_rate_control_words_match_cmpp25() {
-        assert_eq!(DVSI_P25_FULLRATE_FEC, [0x0558, 0x086B, 0x1030, 0x0000, 0x0000, 0x0190]);
-        assert_eq!(DVSI_P25_FULLRATE_NOFEC, [0x0558, 0x086B, 0x0000, 0x0000, 0x0000, 0x0158]);
+        assert_eq!(
+            DVSI_P25_FULLRATE_FEC,
+            [0x0558, 0x086B, 0x1030, 0x0000, 0x0000, 0x0190]
+        );
+        assert_eq!(
+            DVSI_P25_FULLRATE_NOFEC,
+            [0x0558, 0x086B, 0x0000, 0x0000, 0x0000, 0x0158]
+        );
     }
 }

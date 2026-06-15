@@ -14,7 +14,7 @@
 //! Stages are defined in
 //! [`blip25_mbe::codecs::mbe_baseline::analysis::profile::Stage`].
 
-use blip25_mbe::codecs::mbe_baseline::analysis::profile::{Stage, reset, snapshot};
+use blip25_mbe::codecs::mbe_baseline::analysis::profile::{reset, snapshot, Stage};
 use blip25_mbe::vocoder::{Rate, Vocoder};
 use std::time::Instant;
 
@@ -52,7 +52,10 @@ fn main() {
         "instrumented sum : {:.3} s",
         stats.total_ns_sum() as f64 / 1e9
     );
-    println!("{:>17} {:>14} {:>10} {:>8}", "stage", "total (µs)", "µs/frame", "%");
+    println!(
+        "{:>17} {:>14} {:>10} {:>8}",
+        "stage", "total (µs)", "µs/frame", "%"
+    );
     let total = stats.total_ns_sum().max(1) as f64;
     for (stage, ns) in stats.entries() {
         let label = stage.label();
@@ -88,7 +91,10 @@ fn main() {
         "instrumented sum : {:.3} s",
         stats.total_ns_sum() as f64 / 1e9
     );
-    println!("{:>17} {:>14} {:>10} {:>8}", "stage", "total (µs)", "µs/frame", "%");
+    println!(
+        "{:>17} {:>14} {:>10} {:>8}",
+        "stage", "total (µs)", "µs/frame", "%"
+    );
     let total = stats.total_ns_sum().max(1) as f64;
     for (stage, ns) in stats.entries() {
         let label = stage.label();
@@ -104,10 +110,8 @@ fn synthetic_speech(n_frames: usize) -> Vec<i16> {
     let total = n_frames * 160;
     let mut pcm = vec![0i16; total];
     for (n, slot) in pcm.iter_mut().enumerate() {
-        let s1 = 4000.0
-            * (2.0 * core::f64::consts::PI * 220.0 * n as f64 / 8000.0).sin();
-        let s2 = 2000.0
-            * (2.0 * core::f64::consts::PI * 660.0 * n as f64 / 8000.0).sin();
+        let s1 = 4000.0 * (2.0 * core::f64::consts::PI * 220.0 * n as f64 / 8000.0).sin();
+        let s2 = 2000.0 * (2.0 * core::f64::consts::PI * 660.0 * n as f64 / 8000.0).sin();
         *slot = (s1 + s2).round() as i16;
     }
     pcm

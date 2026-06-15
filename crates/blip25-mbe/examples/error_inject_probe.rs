@@ -5,7 +5,7 @@
 //!
 //! Output: 100 × 9 bytes = 900 bytes .ambe9 stream.
 
-use blip25_mbe::rate33::dequantize::{DecoderState, Decoded, decode_to_params};
+use blip25_mbe::rate33::dequantize::{decode_to_params, Decoded, DecoderState};
 use blip25_mbe::rate33::frame::{deinterleave, encode_frame, interleave, DIBITS_PER_FRAME};
 use blip25_mbe::rate33::priority::{prioritize, AMBE_B_COUNT};
 
@@ -52,7 +52,9 @@ fn inject_errors_in_c0(bytes: [u8; 9], n_errors: u32) -> [u8; 9] {
 fn main() {
     // All-voiced clean reference frame
     let mut b = [0u16; AMBE_B_COUNT];
-    b[0] = 60; b[1] = 0; b[2] = 16; // pitch, all-voiced, mid gain; rest=0
+    b[0] = 60;
+    b[1] = 0;
+    b[2] = 16; // pitch, all-voiced, mid gain; rest=0
     let info = prioritize(&b);
     // verify it decodes
     let mut _dec = DecoderState::new();
@@ -75,10 +77,15 @@ fn main() {
     //   91-99: clean
     let mut out = Vec::with_capacity(100 * 9);
     for i in 0..100 {
-        let frame = if i == 50 { inject_errors_in_c0(clean, 4) }
-                    else if i == 70 { inject_errors_in_c0(clean, 2) }
-                    else if i == 90 { inject_errors_in_c0(clean, 3) }
-                    else { clean };
+        let frame = if i == 50 {
+            inject_errors_in_c0(clean, 4)
+        } else if i == 70 {
+            inject_errors_in_c0(clean, 2)
+        } else if i == 90 {
+            inject_errors_in_c0(clean, 3)
+        } else {
+            clean
+        };
         out.extend_from_slice(&frame);
     }
     let binary = std::env::args().any(|a| a == "--binary");

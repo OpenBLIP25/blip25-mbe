@@ -79,7 +79,10 @@ mod serde_l_cap_bool {
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[bool; L_CAP], D::Error> {
         let v = Vec::<bool>::deserialize(d)?;
         if v.len() != L_CAP {
-            return Err(serde::de::Error::invalid_length(v.len(), &format!("{L_CAP}").as_str()));
+            return Err(serde::de::Error::invalid_length(
+                v.len(),
+                &format!("{L_CAP}").as_str(),
+            ));
         }
         let mut out = [false; L_CAP];
         out.copy_from_slice(&v);
@@ -97,7 +100,10 @@ mod serde_l_cap_f32 {
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[f32; L_CAP], D::Error> {
         let v = Vec::<f32>::deserialize(d)?;
         if v.len() != L_CAP {
-            return Err(serde::de::Error::invalid_length(v.len(), &format!("{L_CAP}").as_str()));
+            return Err(serde::de::Error::invalid_length(
+                v.len(),
+                &format!("{L_CAP}").as_str(),
+            ));
         }
         let mut out = [0.0f32; L_CAP];
         out.copy_from_slice(&v);
@@ -153,7 +159,12 @@ impl MbeParams {
         let mut a = [0.0f32; L_CAP];
         v[..n].copy_from_slice(voiced);
         a[..n].copy_from_slice(amplitudes);
-        Ok(Self { omega_0, l, voiced: v, amplitudes: a })
+        Ok(Self {
+            omega_0,
+            l,
+            voiced: v,
+            amplitudes: a,
+        })
     }
 
     /// A silent frame: all unvoiced, all amplitudes zero.
@@ -210,7 +221,9 @@ impl MbeParams {
 
     /// Fundamental frequency in radians/sample.
     #[inline]
-    pub fn omega_0(&self) -> f32 { self.omega_0 }
+    pub fn omega_0(&self) -> f32 {
+        self.omega_0
+    }
 
     /// Fundamental frequency in Hz, for diagnostics.
     #[inline]
@@ -220,7 +233,9 @@ impl MbeParams {
 
     /// Number of harmonics `L`.
     #[inline]
-    pub fn harmonic_count(&self) -> u8 { self.l }
+    pub fn harmonic_count(&self) -> u8 {
+        self.l
+    }
 
     /// Voicing decision for harmonic `l`. Indexed `1..=L`.
     ///
@@ -302,7 +317,10 @@ mod tests {
         // encode_pitch — that's the whole reason `silence_ambe_plus2`
         // exists.
         let p_full = MbeParams::silence();
-        assert_eq!(crate::rate33::dequantize::encode_pitch(p_full.omega_0()), None);
+        assert_eq!(
+            crate::rate33::dequantize::encode_pitch(p_full.omega_0()),
+            None
+        );
     }
 
     #[test]

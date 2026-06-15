@@ -6,7 +6,7 @@
 //! candidates at offsets ±1/8, ±3/8, ±5/8, ±7/8, ±9/8 samples. Also
 //! computes L̂ (Eq. 31) and the quantized pitch index b̂_0 (Eq. 45).
 
-use super::{Complex64, DFT_SIZE, HarmonicBasis, packed_index};
+use super::{packed_index, Complex64, HarmonicBasis, DFT_SIZE};
 
 /// Number of pitch-refinement candidates (BABA-A §5.1.5).
 pub const N_REFINE_CANDIDATES: usize = 10;
@@ -90,11 +90,7 @@ fn e_r_upper_m(omega0: f64) -> i32 {
 /// Compute `E_R(ω_0)` per Eq. 24 — the spectral residual between the
 /// observed `S_w(m)` and the synthetic `S_w(m, ω_0)` built from the
 /// harmonic projections `A_l(ω_0)` of Eq. 28.
-pub(super) fn residual_e_r(
-    sw: &[Complex64; DFT_SIZE],
-    basis: &HarmonicBasis,
-    omega0: f64,
-) -> f64 {
+pub(super) fn residual_e_r(sw: &[Complex64; DFT_SIZE], basis: &HarmonicBasis, omega0: f64) -> f64 {
     let m_max = e_r_upper_m(omega0);
     if m_max < E_R_LOWER_M {
         return 0.0;
@@ -182,8 +178,7 @@ pub fn refine_pitch(
         let abs_off = offset.abs();
         // Strict-less-than keeps the first seen winner; on an exact
         // tie the tie-break kicks in via `abs_off < best_abs_offset`.
-        let take = e_r < best_e_r
-            || (e_r == best_e_r && abs_off < best_abs_offset);
+        let take = e_r < best_e_r || (e_r == best_e_r && abs_off < best_abs_offset);
         if take {
             best_e_r = e_r;
             best_omega = omega0;
@@ -202,8 +197,8 @@ pub fn refine_pitch(
 
 #[cfg(test)]
 mod tests {
+    use super::super::{signal_spectrum, W_R_HALF};
     use super::*;
-    use super::super::{W_R_HALF, signal_spectrum};
 
     #[test]
     fn refine_offsets_are_symmetric_and_quarter_sample_spaced() {
@@ -323,7 +318,10 @@ mod tests {
         let matches_a_candidate = REFINE_OFFSETS
             .iter()
             .any(|&offset| (p_refined - (50.0 + offset)).abs() < 1e-9);
-        assert!(matches_a_candidate, "P refined = {p_refined} not a candidate");
+        assert!(
+            matches_a_candidate,
+            "P refined = {p_refined} not a candidate"
+        );
     }
 
     /// For a broadband harmonic signal at period 50 with `P̂_I = 50`,

@@ -15,14 +15,14 @@
 //! Corresponds to the AMBE-3000 `PKT_RPT_MODE = 0x01` configuration
 //! with identical decoder and encoder rate parameters.
 
-use crate::imbe7200::dequantize::{DecoderState, dequantize, quantize};
+use crate::imbe7200::dequantize::{dequantize, quantize, DecoderState};
 use crate::imbe7200::frame::{decode_frame as decode_full, encode_frame as encode_full};
 use crate::imbe7200::priority::prioritize as prioritize_full;
 use crate::rate33::dequantize::{
-    DecoderState as HalfDecoderState, dequantize as dequantize_half, quantize as quantize_half,
+    dequantize as dequantize_half, quantize as quantize_half, DecoderState as HalfDecoderState,
 };
 use crate::rate33::frame::{
-    DIBITS_PER_FRAME, decode_frame as decode_half, encode_frame as encode_half,
+    decode_frame as decode_half, encode_frame as encode_half, DIBITS_PER_FRAME,
 };
 
 use super::converter::ConvertError;
@@ -40,7 +40,9 @@ pub struct FullRateRepeater {
 
 impl FullRateRepeater {
     /// Cold-start repeater.
-    pub fn new() -> Self { Self::default() }
+    pub fn new() -> Self {
+        Self::default()
+    }
 
     /// Decode + re-encode one full-rate frame.
     pub fn repeat(&mut self, dibits: &[u8; 72]) -> Result<[u8; 72], ConvertError> {
@@ -66,10 +68,15 @@ pub struct HalfRateRepeater {
 
 impl HalfRateRepeater {
     /// Cold-start repeater.
-    pub fn new() -> Self { Self::default() }
+    pub fn new() -> Self {
+        Self::default()
+    }
 
     /// Decode + re-encode one half-rate frame.
-    pub fn repeat(&mut self, dibits: &[u8; DIBITS_PER_FRAME]) -> Result<[u8; DIBITS_PER_FRAME], ConvertError> {
+    pub fn repeat(
+        &mut self,
+        dibits: &[u8; DIBITS_PER_FRAME],
+    ) -> Result<[u8; DIBITS_PER_FRAME], ConvertError> {
         let frame = decode_half(dibits);
         let params = dequantize_half(&frame.info, &mut self.decoder)?;
         let u = quantize_half(&params, &mut self.encoder).map_err(ConvertError::Decode)?;

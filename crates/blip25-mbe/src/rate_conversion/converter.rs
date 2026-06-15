@@ -68,24 +68,22 @@
 
 use core::f32::consts::PI;
 
-use crate::mbe_params::MbeParams;
 use crate::imbe7200::dequantize::{
-    DecodeError, DecoderState, EncodeError, PITCH_INDEX_MAX, dequantize, encode_pitch as full_encode_pitch,
-    pitch_decode as full_pitch_decode, quantize,
+    dequantize, encode_pitch as full_encode_pitch, pitch_decode as full_pitch_decode, quantize,
+    DecodeError, DecoderState, EncodeError, PITCH_INDEX_MAX,
 };
 use crate::imbe7200::frame::{decode_frame as decode_full, encode_frame as encode_full};
-use crate::imbe7200::priority::{
-    IMBE_B_MAX, L_MIN as FULL_L_MIN, prioritize as prioritize_full,
-};
+use crate::imbe7200::priority::{prioritize as prioritize_full, IMBE_B_MAX, L_MIN as FULL_L_MIN};
+use crate::mbe_params::MbeParams;
 use crate::rate33::dequantize::{
-    Decoded, DecoderState as HalfDecoderState, decode_to_params, encode_pitch as half_encode_pitch,
-    quantize as quantize_half,
+    decode_to_params, encode_pitch as half_encode_pitch, quantize as quantize_half, Decoded,
+    DecoderState as HalfDecoderState,
 };
 use crate::rate33::frame::{
-    AMBE_PITCH_TABLE, DIBITS_PER_FRAME, decode_frame as decode_half, encode_frame as encode_half,
+    decode_frame as decode_half, encode_frame as encode_half, AMBE_PITCH_TABLE, DIBITS_PER_FRAME,
 };
-use crate::rate33::priority::{AMBE_B_COUNT, prioritize as prioritize_half};
-use crate::rate_conversion::predictor::{CrossRatePredictorState, blend as cross_rate_blend};
+use crate::rate33::priority::{prioritize as prioritize_half, AMBE_B_COUNT};
+use crate::rate_conversion::predictor::{blend as cross_rate_blend, CrossRatePredictorState};
 
 /// Lowest ω̃₀ in the half-rate Annex L table (entry 119, L = 56).
 /// Used to clamp source parameters to the half-rate grid's range
@@ -180,11 +178,15 @@ pub enum ConvertError {
 }
 
 impl From<DecodeError> for ConvertError {
-    fn from(e: DecodeError) -> Self { Self::Decode(e) }
+    fn from(e: DecodeError) -> Self {
+        Self::Decode(e)
+    }
 }
 
 impl From<EncodeError> for ConvertError {
-    fn from(e: EncodeError) -> Self { Self::Encode(e) }
+    fn from(e: EncodeError) -> Self {
+        Self::Encode(e)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -220,7 +222,9 @@ impl Default for FullToHalfConverter {
 
 impl FullToHalfConverter {
     /// Cold-start converter.
-    pub fn new() -> Self { Self::default() }
+    pub fn new() -> Self {
+        Self::default()
+    }
 
     /// Convert one full-rate frame (72 dibits) into one half-rate
     /// frame (36 dibits). On a full-rate erasure / reserved pitch
@@ -268,13 +272,19 @@ impl FullToHalfConverter {
     }
 
     /// Borrow the source decoder state.
-    pub fn decoder_state(&self) -> &DecoderState { &self.decoder }
+    pub fn decoder_state(&self) -> &DecoderState {
+        &self.decoder
+    }
 
     /// Borrow the destination encoder state.
-    pub fn encoder_state(&self) -> &HalfDecoderState { &self.encoder }
+    pub fn encoder_state(&self) -> &HalfDecoderState {
+        &self.encoder
+    }
 
     /// Borrow the cross-rate predictor state.
-    pub fn predictor_state(&self) -> &CrossRatePredictorState { &self.predictor }
+    pub fn predictor_state(&self) -> &CrossRatePredictorState {
+        &self.predictor
+    }
 
     /// Enable or disable the §4.5 cross-rate magnitude blend. `true`
     /// (default, spec-conformant) applies the predictor on every
@@ -318,7 +328,9 @@ impl Default for HalfToFullConverter {
 
 impl HalfToFullConverter {
     /// Cold-start converter.
-    pub fn new() -> Self { Self::default() }
+    pub fn new() -> Self {
+        Self::default()
+    }
 
     /// Convert one half-rate frame (36 dibits) into one full-rate
     /// frame (72 dibits). Handles all four half-rate frame kinds:
@@ -366,13 +378,19 @@ impl HalfToFullConverter {
     }
 
     /// Borrow the source decoder state.
-    pub fn decoder_state(&self) -> &HalfDecoderState { &self.decoder }
+    pub fn decoder_state(&self) -> &HalfDecoderState {
+        &self.decoder
+    }
 
     /// Borrow the destination encoder state.
-    pub fn encoder_state(&self) -> &DecoderState { &self.encoder }
+    pub fn encoder_state(&self) -> &DecoderState {
+        &self.encoder
+    }
 
     /// Borrow the cross-rate predictor state.
-    pub fn predictor_state(&self) -> &CrossRatePredictorState { &self.predictor }
+    pub fn predictor_state(&self) -> &CrossRatePredictorState {
+        &self.predictor
+    }
 
     /// Enable or disable the §4.5 cross-rate magnitude blend. See
     /// [`FullToHalfConverter::set_predictor_enabled`] for semantics.
@@ -482,8 +500,7 @@ mod tests {
         let amps: Vec<f32> = (1..=l)
             .map(|h| 100.0 * (-(h as f32) * 0.05).exp())
             .collect();
-        let params =
-            MbeParams::new(ambe_plus2_omega_min(), l, &voiced, &amps).unwrap();
+        let params = MbeParams::new(ambe_plus2_omega_min(), l, &voiced, &amps).unwrap();
 
         let mut a_to_b = HalfToFullConverter::new();
         let mut b_to_a = FullToHalfConverter::new();
@@ -530,7 +547,7 @@ mod tests {
 
     // ---- Tone / silence / erasure handling -----------------------------
 
-    use crate::rate33::dequantize::{FrameKind, classify_ambe_plus2_frame};
+    use crate::rate33::dequantize::{classify_ambe_plus2_frame, FrameKind};
 
     /// Build a half-rate erasure frame's 36 dibits by deliberately
     /// prioritizing `b̂₀ = 120` with everything else zero — same path
@@ -625,7 +642,11 @@ mod tests {
         let frame = decode_full(&out);
         let mut sink = DecoderState::new();
         let params = dequantize(&frame.info, &mut sink).expect("tone → voice");
-        assert!(params.harmonic_count() >= 9, "tone yielded L={}", params.harmonic_count());
+        assert!(
+            params.harmonic_count() >= 9,
+            "tone yielded L={}",
+            params.harmonic_count()
+        );
     }
 
     #[test]

@@ -50,15 +50,17 @@ fn main() {
     let widths = [23u32, 23, 23, 23, 15, 15, 15, 7];
     let mut total_diff = 0u32;
     for i in 0..8 {
-        let mask = if widths[i] == 32 { u32::MAX } else { (1u32 << widths[i]) - 1 };
+        let mask = if widths[i] == 32 {
+            u32::MAX
+        } else {
+            (1u32 << widths[i]) - 1
+        };
         let a = c_orig[i] & mask;
         let b = c_roundtrip[i] & mask;
         let xor = a ^ b;
         let diff = popcount_u32(xor);
         total_diff += diff;
-        println!(
-            "  c[{i}] orig=0x{a:07x} rt=0x{b:07x}  diff={diff} xor=0b{xor:023b}",
-        );
+        println!("  c[{i}] orig=0x{a:07x} rt=0x{b:07x}  diff={diff} xor=0b{xor:023b}",);
     }
     println!("  TOTAL bit-diff (c̃-level): {total_diff}");
 

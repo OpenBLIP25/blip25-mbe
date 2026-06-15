@@ -1,6 +1,6 @@
-use std::fs;
-use std::env;
 use blip25_mbe::vocoder::{Rate, Vocoder};
+use std::env;
+use std::fs;
 
 fn main() {
     let args: Vec<String> = env::args().collect();

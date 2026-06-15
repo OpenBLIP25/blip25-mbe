@@ -56,10 +56,7 @@ pub fn pn_sequence(u0: u16) -> [u16; PN_SEQ_LEN] {
     let mut pr = [0u16; PN_SEQ_LEN];
     pr[0] = u0.wrapping_mul(16);
     for n in 1..PN_SEQ_LEN {
-        pr[n] = (173u32
-            .wrapping_mul(pr[n - 1] as u32)
-            .wrapping_add(13849)
-            & 0xFFFF) as u16;
+        pr[n] = (173u32.wrapping_mul(pr[n - 1] as u32).wrapping_add(13849) & 0xFFFF) as u16;
     }
     pr
 }
@@ -220,8 +217,18 @@ pub fn soft_deinterleave(soft: &[i8; SOFT_BITS]) -> SoftCodeVectors {
     for (sym, entry) in ANNEX_H.iter().enumerate() {
         let hi = soft[2 * sym];
         let lo = soft[2 * sym + 1];
-        place_soft(&mut out, entry.bit1_vec as usize, entry.bit1_idx as usize, hi);
-        place_soft(&mut out, entry.bit0_vec as usize, entry.bit0_idx as usize, lo);
+        place_soft(
+            &mut out,
+            entry.bit1_vec as usize,
+            entry.bit1_idx as usize,
+            hi,
+        );
+        place_soft(
+            &mut out,
+            entry.bit0_vec as usize,
+            entry.bit0_idx as usize,
+            lo,
+        );
     }
     out
 }
@@ -256,7 +263,11 @@ pub struct SoftCodeVectors {
 
 impl Default for SoftCodeVectors {
     fn default() -> Self {
-        Self { golay: [[0i8; 23]; 4], hamming: [[0i8; 15]; 3], uncoded: [0i8; 7] }
+        Self {
+            golay: [[0i8; 23]; 4],
+            hamming: [[0i8; 15]; 3],
+            uncoded: [0i8; 7],
+        }
     }
 }
 
@@ -331,7 +342,11 @@ mod tests {
             let m = modulation_masks(u0);
             for i in 0..8 {
                 let len = VECTOR_LENGTHS[i] as u32;
-                let max_mask = if len == 32 { u32::MAX } else { (1u32 << len) - 1 };
+                let max_mask = if len == 32 {
+                    u32::MAX
+                } else {
+                    (1u32 << len) - 1
+                };
                 assert!(
                     m[i] <= max_mask,
                     "mask {i} has bit beyond vector length {len} (u0={u0}, m=0x{:x})",
@@ -368,7 +383,10 @@ mod tests {
     fn pn_consumes_exactly_114_indices_for_masks() {
         // Sanity: total mask bits across m1..m6 = 114, matching the
         // number of non-seed PN indices.
-        let total: u8 = [1u8, 2, 3, 4, 5, 6].iter().map(|&i| VECTOR_LENGTHS[i as usize]).sum();
+        let total: u8 = [1u8, 2, 3, 4, 5, 6]
+            .iter()
+            .map(|&i| VECTOR_LENGTHS[i as usize])
+            .sum();
         assert_eq!(total, 114);
         assert_eq!(PN_SEQ_LEN - 1, 114);
     }
@@ -378,7 +396,11 @@ mod tests {
     /// Mask that keeps only the valid bits of codeword `i`.
     fn valid_mask(i: usize) -> u32 {
         let len = VECTOR_LENGTHS[i] as u32;
-        if len == 32 { u32::MAX } else { (1u32 << len) - 1 }
+        if len == 32 {
+            u32::MAX
+        } else {
+            (1u32 << len) - 1
+        }
     }
 
     #[test]
@@ -387,9 +409,15 @@ mod tests {
         // the 8 vectors' 23+23+23+23+15+15+15+7 = 144 positions.
         let mut seen = [[false; 23]; 8];
         for entry in ANNEX_H.iter() {
-            for (v, i) in [(entry.bit1_vec, entry.bit1_idx), (entry.bit0_vec, entry.bit0_idx)] {
+            for (v, i) in [
+                (entry.bit1_vec, entry.bit1_idx),
+                (entry.bit0_vec, entry.bit0_idx),
+            ] {
                 assert!((i as u8) < VECTOR_LENGTHS[v as usize]);
-                assert!(!seen[v as usize][i as usize], "double coverage at ({v}, {i})");
+                assert!(
+                    !seen[v as usize][i as usize],
+                    "double coverage at ({v}, {i})"
+                );
                 seen[v as usize][i as usize] = true;
             }
         }

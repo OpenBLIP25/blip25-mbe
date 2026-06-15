@@ -39,8 +39,7 @@ const SHARED_LPF_TAIL: usize = (W_I_HALF as usize) - (SAMPLES_PER_FRAME as usize
 /// at once. Buf range is `[−70, 550]` inclusive both ends, so 621
 /// entries: `(slot2_right − slot0_left) + 1` =
 /// `(2·SAMPLES_PER_FRAME + 2·W_I_HALF) + 1`.
-pub const SHARED_LPF_LEN: usize =
-    2 * SAMPLES_PER_FRAME as usize + 2 * W_I_HALF as usize + 1;
+pub const SHARED_LPF_LEN: usize = 2 * SAMPLES_PER_FRAME as usize + 2 * W_I_HALF as usize + 1;
 
 /// Half-support of the input buffer that `PitchSearch::new` consumes.
 /// The LPF needs `±H_LPF_HALF` samples beyond the `w_I` support, so the
@@ -553,11 +552,7 @@ pub fn look_back(current: &PitchSearch, ctx: LookBackContext) -> (f64, f64) {
 /// level pipeline should route through silence/erasure emission per
 /// addendum §0.3.7 rather than call this function with placeholder
 /// tables — the result would be a pitch derived from zeros.
-pub fn look_ahead(
-    current: &PitchSearch,
-    next1: &PitchSearch,
-    next2: &PitchSearch,
-) -> (f64, f64) {
+pub fn look_ahead(current: &PitchSearch, next1: &PitchSearch, next2: &PitchSearch) -> (f64, f64) {
     // Scan P_0 over the full half-sample grid. For each P_0, find
     // P̂_1 ∈ [0.8·P_0, 1.2·P_0] minimizing E_1, then P̂_2 ∈
     // [0.8·P̂_1, 1.2·P̂_1] minimizing E_2. CE_F(P_0) is the sum.
@@ -566,14 +561,8 @@ pub fn look_ahead(
     for i in 0..PITCH_GRID_LEN {
         let p0 = PITCH_GRID_MIN + (i as f64) * PITCH_GRID_STEP;
         let e0 = current.e_of_p_grid(i);
-        let (p1, e1) = next1.argmin_in_range(
-            PITCH_CONTINUITY_LO * p0,
-            PITCH_CONTINUITY_HI * p0,
-        );
-        let (_p2, e2) = next2.argmin_in_range(
-            PITCH_CONTINUITY_LO * p1,
-            PITCH_CONTINUITY_HI * p1,
-        );
+        let (p1, e1) = next1.argmin_in_range(PITCH_CONTINUITY_LO * p0, PITCH_CONTINUITY_HI * p0);
+        let (_p2, e2) = next2.argmin_in_range(PITCH_CONTINUITY_LO * p1, PITCH_CONTINUITY_HI * p1);
         let ce = e0 + e1 + e2;
         if ce < best_ce {
             best_ce = ce;
@@ -600,14 +589,10 @@ pub fn look_ahead(
                 continue;
             };
             let e0s = current.e_of_p(sub);
-            let (p1s, e1s) = next1.argmin_in_range(
-                PITCH_CONTINUITY_LO * sub,
-                PITCH_CONTINUITY_HI * sub,
-            );
-            let (_p2s, e2s) = next2.argmin_in_range(
-                PITCH_CONTINUITY_LO * p1s,
-                PITCH_CONTINUITY_HI * p1s,
-            );
+            let (p1s, e1s) =
+                next1.argmin_in_range(PITCH_CONTINUITY_LO * sub, PITCH_CONTINUITY_HI * sub);
+            let (_p2s, e2s) =
+                next2.argmin_in_range(PITCH_CONTINUITY_LO * p1s, PITCH_CONTINUITY_HI * p1s);
             let ce_sub = e0s + e1s + e2s;
             let ratio = if ce_p0 > 0.0 {
                 ce_sub / ce_p0

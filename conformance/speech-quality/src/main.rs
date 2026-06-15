@@ -22,7 +22,7 @@
 //! when the driver waited on a phantom parity byte. Full-length vectors
 //! run in seconds, so `--frames` is for scoping coverage, not wall time.
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -31,18 +31,15 @@ use std::time::Instant;
 
 use blip25_mbe::codecs::ambe_plus2;
 use blip25_mbe::codecs::mbe_baseline::analysis::{
-    AnalysisOutput, AnalysisState, DenoiseKind, HumNotch, PreDenoise, encode as analysis_encode,
-    encode_ambe_plus2 as analysis_encode_ambe_plus2,
+    encode as analysis_encode, encode_ambe_plus2 as analysis_encode_ambe_plus2, AnalysisOutput,
+    AnalysisState, DenoiseKind, HumNotch, PreDenoise,
 };
 use blip25_mbe::codecs::mbe_baseline::{
-    FrameDisposition, FrameErrorContext, GAMMA_W, SynthState, synthesize_frame,
+    synthesize_frame, FrameDisposition, FrameErrorContext, SynthState, GAMMA_W,
 };
-use blip25_mbe::enhancement::{
-    self as enh, ClassicalConfig, EnhancementMode, EnhancementState,
-};
-use blip25_mbe::mbe_params::MbeParams;
+use blip25_mbe::enhancement::{self as enh, ClassicalConfig, EnhancementMode, EnhancementState};
 use blip25_mbe::imbe7200::dequantize::{
-    DecoderState, dequantize as dequantize_full, quantize as quantize_full,
+    dequantize as dequantize_full, quantize as quantize_full, DecoderState,
 };
 use blip25_mbe::imbe7200::frame::{
     decode_frame as decode_full_frame, encode_frame as encode_full_frame,
@@ -50,12 +47,13 @@ use blip25_mbe::imbe7200::frame::{
 use blip25_mbe::imbe7200::priority::{
     deprioritize as deprioritize_full, prioritize as prioritize_full,
 };
+use blip25_mbe::mbe_params::MbeParams;
 use blip25_mbe::rate33::dequantize::{
-    DecoderState as HalfDecoderState, Decoded as HalfDecoded,
-    decode_to_params as decode_to_params_half, quantize as quantize_half,
+    decode_to_params as decode_to_params_half, quantize as quantize_half, Decoded as HalfDecoded,
+    DecoderState as HalfDecoderState,
 };
 use blip25_mbe::rate33::frame::{
-    DIBITS_PER_FRAME as HALF_DIBITS_PER_FRAME, encode_frame as encode_half_frame,
+    encode_frame as encode_half_frame, DIBITS_PER_FRAME as HALF_DIBITS_PER_FRAME,
 };
 
 const FRAME_SAMPLES: usize = 160;
@@ -440,8 +438,9 @@ impl EnhancementCli {
                 if ov.no_hpf {
                     cfg.biquads[0] = None;
                 } else if let Some(hz) = ov.hpf_cutoff_hz {
-                    cfg.biquads[0] =
-                        Some(blip25_mbe::enhancement::Biquad::high_pass(8_000.0, hz, 0.707));
+                    cfg.biquads[0] = Some(blip25_mbe::enhancement::Biquad::high_pass(
+                        8_000.0, hz, 0.707,
+                    ));
                 }
                 if ov.no_peaking {
                     cfg.biquads[1] = None;
@@ -571,16 +570,24 @@ fn main() -> Result<()> {
                 hum_notch,
             },
         ),
-        Cmd::DecodeRawHalfrate { input, out_wav, binary } => {
-            cmd_decode_raw_ambe_plus2(&input, &out_wav, binary)
-        }
+        Cmd::DecodeRawHalfrate {
+            input,
+            out_wav,
+            binary,
+        } => cmd_decode_raw_ambe_plus2(&input, &out_wav, binary),
         Cmd::DecodeRawMbe { input, out_wav } => cmd_decode_raw_mbe(&input, &out_wav),
-        Cmd::DecodeFecHalfrate { input, out_wav, binary } => {
-            cmd_decode_fec_ambe_plus2(&input, &out_wav, binary)
-        }
-        Cmd::DecodeFecFullrate { input, out_wav, binary, chip_compat, repeat_reset_after } => {
-            cmd_decode_fec_imbe(&input, &out_wav, binary, chip_compat, repeat_reset_after)
-        }
+        Cmd::DecodeFecHalfrate {
+            input,
+            out_wav,
+            binary,
+        } => cmd_decode_fec_ambe_plus2(&input, &out_wav, binary),
+        Cmd::DecodeFecFullrate {
+            input,
+            out_wav,
+            binary,
+            chip_compat,
+            repeat_reset_after,
+        } => cmd_decode_fec_imbe(&input, &out_wav, binary, chip_compat, repeat_reset_after),
     }
 }
 
@@ -602,8 +609,7 @@ fn cmd_ab_matrix(
     enhancement: EnhancementMode,
     log_tone_frames: bool,
 ) -> Result<()> {
-    fs::create_dir_all(out_dir)
-        .with_context(|| format!("create out_dir {}", out_dir.display()))?;
+    fs::create_dir_all(out_dir).with_context(|| format!("create out_dir {}", out_dir.display()))?;
 
     let pcm = read_pcm_i16(pcm_path)?;
     let n_frames_total = pcm.len() / FRAME_SAMPLES;
@@ -691,9 +697,7 @@ fn cmd_ab_matrix(
         let t0 = Instant::now();
         ssh_run(
             chip_host,
-            &format!(
-                "dvsi encode '{remote_pcm}' '{remote_chip_bit}' --frames {n_frames}"
-            ),
+            &format!("dvsi encode '{remote_pcm}' '{remote_chip_bit}' --frames {n_frames}"),
         )?;
         let chip_enc_secs = t0.elapsed().as_secs_f64();
         meta.chip_enc_secs = Some(chip_enc_secs);
@@ -725,15 +729,11 @@ fn cmd_ab_matrix(
         let t0 = Instant::now();
         ssh_run(
             chip_host,
-            &format!(
-                "dvsi decode '{remote_chip_bit}' '{remote_cedec_pcm}' --frames {n_frames}"
-            ),
+            &format!("dvsi decode '{remote_chip_bit}' '{remote_cedec_pcm}' --frames {n_frames}"),
         )?;
         ssh_run(
             chip_host,
-            &format!(
-                "dvsi decode '{remote_our_bit}' '{remote_oedec_pcm}' --frames {n_frames}"
-            ),
+            &format!("dvsi decode '{remote_our_bit}' '{remote_oedec_pcm}' --frames {n_frames}"),
         )?;
         let chip_dec_secs = t0.elapsed().as_secs_f64();
         meta.chip_dec_secs = Some(chip_dec_secs);
@@ -824,8 +824,8 @@ fn our_encode(
             AnalysisOutput::Silence => MbeParams::silence(),
         };
         // Probe-modification pass: amp_scale, vuv_override.
-        let needs_rebuild = (amp_scale - 1.0).abs() > 1e-6
-            || !matches!(vuv_override, VuvOverride::None);
+        let needs_rebuild =
+            (amp_scale - 1.0).abs() > 1e-6 || !matches!(vuv_override, VuvOverride::None);
         let params = if needs_rebuild {
             let l = params.harmonic_count();
             let omega = params.omega_0();
@@ -916,7 +916,13 @@ fn our_decode(
             tone_gate.observe(f, &params, &pcm);
         }
         let prev_was_use = matches!(prev_disposition, Some(FrameDisposition::Use));
-        enh::apply(enhancement, &mut enh_state, &mut pcm, SAMPLE_RATE as f32, prev_was_use);
+        enh::apply(
+            enhancement,
+            &mut enh_state,
+            &mut pcm,
+            SAMPLE_RATE as f32,
+            prev_was_use,
+        );
         prev_disposition = synth_state.last_disposition();
         out.extend_from_slice(&pcm);
     }
@@ -1110,8 +1116,7 @@ fn cmd_ambe_plus2_ab_matrix(
     enhancement: EnhancementMode,
     levers: LeverFlags,
 ) -> Result<()> {
-    fs::create_dir_all(out_dir)
-        .with_context(|| format!("create out_dir {}", out_dir.display()))?;
+    fs::create_dir_all(out_dir).with_context(|| format!("create out_dir {}", out_dir.display()))?;
     let pcm = read_pcm_i16(pcm_path)?;
     let n_frames_total = pcm.len() / FRAME_SAMPLES;
     let n_frames = frames
@@ -1237,11 +1242,15 @@ fn cmd_ambe_plus2_ab_matrix(
         let t0 = Instant::now();
         ssh_run(
             chip_host,
-            &format!("dvsi decode-halfrate '{remote_chip_bit}' '{remote_cedec_pcm}' --frames {n_frames}"),
+            &format!(
+                "dvsi decode-halfrate '{remote_chip_bit}' '{remote_cedec_pcm}' --frames {n_frames}"
+            ),
         )?;
         ssh_run(
             chip_host,
-            &format!("dvsi decode-halfrate '{remote_our_bit}' '{remote_oedec_pcm}' --frames {n_frames}"),
+            &format!(
+                "dvsi decode-halfrate '{remote_our_bit}' '{remote_oedec_pcm}' --frames {n_frames}"
+            ),
         )?;
         let chip_dec_secs = t0.elapsed().as_secs_f64();
         meta.chip_dec_secs = Some(chip_dec_secs);
@@ -1317,7 +1326,8 @@ fn our_encode_ambe_plus2(
         let mut amp_max: u8 = 0;
         for f in 0..n_frames {
             let frame = &pcm[f * FRAME_SAMPLES..(f + 1) * FRAME_SAMPLES];
-            let bits = v.encode_pcm(frame)
+            let bits = v
+                .encode_pcm(frame)
                 .map_err(|e| anyhow!("vocoder encode error at frame {f}: {e:?}"))?;
             if let Some(stats) = v.last_stats().analysis.as_ref() {
                 if let AnalysisOutputKind::Tone { id, amplitude } = stats.output {
@@ -1330,9 +1340,7 @@ fn our_encode_ambe_plus2(
             }
             out.extend_from_slice(&bits);
         }
-        eprintln!(
-            "tone-frame dispatch: {tone_count}/{n_frames} frames emitted as tone frames"
-        );
+        eprintln!("tone-frame dispatch: {tone_count}/{n_frames} frames emitted as tone frames");
         if tone_count > 0 {
             let summary: Vec<String> = id_hist
                 .iter()
@@ -1340,9 +1348,7 @@ fn our_encode_ambe_plus2(
                 .collect();
             let amp_mean = amp_sum as f64 / tone_count as f64;
             eprintln!("  tone-id histogram: {}", summary.join(" "));
-            eprintln!(
-                "  tone A_D: mean={amp_mean:.1} min={amp_min} max={amp_max} (range 0..127)"
-            );
+            eprintln!("  tone A_D: mean={amp_mean:.1} min={amp_min} max={amp_max} (range 0..127)");
         }
         return Ok(out);
     }
@@ -1897,8 +1903,7 @@ fn unpack_dibits(bytes: &[u8]) -> [u8; DIBITS_PER_FRAME] {
 // ----------------------------------------------------------------------------
 
 fn read_pcm_i16(path: &Path) -> Result<Vec<i16>> {
-    let bytes = fs::read(path)
-        .with_context(|| format!("read PCM {}", path.display()))?;
+    let bytes = fs::read(path).with_context(|| format!("read PCM {}", path.display()))?;
     if bytes.len() % 2 != 0 {
         return Err(anyhow!("PCM file {} has odd byte count", path.display()));
     }
@@ -1914,8 +1919,7 @@ fn write_raw_pcm(path: &Path, pcm: &[i16]) -> Result<()> {
     for s in pcm {
         bytes.extend_from_slice(&s.to_le_bytes());
     }
-    fs::write(path, bytes)
-        .with_context(|| format!("write PCM {}", path.display()))
+    fs::write(path, bytes).with_context(|| format!("write PCM {}", path.display()))
 }
 
 fn write_wav(path: &Path, pcm: &[i16]) -> Result<()> {
@@ -1942,8 +1946,10 @@ fn write_wav(path: &Path, pcm: &[i16]) -> Result<()> {
 
 fn ssh_run(host: &str, cmd: &str) -> Result<()> {
     let status = Command::new("ssh")
-        .arg("-o").arg("BatchMode=yes")
-        .arg("-o").arg("StrictHostKeyChecking=accept-new")
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .arg("-o")
+        .arg("StrictHostKeyChecking=accept-new")
         .arg(host)
         .arg(cmd)
         .status()

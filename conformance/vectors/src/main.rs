@@ -28,46 +28,41 @@
 //! channel codec (deinterleave + Golay/Hamming + PN) and the no-FEC
 //! packing convention against DVSI ground truth.
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use blip25_mbe::codecs::mbe_baseline::{
-    FrameErrorContext, GAMMA_W, SynthState, synthesize_frame, synthesize_frame_ambe_plus,
-};
 use blip25_mbe::codecs::mbe_baseline::analysis::{
-    AnalysisError, AnalysisOutput, AnalysisState, VuvResult,
-    band_count_for,
-    encode_ambe_plus2 as analysis_encode_ambe_plus2,
-    encode_with_trace as analysis_encode_with_trace,
+    band_count_for, encode_ambe_plus2 as analysis_encode_ambe_plus2,
+    encode_with_trace as analysis_encode_with_trace, AnalysisError, AnalysisOutput, AnalysisState,
+    VuvResult,
+};
+use blip25_mbe::codecs::mbe_baseline::{
+    synthesize_frame, synthesize_frame_ambe_plus, FrameErrorContext, SynthState, GAMMA_W,
 };
 use blip25_mbe::fec::{golay_23_12_encode, hamming_15_11_encode};
 use blip25_mbe::imbe7200::dequantize::{
-    DecodeError, DecoderState, dequantize as dequantize_full, quantize as quantize_full,
+    dequantize as dequantize_full, quantize as quantize_full, DecodeError, DecoderState,
 };
 use blip25_mbe::imbe7200::fec::{deinterleave as deinterleave_full, modulation_masks};
 use blip25_mbe::imbe7200::frame::{
-    Frame as FullFrame, INFO_WIDTHS,
-    decode_frame as decode_full_frame, encode_frame as encode_full_frame,
+    decode_frame as decode_full_frame, encode_frame as encode_full_frame, Frame as FullFrame,
+    INFO_WIDTHS,
 };
 use blip25_mbe::imbe7200::priority::{
     deprioritize as deprioritize_full, prioritize as prioritize_full,
 };
+use blip25_mbe::mbe_params::MbeParams;
 use blip25_mbe::rate33::dequantize::{
-    Decoded, DecoderState as HalfDecoderState, decode_to_params,
-    dequantize as dequantize_half, quantize as quantize_half,
+    decode_to_params, dequantize as dequantize_half, quantize as quantize_half, Decoded,
+    DecoderState as HalfDecoderState,
 };
 use blip25_mbe::rate33::frame::{
     decode_frame as decode_half_frame, deinterleave as deinterleave_half,
 };
-use blip25_mbe::rate33::priority::{
-    deprioritize as deprioritize_half,
-};
-use blip25_mbe::rate_conversion::converter::{
-    FullToHalfConverter, HalfToFullConverter,
-};
-use blip25_mbe::mbe_params::MbeParams;
+use blip25_mbe::rate33::priority::deprioritize as deprioritize_half;
+use blip25_mbe::rate_conversion::converter::{FullToHalfConverter, HalfToFullConverter};
 use blip25_mbe::vocoder::{Rate, Transcoder};
 
 const BYTES_PER_FEC_FRAME: usize = 18;
@@ -549,12 +544,20 @@ enum HalfratePhaseMode {
 fn main() -> Result<()> {
     let args = Args::parse();
     match args.command {
-        Cmd::Compare { name, rc, stop_on_first } => {
-            cmd_compare(&args.vectors, &name, rc, stop_on_first)
-        }
+        Cmd::Compare {
+            name,
+            rc,
+            stop_on_first,
+        } => cmd_compare(&args.vectors, &name, rc, stop_on_first),
         Cmd::PnDiag { name, rc, frame } => cmd_pn_diag(&args.vectors, &name, rc, frame),
         Cmd::Roundtrip { name, rc } => cmd_roundtrip(&args.vectors, &name, rc),
-        Cmd::DecodePcm { name, rc, gamma_w, m_scale, write_pcm } => cmd_decode_pcm(
+        Cmd::DecodePcm {
+            name,
+            rc,
+            gamma_w,
+            m_scale,
+            write_pcm,
+        } => cmd_decode_pcm(
             &args.vectors,
             &name,
             rc,
@@ -562,15 +565,18 @@ fn main() -> Result<()> {
             m_scale,
             write_pcm.as_deref(),
         ),
-        Cmd::DecodePcmHalfrate { name, gamma_w, write_pcm, phase_mode } => {
-            cmd_decode_pcm_ambe_plus2(
-                &args.vectors,
-                &name,
-                gamma_w.unwrap_or(GAMMA_W),
-                write_pcm.as_deref(),
-                phase_mode,
-            )
-        }
+        Cmd::DecodePcmHalfrate {
+            name,
+            gamma_w,
+            write_pcm,
+            phase_mode,
+        } => cmd_decode_pcm_ambe_plus2(
+            &args.vectors,
+            &name,
+            gamma_w.unwrap_or(GAMMA_W),
+            write_pcm.as_deref(),
+            phase_mode,
+        ),
         Cmd::HalfrateInspect { name, frames } => {
             cmd_ambe_plus2_inspect(&args.vectors, &name, frames)
         }
@@ -582,10 +588,18 @@ fn main() -> Result<()> {
         Cmd::HalfrateFecHistogram { name, rate, rc } => {
             cmd_ambe_plus2_fec_histogram(&args.vectors, &name, &rate, rc)
         }
-        Cmd::ScanTransitions { name, min_transition_ratio, limit } => {
-            cmd_scan_transitions(&args.vectors, &name, min_transition_ratio, limit)
-        }
-        Cmd::XcorrFrame { name, frame, both, gamma_w, m_scale } => cmd_xcorr_frame(
+        Cmd::ScanTransitions {
+            name,
+            min_transition_ratio,
+            limit,
+        } => cmd_scan_transitions(&args.vectors, &name, min_transition_ratio, limit),
+        Cmd::XcorrFrame {
+            name,
+            frame,
+            both,
+            gamma_w,
+            m_scale,
+        } => cmd_xcorr_frame(
             &args.vectors,
             &name,
             frame,
@@ -593,34 +607,85 @@ fn main() -> Result<()> {
             gamma_w.unwrap_or(GAMMA_W),
             m_scale,
         ),
-        Cmd::RateConvert { direction, name, rc } => {
-            cmd_rate_convert(&args.vectors, direction, &name, rc)
-        }
-        Cmd::RateConvertRoundtrip { direction, name, rc } => {
-            cmd_rate_convert_roundtrip(&args.vectors, direction, &name, rc)
-        }
-        Cmd::RateConvertSmoothness { direction, name, rc } => {
-            cmd_rate_convert_smoothness(&args.vectors, direction, &name, rc)
-        }
-        Cmd::HalfrateAnalysisEncode { name, chip_offset, silence_dispatch, dump_frames, pitch_silence_override } => {
-            cmd_ambe_plus2_analysis_encode(
-                &args.vectors,
-                &name,
-                chip_offset,
-                silence_dispatch,
-                dump_frames,
-                pitch_silence_override,
-            )
-        }
-        Cmd::AnalysisEncode { name, rc, dump_frames, chip_offset, silence_dispatch, quantizer_roundtrip, chip_seed_vuv, bitstream, bit_override, max_frames, pitch_silence_override } => {
-            cmd_analysis_encode(&args.vectors, &name, rc, dump_frames, chip_offset, silence_dispatch, quantizer_roundtrip, chip_seed_vuv, bitstream, bit_override.as_deref(), max_frames, pitch_silence_override)
-        }
-        Cmd::P25Sweep { cmp, filter, op, stop_on_first } => {
-            cmd_p25_sweep(&args.vectors, cmp.as_deref(), filter.as_deref(), op.as_deref(), stop_on_first)
-        }
-        Cmd::CrossRateCompare { cmp, filter, verbose_mismatch, csv } => {
-            cmd_cross_rate_compare(&args.vectors, cmp.as_deref(), filter.as_deref(), verbose_mismatch, csv.as_deref())
-        }
+        Cmd::RateConvert {
+            direction,
+            name,
+            rc,
+        } => cmd_rate_convert(&args.vectors, direction, &name, rc),
+        Cmd::RateConvertRoundtrip {
+            direction,
+            name,
+            rc,
+        } => cmd_rate_convert_roundtrip(&args.vectors, direction, &name, rc),
+        Cmd::RateConvertSmoothness {
+            direction,
+            name,
+            rc,
+        } => cmd_rate_convert_smoothness(&args.vectors, direction, &name, rc),
+        Cmd::HalfrateAnalysisEncode {
+            name,
+            chip_offset,
+            silence_dispatch,
+            dump_frames,
+            pitch_silence_override,
+        } => cmd_ambe_plus2_analysis_encode(
+            &args.vectors,
+            &name,
+            chip_offset,
+            silence_dispatch,
+            dump_frames,
+            pitch_silence_override,
+        ),
+        Cmd::AnalysisEncode {
+            name,
+            rc,
+            dump_frames,
+            chip_offset,
+            silence_dispatch,
+            quantizer_roundtrip,
+            chip_seed_vuv,
+            bitstream,
+            bit_override,
+            max_frames,
+            pitch_silence_override,
+        } => cmd_analysis_encode(
+            &args.vectors,
+            &name,
+            rc,
+            dump_frames,
+            chip_offset,
+            silence_dispatch,
+            quantizer_roundtrip,
+            chip_seed_vuv,
+            bitstream,
+            bit_override.as_deref(),
+            max_frames,
+            pitch_silence_override,
+        ),
+        Cmd::P25Sweep {
+            cmp,
+            filter,
+            op,
+            stop_on_first,
+        } => cmd_p25_sweep(
+            &args.vectors,
+            cmp.as_deref(),
+            filter.as_deref(),
+            op.as_deref(),
+            stop_on_first,
+        ),
+        Cmd::CrossRateCompare {
+            cmp,
+            filter,
+            verbose_mismatch,
+            csv,
+        } => cmd_cross_rate_compare(
+            &args.vectors,
+            cmp.as_deref(),
+            filter.as_deref(),
+            verbose_mismatch,
+            csv.as_deref(),
+        ),
     }
 }
 
@@ -650,8 +715,8 @@ fn cmd_decode_pcm(
     let fec_path = dir.join("p25").join(format!("{name}.bit"));
     let pcm_path = dir.join("p25").join(format!("{name}.pcm"));
 
-    let fec_bytes = fs::read(&fec_path)
-        .with_context(|| format!("read FEC vector {}", fec_path.display()))?;
+    let fec_bytes =
+        fs::read(&fec_path).with_context(|| format!("read FEC vector {}", fec_path.display()))?;
     let pcm_ref_bytes = fs::read(&pcm_path)
         .with_context(|| format!("read reference PCM {}", pcm_path.display()))?;
 
@@ -671,7 +736,10 @@ fn cmd_decode_pcm(
 
     println!("vector:        {name}{}", if rc { " (rc)" } else { "" });
     println!("frames:        {n_frames}");
-    println!("ref samples:   {n_ref_samples} (= {} frames)", n_ref_samples / FRAME_SAMPLES);
+    println!(
+        "ref samples:   {n_ref_samples} (= {} frames)",
+        n_ref_samples / FRAME_SAMPLES
+    );
 
     // Decode the reference PCM as i16 little-endian.
     let pcm_ref: Vec<i16> = pcm_ref_bytes
@@ -759,7 +827,12 @@ fn cmd_decode_pcm(
         }
         fs::write(out_path, &bytes)
             .with_context(|| format!("write synthesized PCM to {}", out_path.display()))?;
-        println!("wrote {} samples ({} bytes) to {}", pcm_out.len(), bytes.len(), out_path.display());
+        println!(
+            "wrote {} samples ({} bytes) to {}",
+            pcm_out.len(),
+            bytes.len(),
+            out_path.display()
+        );
     }
     Ok(())
 }
@@ -791,8 +864,7 @@ fn cmd_roundtrip(root: &Path, name: &str, rc: bool) -> Result<()> {
     let mut vec_matches = [0usize; 8];
 
     for f in 0..n_frames {
-        let frame_bytes =
-            &nofec_bytes[f * BYTES_PER_NOFEC_FRAME..(f + 1) * BYTES_PER_NOFEC_FRAME];
+        let frame_bytes = &nofec_bytes[f * BYTES_PER_NOFEC_FRAME..(f + 1) * BYTES_PER_NOFEC_FRAME];
         let u_orig = unpack_nofec_info(frame_bytes);
 
         // Decode → params.
@@ -909,8 +981,16 @@ fn cmd_pn_diag(root: &Path, name: &str, rc: bool, frame: usize) -> Result<()> {
         let n = widths[i] as u32;
         let mask = if n == 32 { u32::MAX } else { (1u32 << n) - 1 };
         let reversed = reverse_bits_within(our_mask[i], widths[i]);
-        let mark_norm = if dvsi_mask[i] & mask == our_mask[i] & mask { '✓' } else { ' ' };
-        let mark_rev = if dvsi_mask[i] & mask == reversed & mask { '✓' } else { ' ' };
+        let mark_norm = if dvsi_mask[i] & mask == our_mask[i] & mask {
+            '✓'
+        } else {
+            ' '
+        };
+        let mark_rev = if dvsi_mask[i] & mask == reversed & mask {
+            '✓'
+        } else {
+            ' '
+        };
         println!(
             "  {i}   0x{:06x}              0x{:06x} {}            0x{:06x} {}",
             dvsi_mask[i] & mask,
@@ -1007,11 +1087,15 @@ fn cmd_decode_pcm_ambe_plus2(
         // AMBE-3000_Decoder_Implementation_Spec §5; Baseline is
         // available for A/B listening tests of the phase-regen
         // perceptual claim.
-        let synth: fn(&MbeParams, &FrameErrorContext, f64, &mut SynthState) -> [i16; FRAME_SAMPLES] =
-            match phase_mode {
-                HalfratePhaseMode::Baseline => synthesize_frame,
-                HalfratePhaseMode::AmbePlus => synthesize_frame_ambe_plus,
-            };
+        let synth: fn(
+            &MbeParams,
+            &FrameErrorContext,
+            f64,
+            &mut SynthState,
+        ) -> [i16; FRAME_SAMPLES] = match phase_mode {
+            HalfratePhaseMode::Baseline => synthesize_frame,
+            HalfratePhaseMode::AmbePlus => synthesize_frame_ambe_plus,
+        };
         match decode_to_params(&ambe.info, &mut dec_state) {
             Ok(Decoded::Voice(params)) => {
                 voice_frames += 1;
@@ -1032,9 +1116,7 @@ fn cmd_decode_pcm_ambe_plus2(
     }
 
     println!("decoded:       {} samples", pcm_out.len());
-    println!(
-        "frame mix:     voice={voice_frames}, tone={tone_frames}, erasure={erasure_frames}"
-    );
+    println!("frame mix:     voice={voice_frames}, tone={tone_frames}, erasure={erasure_frames}");
     println!();
 
     let n = pcm_out.len().min(pcm_ref.len());
@@ -1077,7 +1159,11 @@ fn cmd_decode_pcm_ambe_plus2(
         }
         fs::write(out_path, &bytes)
             .with_context(|| format!("write PCM to {}", out_path.display()))?;
-        println!("\nwrote synthesized PCM: {} ({} samples)", out_path.display(), pcm_out.len());
+        println!(
+            "\nwrote synthesized PCM: {} ({} samples)",
+            out_path.display(),
+            pcm_out.len()
+        );
     }
 
     Ok(())
@@ -1093,7 +1179,8 @@ fn cmd_ambe_plus2_seam_dump(root: &Path, name: &str, frame_idx: usize) -> Result
         return Err(anyhow!("frame {frame_idx} out of range (have {n_frames})"));
     }
 
-    let frame = &bit_bytes[frame_idx * BYTES_PER_HALFRATE_FRAME..(frame_idx + 1) * BYTES_PER_HALFRATE_FRAME];
+    let frame = &bit_bytes
+        [frame_idx * BYTES_PER_HALFRATE_FRAME..(frame_idx + 1) * BYTES_PER_HALFRATE_FRAME];
     let dibits = unpack_dibits_ambe_plus2(frame);
 
     println!("=== Frame {frame_idx} of r33/{name}.bit ===\n");
@@ -1101,7 +1188,11 @@ fn cmd_ambe_plus2_seam_dump(root: &Path, name: &str, frame_idx: usize) -> Result
     // Step 1: ĉ vectors after Annex S deinterleave.
     let c = deinterleave_half(&dibits);
     println!("After Annex S deinterleave:");
-    println!("  ĉ₀ (24 bits): 0x{:06x} = {:024b}", c[0] & 0xFF_FFFF, c[0] & 0xFF_FFFF);
+    println!(
+        "  ĉ₀ (24 bits): 0x{:06x} = {:024b}",
+        c[0] & 0xFF_FFFF,
+        c[0] & 0xFF_FFFF
+    );
     println!("  ĉ₁ (23 bits): 0x{:06x}", c[1] & 0x7F_FFFF);
     println!("  ĉ₂ (11 bits): 0x{:03x}", c[2] & 0x7FF);
     println!("  ĉ₃ (14 bits): 0x{:04x}", c[3] & 0x3FFF);
@@ -1112,11 +1203,16 @@ fn cmd_ambe_plus2_seam_dump(root: &Path, name: &str, frame_idx: usize) -> Result
     let d0 = golay_24_12_decode(c[0]);
     let u0 = d0.info;
     println!("After Golay-24-12 decode of ĉ₀ (current convention):");
-    println!("  û₀ (12 bits): 0x{:03x} = {:012b}  (errors={})", u0, u0, d0.errors);
+    println!(
+        "  û₀ (12 bits): 0x{:03x} = {:012b}  (errors={})",
+        u0, u0, d0.errors
+    );
     let c0_rev = {
         let mut r = 0u32;
         for i in 0..24 {
-            if (c[0] >> i) & 1 == 1 { r |= 1 << (23 - i); }
+            if (c[0] >> i) & 1 == 1 {
+                r |= 1 << (23 - i);
+            }
         }
         r
     };
@@ -1124,7 +1220,10 @@ fn cmd_ambe_plus2_seam_dump(root: &Path, name: &str, frame_idx: usize) -> Result
     let u0r = d0r.info;
     println!("After Golay-24-12 decode of bit-reversed ĉ₀:");
     println!("  ĉ₀_rev     : 0x{c0_rev:06x}");
-    println!("  û₀ (12 bits): 0x{:03x} = {:012b}  (errors={})", u0r, u0r, d0r.errors);
+    println!(
+        "  û₀ (12 bits): 0x{:03x} = {:012b}  (errors={})",
+        u0r, u0r, d0r.errors
+    );
     println!();
 
     // Step 3: bit-identity check ĉ₀[0..11] vs û₀[0..11]. In a [I|P]
@@ -1138,8 +1237,12 @@ fn cmd_ambe_plus2_seam_dump(root: &Path, name: &str, frame_idx: usize) -> Result
         let ub = ((u0 >> k) & 1) as u8;
         let urev = ((u0 >> (11 - k)) & 1) as u8;
         let m_lo = if cb == ub { "✓" } else { " " };
-        if cb == ub { match_low += 1; }
-        if cb == urev { match_rev += 1; }
+        if cb == ub {
+            match_low += 1;
+        }
+        if cb == urev {
+            match_rev += 1;
+        }
         println!("  {k:>3}    {cb}      {ub}      {m_lo}");
     }
     println!();
@@ -1164,13 +1267,24 @@ fn cmd_ambe_plus2_seam_dump(root: &Path, name: &str, frame_idx: usize) -> Result
     // assignment matches.
     println!();
     println!("Annex S bit-lane sanity (per user-provided PDF description):");
-    println!("  symbol 0 raw dibit: {}  (bit1={}, bit0={})",
-        dibits[0], (dibits[0] >> 1) & 1, dibits[0] & 1);
-    println!("  symbol 2 raw dibit: {}  (bit1={}, bit0={})",
-        dibits[2], (dibits[2] >> 1) & 1, dibits[2] & 1);
+    println!(
+        "  symbol 0 raw dibit: {}  (bit1={}, bit0={})",
+        dibits[0],
+        (dibits[0] >> 1) & 1,
+        dibits[0] & 1
+    );
+    println!(
+        "  symbol 2 raw dibit: {}  (bit1={}, bit0={})",
+        dibits[2],
+        (dibits[2] >> 1) & 1,
+        dibits[2] & 1
+    );
     println!("  Per spec: bit1 of symbol 0 → ĉ₀[23], bit1 of symbol 2 → ĉ₀[22].");
-    println!("  Our deinterleaver result: ĉ₀[23] = {}, ĉ₀[22] = {}",
-        (c[0] >> 23) & 1, (c[0] >> 22) & 1);
+    println!(
+        "  Our deinterleaver result: ĉ₀[23] = {}, ĉ₀[22] = {}",
+        (c[0] >> 23) & 1,
+        (c[0] >> 22) & 1
+    );
 
     Ok(())
 }
@@ -1183,19 +1297,28 @@ fn cmd_ambe_plus2_encoder_sanity() -> Result<()> {
     let omega_0 = 2.0 * PI * 150.0 / 8000.0;
     let l = MbeParams::harmonic_count_for(omega_0);
     let voiced: Vec<bool> = (1..=l).map(|_| true).collect();
-    let amps: Vec<f32> = (1..=l)
-        .map(|h| 2000.0 / (h as f32).powf(0.6))
-        .collect();
+    let amps: Vec<f32> = (1..=l).map(|h| 2000.0 / (h as f32).powf(0.6)).collect();
     let params = MbeParams::new(omega_0, l, &voiced, &amps).unwrap();
 
     println!("Synthetic speech-scale MbeParams:");
-    println!("  ω₀ = {omega_0:.4} rad/s ({:.1} Hz)", params.fundamental_hz());
+    println!(
+        "  ω₀ = {omega_0:.4} rad/s ({:.1} Hz)",
+        params.fundamental_hz()
+    );
     println!("  L  = {l}");
-    println!("  M_l range = {:.1} .. {:.1}", amps.iter().cloned().fold(f32::INFINITY, f32::min),
-        amps.iter().cloned().fold(f32::NEG_INFINITY, f32::max));
-    println!("  log₂(M_l) range ≈ {:.2} .. {:.2}",
+    println!(
+        "  M_l range = {:.1} .. {:.1}",
+        amps.iter().cloned().fold(f32::INFINITY, f32::min),
+        amps.iter().cloned().fold(f32::NEG_INFINITY, f32::max)
+    );
+    println!(
+        "  log₂(M_l) range ≈ {:.2} .. {:.2}",
         amps.iter().cloned().fold(f32::INFINITY, f32::min).log2(),
-        amps.iter().cloned().fold(f32::NEG_INFINITY, f32::max).log2());
+        amps.iter()
+            .cloned()
+            .fold(f32::NEG_INFINITY, f32::max)
+            .log2()
+    );
     println!();
 
     let mut state = HalfDecoderState::new();
@@ -1204,10 +1327,14 @@ fn cmd_ambe_plus2_encoder_sanity() -> Result<()> {
     for iter in 0..5 {
         let u = quantize_half(&params, &mut state).unwrap();
         let b = deprioritize_half(&u);
-        println!("iter {iter}: b̂ = [b0={}, b1={}, b2={}, b3={}, b4={}, b5={}, b6={}, b7={}, b8={}]",
-            b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8]);
-        println!("         u = [0x{:03x}, 0x{:03x}, 0x{:03x}, 0x{:04x}]",
-            u[0], u[1], u[2], u[3]);
+        println!(
+            "iter {iter}: b̂ = [b0={}, b1={}, b2={}, b3={}, b4={}, b5={}, b6={}, b7={}, b8={}]",
+            b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8]
+        );
+        println!(
+            "         u = [0x{:03x}, 0x{:03x}, 0x{:03x}, 0x{:04x}]",
+            u[0], u[1], u[2], u[3]
+        );
         println!("         prev_γ = {:.4}", state.previous_gamma());
     }
 
@@ -1219,8 +1346,7 @@ fn cmd_ambe_plus2_encoder_sanity() -> Result<()> {
 fn cmd_ambe_plus2_inspect(root: &Path, name: &str, frames_to_dump: usize) -> Result<()> {
     let dir = root.join("tv-std").join("tv").join("r33");
     let bit_path = dir.join(format!("{name}.bit"));
-    let bit_bytes = fs::read(&bit_path)
-        .with_context(|| format!("read {}", bit_path.display()))?;
+    let bit_bytes = fs::read(&bit_path).with_context(|| format!("read {}", bit_path.display()))?;
     let n_frames = bit_bytes.len() / BYTES_PER_HALFRATE_FRAME;
 
     let mut dec_state = HalfDecoderState::new();
@@ -1258,25 +1384,38 @@ fn cmd_ambe_plus2_inspect(root: &Path, name: &str, frames_to_dump: usize) -> Res
 
                 // Raw bit layout: show u[] and the deprioritized b[].
                 let b = deprioritize_half(&ambe.info);
-                println!("  raw u[]  = [0x{:03x}, 0x{:03x}, 0x{:03x}, 0x{:04x}]",
-                    ambe.info[0], ambe.info[1], ambe.info[2], ambe.info[3]);
-                println!("  b̂ vals   = [b0={}, b1={}, b2={}, b3={}, b4={}, b5={}, b6={}, b7={}, b8={}]",
-                    b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8]);
+                println!(
+                    "  raw u[]  = [0x{:03x}, 0x{:03x}, 0x{:03x}, 0x{:04x}]",
+                    ambe.info[0], ambe.info[1], ambe.info[2], ambe.info[3]
+                );
+                println!(
+                    "  b̂ vals   = [b0={}, b1={}, b2={}, b3={}, b4={}, b5={}, b6={}, b7={}, b8={}]",
+                    b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8]
+                );
 
                 let pcm = synthesize_frame(&params, &err, GAMMA_W, &mut synth_state);
                 let pcm_peak = pcm.iter().map(|s| s.abs()).max().unwrap_or(0);
                 let pcm_rms = (pcm.iter().map(|&s| (s as f64).powi(2)).sum::<f64>()
-                    / pcm.len() as f64).sqrt();
+                    / pcm.len() as f64)
+                    .sqrt();
 
                 println!("frame {f} (voice):");
-                println!("  ω₀            = {:.6} rad/s  ({:.1} Hz)",
-                    params.omega_0(), params.fundamental_hz());
+                println!(
+                    "  ω₀            = {:.6} rad/s  ({:.1} Hz)",
+                    params.omega_0(),
+                    params.fundamental_hz()
+                );
                 println!("  L             = {l}");
                 println!("  voiced count  = {vcount}/{l}");
                 println!("  amp min/mean/max = {amp_min:.4} / {amp_mean:.4} / {amp_max:.4}");
                 println!("  amp non-finite  = {nonfin}");
-                println!("  first 8 amps  = {:?}",
-                    amps.iter().take(8).map(|a| format!("{a:.3}")).collect::<Vec<_>>());
+                println!(
+                    "  first 8 amps  = {:?}",
+                    amps.iter()
+                        .take(8)
+                        .map(|a| format!("{a:.3}"))
+                        .collect::<Vec<_>>()
+                );
                 println!("  first 8 vuv   = {:?}", &voiced[..voiced.len().min(8)]);
                 println!("  prev_gamma    = {:.6}", dec_state.previous_gamma());
                 println!("  prev_L        = {}", dec_state.previous_l());
@@ -1296,12 +1435,7 @@ fn cmd_ambe_plus2_inspect(root: &Path, name: &str, frames_to_dump: usize) -> Res
     Ok(())
 }
 
-fn cmd_scan_transitions(
-    root: &Path,
-    name: &str,
-    min_ratio: f32,
-    limit: usize,
-) -> Result<()> {
+fn cmd_scan_transitions(root: &Path, name: &str, min_ratio: f32, limit: usize) -> Result<()> {
     let dir = root.join("tv-std").join("tv").join("p25");
     let fec_path = dir.join(format!("{name}.bit"));
     let pcm_path = dir.join(format!("{name}.pcm"));
@@ -1352,11 +1486,7 @@ fn cmd_scan_transitions(
         // Voiced-only synthesis for the xcorr — matches what
         // cmd_xcorr_frame does.
         let pcm = synthesize_frame(&params, &err, 0.0, &mut synth_state);
-        let voiced_count = params
-            .voiced_slice()
-            .iter()
-            .filter(|&&v| v)
-            .count() as u8;
+        let voiced_count = params.voiced_slice().iter().filter(|&&v| v).count() as u8;
         let curr = FrameSnapshot {
             idx: f,
             l: params.harmonic_count(),
@@ -1467,8 +1597,12 @@ fn cmd_scan_transitions(
             sum_peak += peak_corr;
             sum_peak_abs += peak_corr.abs();
             lag_hist[(peak_lag + 20) as usize] += 1;
-            if peak_corr < 0.0 { neg_peak_count += 1; }
-            if peak_corr > 0.0 { pos_peak_count += 1; }
+            if peak_corr < 0.0 {
+                neg_peak_count += 1;
+            }
+            if peak_corr > 0.0 {
+                pos_peak_count += 1;
+            }
             scored += 1;
         }
         if scored > 0 {
@@ -1478,9 +1612,7 @@ fn cmd_scan_transitions(
             println!(
                 "  aggregate over {scored}: mean peak corr = {mean_peak:+.3}, mean |peak| = {mean_peak_abs:.3}"
             );
-            println!(
-                "  sign split: {neg_peak_count} negative, {pos_peak_count} positive"
-            );
+            println!("  sign split: {neg_peak_count} negative, {pos_peak_count} positive");
             let mut lag_buckets: Vec<(i32, usize)> = (0..41usize)
                 .filter(|&i| lag_hist[i] > 0)
                 .map(|i| (i as i32 - 20, lag_hist[i]))
@@ -1591,8 +1723,8 @@ fn cmd_xcorr_frame(
     let fec_path = dir.join(format!("{name}.bit"));
     let pcm_path = dir.join(format!("{name}.pcm"));
 
-    let fec_bytes = fs::read(&fec_path)
-        .with_context(|| format!("read FEC vector {}", fec_path.display()))?;
+    let fec_bytes =
+        fs::read(&fec_path).with_context(|| format!("read FEC vector {}", fec_path.display()))?;
     let pcm_ref_bytes = fs::read(&pcm_path)
         .with_context(|| format!("read reference PCM {}", pcm_path.display()))?;
 
@@ -1671,7 +1803,14 @@ fn cmd_xcorr_frame(
         .collect();
     println!("vector:         {name}");
     println!("frame:          {frame_idx} of {n_frames}");
-    println!("decode path:    {}", if both { "voiced + unvoiced (γ_w applied)" } else { "voiced only (γ_w = 0)" });
+    println!(
+        "decode path:    {}",
+        if both {
+            "voiced + unvoiced (γ_w applied)"
+        } else {
+            "voiced only (γ_w = 0)"
+        }
+    );
     println!("m_scale:        {m_scale}");
     println!(
         "ω̃₀ = {:.4} (= {:.1} Hz),  L = {l},  voiced = {voiced_count} / {l}",
@@ -1680,7 +1819,12 @@ fn cmd_xcorr_frame(
     );
     println!(
         "voiced harmonics: {}",
-        voiced_idx.iter().take(12).map(|x| x.to_string()).collect::<Vec<_>>().join(", ")
+        voiced_idx
+            .iter()
+            .take(12)
+            .map(|x| x.to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
     );
     println!("peak M̃_l:       {peak_m:.0}");
     println!();
@@ -1741,9 +1885,7 @@ fn cmd_xcorr_frame(
         println!("    Eq. 131/132); or §1.12.2 Eq. 127 sum bounds / factor-of-2.");
     }
     println!();
-    println!(
-        "If you want to see the waveforms directly, first 16 samples side by side:"
-    );
+    println!("If you want to see the waveforms directly, first 16 samples side by side:");
     println!("  n   our     DVSI    diff");
     for n in 0..16 {
         let o = our_frame[n];
@@ -1786,7 +1928,9 @@ fn cmd_ambe_plus2_roundtrip(root: &Path, name: &str) -> Result<()> {
     let bit_bytes = fs::read(&bit_path)
         .with_context(|| format!("read half-rate vector {}", bit_path.display()))?;
     if bit_bytes.len() % BYTES_PER_HALFRATE_FRAME != 0 {
-        return Err(anyhow!("half-rate .bit file is not a whole number of frames"));
+        return Err(anyhow!(
+            "half-rate .bit file is not a whole number of frames"
+        ));
     }
     let n_frames = bit_bytes.len() / BYTES_PER_HALFRATE_FRAME;
 
@@ -1838,14 +1982,27 @@ fn cmd_ambe_plus2_roundtrip(root: &Path, name: &str) -> Result<()> {
     }
     let pct = |n: usize| 100.0 * n as f64 / voice_frames as f64;
     println!("Parameter-level bit-exact roundtrip (voice frames only):");
-    println!("  pitch   b̂₀:  {pitch_match:>5} / {voice_frames}   {:5.1}%", pct(pitch_match));
-    println!("  V/UV    b̂₁:  {vuv_match:>5} / {voice_frames}   {:5.1}%", pct(vuv_match));
-    println!("  gain    b̂₂:  {gain_match:>5} / {voice_frames}   {:5.1}%", pct(gain_match));
+    println!(
+        "  pitch   b̂₀:  {pitch_match:>5} / {voice_frames}   {:5.1}%",
+        pct(pitch_match)
+    );
+    println!(
+        "  V/UV    b̂₁:  {vuv_match:>5} / {voice_frames}   {:5.1}%",
+        pct(vuv_match)
+    );
+    println!(
+        "  gain    b̂₂:  {gain_match:>5} / {voice_frames}   {:5.1}%",
+        pct(gain_match)
+    );
     Ok(())
 }
 
 fn cmd_ambe_plus2_fec_histogram(root: &Path, name: &str, rate: &str, rc: bool) -> Result<()> {
-    let base = if rc { root.join("tv-rc") } else { root.join("tv-std").join("tv") };
+    let base = if rc {
+        root.join("tv-rc")
+    } else {
+        root.join("tv-std").join("tv")
+    };
     let bit_path = base.join(rate).join(format!("{name}.bit"));
     let bit_bytes = fs::read(&bit_path)
         .with_context(|| format!("read half-rate vector {}", bit_path.display()))?;
@@ -1867,24 +2024,55 @@ fn cmd_ambe_plus2_fec_histogram(root: &Path, name: &str, rate: &str, rc: bool) -
         let dibits = unpack_dibits_ambe_plus2(frame);
         let ambe = decode_half_frame(&dibits);
         let e = ambe.errors[0];
-        let bucket = if e == u8::MAX { 4 } else { usize::from(e).min(3) };
+        let bucket = if e == u8::MAX {
+            4
+        } else {
+            usize::from(e).min(3)
+        };
         hist[bucket] += 1;
     }
 
-    let label = if rc { format!("tv-rc/{rate}") } else { format!("tv-std/tv/{rate}") };
+    let label = if rc {
+        format!("tv-rc/{rate}")
+    } else {
+        format!("tv-std/tv/{rate}")
+    };
     println!("vector:  {name} ({label})");
     println!("frames:  {n_frames}");
     println!();
     println!("Golay [24,12] error-count histogram (ĉ₀):");
     let pct = |n: usize| 100.0 * n as f64 / n_frames as f64;
-    println!("  errors=0:            {:>5}   {:5.1}%", hist[0], pct(hist[0]));
-    println!("  errors=1:            {:>5}   {:5.1}%", hist[1], pct(hist[1]));
-    println!("  errors=2:            {:>5}   {:5.1}%", hist[2], pct(hist[2]));
-    println!("  errors=3:            {:>5}   {:5.1}%", hist[3], pct(hist[3]));
-    println!("  uncorrectable (≥4):  {:>5}   {:5.1}%", hist[4], pct(hist[4]));
+    println!(
+        "  errors=0:            {:>5}   {:5.1}%",
+        hist[0],
+        pct(hist[0])
+    );
+    println!(
+        "  errors=1:            {:>5}   {:5.1}%",
+        hist[1],
+        pct(hist[1])
+    );
+    println!(
+        "  errors=2:            {:>5}   {:5.1}%",
+        hist[2],
+        pct(hist[2])
+    );
+    println!(
+        "  errors=3:            {:>5}   {:5.1}%",
+        hist[3],
+        pct(hist[3])
+    );
+    println!(
+        "  uncorrectable (≥4):  {:>5}   {:5.1}%",
+        hist[4],
+        pct(hist[4])
+    );
     println!();
     let correctable = hist[0] + hist[1] + hist[2] + hist[3];
-    println!("correctable frames:    {correctable} / {n_frames}   ({:.1}%)", pct(correctable));
+    println!(
+        "correctable frames:    {correctable} / {n_frames}   ({:.1}%)",
+        pct(correctable)
+    );
     println!();
     // Expected rate-33 chance hit rate for random 24-bit vectors: 2^12/2^24 ≈ 2.4e-4.
     // One or two "errors=0" frames out of a few hundred is consistent with rate-39
@@ -1895,7 +2083,9 @@ fn cmd_ambe_plus2_fec_histogram(root: &Path, name: &str, rate: &str, rc: bool) -
         println!("PASS — every frame is a valid Golay [24,12] codeword. Input is genuine rate 33 (FEC-encoded).");
     } else if hist[0] <= chance_zero_cap && (50..=65).contains(&correctable_pct) {
         println!("FINGERPRINT MATCH — errors=0 count is at chance level and correctable-frame ratio is ~57%.");
-        println!("This is the `C(24,k)/2325` signature of no-FEC bits fed through a Golay decoder.");
+        println!(
+            "This is the `C(24,k)/2325` signature of no-FEC bits fed through a Golay decoder."
+        );
         println!("Input is NOT rate 33. Likely rate 39 (72 raw voice bits, no FEC) — see");
         println!("~/blip25-specs/analysis/dvsi_test_vector_modes.md.");
     } else {
@@ -1931,8 +2121,8 @@ fn cmd_compare(root: &Path, name: &str, rc: bool, stop_on_first: bool) -> Result
     let fec_path = dir.join("p25").join(format!("{name}.bit"));
     let nofec_path = dir.join("p25_nofec").join(format!("{name}.bit"));
 
-    let fec_bytes = fs::read(&fec_path)
-        .with_context(|| format!("read FEC vector {}", fec_path.display()))?;
+    let fec_bytes =
+        fs::read(&fec_path).with_context(|| format!("read FEC vector {}", fec_path.display()))?;
     let nofec_bytes = fs::read(&nofec_path)
         .with_context(|| format!("read no-FEC vector {}", nofec_path.display()))?;
 
@@ -1972,8 +2162,7 @@ fn cmd_compare(root: &Path, name: &str, rc: bool, stop_on_first: bool) -> Result
 
     for f in 0..n_frames {
         let fec_frame = &fec_bytes[f * BYTES_PER_FEC_FRAME..(f + 1) * BYTES_PER_FEC_FRAME];
-        let nofec_frame =
-            &nofec_bytes[f * BYTES_PER_NOFEC_FRAME..(f + 1) * BYTES_PER_NOFEC_FRAME];
+        let nofec_frame = &nofec_bytes[f * BYTES_PER_NOFEC_FRAME..(f + 1) * BYTES_PER_NOFEC_FRAME];
 
         let dibits = unpack_dibits(fec_frame);
         let decoded: FullFrame = decode_full_frame(&dibits);
@@ -1997,7 +2186,10 @@ fn cmd_compare(root: &Path, name: &str, rc: bool, stop_on_first: bool) -> Result
 
     println!("matched:   {matches} / {n_frames}");
     println!("mismatched: {mismatches}");
-    println!("avg FEC errors per frame: {:.3}", f64::from(total_fec_errors) / n_frames as f64);
+    println!(
+        "avg FEC errors per frame: {:.3}",
+        f64::from(total_fec_errors) / n_frames as f64
+    );
 
     if mismatches == 0 {
         println!();
@@ -2012,7 +2204,11 @@ fn report_mismatch(frame_idx: usize, decoded: &FullFrame, expected: &[u16; 8]) {
     println!("FIRST DIVERGENCE at frame {frame_idx}");
     println!("  vector  width  decoded   expected  errors");
     for i in 0..8 {
-        let mark = if decoded.info[i] == expected[i] { ' ' } else { '*' };
+        let mark = if decoded.info[i] == expected[i] {
+            ' '
+        } else {
+            '*'
+        };
         println!(
             "  û_{i}    {:>3}    0x{:04x}    0x{:04x}    {}     {mark}",
             INFO_WIDTHS[i], decoded.info[i], expected[i], decoded.errors[i]
@@ -2201,8 +2397,8 @@ impl ConvertStats {
         let pitch_rms = (self.pitch_cents_sq_sum / n).sqrt();
         let pitch_mean_abs = self.pitch_cents_abs_sum / n;
         let l_mismatch_pct = 100.0 * self.l_mismatches as f64 / n;
-        let voicing_pct = 100.0 * self.voicing_matches as f64
-            / (self.harmonics_compared.max(1) as f64);
+        let voicing_pct =
+            100.0 * self.voicing_matches as f64 / (self.harmonics_compared.max(1) as f64);
         let amp_rms_db = (self.amp_db_sq_sum / hn).sqrt();
         let amp_mean_abs_db = self.amp_db_abs_sum / hn;
 
@@ -2215,11 +2411,8 @@ impl ConvertStats {
             self.l_mismatches, self.frames, l_mismatch_pct
         );
         if !self.l_delta_hist.is_empty() {
-            let mut entries: Vec<(i32, usize)> = self
-                .l_delta_hist
-                .iter()
-                .map(|(k, v)| (*k, *v))
-                .collect();
+            let mut entries: Vec<(i32, usize)> =
+                self.l_delta_hist.iter().map(|(k, v)| (*k, *v)).collect();
             entries.sort_by(|a, b| b.1.cmp(&a.1));
             let top: Vec<String> = entries
                 .iter()
@@ -2275,22 +2468,37 @@ impl SkipStats {
         }
         println!("non-comparable frames: {}", self.non_comparable());
         if self.tone_passthrough > 0 {
-            println!("  tone pass-through (src→dst):     {}", self.tone_passthrough);
+            println!(
+                "  tone pass-through (src→dst):     {}",
+                self.tone_passthrough
+            );
         }
         if self.erasure_passthrough > 0 {
-            println!("  erasure pass-through (src→dst):  {}", self.erasure_passthrough);
+            println!(
+                "  erasure pass-through (src→dst):  {}",
+                self.erasure_passthrough
+            );
         }
         if self.erasure_mismatch > 0 {
-            println!("  erasure MISMATCH (bug — inspect): {}", self.erasure_mismatch);
+            println!(
+                "  erasure MISMATCH (bug — inspect): {}",
+                self.erasure_mismatch
+            );
         }
         if self.src_decode_errors > 0 {
-            println!("  source dequantize errors:        {}", self.src_decode_errors);
+            println!(
+                "  source dequantize errors:        {}",
+                self.src_decode_errors
+            );
         }
         if self.convert_errors > 0 {
             println!("  converter errors (dst pitch):    {}", self.convert_errors);
         }
         if self.dst_decode_errors > 0 {
-            println!("  dst dequantize errors:           {}", self.dst_decode_errors);
+            println!(
+                "  dst dequantize errors:           {}",
+                self.dst_decode_errors
+            );
         }
     }
 }
@@ -2310,8 +2518,8 @@ fn cmd_rate_convert(
 fn cmd_rate_convert_full_to_half(root: &Path, name: &str, rc: bool) -> Result<()> {
     let dir = vector_dir(root, rc);
     let fec_path = dir.join("p25").join(format!("{name}.bit"));
-    let fec_bytes = fs::read(&fec_path)
-        .with_context(|| format!("read FEC vector {}", fec_path.display()))?;
+    let fec_bytes =
+        fs::read(&fec_path).with_context(|| format!("read FEC vector {}", fec_path.display()))?;
     if fec_bytes.len() % BYTES_PER_FEC_FRAME != 0 {
         return Err(anyhow!(
             "FEC file {} is {} bytes — not a multiple of {}",
@@ -2322,7 +2530,10 @@ fn cmd_rate_convert_full_to_half(root: &Path, name: &str, rc: bool) -> Result<()
     }
     let n_frames = fec_bytes.len() / BYTES_PER_FEC_FRAME;
 
-    println!("vector:            {name}{} (full → half)", if rc { " (rc)" } else { "" });
+    println!(
+        "vector:            {name}{} (full → half)",
+        if rc { " (rc)" } else { "" }
+    );
     println!("frames:            {n_frames}");
     println!();
 
@@ -2363,7 +2574,7 @@ fn cmd_rate_convert_full_to_half(root: &Path, name: &str, rc: bool) -> Result<()
                 // Full-rate reserved pitch — converter should emit a
                 // half-rate erasure signal.
                 let dst_frame = decode_half_frame(&dst_dibits);
-                use blip25_mbe::rate33::dequantize::{FrameKind, classify_ambe_plus2_frame};
+                use blip25_mbe::rate33::dequantize::{classify_ambe_plus2_frame, FrameKind};
                 match classify_ambe_plus2_frame(&dst_frame.info) {
                     FrameKind::Erasure => skips.erasure_passthrough += 1,
                     _ => skips.erasure_mismatch += 1,
@@ -2380,7 +2591,11 @@ fn cmd_rate_convert_full_to_half(root: &Path, name: &str, rc: bool) -> Result<()
 }
 
 fn cmd_rate_convert_half_to_full(root: &Path, name: &str, rc: bool) -> Result<()> {
-    let base = if rc { root.join("tv-rc") } else { root.join("tv-std").join("tv") };
+    let base = if rc {
+        root.join("tv-rc")
+    } else {
+        root.join("tv-std").join("tv")
+    };
     let bit_path = base.join("r33").join(format!("{name}.bit"));
     let bit_bytes = fs::read(&bit_path)
         .with_context(|| format!("read half-rate vector {}", bit_path.display()))?;
@@ -2394,7 +2609,10 @@ fn cmd_rate_convert_half_to_full(root: &Path, name: &str, rc: bool) -> Result<()
     }
     let n_frames = bit_bytes.len() / BYTES_PER_HALFRATE_FRAME;
 
-    println!("vector:            {name}{} (half → full, r33)", if rc { " (rc)" } else { "" });
+    println!(
+        "vector:            {name}{} (half → full, r33)",
+        if rc { " (rc)" } else { "" }
+    );
     println!("frames:            {n_frames}");
     println!();
 
@@ -2483,14 +2701,17 @@ fn cmd_rate_convert_roundtrip(
 fn cmd_rate_convert_roundtrip_full(root: &Path, name: &str, rc: bool) -> Result<()> {
     let dir = vector_dir(root, rc);
     let fec_path = dir.join("p25").join(format!("{name}.bit"));
-    let fec_bytes = fs::read(&fec_path)
-        .with_context(|| format!("read FEC vector {}", fec_path.display()))?;
+    let fec_bytes =
+        fs::read(&fec_path).with_context(|| format!("read FEC vector {}", fec_path.display()))?;
     if fec_bytes.len() % BYTES_PER_FEC_FRAME != 0 {
         return Err(anyhow!("FEC file is not a whole number of frames"));
     }
     let n_frames = fec_bytes.len() / BYTES_PER_FEC_FRAME;
 
-    println!("vector:            {name}{} (full → half → full)", if rc { " (rc)" } else { "" });
+    println!(
+        "vector:            {name}{} (full → half → full)",
+        if rc { " (rc)" } else { "" }
+    );
     println!("frames:            {n_frames}");
     println!();
 
@@ -2547,7 +2768,11 @@ fn cmd_rate_convert_roundtrip_full(root: &Path, name: &str, rc: bool) -> Result<
 }
 
 fn cmd_rate_convert_roundtrip_half(root: &Path, name: &str, rc: bool) -> Result<()> {
-    let base = if rc { root.join("tv-rc") } else { root.join("tv-std").join("tv") };
+    let base = if rc {
+        root.join("tv-rc")
+    } else {
+        root.join("tv-std").join("tv")
+    };
     let bit_path = base.join("r33").join(format!("{name}.bit"));
     let bit_bytes = fs::read(&bit_path)
         .with_context(|| format!("read half-rate vector {}", bit_path.display()))?;
@@ -2556,7 +2781,10 @@ fn cmd_rate_convert_roundtrip_half(root: &Path, name: &str, rc: bool) -> Result<
     }
     let n_frames = bit_bytes.len() / BYTES_PER_HALFRATE_FRAME;
 
-    println!("vector:            {name}{} (half → full → half, r33)", if rc { " (rc)" } else { "" });
+    println!(
+        "vector:            {name}{} (half → full → half, r33)",
+        if rc { " (rc)" } else { "" }
+    );
     println!("frames:            {n_frames}");
     println!();
 
@@ -2637,13 +2865,14 @@ fn cmd_rate_convert_roundtrip_half(root: &Path, name: &str, rc: bool) -> Result<
 
     skips.print();
     if outbound_errs > 0 || inbound_errs > 0 {
-        println!(
-            "  (breakdown: outbound a→b {outbound_errs}, inbound b→a {inbound_errs})"
-        );
+        println!("  (breakdown: outbound a→b {outbound_errs}, inbound b→a {inbound_errs})");
     }
     if !inbound_examples.is_empty() {
         println!();
-        println!("First {} inbound-hop failures (ω₀ src → full-rate mid):", inbound_examples.len());
+        println!(
+            "First {} inbound-hop failures (ω₀ src → full-rate mid):",
+            inbound_examples.len()
+        );
         for (f, src_w, src_l, mid_w) in &inbound_examples {
             println!("  frame {f:>3}: src ω₀={src_w:.6} (L={src_l}) → mid ω₀={mid_w:.6}");
         }
@@ -2814,8 +3043,8 @@ fn measure_smoothness_full_to_half(
 fn smoothness_full_to_half(root: &Path, name: &str, rc: bool) -> Result<()> {
     let dir = vector_dir(root, rc);
     let fec_path = dir.join("p25").join(format!("{name}.bit"));
-    let fec_bytes = fs::read(&fec_path)
-        .with_context(|| format!("read FEC vector {}", fec_path.display()))?;
+    let fec_bytes =
+        fs::read(&fec_path).with_context(|| format!("read FEC vector {}", fec_path.display()))?;
     if fec_bytes.len() % BYTES_PER_FEC_FRAME != 0 {
         return Err(anyhow!("FEC file is not a whole number of frames"));
     }
@@ -2882,7 +3111,11 @@ fn measure_smoothness_half_to_full(
 }
 
 fn smoothness_half_to_full(root: &Path, name: &str, rc: bool) -> Result<()> {
-    let base = if rc { root.join("tv-rc") } else { root.join("tv-std").join("tv") };
+    let base = if rc {
+        root.join("tv-rc")
+    } else {
+        root.join("tv-std").join("tv")
+    };
     let bit_path = base.join("r33").join(format!("{name}.bit"));
     let bit_bytes = fs::read(&bit_path)
         .with_context(|| format!("read half-rate vector {}", bit_path.display()))?;
@@ -2965,8 +3198,8 @@ fn cmd_ambe_plus2_analysis_encode(
     let pcm_path = dir.join(format!("{name}.pcm"));
     let bit_path = dir.join(format!("{name}.bit"));
 
-    let pcm_bytes = fs::read(&pcm_path)
-        .with_context(|| format!("read PCM vector {}", pcm_path.display()))?;
+    let pcm_bytes =
+        fs::read(&pcm_path).with_context(|| format!("read PCM vector {}", pcm_path.display()))?;
     let bit_bytes = fs::read(&bit_path)
         .with_context(|| format!("read half-rate bit vector {}", bit_path.display()))?;
 
@@ -3001,14 +3234,10 @@ fn cmd_ambe_plus2_analysis_encode(
         .map(|c| i16::from_le_bytes([c[0], c[1]]))
         .collect();
 
-    println!(
-        "vector:            {name} (half-rate r33, analysis-encode)"
-    );
+    println!("vector:            {name} (half-rate r33, analysis-encode)");
     println!("frames:            {n_frames}");
     if chip_offset != 0 {
-        println!(
-            "chip offset:       {chip_offset:+} (chip[f + offset] vs encoder[f])"
-        );
+        println!("chip offset:       {chip_offset:+} (chip[f + offset] vs encoder[f])");
     }
     if silence_dispatch {
         println!("silence dispatch:  on (silent frames tallied, not compared)");
@@ -3182,16 +3411,28 @@ impl AnalysisSkipStats {
             println!("  preroll (encoder look-ahead fill): {}", self.preroll);
         }
         if self.encoder_silence > 0 {
-            println!("  encoder silence dispatch:          {}", self.encoder_silence);
+            println!(
+                "  encoder silence dispatch:          {}",
+                self.encoder_silence
+            );
         }
         if self.encoder_errors > 0 {
-            println!("  encoder errors:                    {}", self.encoder_errors);
+            println!(
+                "  encoder errors:                    {}",
+                self.encoder_errors
+            );
         }
         if self.chip_decode_errors > 0 {
-            println!("  chip dequantize errors:            {}", self.chip_decode_errors);
+            println!(
+                "  chip dequantize errors:            {}",
+                self.chip_decode_errors
+            );
         }
         if self.chip_out_of_range > 0 {
-            println!("  chip bit-frame out of range:       {}", self.chip_out_of_range);
+            println!(
+                "  chip bit-frame out of range:       {}",
+                self.chip_out_of_range
+            );
         }
     }
 }
@@ -3309,23 +3550,37 @@ impl VuvBandStats {
         println!("V/UV per-band analysis ({} frames):", self.frames);
         println!(
             "  {:>4}  {:>6} {:>6} {:>6}  {:>5} {:>5}  {:>8} {:>8}  {:>8}",
-            "band", "compar", "disag", "dis%",
-            "V→U", "U→V",
-            "D̄_k dis", "Θ̄_ξ dis", "|margin|"
+            "band", "compar", "disag", "dis%", "V→U", "U→V", "D̄_k dis", "Θ̄_ξ dis", "|margin|"
         );
         for k in 1..=self.max_k as usize {
             let c = self.band_compared[k];
-            if c == 0 { continue; }
+            if c == 0 {
+                continue;
+            }
             let d = self.band_disagree[k];
             let pct = 100.0 * d as f64 / c as f64;
-            let dk_mean = if d > 0 { self.band_dk_sum_disagree[k] / d as f64 } else { 0.0 };
-            let th_mean = if d > 0 { self.band_theta_sum_disagree[k] / d as f64 } else { 0.0 };
+            let dk_mean = if d > 0 {
+                self.band_dk_sum_disagree[k] / d as f64
+            } else {
+                0.0
+            };
+            let th_mean = if d > 0 {
+                self.band_theta_sum_disagree[k] / d as f64
+            } else {
+                0.0
+            };
             let margin_abs = self.band_margin_abs_sum[k] / c as f64;
             println!(
                 "  {:>4}  {:>6} {:>6} {:>5.1}%  {:>5} {:>5}  {:>8.4} {:>8.4}  {:>8.4}",
-                k, c, d, pct,
-                self.band_v_to_u[k], self.band_u_to_v[k],
-                dk_mean, th_mean, margin_abs
+                k,
+                c,
+                d,
+                pct,
+                self.band_v_to_u[k],
+                self.band_u_to_v[k],
+                dk_mean,
+                th_mean,
+                margin_abs
             );
         }
     }
@@ -3394,8 +3649,7 @@ impl BitstreamStats {
                 INFO_WIDTHS[i], self.vec_matches[i], pct
             );
         }
-        let dpct = 100.0 * self.dibits_matched as f64
-            / self.dibits_compared.max(1) as f64;
+        let dpct = 100.0 * self.dibits_matched as f64 / self.dibits_compared.max(1) as f64;
         println!(
             "  dibits:          {} / {} ({:.1}%)",
             self.dibits_matched, self.dibits_compared, dpct
@@ -3424,10 +3678,10 @@ fn cmd_analysis_encode(
         None => dir.join("p25").join(format!("{name}.bit")),
     };
 
-    let pcm_bytes = fs::read(&pcm_path)
-        .with_context(|| format!("read PCM vector {}", pcm_path.display()))?;
-    let fec_bytes = fs::read(&fec_path)
-        .with_context(|| format!("read FEC vector {}", fec_path.display()))?;
+    let pcm_bytes =
+        fs::read(&pcm_path).with_context(|| format!("read PCM vector {}", pcm_path.display()))?;
+    let fec_bytes =
+        fs::read(&fec_path).with_context(|| format!("read FEC vector {}", fec_path.display()))?;
 
     if pcm_bytes.len() % (FRAME_SAMPLES * 2) != 0 {
         return Err(anyhow!(
@@ -3486,7 +3740,9 @@ fn cmd_analysis_encode(
         println!("quantizer roundtrip: on (encode → quantize → dequantize decomposition)");
     }
     if chip_seed_vuv {
-        println!("chip-seed V/UV:    on (override encoder vuv_prev with chip decisions each frame)");
+        println!(
+            "chip-seed V/UV:    on (override encoder vuv_prev with chip decisions each frame)"
+        );
     }
     if bitstream {
         println!("bitstream:         on (full encode path → dibit/info-vector comparison)");
@@ -3536,11 +3792,25 @@ fn cmd_analysis_encode(
             "{:>5}  {:>9} {:>9} {:>8}   {:>3} {:>3} {:>4}   \
              {:>6} {:>6} {:>8} {:>8} {:>8} {:>8}   \
              {:>10} {:>10} {:>7} {:>3}   {:<16}  {}",
-            "frame", "ω̂_0 chip", "ω̂_0 enc", "Δ cents",
-            "Lc", "Le", "ΔL",
-            "P̂_I", "P_chip", "E(P̂_B)", "E(P̂_F)", "E(P̂_I)", "E(P_ch)",
-            "E_f", "η", "Ef/η", "sil",
-            "voicing chip", "voicing enc"
+            "frame",
+            "ω̂_0 chip",
+            "ω̂_0 enc",
+            "Δ cents",
+            "Lc",
+            "Le",
+            "ΔL",
+            "P̂_I",
+            "P_chip",
+            "E(P̂_B)",
+            "E(P̂_F)",
+            "E(P̂_I)",
+            "E(P_ch)",
+            "E_f",
+            "η",
+            "Ef/η",
+            "sil",
+            "voicing chip",
+            "voicing enc"
         );
     }
 
@@ -3635,10 +3905,14 @@ fn cmd_analysis_encode(
                                     rt_vs_chip_stats.push(ref_params, &rt_params);
                                     q_loss_stats.push(&enc_params, &rt_params);
                                 }
-                                Err(_) => { rt_errors += 1; }
+                                Err(_) => {
+                                    rt_errors += 1;
+                                }
                             }
                         }
-                        Err(_) => { rt_errors += 1; }
+                        Err(_) => {
+                            rt_errors += 1;
+                        }
                     }
                 }
 
@@ -3730,7 +4004,8 @@ fn cmd_analysis_encode(
                             if chip_v[(first_l - 1) as usize] { 1 } else { 0 };
                     }
                 }
-                encoder_state.vuv_state_mut()
+                encoder_state
+                    .vuv_state_mut()
                     .override_vuv_prev(&band_decisions, k_chip);
             }
         }
@@ -3752,7 +4027,10 @@ fn cmd_analysis_encode(
     vuv_band_stats.print();
     if vuv_band_stats_l_match.frames > 0 {
         println!();
-        println!("V/UV per-band (L-matching frames only, {} frames):", vuv_band_stats_l_match.frames);
+        println!(
+            "V/UV per-band (L-matching frames only, {} frames):",
+            vuv_band_stats_l_match.frames
+        );
         vuv_band_stats_l_match.print();
     }
     if quantizer_roundtrip {
@@ -3835,7 +4113,11 @@ fn content_category(path: &str) -> String {
         .chars()
         .take_while(|c| c.is_ascii_alphabetic())
         .collect();
-    if prefix.is_empty() { stem.to_string() } else { prefix }
+    if prefix.is_empty() {
+        stem.to_string()
+    } else {
+        prefix
+    }
 }
 
 fn parse_cmpp25_line(line: &str, line_no: usize) -> Result<Option<TestLine>> {
@@ -3863,7 +4145,10 @@ fn parse_cmpp25_line(line: &str, line_no: usize) -> Result<Option<TestLine>> {
         match t {
             "-c" => {
                 if toks.get(i + 1) != Some(&"P25") {
-                    return Err(anyhow!("line {line_no}: non-P25 codec `{:?}`", toks.get(i + 1)));
+                    return Err(anyhow!(
+                        "line {line_no}: non-P25 codec `{:?}`",
+                        toks.get(i + 1)
+                    ));
                 }
                 i += 2;
             }
@@ -3883,9 +4168,9 @@ fn parse_cmpp25_line(line: &str, line_no: usize) -> Result<Option<TestLine>> {
                 i += 1;
             }
             "-sdbits" => {
-                let n = toks.get(i + 1).ok_or_else(|| {
-                    anyhow!("line {line_no}: -sdbits missing value")
-                })?;
+                let n = toks
+                    .get(i + 1)
+                    .ok_or_else(|| anyhow!("line {line_no}: -sdbits missing value"))?;
                 sdbits = Some(
                     n.parse::<u8>()
                         .map_err(|e| anyhow!("line {line_no}: bad sdbits `{n}`: {e}"))?,
@@ -4078,12 +4363,16 @@ fn run_line(cmp_dir: &Path, line: &TestLine) -> Result<LineOutcome> {
 fn run_dec(cmp_dir: &Path, line: &TestLine) -> Result<LineOutcome> {
     let input_path = cmp_dir.join(&line.input);
     let ref_path = cmp_dir.join(&line.reference);
-    let bit_bytes = fs::read(&input_path)
-        .with_context(|| format!("read input {}", input_path.display()))?;
-    let ref_pcm_bytes = fs::read(&ref_path)
-        .with_context(|| format!("read reference {}", ref_path.display()))?;
+    let bit_bytes =
+        fs::read(&input_path).with_context(|| format!("read input {}", input_path.display()))?;
+    let ref_pcm_bytes =
+        fs::read(&ref_path).with_context(|| format!("read reference {}", ref_path.display()))?;
 
-    let frame_bytes = if line.fec { BYTES_PER_FEC_FRAME } else { BYTES_PER_NOFEC_FRAME };
+    let frame_bytes = if line.fec {
+        BYTES_PER_FEC_FRAME
+    } else {
+        BYTES_PER_NOFEC_FRAME
+    };
     if bit_bytes.len() % frame_bytes != 0 {
         return Err(anyhow!(
             "{}: {} bytes not a multiple of {}",
@@ -4108,12 +4397,16 @@ fn run_dec(cmp_dir: &Path, line: &TestLine) -> Result<LineOutcome> {
 fn run_enc(cmp_dir: &Path, line: &TestLine) -> Result<LineOutcome> {
     let input_path = cmp_dir.join(&line.input);
     let ref_path = cmp_dir.join(&line.reference);
-    let pcm_bytes = fs::read(&input_path)
-        .with_context(|| format!("read input {}", input_path.display()))?;
-    let ref_bit_bytes = fs::read(&ref_path)
-        .with_context(|| format!("read reference {}", ref_path.display()))?;
+    let pcm_bytes =
+        fs::read(&input_path).with_context(|| format!("read input {}", input_path.display()))?;
+    let ref_bit_bytes =
+        fs::read(&ref_path).with_context(|| format!("read reference {}", ref_path.display()))?;
 
-    let frame_bytes = if line.fec { BYTES_PER_FEC_FRAME } else { BYTES_PER_NOFEC_FRAME };
+    let frame_bytes = if line.fec {
+        BYTES_PER_FEC_FRAME
+    } else {
+        BYTES_PER_NOFEC_FRAME
+    };
     if ref_bit_bytes.len() % frame_bytes != 0 {
         return Err(anyhow!("reference .bit not a multiple of {}", frame_bytes));
     }
@@ -4127,10 +4420,10 @@ fn run_enc(cmp_dir: &Path, line: &TestLine) -> Result<LineOutcome> {
 fn run_encdec(cmp_dir: &Path, line: &TestLine) -> Result<LineOutcome> {
     let input_path = cmp_dir.join(&line.input);
     let ref_path = cmp_dir.join(&line.reference);
-    let pcm_bytes = fs::read(&input_path)
-        .with_context(|| format!("read input {}", input_path.display()))?;
-    let ref_pcm_bytes = fs::read(&ref_path)
-        .with_context(|| format!("read reference {}", ref_path.display()))?;
+    let pcm_bytes =
+        fs::read(&input_path).with_context(|| format!("read input {}", input_path.display()))?;
+    let ref_pcm_bytes =
+        fs::read(&ref_path).with_context(|| format!("read reference {}", ref_path.display()))?;
 
     if ref_pcm_bytes.len() % (FRAME_SAMPLES * 2) != 0 {
         return Err(anyhow!("reference PCM not whole number of 20 ms frames"));
@@ -4165,11 +4458,7 @@ fn load_pcm_padded_to_frames(pcm_bytes: &[u8], n_frames: usize) -> Vec<i16> {
 /// Decode `bit_bytes` (FEC or no-FEC) to `i16` PCM samples, returning
 /// the output and the count of frames replaced with silence because
 /// dequantize rejected the pitch index.
-fn decode_to_pcm(
-    bit_bytes: &[u8],
-    fec: bool,
-    n_frames: usize,
-) -> Result<(Vec<i16>, u64)> {
+fn decode_to_pcm(bit_bytes: &[u8], fec: bool, n_frames: usize) -> Result<(Vec<i16>, u64)> {
     let mut decoder_state = DecoderState::new();
     let mut synth_state = SynthState::new();
     let mut pcm_out: Vec<i16> = Vec::with_capacity(n_frames * FRAME_SAMPLES);
@@ -4221,7 +4510,11 @@ fn decode_to_pcm(
 /// preroll frames 0 and 1) are emitted as the `MbeParams::silence()`
 /// frame so that byte counts stay aligned with the reference.
 fn encode_pcm_to_bits(pcm: &[i16], n_frames: usize, fec: bool) -> Result<Vec<u8>> {
-    let frame_bytes = if fec { BYTES_PER_FEC_FRAME } else { BYTES_PER_NOFEC_FRAME };
+    let frame_bytes = if fec {
+        BYTES_PER_FEC_FRAME
+    } else {
+        BYTES_PER_NOFEC_FRAME
+    };
     let mut out = Vec::with_capacity(n_frames * frame_bytes);
     let mut enc_state = AnalysisState::new();
     let mut quant_state = DecoderState::new();
@@ -4330,8 +4623,8 @@ fn cmd_p25_sweep(
         .parent()
         .ok_or_else(|| anyhow!("cmp file has no parent directory"))?;
 
-    let contents = fs::read_to_string(cmp_path)
-        .with_context(|| format!("read {}", cmp_path.display()))?;
+    let contents =
+        fs::read_to_string(cmp_path).with_context(|| format!("read {}", cmp_path.display()))?;
 
     // Parse every line.
     let mut lines: Vec<TestLine> = Vec::new();
@@ -4348,9 +4641,7 @@ fn cmd_p25_sweep(
         .into_iter()
         .filter(|tl| {
             filter.is_none_or(|f| tl.input.contains(f))
-                && op_filter
-                    .as_deref()
-                    .is_none_or(|o| tl.op.as_str() == o)
+                && op_filter.as_deref().is_none_or(|o| tl.op.as_str() == o)
         })
         .collect();
 
@@ -4503,12 +4794,8 @@ fn stratum_metrics_line(op: SweepOp, s: &SweepStratum) -> String {
 
 // ---------- cross-rate-compare ---------------------------------------
 
-const P25_FEC_RCW: [&str; 6] = [
-    "0x0558", "0x086b", "0x1030", "0x0000", "0x0000", "0x0190",
-];
-const P25_NOFEC_RCW: [&str; 6] = [
-    "0x0558", "0x086b", "0x0000", "0x0000", "0x0000", "0x0158",
-];
+const P25_FEC_RCW: [&str; 6] = ["0x0558", "0x086b", "0x1030", "0x0000", "0x0000", "0x0190"];
+const P25_NOFEC_RCW: [&str; 6] = ["0x0558", "0x086b", "0x0000", "0x0000", "0x0000", "0x0158"];
 
 /// Parse one `-rd <…>` or `-re <…>` selector starting at `toks[i]`.
 /// Returns the recognised P25 [`Rate`] and the number of tokens
@@ -4521,13 +4808,20 @@ fn parse_rate_selector(toks: &[&str], i: usize) -> Option<(Option<Rate>, usize)>
         // Six-word RCW: read tokens [i..i+6]. Compare case-insensitively
         // since cmprc.txt mixes 0x086b and 0x086B casing.
         let words: Vec<String> = (0..6)
-            .map(|k| toks.get(i + k).map(|s| s.to_ascii_lowercase()).unwrap_or_default())
+            .map(|k| {
+                toks.get(i + k)
+                    .map(|s| s.to_ascii_lowercase())
+                    .unwrap_or_default()
+            })
             .collect();
         if words.iter().any(|w| w.is_empty()) {
             return None;
         }
         let p25_fec: Vec<String> = P25_FEC_RCW.iter().map(|s| s.to_ascii_lowercase()).collect();
-        let p25_nofec: Vec<String> = P25_NOFEC_RCW.iter().map(|s| s.to_ascii_lowercase()).collect();
+        let p25_nofec: Vec<String> = P25_NOFEC_RCW
+            .iter()
+            .map(|s| s.to_ascii_lowercase())
+            .collect();
         let rate = if words == p25_fec {
             Some(Rate::Imbe7200x4400)
         } else if words == p25_nofec {
@@ -4554,10 +4848,7 @@ struct CrossRateLine {
     reference: PathBuf,
 }
 
-fn parse_cross_rate_line(
-    cmp_dir: &Path,
-    line: &str,
-) -> Result<Option<Option<CrossRateLine>>> {
+fn parse_cross_rate_line(cmp_dir: &Path, line: &str) -> Result<Option<Option<CrossRateLine>>> {
     // Outer Option: None = not a cmprc cross-rate line (blank/comment/encdec).
     // Inner Option: None = parses fine but src/dst isn't a P25 rate (skip).
     let line = line.trim();
@@ -4622,8 +4913,7 @@ fn find_transcode_chain(src: Rate, dst: Rate) -> Option<Vec<Rate>> {
     if src == dst {
         return Some(vec![src]);
     }
-    let mut parent: std::collections::HashMap<Rate, Rate> =
-        std::collections::HashMap::new();
+    let mut parent: std::collections::HashMap<Rate, Rate> = std::collections::HashMap::new();
     let mut queue = std::collections::VecDeque::from([src]);
     while let Some(node) = queue.pop_front() {
         for &cand in &ALL_P25_RATES {
@@ -4639,7 +4929,9 @@ fn find_transcode_chain(src: Rate, dst: Rate) -> Option<Vec<Rate>> {
                     while let Some(&p) = parent.get(&cur) {
                         path.push(p);
                         cur = p;
-                        if cur == src { break; }
+                        if cur == src {
+                            break;
+                        }
                     }
                     path.reverse();
                     return Some(path);
@@ -4718,12 +5010,16 @@ struct CrossRateStats {
 
 impl CrossRateStats {
     fn frame_match_pct(&self) -> f64 {
-        if self.frames_total == 0 { 0.0 } else {
+        if self.frames_total == 0 {
+            0.0
+        } else {
             100.0 * self.frames_bit_exact as f64 / self.frames_total as f64
         }
     }
     fn byte_match_pct(&self) -> f64 {
-        if self.bytes_total == 0 { 0.0 } else {
+        if self.bytes_total == 0 {
+            0.0
+        } else {
             100.0 * self.bytes_bit_exact as f64 / self.bytes_total as f64
         }
     }
@@ -4763,12 +5059,10 @@ fn cmd_cross_rate_compare(
             Some(Some(tl)) => {
                 total_rc += 1;
                 if let Some(f) = filter {
-                    let stem = tl
-                        .input
-                        .file_stem()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("");
-                    if !stem.contains(f) { continue; }
+                    let stem = tl.input.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+                    if !stem.contains(f) {
+                        continue;
+                    }
                 }
                 lines.push(tl);
             }
@@ -4779,7 +5073,9 @@ fn cmd_cross_rate_compare(
         "total -rc lines in file:    {total_rc} ({non_p25_skipped} skipped: src or dst not a P25 rate)"
     );
     println!("P25 cross-rate lines to run: {}", lines.len());
-    if let Some(f) = filter { println!("filter:                     --filter {f}"); }
+    if let Some(f) = filter {
+        println!("filter:                     --filter {f}");
+    }
     println!();
 
     use std::collections::HashMap;
@@ -4966,8 +5262,7 @@ fn cmd_cross_rate_compare(
                 n_be,
             ));
         }
-        fs::write(csv_path, s)
-            .with_context(|| format!("write csv {}", csv_path.display()))?;
+        fs::write(csv_path, s).with_context(|| format!("write csv {}", csv_path.display()))?;
         println!("\nper-line CSV: {}", csv_path.display());
     }
 

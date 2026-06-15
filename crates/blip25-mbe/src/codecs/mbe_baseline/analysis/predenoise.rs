@@ -141,7 +141,7 @@ pub struct PreDenoise {
     sub_min_t: [[f64; N_BINS]; U_SUB],
     sub_idx: usize,
     frame_in_sub: usize,
-    n_psd: [f64; N_BINS], // noise power estimate
+    n_psd: [f64; N_BINS],    // noise power estimate
     p_speech: [f64; N_BINS], // IMCRA speech-presence probability p(k)
 
     // Decision-directed SNR memory.
@@ -609,7 +609,9 @@ mod tests {
         let mut x: u64 = 0x1234_5678;
         let noise: Vec<i16> = (0..FRAME * 60)
             .map(|_| {
-                x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                x = x
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 (((x >> 40) as i32 & 0x7FF) - 1024) as i16
             })
             .collect();
@@ -647,5 +649,3 @@ mod tests {
         assert_eq!(d.boot_count, 0);
     }
 }
-
-

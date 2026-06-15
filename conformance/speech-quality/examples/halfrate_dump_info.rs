@@ -1,4 +1,4 @@
-use blip25_mbe::rate33::frame::{DIBITS_PER_FRAME, decode_frame};
+use blip25_mbe::rate33::frame::{decode_frame, DIBITS_PER_FRAME};
 use std::fs;
 
 fn unpack(bytes: &[u8]) -> [u8; DIBITS_PER_FRAME] {
@@ -7,8 +7,8 @@ fn unpack(bytes: &[u8]) -> [u8; DIBITS_PER_FRAME] {
     for slot in &mut out {
         let mut d = 0u8;
         for _ in 0..2 {
-            let b = (bytes[bit/8] >> (7-(bit%8))) & 1;
-            d = (d<<1) | b;
+            let b = (bytes[bit / 8] >> (7 - (bit % 8))) & 1;
+            d = (d << 1) | b;
             bit += 1;
         }
         *slot = d;
@@ -21,9 +21,11 @@ fn main() {
     let bytes = fs::read(&path).unwrap();
     let n = bytes.len() / 9;
     for f in 0..n {
-        let dibits = unpack(&bytes[f*9..(f+1)*9]);
+        let dibits = unpack(&bytes[f * 9..(f + 1) * 9]);
         let frame = decode_frame(&dibits);
-        println!("{:04x} {:04x} {:04x} {:04x}",
-            frame.info[0], frame.info[1], frame.info[2], frame.info[3]);
+        println!(
+            "{:04x} {:04x} {:04x} {:04x}",
+            frame.info[0], frame.info[1], frame.info[2], frame.info[3]
+        );
     }
 }

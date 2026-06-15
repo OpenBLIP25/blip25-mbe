@@ -25,7 +25,7 @@
 
 use core::f64::consts::PI as PI64;
 
-use crate::mbe_params::{L_MAX, MbeParams};
+use crate::mbe_params::{MbeParams, L_MAX};
 
 pub mod analysis;
 pub mod phase_regen;
@@ -111,8 +111,7 @@ pub fn enhance_spectral_amplitudes(
             let bar = if 8 * (i + 1) <= l {
                 f64::from(m) // first branch — bypass for the lowest ⌊L̃/8⌋
             } else {
-                let num = r_m0 * r_m0 + r_m1 * r_m1
-                    - 2.0 * r_m0 * r_m1 * (omega_0 * l_one).cos();
+                let num = r_m0 * r_m0 + r_m1 * r_m1 - 2.0 * r_m0 * r_m1 * (omega_0 * l_one).cos();
                 if num <= 0.0 {
                     f64::from(m) // numerator pathology → passthrough
                 } else {
@@ -227,17 +226,12 @@ pub enum FrameDisposition {
 /// `b̂₀ invalid` **OR** (`ε₀ ≥ 2` AND `ε_T ≥ 10 + 40·ε_R(0)`).
 ///
 /// Per §1.11.2 mute supersedes repeat when `ε_R(0) > 0.0875`.
-pub fn frame_disposition(
-    err: &FrameErrorContext,
-    epsilon_r_prev: f64,
-) -> (FrameDisposition, f64) {
-    let epsilon_r =
-        0.95 * epsilon_r_prev + 0.05 * (f64::from(err.epsilon_t) / 144.0);
+pub fn frame_disposition(err: &FrameErrorContext, epsilon_r_prev: f64) -> (FrameDisposition, f64) {
+    let epsilon_r = 0.95 * epsilon_r_prev + 0.05 * (f64::from(err.epsilon_t) / 144.0);
     let disp = if epsilon_r > MUTE_EPSILON_R_THRESHOLD {
         FrameDisposition::Mute
     } else if err.bad_pitch
-        || (err.epsilon_0 >= 2
-            && f64::from(err.epsilon_t) >= 10.0 + 40.0 * epsilon_r)
+        || (err.epsilon_0 >= 2 && f64::from(err.epsilon_t) >= 10.0 + 40.0 * epsilon_r)
     {
         FrameDisposition::Repeat
     } else {
@@ -268,10 +262,7 @@ pub fn frame_disposition_halfrate(
     let epsilon_r = 0.95 * epsilon_r_prev + 0.001064 * f64::from(err.epsilon_t);
     let disp = if epsilon_r > MUTE_EPSILON_R_THRESHOLD_HALFRATE {
         FrameDisposition::Mute
-    } else if err.bad_pitch
-        || err.epsilon_0 >= 4
-        || (err.epsilon_0 >= 2 && err.epsilon_t >= 6)
-    {
+    } else if err.bad_pitch || err.epsilon_0 >= 4 || (err.epsilon_0 >= 2 && err.epsilon_t >= 6) {
         FrameDisposition::Repeat
     } else {
         FrameDisposition::Use
@@ -343,14 +334,24 @@ pub fn apply_smoothing(
     };
 
     // Eq. 116: γ_M scaling.
-    let gamma_m: f64 = if tau_m > a_m { 1.0 } else if a_m > 0.0 { tau_m / a_m } else { 1.0 };
+    let gamma_m: f64 = if tau_m > a_m {
+        1.0
+    } else if a_m > 0.0 {
+        tau_m / a_m
+    } else {
+        1.0
+    };
 
     let mut m_bar_out = [0f32; L_MAX as usize];
     for (i, &m) in m_bar.iter().enumerate() {
         m_bar_out[i] = ((f64::from(m)) * gamma_m) as f32;
     }
 
-    SmoothedFrame { m_bar: m_bar_out, v_bar, tau_m }
+    SmoothedFrame {
+        m_bar: m_bar_out,
+        v_bar,
+        tau_m,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -436,7 +437,6 @@ fn default_lcg_gen() -> UnvoicedNoiseGen {
 /// Annex C (pitch refinement window) CSVs. Decoder-init constant.
 pub const GAMMA_W: f64 = 146.643269;
 
-
 /// Cross-frame state for the unvoiced synthesizer (§1.12.1).
 #[derive(Clone, Debug)]
 pub struct UnvoicedSynthState {
@@ -488,10 +488,7 @@ impl UnvoicedSynthState {
     /// `lcg ← (a·lcg + c) mod m`. Defaults follow [`UnvoicedNoiseGen`].
     #[inline]
     fn next_noise(&mut self) -> f64 {
-        self.lcg = self.lcg_a
-            .wrapping_mul(self.lcg)
-            .wrapping_add(self.lcg_c)
-            % self.lcg_m;
+        self.lcg = self.lcg_a.wrapping_mul(self.lcg).wrapping_add(self.lcg_c) % self.lcg_m;
         f64::from(self.lcg)
     }
 
@@ -890,7 +887,15 @@ pub fn synthesize_voiced(
     // Default to the spec LCG modulus for ρ_l (Eq. 141) — used by all
     // existing tests and by full-rate IMBE. AmbePlus phase mode ignores
     // the modulus (it bypasses Eq. 141 in favour of phase regen).
-    synthesize_voiced_with_lcg_modulus(omega_0, m_bar, v_bar, noise_samples, phase_mode, 53125, state)
+    synthesize_voiced_with_lcg_modulus(
+        omega_0,
+        m_bar,
+        v_bar,
+        noise_samples,
+        phase_mode,
+        53125,
+        state,
+    )
 }
 
 /// Variant of [`synthesize_voiced`] that lets the caller specify the
@@ -950,8 +955,7 @@ pub fn synthesize_voiced_with_lcg_modulus(
                     let u_l = noise_samples[l - 1];
                     let rho_l = (2.0 * PI64 / lcg_m) * u_l - PI64; // Eq. 141
                     let l_curr_f = if l_curr > 0 { f64::from(l_curr) } else { 1.0 };
-                    phi_curr[l] = psi_curr[l]
-                        + f64::from(l_uv) * rho_l / l_curr_f * (l as f64);
+                    phi_curr[l] = psi_curr[l] + f64::from(l_uv) * rho_l / l_curr_f * (l as f64);
                 }
             }
         }
@@ -1008,8 +1012,16 @@ pub fn synthesize_voiced_with_lcg_modulus(
     let mut s_v = [0f64; FRAME_SAMPLES];
     for l in 1..=max_l {
         let l_f = l as f64;
-        let m_curr_l = if l <= l_curr as usize { f64::from(m_bar[l - 1]) } else { 0.0 };
-        let m_prev_l = if l <= l_prev as usize { state.prev_m_bar[l] } else { 0.0 };
+        let m_curr_l = if l <= l_curr as usize {
+            f64::from(m_bar[l - 1])
+        } else {
+            0.0
+        };
+        let m_prev_l = if l <= l_prev as usize {
+            state.prev_m_bar[l]
+        } else {
+            0.0
+        };
         let v_curr = l <= l_curr as usize && v_bar[l - 1];
         let v_prev = l <= l_prev as usize && state.prev_v_bar[l];
 
@@ -1091,8 +1103,8 @@ pub fn synthesize_voiced_with_lcg_modulus(
             }
             Branch::VVRamp => {
                 // Quadratic phase — keep direct cos().
-                let delta_phi = phi_curr[l] - state.phi[l]
-                    - (omega_prev + omega_curr) * l_f * n_f / 2.0;
+                let delta_phi =
+                    phi_curr[l] - state.phi[l] - (omega_prev + omega_curr) * l_f * n_f / 2.0;
                 let wrapped = wrap_phase(delta_phi);
                 let delta_omega_l = wrapped / n_f;
                 let theta0 = state.phi[l];
@@ -1100,9 +1112,8 @@ pub fn synthesize_voiced_with_lcg_modulus(
                 for n in 0..FRAME_SAMPLES {
                     let nf = n as f64;
                     let a_l = m_prev_l + (nf / n_f) * (m_curr_l - m_prev_l);
-                    let theta_l = theta0
-                        + (omega_prev * l_f + delta_omega_l) * nf
-                        + coef_n2 * nf * nf;
+                    let theta_l =
+                        theta0 + (omega_prev * l_f + delta_omega_l) * nf + coef_n2 * nf * nf;
                     s_v[n] += 2.0 * a_l * theta_l.cos();
                 }
             }
@@ -1423,7 +1434,10 @@ pub fn synthesize_repeat_with_mode(
     // Force Repeat disposition by setting bad_pitch on a local err
     // copy; do not touch state.err so consumer-driven error accounting
     // is preserved.
-    let err = FrameErrorContext { bad_pitch: true, ..state.err };
+    let err = FrameErrorContext {
+        bad_pitch: true,
+        ..state.err
+    };
     let params = MbeParams::silence();
     synthesize_frame_with_mode(&params, &err, state.gamma_w, phase_mode, state)
 }
@@ -1553,10 +1567,9 @@ fn synthesize_frame_with_mode(
     state.repeat_count = next_repeat_count;
 
     // §1.10 enhancement: M̃_l → M̄_l, update S_E.
-    let (m_bar_full, s_e_new) = analysis::profile::time(
-        analysis::profile::Stage::Enhance,
-        || enhance_spectral_amplitudes(&m_tilde_arr[..l as usize], omega_0, state.s_e),
-    );
+    let (m_bar_full, s_e_new) = analysis::profile::time(analysis::profile::Stage::Enhance, || {
+        enhance_spectral_amplitudes(&m_tilde_arr[..l as usize], omega_0, state.s_e)
+    });
     state.s_e = s_e_new;
 
     // §1.11.3 V/UV-and-amplitude smoothing.
@@ -1697,11 +1710,7 @@ mod tests {
     #[test]
     fn synth_window_symmetric() {
         for n in 1..=105 {
-            assert_eq!(
-                synth_window(-n),
-                synth_window(n),
-                "wS(-{n}) != wS({n})"
-            );
+            assert_eq!(synth_window(-n), synth_window(n), "wS(-{n}) != wS({n})");
         }
     }
 
@@ -1759,13 +1768,18 @@ mod tests {
         // double precision before the f64 → f32 cast; we just check
         // the round-tripped energy matches within a small tolerance.
         let l = 24usize;
-        let m_tilde: Vec<f32> = (1..=l).map(|i| (i as f32 * 0.3).sin().abs() + 0.1).collect();
+        let m_tilde: Vec<f32> = (1..=l)
+            .map(|i| (i as f32 * 0.3).sin().abs() + 0.1)
+            .collect();
         let omega_0 = std::f32::consts::PI / 12.0;
         let (m_bar, _) = enhance_spectral_amplitudes(&m_tilde, omega_0, INIT_S_E);
         let energy_in = sum_sq(&m_tilde);
         let energy_out = sum_sq(&m_bar[..l]);
         let rel_err = (energy_out - energy_in).abs() / energy_in;
-        assert!(rel_err < 1e-4, "energy drift {rel_err} (in={energy_in}, out={energy_out})");
+        assert!(
+            rel_err < 1e-4,
+            "energy drift {rel_err} (in={energy_in}, out={energy_out})"
+        );
     }
 
     #[test]
@@ -1817,7 +1831,12 @@ mod tests {
     // ---- §1.11 smoothing / disposition -----------------------------------
 
     fn err(epsilon_0: u8, epsilon_t: u8, epsilon_4: u8) -> FrameErrorContext {
-        FrameErrorContext { epsilon_0, epsilon_4, epsilon_t, bad_pitch: false }
+        FrameErrorContext {
+            epsilon_0,
+            epsilon_4,
+            epsilon_t,
+            bad_pitch: false,
+        }
     }
 
     #[test]
@@ -2204,14 +2223,27 @@ mod tests {
         v_bar[0] = true;
         let noise = [0f64; L_MAX as usize];
         let mut state = VoicedSynthState::new();
-        let _ = synthesize_voiced(omega_0, &m_bar, &v_bar, &noise, PhaseMode::Baseline, &mut state);
-        let pcm = synthesize_voiced(omega_0, &m_bar, &v_bar, &noise, PhaseMode::Baseline, &mut state);
+        let _ = synthesize_voiced(
+            omega_0,
+            &m_bar,
+            &v_bar,
+            &noise,
+            PhaseMode::Baseline,
+            &mut state,
+        );
+        let pcm = synthesize_voiced(
+            omega_0,
+            &m_bar,
+            &v_bar,
+            &noise,
+            PhaseMode::Baseline,
+            &mut state,
+        );
 
         // Output should have measurable energy concentrated around
         // ω₀. We just sanity-check non-zero variance.
         let mean: f64 = pcm.iter().sum::<f64>() / pcm.len() as f64;
-        let var: f64 = pcm.iter().map(|&s| (s - mean).powi(2)).sum::<f64>()
-            / pcm.len() as f64;
+        let var: f64 = pcm.iter().map(|&s| (s - mean).powi(2)).sum::<f64>() / pcm.len() as f64;
         assert!(var > 100.0, "voiced steady-state variance too low: {var}");
     }
 
@@ -2231,10 +2263,38 @@ mod tests {
         let noise = [0f64; L_MAX as usize];
         let mut state = VoicedSynthState::new();
         // Warm up.
-        let _ = synthesize_voiced(omega_0, &m_bar, &v_bar, &noise, PhaseMode::Baseline, &mut state);
-        let _ = synthesize_voiced(omega_0, &m_bar, &v_bar, &noise, PhaseMode::Baseline, &mut state);
-        let pcm_a = synthesize_voiced(omega_0, &m_bar, &v_bar, &noise, PhaseMode::Baseline, &mut state);
-        let pcm_b = synthesize_voiced(omega_0, &m_bar, &v_bar, &noise, PhaseMode::Baseline, &mut state);
+        let _ = synthesize_voiced(
+            omega_0,
+            &m_bar,
+            &v_bar,
+            &noise,
+            PhaseMode::Baseline,
+            &mut state,
+        );
+        let _ = synthesize_voiced(
+            omega_0,
+            &m_bar,
+            &v_bar,
+            &noise,
+            PhaseMode::Baseline,
+            &mut state,
+        );
+        let pcm_a = synthesize_voiced(
+            omega_0,
+            &m_bar,
+            &v_bar,
+            &noise,
+            PhaseMode::Baseline,
+            &mut state,
+        );
+        let pcm_b = synthesize_voiced(
+            omega_0,
+            &m_bar,
+            &v_bar,
+            &noise,
+            PhaseMode::Baseline,
+            &mut state,
+        );
         let last_a = pcm_a[FRAME_SAMPLES - 1];
         let first_b = pcm_b[0];
         // Approximate continuity: difference well below the typical
@@ -2275,18 +2335,38 @@ mod tests {
 
         let mut state_base = VoicedSynthState::new();
         let _ = synthesize_voiced(
-            omega_0, &m_bar, &v_bar, &noise, PhaseMode::Baseline, &mut state_base,
+            omega_0,
+            &m_bar,
+            &v_bar,
+            &noise,
+            PhaseMode::Baseline,
+            &mut state_base,
         );
         let pcm_base = synthesize_voiced(
-            omega_0, &m_bar, &v_bar, &noise, PhaseMode::Baseline, &mut state_base,
+            omega_0,
+            &m_bar,
+            &v_bar,
+            &noise,
+            PhaseMode::Baseline,
+            &mut state_base,
         );
 
         let mut state_amb = VoicedSynthState::new();
         let _ = synthesize_voiced(
-            omega_0, &m_bar, &v_bar, &noise, PhaseMode::AmbePlus, &mut state_amb,
+            omega_0,
+            &m_bar,
+            &v_bar,
+            &noise,
+            PhaseMode::AmbePlus,
+            &mut state_amb,
         );
         let pcm_amb = synthesize_voiced(
-            omega_0, &m_bar, &v_bar, &noise, PhaseMode::AmbePlus, &mut state_amb,
+            omega_0,
+            &m_bar,
+            &v_bar,
+            &noise,
+            PhaseMode::AmbePlus,
+            &mut state_amb,
         );
 
         // Overall waveforms should differ.
@@ -2312,11 +2392,21 @@ mod tests {
 
         let mut state_base = VoicedSynthState::new();
         let pcm_base = synthesize_voiced(
-            0.2, &m_bar, &v_bar, &noise, PhaseMode::Baseline, &mut state_base,
+            0.2,
+            &m_bar,
+            &v_bar,
+            &noise,
+            PhaseMode::Baseline,
+            &mut state_base,
         );
         let mut state_amb = VoicedSynthState::new();
         let pcm_amb = synthesize_voiced(
-            0.2, &m_bar, &v_bar, &noise, PhaseMode::AmbePlus, &mut state_amb,
+            0.2,
+            &m_bar,
+            &v_bar,
+            &noise,
+            PhaseMode::AmbePlus,
+            &mut state_amb,
         );
         for (i, (a, b)) in pcm_base.iter().zip(pcm_amb.iter()).enumerate() {
             assert!(
@@ -2381,7 +2471,10 @@ mod tests {
         let voiced = vec![true; 9];
         let amps = vec![100f32; 9];
         let p = build_params(0.2, &voiced, &amps);
-        let err = FrameErrorContext { epsilon_t: 100, ..Default::default() };
+        let err = FrameErrorContext {
+            epsilon_t: 100,
+            ..Default::default()
+        };
         let mut state = SynthState::new();
         state.epsilon_r = 0.5; // > MUTE_EPSILON_R_THRESHOLD
         let s_e_init = state.s_e;
@@ -2391,7 +2484,10 @@ mod tests {
         let peak = pcm.iter().map(|s| s.unsigned_abs()).max().unwrap_or(0);
         let nonzero = pcm.iter().filter(|&&s| s != 0).count();
         assert!(peak < 1500, "Mute noise peak too loud: {peak}");
-        assert!(nonzero > FRAME_SAMPLES / 2, "Mute noise too sparse: {nonzero}");
+        assert!(
+            nonzero > FRAME_SAMPLES / 2,
+            "Mute noise too sparse: {nonzero}"
+        );
         // State should still have advanced (so re-acquisition works).
         assert_ne!(state.s_e, s_e_init);
     }
@@ -2426,7 +2522,10 @@ mod tests {
         let p_good = build_params(0.2, &voiced, &amps);
         let p_repeat = build_params(0.1, &vec![false; 12], &vec![1.0; 12]);
         let err_use = FrameErrorContext::default();
-        let err_repeat = FrameErrorContext { bad_pitch: true, ..Default::default() };
+        let err_repeat = FrameErrorContext {
+            bad_pitch: true,
+            ..Default::default()
+        };
 
         let mut state_a = SynthState::new();
         let _ = synthesize_frame(&p_good, &err_use, GAMMA_W, &mut state_a);
@@ -2470,7 +2569,8 @@ mod tests {
         let pcm_on = synthesize_frame(&p_high, &err, GAMMA_W, &mut state_on);
 
         assert_eq!(
-            &pcm_off[..], &pcm_on[..],
+            &pcm_off[..],
+            &pcm_on[..],
             "full-rate IMBE (PhaseMode::Baseline) must be unaffected by chip_compat flags"
         );
     }
@@ -2495,8 +2595,10 @@ mod tests {
 
         let mut state_on = SynthState::new();
         state_on.set_chip_compat(true);
-        assert!(!state_on.chip_compat_spectral_clamp(),
-            "standalone flag should stay off — clamp is enabled via chip_compat");
+        assert!(
+            !state_on.chip_compat_spectral_clamp(),
+            "standalone flag should stay off — clamp is enabled via chip_compat"
+        );
         let _ = synthesize_frame_ambe_plus(&p_low, &err, GAMMA_W, &mut state_on);
         let pcm_on = synthesize_frame_ambe_plus(&p_high, &err, GAMMA_W, &mut state_on);
 
@@ -2523,7 +2625,11 @@ mod tests {
         let _ = synthesize_frame_ambe_plus(&p_low, &err, GAMMA_W, &mut state_b);
         let pcm_b = synthesize_frame_ambe_plus(&p_high, &err, GAMMA_W, &mut state_b);
 
-        assert_eq!(&pcm_a[..], &pcm_b[..], "default-off must not alter synth output");
+        assert_eq!(
+            &pcm_a[..],
+            &pcm_b[..],
+            "default-off must not alter synth output"
+        );
     }
 
     #[test]
@@ -2549,7 +2655,10 @@ mod tests {
 
         let rms_off = rms(&pcm_off);
         let rms_on = rms(&pcm_on);
-        assert!(rms_on < rms_off, "clamp must reduce RMS on large L-jump: off={rms_off:.1} on={rms_on:.1}");
+        assert!(
+            rms_on < rms_off,
+            "clamp must reduce RMS on large L-jump: off={rms_off:.1} on={rms_on:.1}"
+        );
         // Roughly 0.75× per sweep data — allow generous bounds.
         let ratio = rms_on / rms_off;
         assert!(ratio < 0.95, "expected ratio < 0.95, got {ratio:.3}");
@@ -2582,8 +2691,10 @@ mod tests {
 
         let rms_off = rms(&pcm_off);
         let rms_on = rms(&pcm_on);
-        assert!(rms_on < rms_off,
-            "clamp must reduce RMS on large L-down-jump: off={rms_off:.1} on={rms_on:.1}");
+        assert!(
+            rms_on < rms_off,
+            "clamp must reduce RMS on large L-down-jump: off={rms_off:.1} on={rms_on:.1}"
+        );
     }
 
     #[test]
@@ -2604,8 +2715,11 @@ mod tests {
         let _ = synthesize_frame_ambe_plus(&p_a, &err, GAMMA_W, &mut state_on);
         let pcm_on = synthesize_frame_ambe_plus(&p_b, &err, GAMMA_W, &mut state_on);
 
-        assert_eq!(&pcm_off[..], &pcm_on[..],
-            "small L change (|ΔL|=7, below threshold of 25) must not trigger clamp");
+        assert_eq!(
+            &pcm_off[..],
+            &pcm_on[..],
+            "small L change (|ΔL|=7, below threshold of 25) must not trigger clamp"
+        );
     }
 
     #[test]
@@ -2617,7 +2731,11 @@ mod tests {
         // assert on RMS instead — it integrates the whole frame.
         let p = build_params(0.3, &vec![true; 20], &vec![50f32; 20]);
         let err_clean = FrameErrorContext::default();
-        let err_e2 = FrameErrorContext { epsilon_0: 2, epsilon_t: 2, ..Default::default() };
+        let err_e2 = FrameErrorContext {
+            epsilon_0: 2,
+            epsilon_t: 2,
+            ..Default::default()
+        };
 
         // Warm up state with a clean frame so ΔL=0 on the next call.
         let mut state_off = SynthState::new();
@@ -2634,7 +2752,10 @@ mod tests {
         };
         let rms_off = rms(&pcm_off);
         let rms_on = rms(&pcm_on);
-        assert!(rms_on < rms_off, "ε₀≥2 must trigger clamp: off={rms_off:.1} on={rms_on:.1}");
+        assert!(
+            rms_on < rms_off,
+            "ε₀≥2 must trigger clamp: off={rms_off:.1} on={rms_on:.1}"
+        );
     }
 
     #[test]
@@ -2643,7 +2764,9 @@ mod tests {
         // hit the clamp (1.2 high, 0.5 low). Non-bypassed M̄_l / M̃_l
         // ratios must lie in [0.5·γ, 1.2·γ] for some shared γ.
         let l = 12usize; // small enough that 8·l > L̃ for all l ≥ 2
-        let m_tilde: Vec<f32> = vec![1e-3, 10.0, 0.01, 5.0, 0.05, 3.0, 0.1, 2.0, 0.2, 1.5, 0.3, 1.0];
+        let m_tilde: Vec<f32> = vec![
+            1e-3, 10.0, 0.01, 5.0, 0.05, 3.0, 0.1, 2.0, 0.2, 1.5, 0.3, 1.0,
+        ];
         let omega_0 = std::f32::consts::PI / 6.0;
         let (m_bar, _) = enhance_spectral_amplitudes(&m_tilde, omega_0, INIT_S_E);
         // All non-bypassed (l ≥ 2 since L=12 means only l=1 is bypassed)

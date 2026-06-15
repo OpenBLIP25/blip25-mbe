@@ -8,7 +8,9 @@
 //!
 //! Usage: hum_diag_probe <clean.pcm> <hum.pcm>
 
-use blip25_mbe::codecs::mbe_baseline::analysis::{encode_ambe_plus2, AnalysisOutput, AnalysisState};
+use blip25_mbe::codecs::mbe_baseline::analysis::{
+    encode_ambe_plus2, AnalysisOutput, AnalysisState,
+};
 
 const FRAME: usize = 160;
 
@@ -177,9 +179,7 @@ fn main() {
         "  frames with >=1 voiced-band-count change: {voicing_flip_frames} ({:.1}%)",
         100.0 * voicing_flip_frames as f64 / n_voiced_frames.max(1) as f64
     );
-    println!(
-        "  total |Δ(n_voiced bands)| across frames: {voicing_flip_total}"
-    );
+    println!("  total |Δ(n_voiced bands)| across frames: {voicing_flip_total}");
     println!("  Voice<->Silence flips: {silence_flip}");
     println!();
     println!("--- (c) LOW-BAND AMPLITUDE / §0.5 ---");

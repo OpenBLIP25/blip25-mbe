@@ -22,7 +22,7 @@
 //! and target encoder is undamped. The 0.65 blend is a first-order
 //! low-pass filter applied at the rate-boundary seam.
 
-use crate::mbe_params::{L_MAX, MbeParams};
+use crate::mbe_params::{MbeParams, L_MAX};
 use crate::rate33::frame::AMBE_PITCH_TABLE;
 
 /// Rate-converter predictor coefficient per US7634399 col. 7 line 10.
@@ -173,8 +173,8 @@ pub fn blend(
             // 0.65 · prior_resampled + 0.35 · current, in linear domain.
             let prior_linear = (2.0_f64).powf(prev_resampled_log) as f32;
             let curr = blended[l_b - 1];
-            blended[l_b - 1] = RHO_CROSS_RATE as f32 * prior_linear
-                + (1.0 - RHO_CROSS_RATE as f32) * curr;
+            blended[l_b - 1] =
+                RHO_CROSS_RATE as f32 * prior_linear + (1.0 - RHO_CROSS_RATE as f32) * curr;
         }
     }
     // Fast path (|R−1| ≤ 0.01): blended already holds current amps; no
@@ -250,7 +250,10 @@ mod tests {
         let params = make_params(target_omega, 20, 100.0);
         let out = blend(&params, target_omega, 20, &mut state);
         for (i, &a) in out.amplitudes_slice().iter().enumerate().take(20) {
-            assert_eq!(a, 100.0, "harmonic {i}: fast-path should pass current through");
+            assert_eq!(
+                a, 100.0,
+                "harmonic {i}: fast-path should pass current through"
+            );
         }
         // State advanced.
         assert_eq!(state.l_prev, 20);
@@ -324,7 +327,9 @@ mod tests {
         state.omega_0_prev = 0.14;
         state.l_prev = 10;
         let l: u8 = 10;
-        let voiced = vec![true, false, true, false, true, false, true, false, true, false];
+        let voiced = vec![
+            true, false, true, false, true, false, true, false, true, false,
+        ];
         let amps = vec![100.0_f32; l as usize];
         let params = MbeParams::new(0.15, l, &voiced, &amps).unwrap();
         let out = blend(&params, 0.15, l, &mut state);

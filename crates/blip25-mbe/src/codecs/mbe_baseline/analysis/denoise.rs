@@ -229,7 +229,13 @@ impl NoiseSpectrum {
     ///
     /// The reference spectrum is updated every frame regardless of
     /// eligibility so the cos-sim test always has a recent baseline.
-    pub fn update(&mut self, sw: &[Complex64; DFT_SIZE], silent: bool, frame_energy: f64, noise_floor_eta: f64) {
+    pub fn update(
+        &mut self,
+        sw: &[Complex64; DFT_SIZE],
+        silent: bool,
+        frame_energy: f64,
+        noise_floor_eta: f64,
+    ) {
         // Stage 1: spectral stationarity test (uses prior reference).
         let cos_sim = self.stationarity_cos_sim(sw);
         let stationary = cos_sim >= STATIONARITY_COS_THRESHOLD;
@@ -244,8 +250,7 @@ impl NoiseSpectrum {
         } else {
             for (m, slot) in self.spectrum_ref.iter_mut().enumerate() {
                 let cur = sw[m].norm_sqr();
-                *slot = STATIONARITY_REF_LAMBDA * *slot
-                    + (1.0 - STATIONARITY_REF_LAMBDA) * cur;
+                *slot = STATIONARITY_REF_LAMBDA * *slot + (1.0 - STATIONARITY_REF_LAMBDA) * cur;
             }
         }
 
@@ -307,8 +312,8 @@ pub fn apply_subtraction(
                 if s_psd <= 1e-30 {
                     continue;
                 }
-                let suppressed = (s_psd - SUBTRACTION_BETA * state.n_psd[m])
-                    .max(SPECTRAL_FLOOR_ALPHA * s_psd);
+                let suppressed =
+                    (s_psd - SUBTRACTION_BETA * state.n_psd[m]).max(SPECTRAL_FLOOR_ALPHA * s_psd);
                 let gain = (suppressed / s_psd).sqrt();
                 out[m] = Complex64::new(sw[m].re * gain, sw[m].im * gain);
             }
@@ -327,8 +332,8 @@ pub fn apply_subtraction(
                 // Decision-directed a-priori SNR ξ̂_t = α·|Â_{t-1}|²/N
                 //                              + (1-α)·max(γ - 1, 0).
                 let xi = (DD_SNR_SMOOTHING * state.prev_enhanced_psd[m] / n_psd
-                        + (1.0 - DD_SNR_SMOOTHING) * gamma)
-                        .max(A_PRIORI_SNR_FLOOR);
+                    + (1.0 - DD_SNR_SMOOTHING) * gamma)
+                    .max(A_PRIORI_SNR_FLOOR);
                 // Wiener gain, with the same `sqrt(α)` floor Boll mode
                 // uses — prevents the gain from collapsing on bins
                 // whose a-priori SNR estimate dips low (which on
@@ -427,8 +432,11 @@ mod tests {
         voice[10] = Complex64::new(50.0, 0.0);
         state.update(&voice, false, 100.0, 1.0);
         for m in 0..DFT_SIZE {
-            assert!((state.n_psd[m] - baseline).abs() < 1e-9,
-                "voiced update leaked: bin {m} = {}", state.n_psd[m]);
+            assert!(
+                (state.n_psd[m] - baseline).abs() < 1e-9,
+                "voiced update leaked: bin {m} = {}",
+                state.n_psd[m]
+            );
         }
     }
 
@@ -448,10 +456,16 @@ mod tests {
         let expected_gain = ((1.0 - SUBTRACTION_BETA).max(SPECTRAL_FLOOR_ALPHA)).sqrt();
         let expected_max = expected_gain * 0.5 + 1e-9;
         for m in 0..DFT_SIZE {
-            assert!(out[m].re.abs() <= expected_max,
-                "bin {m} expected ≤ {expected_max:.4}, got {}", out[m].re);
-            assert!(out[m].re.abs() < 0.5,
-                "bin {m} not attenuated at all: {}", out[m].re);
+            assert!(
+                out[m].re.abs() <= expected_max,
+                "bin {m} expected ≤ {expected_max:.4}, got {}",
+                out[m].re
+            );
+            assert!(
+                out[m].re.abs() < 0.5,
+                "bin {m} not attenuated at all: {}",
+                out[m].re
+            );
         }
     }
 
@@ -466,10 +480,16 @@ mod tests {
         let signal = flat_spectrum(10.0);
         let out = apply_subtraction(&signal, &mut state);
         for m in 0..DFT_SIZE {
-            assert!((out[m].re - 10.0).abs() < 0.5,
-                "bin {m} over-attenuated: {}", out[m].re);
-            assert!(out[m].re.abs() > 5.0,
-                "bin {m} excessively attenuated: {}", out[m].re);
+            assert!(
+                (out[m].re - 10.0).abs() < 0.5,
+                "bin {m} over-attenuated: {}",
+                out[m].re
+            );
+            assert!(
+                out[m].re.abs() > 5.0,
+                "bin {m} excessively attenuated: {}",
+                out[m].re
+            );
         }
     }
 }

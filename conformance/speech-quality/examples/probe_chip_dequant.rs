@@ -5,7 +5,7 @@
 //! FEC/dequant (params would be garbage) vs synth (params look OK,
 //! output still wrong).
 
-use blip25_mbe::imbe7200::dequantize::{DecodeError, DecoderState, dequantize};
+use blip25_mbe::imbe7200::dequantize::{dequantize, DecodeError, DecoderState};
 use blip25_mbe::imbe7200::frame::decode_frame;
 use std::fs;
 

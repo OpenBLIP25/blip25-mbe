@@ -101,11 +101,8 @@ pub const INFO_BITS_TOTAL: u16 = 49;
 /// verified a bijection across alltone/clean/dam/mark/alert (see
 /// `examples/derive_r34_order.rs`).
 pub const R34_BIT_ORDER: [u8; 49] = [
-    0, 18, 36, 1, 19, 37, 2, 20, 38, 3, 21, 39,
-    4, 22, 40, 5, 23, 41, 6, 24, 42, 7, 25, 43,
-    8, 26, 44, 9, 27, 45, 10, 28, 46, 11, 29, 47,
-    12, 30, 48, 13, 31, 14, 32, 15, 33, 16, 34, 17,
-    35,
+    0, 18, 36, 1, 19, 37, 2, 20, 38, 3, 21, 39, 4, 22, 40, 5, 23, 41, 6, 24, 42, 7, 25, 43, 8, 26,
+    44, 9, 27, 45, 10, 28, 46, 11, 29, 47, 12, 30, 48, 13, 31, 14, 32, 15, 33, 16, 34, 17, 35,
 ];
 
 /// Pack the four info vectors `û₀..û₃` into a 7-byte R34 no-FEC frame,
@@ -221,7 +218,12 @@ pub struct SoftCodeVectors {
 
 impl Default for SoftCodeVectors {
     fn default() -> Self {
-        Self { c0: [0i8; 24], c1: [0i8; 23], c2: [0i8; 11], c3: [0i8; 14] }
+        Self {
+            c0: [0i8; 24],
+            c1: [0i8; 23],
+            c2: [0i8; 11],
+            c3: [0i8; 14],
+        }
     }
 }
 
@@ -236,8 +238,18 @@ pub fn soft_deinterleave(soft: &[i8; SOFT_BITS]) -> SoftCodeVectors {
     for (sym, entry) in ANNEX_S.iter().enumerate() {
         let hi = soft[2 * sym];
         let lo = soft[2 * sym + 1];
-        place_soft(&mut out, entry.bit1_vec as usize, entry.bit1_idx as usize, hi);
-        place_soft(&mut out, entry.bit0_vec as usize, entry.bit0_idx as usize, lo);
+        place_soft(
+            &mut out,
+            entry.bit1_vec as usize,
+            entry.bit1_idx as usize,
+            hi,
+        );
+        place_soft(
+            &mut out,
+            entry.bit0_vec as usize,
+            entry.bit0_idx as usize,
+            lo,
+        );
     }
     out
 }
@@ -282,10 +294,7 @@ pub fn pn_sequence(u0: u16) -> [u16; PN_SEQ_LEN] {
     let mut pr = [0u16; PN_SEQ_LEN];
     pr[0] = u0.wrapping_mul(16);
     for n in 1..PN_SEQ_LEN {
-        pr[n] = (173u32
-            .wrapping_mul(pr[n - 1] as u32)
-            .wrapping_add(13849)
-            & 0xFFFF) as u16;
+        pr[n] = (173u32.wrapping_mul(pr[n - 1] as u32).wrapping_add(13849) & 0xFFFF) as u16;
     }
     pr
 }
@@ -459,7 +468,11 @@ mod tests {
 
     fn valid_mask(i: usize) -> u32 {
         let len = CODE_WIDTHS[i] as u32;
-        if len == 32 { u32::MAX } else { (1u32 << len) - 1 }
+        if len == 32 {
+            u32::MAX
+        } else {
+            (1u32 << len) - 1
+        }
     }
 
     #[test]
@@ -473,11 +486,17 @@ mod tests {
     fn r34_bit_order_is_a_bijection() {
         let mut seen = [false; INFO_BITS_TOTAL as usize];
         for &p in R34_BIT_ORDER.iter() {
-            assert!((p as usize) < INFO_BITS_TOTAL as usize, "index {p} out of range");
+            assert!(
+                (p as usize) < INFO_BITS_TOTAL as usize,
+                "index {p} out of range"
+            );
             assert!(!seen[p as usize], "natural bit {p} mapped twice");
             seen[p as usize] = true;
         }
-        assert!(seen.iter().all(|&b| b), "R34_BIT_ORDER does not cover all 49 bits");
+        assert!(
+            seen.iter().all(|&b| b),
+            "R34_BIT_ORDER does not cover all 49 bits"
+        );
     }
 
     #[test]
@@ -492,7 +511,11 @@ mod tests {
             ];
             let bytes = pack_no_fec(&info);
             // Pad bits 49..55 must be zero.
-            assert_eq!(bytes[6] & 0x7F, 0, "trailing pad bits not zero for {info:?}");
+            assert_eq!(
+                bytes[6] & 0x7F,
+                0,
+                "trailing pad bits not zero for {info:?}"
+            );
             assert_eq!(unpack_no_fec(&bytes), info, "roundtrip failed for {info:?}");
         }
     }
@@ -514,7 +537,10 @@ mod tests {
     fn interleave_covers_every_codeword_bit_exactly_once() {
         let mut seen = [[false; 24]; 4];
         for entry in ANNEX_S.iter() {
-            for (v, i) in [(entry.bit1_vec, entry.bit1_idx), (entry.bit0_vec, entry.bit0_idx)] {
+            for (v, i) in [
+                (entry.bit1_vec, entry.bit1_idx),
+                (entry.bit0_vec, entry.bit0_idx),
+            ] {
                 assert!((i as u8) < CODE_WIDTHS[v as usize]);
                 assert!(!seen[v as usize][i as usize]);
                 seen[v as usize][i as usize] = true;
@@ -611,7 +637,11 @@ mod tests {
     #[test]
     fn frame_roundtrip_zero_and_sampled() {
         for seed in [0u32, 1, 0xDEADBEEF, 0xCAFEBABE, 0x12345678] {
-            let u = if seed == 0 { [0u16; 4] } else { sample_info(seed) };
+            let u = if seed == 0 {
+                [0u16; 4]
+            } else {
+                sample_info(seed)
+            };
             let dibits = encode_frame(&u);
             for (s, d) in dibits.iter().enumerate() {
                 assert!(*d < 4, "symbol {s} not a dibit (seed {seed:08x})");
@@ -702,9 +732,13 @@ mod tests {
     fn annex_m_all_voiced_and_all_unvoiced_endpoints() {
         assert_eq!(AMBE_VUV_CODEBOOK.len(), 32);
         // b₁ = 0 → all 8 voiced (impl-spec §12.9 spot value).
-        for &v in &AMBE_VUV_CODEBOOK[0] { assert!(v); }
+        for &v in &AMBE_VUV_CODEBOOK[0] {
+            assert!(v);
+        }
         // b₁ = 16 → all 8 unvoiced.
-        for &v in &AMBE_VUV_CODEBOOK[16] { assert!(!v); }
+        for &v in &AMBE_VUV_CODEBOOK[16] {
+            assert!(!v);
+        }
     }
 
     #[test]
@@ -793,7 +827,11 @@ mod tests {
     #[test]
     fn soft_decode_matches_hard_on_clean_input() {
         for seed in [0u32, 1, 0xDEADBEEF, 0xCAFEBABE, 0x12345678] {
-            let u = if seed == 0 { [0u16; 4] } else { sample_info(seed) };
+            let u = if seed == 0 {
+                [0u16; 4]
+            } else {
+                sample_info(seed)
+            };
             let dibits = encode_frame(&u);
             let soft = dibits_to_soft(&dibits, 120);
             let soft_frame = decode_frame_soft(&soft);

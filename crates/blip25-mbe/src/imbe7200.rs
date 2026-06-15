@@ -26,7 +26,7 @@
 //! with the AMBE+2 codec for SCBA-mask noise immunity are the
 //! motivating example for keeping the two layers separate.
 
-pub mod frame;
-pub mod fec;
-pub mod priority;
 pub mod dequantize;
+pub mod fec;
+pub mod frame;
+pub mod priority;

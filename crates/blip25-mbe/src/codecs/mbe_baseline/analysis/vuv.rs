@@ -6,7 +6,7 @@
 //! precomputed S_w(m) from §0.2, ω̂_0/L̂/â_l/b̂_l from §0.4, and
 //! E(P̂_I) from §0.3.
 
-use super::{Complex64, DFT_SIZE, HarmonicBasis, PitchRefinement, packed_index};
+use super::{packed_index, Complex64, HarmonicBasis, PitchRefinement, DFT_SIZE};
 
 /// Maximum band count `K̂` per Eq. 34 (cap).
 pub const K_HAT_MAX: u8 = 12;
@@ -121,7 +121,9 @@ impl VuvState {
     /// `k_hat` is the band count to write.
     pub fn override_vuv_prev(&mut self, decisions: &[u8], k_hat: u8) {
         self.vuv_prev.fill(0);
-        let n = (k_hat as usize).min(decisions.len()).min(K_HAT_MAX as usize);
+        let n = (k_hat as usize)
+            .min(decisions.len())
+            .min(K_HAT_MAX as usize);
         for k in 1..=n {
             self.vuv_prev[k] = decisions[k];
         }
@@ -314,8 +316,8 @@ pub fn determine_vuv(
 
 #[cfg(test)]
 mod tests {
+    use super::super::{refine_pitch, signal_spectrum, L_HAT_MAX, L_HAT_MIN, W_R_HALF};
     use super::*;
-    use super::super::{L_HAT_MAX, L_HAT_MIN, W_R_HALF, refine_pitch, signal_spectrum};
 
     /// Helper: broadband periodic signal for VUV tests (same as §0.4/§0.5).
     fn broadband_periodic(period: f64, max_h: u32) -> [f64; (2 * W_R_HALF + 1) as usize] {

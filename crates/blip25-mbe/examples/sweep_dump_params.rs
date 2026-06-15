@@ -7,11 +7,9 @@
 //! Output CSV columns: frame, L, omega_0, M_bar_0, M_bar_1, ..., M_bar_(L-1)
 //! (variable column count per row; readers should split per row)
 
-use blip25_mbe::rate33::dequantize::{
-    DecoderState, Decoded, decode_to_params,
-};
-use blip25_mbe::rate33::frame::decode_frame;
 use blip25_mbe::codecs::mbe_baseline::{enhance_spectral_amplitudes, INIT_S_E};
+use blip25_mbe::rate33::dequantize::{decode_to_params, Decoded, DecoderState};
+use blip25_mbe::rate33::frame::decode_frame;
 use std::io::Write;
 
 fn main() {

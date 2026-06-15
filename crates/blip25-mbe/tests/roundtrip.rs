@@ -25,17 +25,16 @@
 //! `conformance-vectors rate-convert-roundtrip` subcommand surfaces
 //! the boundary behaviour on real speech.
 
-use blip25_mbe::mbe_params::MbeParams;
 use blip25_mbe::imbe7200::dequantize::{
-    DecoderState, dequantize as dequantize_full, quantize as quantize_full,
+    dequantize as dequantize_full, quantize as quantize_full, DecoderState,
 };
 use blip25_mbe::imbe7200::frame::{
     decode_frame as decode_full_frame, encode_frame as encode_full_frame,
 };
 use blip25_mbe::imbe7200::priority::prioritize as prioritize_full;
+use blip25_mbe::mbe_params::MbeParams;
 use blip25_mbe::rate33::dequantize::{
-    DecoderState as HalfDecoderState, dequantize as dequantize_half,
-    quantize as quantize_half,
+    dequantize as dequantize_half, quantize as quantize_half, DecoderState as HalfDecoderState,
 };
 use blip25_mbe::rate33::frame::{
     decode_frame as decode_half_frame, encode_frame as encode_half_frame,
@@ -77,13 +76,11 @@ fn stream_full_to_half(params: &MbeParams, n_frames: usize) -> (MbeParams, MbePa
         let dibits = encode_full_frame(&u);
 
         let src_frame = decode_full_frame(&dibits);
-        let src_params =
-            dequantize_full(&src_frame.info, &mut src_state).expect("source dequant");
+        let src_params = dequantize_full(&src_frame.info, &mut src_state).expect("source dequant");
 
         let dst_dibits = conv.convert(&dibits).expect("convert full→half");
         let dst_frame = decode_half_frame(&dst_dibits);
-        let dst_params =
-            dequantize_half(&dst_frame.info, &mut dst_state).expect("dst dequant");
+        let dst_params = dequantize_half(&dst_frame.info, &mut dst_state).expect("dst dequant");
 
         last_src = src_params;
         last_dst = dst_params;
@@ -103,13 +100,11 @@ fn stream_half_to_full(params: &MbeParams, n_frames: usize) -> (MbeParams, MbePa
         let dibits = encode_half_frame(&u);
 
         let src_frame = decode_half_frame(&dibits);
-        let src_params =
-            dequantize_half(&src_frame.info, &mut src_state).expect("source dequant");
+        let src_params = dequantize_half(&src_frame.info, &mut src_state).expect("source dequant");
 
         let dst_dibits = conv.convert(&dibits).expect("convert half→full");
         let dst_frame = decode_full_frame(&dst_dibits);
-        let dst_params =
-            dequantize_full(&dst_frame.info, &mut dst_state).expect("dst dequant");
+        let dst_params = dequantize_full(&dst_frame.info, &mut dst_state).expect("dst dequant");
 
         last_src = src_params;
         last_dst = dst_params;
@@ -146,8 +141,7 @@ fn full_to_half_preserves_pitch_within_one_grid_step() {
             cents < 40.0,
             "ω₀={omega_0}: full→half pitch drifted {cents:.2} cents"
         );
-        let l_delta =
-            (src.harmonic_count() as i32 - dst.harmonic_count() as i32).abs();
+        let l_delta = (src.harmonic_count() as i32 - dst.harmonic_count() as i32).abs();
         assert!(l_delta <= 1, "ω₀={omega_0}: ΔL={l_delta} exceeds 1");
     }
 }
@@ -162,8 +156,7 @@ fn half_to_full_preserves_pitch_within_one_grid_step() {
             cents < 40.0,
             "ω₀={omega_0}: half→full pitch drifted {cents:.2} cents"
         );
-        let l_delta =
-            (src.harmonic_count() as i32 - dst.harmonic_count() as i32).abs();
+        let l_delta = (src.harmonic_count() as i32 - dst.harmonic_count() as i32).abs();
         assert!(l_delta <= 1, "ω₀={omega_0}: ΔL={l_delta} exceeds 1");
     }
 }
@@ -229,15 +222,13 @@ fn full_round_trip_converges_within_grid_step() {
             let dibits = encode_full_frame(&u);
 
             let src_frame = decode_full_frame(&dibits);
-            let src_params =
-                dequantize_full(&src_frame.info, &mut src_state).unwrap();
+            let src_params = dequantize_full(&src_frame.info, &mut src_state).unwrap();
 
             let mid = a_to_b.convert(&dibits).unwrap();
             let back = b_to_a.convert(&mid).unwrap();
 
             let final_frame = decode_full_frame(&back);
-            let final_params =
-                dequantize_full(&final_frame.info, &mut final_state).unwrap();
+            let final_params = dequantize_full(&final_frame.info, &mut final_state).unwrap();
             last_src = src_params;
             last_final = final_params;
         }

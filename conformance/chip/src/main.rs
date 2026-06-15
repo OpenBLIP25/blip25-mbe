@@ -36,7 +36,6 @@ use blip25_mbe::codecs::mbe_baseline::analysis::{
     encode as analysis_encode, AnalysisOutput, AnalysisState,
 };
 use blip25_mbe::codecs::mbe_baseline::{synthesize_frame, FrameErrorContext, SynthState, GAMMA_W};
-use blip25_mbe::mbe_params::{MbeParams, L_MIN};
 use blip25_mbe::imbe7200::dequantize::{
     band_for_harmonic, dequantize as dequantize_full, quantize as quantize_full, vuv_band_count,
     DecoderState,
@@ -45,6 +44,7 @@ use blip25_mbe::imbe7200::frame::{
     decode_frame as decode_full_frame, encode_frame as encode_full_frame,
 };
 use blip25_mbe::imbe7200::priority::prioritize as prioritize_full;
+use blip25_mbe::mbe_params::{MbeParams, L_MIN};
 
 const FRAME_SAMPLES: usize = 160;
 const BYTES_PER_FEC_FRAME: usize = 18;
@@ -698,7 +698,11 @@ enum ProbeExpect {
     Rms { amplitude: f32 },
     /// Report steady-state PCM peak-magnitude (frames 10..20). Used for
     /// M̃_l probe and §1.10 bypass comparisons.
-    Peak { harmonic_l: u8, amplitude: f32, l_total: u8 },
+    Peak {
+        harmonic_l: u8,
+        amplitude: f32,
+        l_total: u8,
+    },
 }
 
 /// Probe block length. Each block runs the chip on a sustained
@@ -710,7 +714,11 @@ const PROBE_BLOCK_FRAMES: usize = 20;
 /// tiny jitter so the input is not bit-identical frame-to-frame
 /// (defeats the chip's stationary-signal suppressor).
 fn jitter_factor(frame_idx: usize) -> f32 {
-    if frame_idx & 1 == 0 { 1.00 } else { 0.99 }
+    if frame_idx & 1 == 0 {
+        1.00
+    } else {
+        0.99
+    }
 }
 
 fn build_unvoiced_flat(omega_0: f32, m_flat: f32) -> MbeParams {
@@ -733,8 +741,7 @@ fn build_voiced_only_at_l(omega_0: f32, target_l: u8, amplitude: f32) -> MbePara
     let voiced = band_uniform_voicing(l_total, k, |_| true);
     let mut amps = vec![1.0_f32; l_total as usize];
     amps[(target_l - 1) as usize] = amplitude;
-    MbeParams::new(omega_0, l_total, &voiced, &amps)
-        .expect("single-harmonic-at-l params")
+    MbeParams::new(omega_0, l_total, &voiced, &amps).expect("single-harmonic-at-l params")
 }
 
 /// §3.1 γ_w — all-unvoiced flat amplitude. Generate one 20-frame
@@ -914,7 +921,11 @@ fn cmd_probe_generate(out_dir: &Path) -> Result<()> {
         // that probe-compare re-parses).
         let expect_line = match sc.expect {
             ProbeExpect::Rms { amplitude } => format!("EXPECT rms amplitude={amplitude}"),
-            ProbeExpect::Peak { harmonic_l, amplitude, l_total } => format!(
+            ProbeExpect::Peak {
+                harmonic_l,
+                amplitude,
+                l_total,
+            } => format!(
                 "EXPECT peak harmonic_l={harmonic_l} amplitude={amplitude} l_total={l_total}"
             ),
         };
@@ -986,7 +997,11 @@ fn per_frame_peak(pcm: &[i16]) -> Vec<i32> {
             if b > pcm.len() {
                 return 0;
             }
-            pcm[a..b].iter().map(|&x| (x as i32).abs()).max().unwrap_or(0)
+            pcm[a..b]
+                .iter()
+                .map(|&x| (x as i32).abs())
+                .max()
+                .unwrap_or(0)
         })
         .collect()
 }
@@ -1012,9 +1027,7 @@ fn cmd_probe_compare(dir: &Path) -> Result<()> {
 
     println!(
         "{:<36}  {:>5}  {:>10}  {:>10}  {:>8}  {:>10}  {:>10}  {:>8}",
-        "scenario", "probe",
-        "loc_rms_mx", "chp_rms_mx", "rms_r",
-        "loc_pk_mx", "chp_pk_mx", "pk_r",
+        "scenario", "probe", "loc_rms_mx", "chp_rms_mx", "rms_r", "loc_pk_mx", "chp_pk_mx", "pk_r",
     );
     println!("{}", "-".repeat(108));
 
@@ -1045,7 +1058,11 @@ fn cmd_probe_compare(dir: &Path) -> Result<()> {
         let chip_rms = max_frame_rms(&chip);
         let local_pk = max_frame_peak(&local);
         let chip_pk = max_frame_peak(&chip);
-        let rms_ratio = if local_rms > 0.1 { chip_rms / local_rms } else { 0.0 };
+        let rms_ratio = if local_rms > 0.1 {
+            chip_rms / local_rms
+        } else {
+            0.0
+        };
         let pk_ratio = if local_pk > 0 {
             chip_pk as f64 / local_pk as f64
         } else {
@@ -1144,8 +1161,8 @@ fn cmd_chip_vs_ours(
     align_offset: i32,
 ) -> Result<()> {
     let pcm = read_pcm_le_i16(pcm_path)?;
-    let chip_bytes = fs::read(chip_bits_path)
-        .with_context(|| format!("read {}", chip_bits_path.display()))?;
+    let chip_bytes =
+        fs::read(chip_bits_path).with_context(|| format!("read {}", chip_bits_path.display()))?;
     if chip_bytes.len() % BYTES_PER_FEC_FRAME != 0 {
         return Err(anyhow!(
             "{}: not a whole number of {}-byte frames",
@@ -1222,11 +1239,19 @@ fn cmd_chip_vs_ours(
 
     println!(
         "{:>5}  {:<8}  {:>3} {:>3} {:>3}  {:>7} {:>7} {:>+7}  {:>4} {:>4} {:>3}  {:>9} {:>9}",
-        "frame", "src",
-        "Lc", "Lo", "dL",
-        "ω0_c", "ω0_o", "dcent",
-        "Vbc", "Vbo", "dV",
-        "rms_dlog2", "pk_dlog2",
+        "frame",
+        "src",
+        "Lc",
+        "Lo",
+        "dL",
+        "ω0_c",
+        "ω0_o",
+        "dcent",
+        "Vbc",
+        "Vbo",
+        "dV",
+        "rms_dlog2",
+        "pk_dlog2",
     );
     println!("{}", "-".repeat(98));
 

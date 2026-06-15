@@ -69,7 +69,11 @@ mod tests {
     /// (i.e. b̂_{L+2}). Useful for constructing valid `b` arrays.
     fn max_src_param_for(l: u8) -> u8 {
         let l_idx = (l - L_MIN) as usize;
-        IMBE_BIT_MAP[l_idx].iter().map(|m| m.src_param).max().unwrap()
+        IMBE_BIT_MAP[l_idx]
+            .iter()
+            .map(|m| m.src_param)
+            .max()
+            .unwrap()
     }
 
     /// Width (in bits) of parameter b̂_{src_param} for a given L,
@@ -93,7 +97,11 @@ mod tests {
                 continue;
             }
             state = state.wrapping_mul(1664525).wrapping_add(1013904223);
-            let mask = if w == 16 { u16::MAX } else { ((1u32 << w) - 1) as u16 };
+            let mask = if w == 16 {
+                u16::MAX
+            } else {
+                ((1u32 << w) - 1) as u16
+            };
             b[src as usize] = (state as u16) & mask;
         }
         b
@@ -108,9 +116,12 @@ mod tests {
                 // All dst bits must fit within their vector widths.
                 let widths = [12u8, 12, 12, 12, 11, 11, 11, 7];
                 for (i, &w) in widths.iter().enumerate() {
-                    let mask = if w == 16 { u16::MAX } else { ((1u16 << w) - 1) as u16 };
-                    assert_eq!(u[i] & !mask, 0,
-                        "L={l}: û{i} has bits beyond width {w}");
+                    let mask = if w == 16 {
+                        u16::MAX
+                    } else {
+                        ((1u16 << w) - 1) as u16
+                    };
+                    assert_eq!(u[i] & !mask, 0, "L={l}: û{i} has bits beyond width {w}");
                 }
                 let b2 = deprioritize(&u, l);
                 assert_eq!(b2, b, "L={l}, seed=0x{seed:08x}");
@@ -157,7 +168,10 @@ mod tests {
                 .filter(|m| m.src_param == 0 && m.src_bit >= 2)
                 .map(|m| (m.dst_vec, m.dst_bit))
                 .collect();
-            assert_eq!(positions, l_min_positions, "L={l}: pitch MSB positions differ from L=9");
+            assert_eq!(
+                positions, l_min_positions,
+                "L={l}: pitch MSB positions differ from L=9"
+            );
         }
     }
 
@@ -170,9 +184,11 @@ mod tests {
                 b[m.src_param as usize] = 1 << m.src_bit;
                 let u = prioritize(&b, l);
                 let ones: u32 = u.iter().map(|x| x.count_ones()).sum();
-                assert_eq!(ones, 1,
+                assert_eq!(
+                    ones, 1,
                     "L={l} (src={}, bit={}) produced {ones} ones",
-                    m.src_param, m.src_bit);
+                    m.src_param, m.src_bit
+                );
                 let b2 = deprioritize(&u, l);
                 assert_eq!(b2, b);
             }

@@ -68,10 +68,8 @@ fn synthetic_speech(n_frames: usize) -> Vec<i16> {
     for (n, slot) in pcm.iter_mut().enumerate() {
         // Mix of two slow-changing tones — voice-like spectral content
         // for the analysis encoder to chew on.
-        let s1 = 4000.0
-            * (2.0 * core::f64::consts::PI * 220.0 * n as f64 / 8000.0).sin();
-        let s2 = 2000.0
-            * (2.0 * core::f64::consts::PI * 660.0 * n as f64 / 8000.0).sin();
+        let s1 = 4000.0 * (2.0 * core::f64::consts::PI * 220.0 * n as f64 / 8000.0).sin();
+        let s2 = 2000.0 * (2.0 * core::f64::consts::PI * 660.0 * n as f64 / 8000.0).sin();
         *slot = (s1 + s2).round() as i16;
     }
     pcm

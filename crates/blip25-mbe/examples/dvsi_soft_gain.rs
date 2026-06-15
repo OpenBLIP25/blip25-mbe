@@ -27,10 +27,8 @@
 
 use blip25_mbe::dvsi_soft_decision::unpack_nibble_stream;
 
-const DEFAULT_DIR_FULL: &str =
-    "/mnt/share/P25-IQ-Samples/Research/DVSI Vectors/tv-std/tv/p25";
-const DEFAULT_DIR_R33: &str =
-    "/mnt/share/P25-IQ-Samples/Research/DVSI Vectors/tv-rc/r33";
+const DEFAULT_DIR_FULL: &str = "/mnt/share/P25-IQ-Samples/Research/DVSI Vectors/tv-std/tv/p25";
+const DEFAULT_DIR_R33: &str = "/mnt/share/P25-IQ-Samples/Research/DVSI Vectors/tv-rc/r33";
 
 /// MSB-first hard `.bit` bytes -> dibits, dibit = (hi<<1)|lo, matching the
 /// crate's `unpack_dibits_n` convention. Length is `8 * bytes / 2` dibits.
@@ -140,9 +138,7 @@ fn main() {
 
     let (ops, default_dir, truth_name, vec_prefix) = match rate.as_str() {
         "33" | "r33" | "rate33" => (rate33_ops(), DEFAULT_DIR_R33, "dam.bit", "dam"),
-        "full" | "fullrate" | "imbe" => {
-            (full_rate_ops(), DEFAULT_DIR_FULL, "clean.bit", "clean")
-        }
+        "full" | "fullrate" | "imbe" => (full_rate_ops(), DEFAULT_DIR_FULL, "clean.bit", "clean"),
         other => {
             eprintln!("unknown --rate {other:?} (expected `full` or `33`)");
             std::process::exit(2);

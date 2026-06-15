@@ -76,10 +76,10 @@ pub mod mbe_params;
 
 pub mod codecs;
 
-pub mod imbe7200;
-pub mod rate33;
 pub mod dvsi_3000;
 pub mod dvsi_soft_decision;
+pub mod imbe7200;
+pub mod rate33;
 
 pub mod rate_conversion;
 

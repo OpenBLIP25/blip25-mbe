@@ -11,12 +11,12 @@
 //!
 //! Reads no inputs; emits a CSV table to stdout.
 
+use blip25_mbe::codecs::ambe_plus2::{synthesize_frame, SynthState, SAMPLES_PER_FRAME};
+use blip25_mbe::codecs::mbe_baseline::analysis::tone_detect::TONE_DETECT_FRAME;
+use blip25_mbe::codecs::mbe_baseline::analysis::{detect_tone, ToneDetection};
 use blip25_mbe::rate33::dequantize::{
     tone_to_mbe_params, TONE_AMPLITUDE_EXPONENT_STEP, TONE_AMPLITUDE_PEAK,
 };
-use blip25_mbe::codecs::ambe_plus2::{synthesize_frame, SynthState, SAMPLES_PER_FRAME};
-use blip25_mbe::codecs::mbe_baseline::analysis::{detect_tone, ToneDetection};
-use blip25_mbe::codecs::mbe_baseline::analysis::tone_detect::TONE_DETECT_FRAME;
 
 const STEADY_FRAMES: usize = 30; // discard first half, measure second half
 
@@ -42,12 +42,15 @@ fn rms(pcm: &[i16]) -> f64 {
 }
 
 fn db20(x: f64) -> f64 {
-    if x <= 0.0 { f64::NEG_INFINITY } else { 20.0 * x.log10() }
+    if x <= 0.0 {
+        f64::NEG_INFINITY
+    } else {
+        20.0 * x.log10()
+    }
 }
 
 fn expected_m_tilde(amplitude: u8) -> f64 {
-    TONE_AMPLITUDE_PEAK
-        * 10f64.powf(TONE_AMPLITUDE_EXPONENT_STEP * (f64::from(amplitude) - 127.0))
+    TONE_AMPLITUDE_PEAK * 10f64.powf(TONE_AMPLITUDE_EXPONENT_STEP * (f64::from(amplitude) - 127.0))
 }
 
 fn sweep_amp(label: &str, id: u8, ad_values: &[u8]) {
@@ -75,9 +78,7 @@ fn sweep_amp(label: &str, id: u8, ad_values: &[u8]) {
         } else {
             ""
         };
-        println!(
-            "{ad},{m:.1},{p:.1},{r:.1},{p_per_m:.4},{db_per_step:+.4},{r_per_m:.4},{note}"
-        );
+        println!("{ad},{m:.1},{p:.1},{r:.1},{p_per_m:.4},{db_per_step:+.4},{r_per_m:.4},{note}");
         prev_peak = Some(p);
         prev_ad = Some(ad);
     }
@@ -107,8 +108,10 @@ fn main() {
     // Slope diagnostic: do the peak measurements honor 0.7115 dB/step?
     // The "peak_db_per_step" column should be ~0.7115 for a perfectly
     // calibrated synth.
-    println!("# Eq. 209 reference: 10·log10(10^0.03555) = {:.4} dB/step",
-        20.0 * TONE_AMPLITUDE_EXPONENT_STEP);
+    println!(
+        "# Eq. 209 reference: 10·log10(10^0.03555) = {:.4} dB/step",
+        20.0 * TONE_AMPLITUDE_EXPONENT_STEP
+    );
     println!("# (the per-step delta in 'peak_db_per_step' should match this)");
 
     // Round-trip probe: known input → encode → decode → output.
@@ -186,8 +189,7 @@ fn sum_two_sines_frame(f1: f64, f2: f64, per_tone_peak: i16) -> [i16; TONE_DETEC
     let two_pi = 2.0 * core::f64::consts::PI;
     for n in 0..TONE_DETECT_FRAME {
         let t = n as f64 / 8000.0;
-        let s = (per_tone_peak as f64)
-            * ((two_pi * f1 * t).sin() + (two_pi * f2 * t).sin());
+        let s = (per_tone_peak as f64) * ((two_pi * f1 * t).sin() + (two_pi * f2 * t).sin());
         out[n] = s.round().clamp(-32768.0, 32767.0) as i16;
     }
     out

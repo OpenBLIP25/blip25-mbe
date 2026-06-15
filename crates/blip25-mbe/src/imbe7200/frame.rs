@@ -93,8 +93,12 @@ pub fn decode_frame(dibits: &[u8; 72]) -> Frame {
     let u7 = (c[7] & 0x7F) as u16;
 
     Frame {
-        info: [d0.info, d1.info, d2.info, d3.info, d4.info, d5.info, d6.info, u7],
-        errors: [d0.errors, d1.errors, d2.errors, d3.errors, d4.errors, d5.errors, d6.errors, 0],
+        info: [
+            d0.info, d1.info, d2.info, d3.info, d4.info, d5.info, d6.info, u7,
+        ],
+        errors: [
+            d0.errors, d1.errors, d2.errors, d3.errors, d4.errors, d5.errors, d6.errors, 0,
+        ],
     }
 }
 
@@ -154,8 +158,12 @@ pub fn decode_frame_soft(soft: &[i8; SOFT_BITS]) -> Frame {
     }
 
     Frame {
-        info: [d0.info, d1.info, d2.info, d3.info, d4.info, d5.info, d6.info, u7],
-        errors: [d0.errors, d1.errors, d2.errors, d3.errors, d4.errors, d5.errors, d6.errors, 0],
+        info: [
+            d0.info, d1.info, d2.info, d3.info, d4.info, d5.info, d6.info, u7,
+        ],
+        errors: [
+            d0.errors, d1.errors, d2.errors, d3.errors, d4.errors, d5.errors, d6.errors, 0,
+        ],
     }
 }
 
@@ -175,7 +183,11 @@ pub fn encode_frame(info: &[u16; 8]) -> [u8; 72] {
     // stray high bits can't silently corrupt the frame.
     let u: [u16; 8] = core::array::from_fn(|i| {
         let w = INFO_WIDTHS[i] as u32;
-        let m = if w == 16 { u16::MAX } else { ((1u32 << w) - 1) as u16 };
+        let m = if w == 16 {
+            u16::MAX
+        } else {
+            ((1u32 << w) - 1) as u16
+        };
         info[i] & m
     });
 
@@ -215,7 +227,11 @@ mod tests {
         for i in 0..8 {
             state = state.wrapping_mul(1664525).wrapping_add(1013904223);
             let w = INFO_WIDTHS[i] as u32;
-            let m = if w == 16 { u16::MAX } else { ((1u32 << w) - 1) as u16 };
+            let m = if w == 16 {
+                u16::MAX
+            } else {
+                ((1u32 << w) - 1) as u16
+            };
             out[i] = (state as u16) & m;
         }
         out
@@ -355,7 +371,11 @@ mod tests {
     #[test]
     fn soft_decode_matches_hard_on_clean_input() {
         for seed in [0u32, 1, 0xDEADBEEF, 0xCAFEBABE, 0x12345678] {
-            let u = if seed == 0 { [0u16; 8] } else { sample_info(seed) };
+            let u = if seed == 0 {
+                [0u16; 8]
+            } else {
+                sample_info(seed)
+            };
             let dibits = encode_frame(&u);
             let soft = dibits_to_soft(&dibits, 120);
             let soft_frame = decode_frame_soft(&soft);

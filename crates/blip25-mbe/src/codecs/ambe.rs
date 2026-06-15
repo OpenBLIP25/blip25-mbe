@@ -21,8 +21,8 @@
 //! consumer gets the state type from the same module as the synth.
 
 use crate::codecs::mbe_baseline::{
-    synthesize_frame as baseline_synthesize,
-    synthesize_repeat as baseline_synthesize_repeat, FRAME_SAMPLES,
+    synthesize_frame as baseline_synthesize, synthesize_repeat as baseline_synthesize_repeat,
+    FRAME_SAMPLES,
 };
 use crate::mbe_params::MbeParams;
 
@@ -38,10 +38,7 @@ pub const SAMPLES_PER_FRAME: usize = FRAME_SAMPLES;
 /// mute) reads [`SynthState::err`]; calibration scale reads
 /// [`SynthState::gamma_w`]. Both default to "error-free" and the
 /// committed `γ_w` on a fresh [`SynthState::new`].
-pub fn synthesize_frame(
-    params: &MbeParams,
-    state: &mut SynthState,
-) -> [i16; SAMPLES_PER_FRAME] {
+pub fn synthesize_frame(params: &MbeParams, state: &mut SynthState) -> [i16; SAMPLES_PER_FRAME] {
     let err = state.err;
     let gamma_w = state.gamma_w;
     baseline_synthesize(params, &err, gamma_w, state)
@@ -55,10 +52,7 @@ pub fn synthesize_frame(
 /// prefer this entry point for dispatch symmetry — a future
 /// dual-sinusoid renderer could land here without touching the voice
 /// path.
-pub fn synthesize_tone(
-    params: &MbeParams,
-    state: &mut SynthState,
-) -> [i16; SAMPLES_PER_FRAME] {
+pub fn synthesize_tone(params: &MbeParams, state: &mut SynthState) -> [i16; SAMPLES_PER_FRAME] {
     synthesize_frame(params, state)
 }
 
@@ -78,13 +72,8 @@ mod tests {
     fn synthesize_frame_returns_expected_sample_count() {
         let voiced = vec![false; L_MIN as usize];
         let amps = vec![0.0f32; L_MIN as usize];
-        let params = MbeParams::new(
-            2.0 * core::f32::consts::PI / 50.0,
-            L_MIN,
-            &voiced,
-            &amps,
-        )
-        .unwrap();
+        let params =
+            MbeParams::new(2.0 * core::f32::consts::PI / 50.0, L_MIN, &voiced, &amps).unwrap();
         let mut state = SynthState::new();
         let pcm = synthesize_frame(&params, &mut state);
         assert_eq!(pcm.len(), SAMPLES_PER_FRAME);

@@ -28,7 +28,6 @@ pub struct FecDecoded {
     pub errors: u8,
 }
 
-
 // ---------------------------------------------------------------------------
 // Golay (23, 12), d = 7
 // ---------------------------------------------------------------------------
@@ -196,7 +195,10 @@ pub fn golay_24_12_decode(codeword: u32) -> FecDecoded {
         // Parity mismatch with <3 inner errors → total is d23.errors + 1.
         d23.errors + 1
     };
-    FecDecoded { info: d23.info, errors }
+    FecDecoded {
+        info: d23.info,
+        errors,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -208,8 +210,7 @@ pub fn golay_24_12_decode(codeword: u32) -> FecDecoded {
 /// Source: TIA-102.BABA-A §1.5.2. Each entry is a 4-bit parity word in
 /// which the MSB is the first parity column (p₀) and the LSB is p₃.
 const HAMMING_15_11_PARITY: [u8; 11] = [
-    0b1111, 0b1110, 0b1101, 0b1100, 0b1011, 0b1010, 0b1001, 0b0111, 0b0110,
-    0b0101, 0b0011,
+    0b1111, 0b1110, 0b1101, 0b1100, 0b1011, 0b1010, 0b1001, 0b0111, 0b0110, 0b0101, 0b0011,
 ];
 
 /// Encode 11 information bits into a 15-bit Hamming codeword.
@@ -260,7 +261,10 @@ pub fn hamming_15_11_decode(codeword: u16) -> FecDecoded {
     for i in 0..11 {
         if u16::from(HAMMING_15_11_PARITY[i]) == syndrome {
             let corrected = info ^ (1 << (10 - i));
-            return FecDecoded { info: corrected, errors: 1 };
+            return FecDecoded {
+                info: corrected,
+                errors: 1,
+            };
         }
     }
 
@@ -425,7 +429,8 @@ fn chase_decode_u32<const N: usize, const T: u32>(
             _ => best = Some((decoded, dist)),
         }
     }
-    best.map(|(d, _)| d).expect("Chase search emits at least the zero-flip candidate")
+    best.map(|(d, _)| d)
+        .expect("Chase search emits at least the zero-flip candidate")
 }
 
 fn chase_decode_u16<const N: usize, const T: u32>(
@@ -453,7 +458,8 @@ fn chase_decode_u16<const N: usize, const T: u32>(
             _ => best = Some((decoded, dist)),
         }
     }
-    best.map(|(d, _)| d).expect("Chase search emits at least the zero-flip candidate")
+    best.map(|(d, _)| d)
+        .expect("Chase search emits at least the zero-flip candidate")
 }
 
 #[cfg(test)]
@@ -596,8 +602,7 @@ mod tests {
             for b in (a + 1)..24 {
                 for c in (b + 1)..24 {
                     for d_bit in (c + 1)..24 {
-                        let err =
-                            (1u32 << a) | (1u32 << b) | (1u32 << c) | (1u32 << d_bit);
+                        let err = (1u32 << a) | (1u32 << b) | (1u32 << c) | (1u32 << d_bit);
                         let res = golay_24_12_decode(cw ^ err);
                         total += 1;
                         if res.errors == u8::MAX {

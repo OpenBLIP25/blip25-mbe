@@ -6,7 +6,7 @@
 //! rock-steady.
 
 use blip25_mbe::codecs::mbe_baseline::analysis::{
-    AnalysisOutput, AnalysisState, encode as analysis_encode,
+    encode as analysis_encode, AnalysisOutput, AnalysisState,
 };
 use std::env;
 use std::fs;
@@ -53,8 +53,10 @@ fn main() {
     }
 
     // Header.
-    let mut hdr = format!("{:>5}  {:>9}  {:>3} {:>3}  {:>8}  {:>8}  {:>8}  {:>8}",
-        "frame", "ω̂_0", "L̂", "V", "M̂_1(dB)", "M̂_2(dB)", "M̂_3(dB)", "Σ M̂²");
+    let mut hdr = format!(
+        "{:>5}  {:>9}  {:>3} {:>3}  {:>8}  {:>8}  {:>8}  {:>8}",
+        "frame", "ω̂_0", "L̂", "V", "M̂_1(dB)", "M̂_2(dB)", "M̂_3(dB)", "Σ M̂²"
+    );
     if let Some(h) = dump_h {
         for i in 1..=h {
             hdr.push_str(&format!("  {:>7}", format!("M̂_{}", i)));
@@ -68,7 +70,10 @@ fn main() {
         let params = match out {
             AnalysisOutput::Voice(p) => p,
             AnalysisOutput::Silence => {
-                println!("{:>5}  {:>9}  {:>3} {:>3}  <preroll or silence>", f, "-", "-", "-");
+                println!(
+                    "{:>5}  {:>9}  {:>3} {:>3}  <preroll or silence>",
+                    f, "-", "-", "-"
+                );
                 continue;
             }
         };
@@ -89,11 +94,15 @@ fn main() {
                 f64::NAN
             }
         };
-        let mut row = format!("{:>5}  {:>9.5}  {:>3} {:>3}  {:>8.2}  {:>8.2}  {:>8.2}  {:>8.3e}",
+        let mut row = format!(
+            "{:>5}  {:>9.5}  {:>3} {:>3}  {:>8.2}  {:>8.2}  {:>8.2}  {:>8.3e}",
             f,
             params.omega_0(),
-            l, voiced_count,
-            get_db(1), get_db(2), get_db(3),
+            l,
+            voiced_count,
+            get_db(1),
+            get_db(2),
+            get_db(3),
             total_energy,
         );
         if let Some(h) = dump_h {

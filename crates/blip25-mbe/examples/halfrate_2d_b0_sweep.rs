@@ -19,12 +19,10 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 
-use blip25_mbe::rate33::dequantize::{
-    DecoderState, Decoded, decode_to_params, dequantize,
-};
+use blip25_mbe::mbe_params::MbeParams;
+use blip25_mbe::rate33::dequantize::{decode_to_params, dequantize, Decoded, DecoderState};
 use blip25_mbe::rate33::frame::{decode_frame, encode_frame, DIBITS_PER_FRAME};
 use blip25_mbe::rate33::priority::{prioritize, AMBE_B_COUNT};
-use blip25_mbe::mbe_params::MbeParams;
 use blip25_mbe::vocoder::{Rate, Vocoder};
 
 const FRAMES_PER_CELL: usize = 100;
@@ -116,21 +114,32 @@ fn cmd_gen(args: &[String]) -> std::io::Result<()> {
                 let (low_bytes, low_params) = build_frame(low_b0, b2);
                 let (high_bytes, high_params) = build_frame(high_b0, b2);
                 let cos_sim = cosine_similarity(&low_params, &high_params);
-                let dl = (high_params.harmonic_count() as i32 - low_params.harmonic_count() as i32).abs();
+                let dl = (high_params.harmonic_count() as i32 - low_params.harmonic_count() as i32)
+                    .abs();
                 let domega = (high_params.omega_0() as f64 - low_params.omega_0() as f64).abs();
                 let mut stream = Vec::with_capacity(FRAMES_PER_CELL * 9);
                 for f in 0..FRAMES_PER_CELL {
-                    let frame = if f == TRIGGER_IDX { high_bytes } else { low_bytes };
+                    let frame = if f == TRIGGER_IDX {
+                        high_bytes
+                    } else {
+                        low_bytes
+                    };
                     stream.extend_from_slice(&frame);
                 }
                 fs::write(out_dir.join(format!("cell_{:05}.ambe9", idx)), &stream)?;
                 manifest.push_str(&format!(
                     "{},{},{},{},{},{},{:.6},{:.6},{},{:.6},{:.6}\n",
                     idx,
-                    low_b0, high_b0, b2,
-                    low_params.harmonic_count(), high_params.harmonic_count(),
-                    low_params.omega_0(), high_params.omega_0(),
-                    dl, domega, cos_sim,
+                    low_b0,
+                    high_b0,
+                    b2,
+                    low_params.harmonic_count(),
+                    high_params.harmonic_count(),
+                    low_params.omega_0(),
+                    high_params.omega_0(),
+                    dl,
+                    domega,
+                    cos_sim,
                 ));
                 idx += 1;
             }
@@ -146,16 +155,25 @@ fn peak_rms(pcm: &[i16]) -> (f64, f64) {
     let mut sq = 0f64;
     for &s in pcm {
         let a = (s as i32).abs();
-        if a > peak { peak = a; }
+        if a > peak {
+            peak = a;
+        }
         sq += (s as f64) * (s as f64);
     }
-    let rms = if pcm.is_empty() { 0.0 } else { (sq / pcm.len() as f64).sqrt() };
+    let rms = if pcm.is_empty() {
+        0.0
+    } else {
+        (sq / pcm.len() as f64).sqrt()
+    };
     (peak as f64, rms)
 }
 
 fn read_pcm(path: &PathBuf) -> std::io::Result<Vec<i16>> {
     let raw = fs::read(path)?;
-    Ok(raw.chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]])).collect())
+    Ok(raw
+        .chunks_exact(2)
+        .map(|b| i16::from_le_bytes([b[0], b[1]]))
+        .collect())
 }
 
 fn cmd_score(args: &[String]) -> std::io::Result<()> {
@@ -170,9 +188,13 @@ fn cmd_score(args: &[String]) -> std::io::Result<()> {
     let mut missing = 0usize;
     let mut counted = 0usize;
     for (li, line) in manifest.lines().enumerate() {
-        if li == 0 { continue; }
+        if li == 0 {
+            continue;
+        }
         let f: Vec<&str> = line.split(',').collect();
-        if f.len() != 11 { continue; }
+        if f.len() != 11 {
+            continue;
+        }
         let cell_idx: usize = f[0].parse().unwrap();
         let chip_path = out_dir.join(format!("chip_{:05}.pcm", cell_idx));
         if !chip_path.exists() {
@@ -205,20 +227,44 @@ fn cmd_score(args: &[String]) -> std::io::Result<()> {
         let e_pre = 50 * SAMPLES_PER_FRAME;
         let (_, chip_pre_rms) = peak_rms(&chip[s_pre..e_pre]);
         let (_, ours_pre_rms) = peak_rms(&ours[s_pre..e_pre]);
-        let rms_ratio = if ours_rms > 0.0 { chip_rms / ours_rms } else { 0.0 };
-        let peak_ratio = if ours_peak > 0.0 { chip_peak / ours_peak } else { 0.0 };
+        let rms_ratio = if ours_rms > 0.0 {
+            chip_rms / ours_rms
+        } else {
+            0.0
+        };
+        let peak_ratio = if ours_peak > 0.0 {
+            chip_peak / ours_peak
+        } else {
+            0.0
+        };
 
         out.push_str(&format!(
             "{},{},{},{},{},{},{},{:.6},{:.6},{:.1},{:.1},{:.1},{:.1},{:.4},{:.4},{:.1},{:.1}\n",
-            cell_idx, f[1], f[2], f[3], f[4], f[5], f[8], f[9].parse::<f64>().unwrap_or(0.0),
+            cell_idx,
+            f[1],
+            f[2],
+            f[3],
+            f[4],
+            f[5],
+            f[8],
+            f[9].parse::<f64>().unwrap_or(0.0),
             f[10].parse::<f64>().unwrap_or(0.0),
-            chip_peak, chip_rms, ours_peak, ours_rms, rms_ratio, peak_ratio,
-            chip_pre_rms, ours_pre_rms,
+            chip_peak,
+            chip_rms,
+            ours_peak,
+            ours_rms,
+            rms_ratio,
+            peak_ratio,
+            chip_pre_rms,
+            ours_pre_rms,
         ));
         counted += 1;
     }
     fs::write(out_dir.join("results.csv"), &out)?;
-    eprintln!("scored {} cells ({} missing); results.csv written", counted, missing);
+    eprintln!(
+        "scored {} cells ({} missing); results.csv written",
+        counted, missing
+    );
     Ok(())
 }
 
@@ -244,16 +290,22 @@ fn cmd_dump_params(args: &[String]) -> std::io::Result<()> {
     let params_dir = out_dir.join("params");
     fs::create_dir_all(&params_dir)?;
     for (li, line) in manifest.lines().enumerate() {
-        if li == 0 { continue; }
+        if li == 0 {
+            continue;
+        }
         let f: Vec<&str> = line.split(',').collect();
-        if f.len() != 11 { continue; }
+        if f.len() != 11 {
+            continue;
+        }
         let cell_idx: usize = f[0].parse().unwrap();
         let ambe_path = out_dir.join(format!("cell_{:05}.ambe9", cell_idx));
         let ambe = fs::read(&ambe_path)?;
         let mut state = DecoderState::new();
         let mut buf = String::new();
         buf.push_str("frame,omega_0,l");
-        for k in 1..=56 { buf.push_str(&format!(",M{}", k)); }
+        for k in 1..=56 {
+            buf.push_str(&format!(",M{}", k));
+        }
         buf.push('\n');
         let fb = 9; // half-rate FEC frame is 9 bytes
         let n = ambe.len() / fb;
@@ -269,7 +321,12 @@ fn cmd_dump_params(args: &[String]) -> std::io::Result<()> {
                     continue;
                 }
             };
-            buf.push_str(&format!("{},{:.6},{}", i, params.omega_0(), params.harmonic_count()));
+            buf.push_str(&format!(
+                "{},{:.6},{}",
+                i,
+                params.omega_0(),
+                params.harmonic_count()
+            ));
             let amps = params.amplitudes_slice();
             for k in 0..56 {
                 let v = if k < amps.len() { amps[k] } else { 0.0 };
@@ -299,6 +356,9 @@ fn main() -> std::io::Result<()> {
         "gen" => cmd_gen(&rest),
         "score" => cmd_score(&rest),
         "dump-params" => cmd_dump_params(&rest),
-        _ => { eprintln!("unknown subcommand"); std::process::exit(2); }
+        _ => {
+            eprintln!("unknown subcommand");
+            std::process::exit(2);
+        }
     }
 }

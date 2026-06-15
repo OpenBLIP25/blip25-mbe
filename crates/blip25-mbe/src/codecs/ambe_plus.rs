@@ -31,10 +31,7 @@ pub const SAMPLES_PER_FRAME: usize = FRAME_SAMPLES;
 /// Generation-2 (AMBE+) phase regeneration per US5701390, replacing
 /// BABA-A Eq. 141. Frame-error handling and `γ_w` read from
 /// [`SynthState`] (see module-level docs for defaults).
-pub fn synthesize_frame(
-    params: &MbeParams,
-    state: &mut SynthState,
-) -> [i16; SAMPLES_PER_FRAME] {
+pub fn synthesize_frame(params: &MbeParams, state: &mut SynthState) -> [i16; SAMPLES_PER_FRAME] {
     let err = state.err;
     let gamma_w = state.gamma_w;
     baseline_synthesize_ambe_plus(params, &err, gamma_w, state)
@@ -42,10 +39,7 @@ pub fn synthesize_frame(
 
 /// Synthesize one tone frame of PCM from `params`. Delegates to
 /// [`synthesize_frame`] pending a tone-specific renderer.
-pub fn synthesize_tone(
-    params: &MbeParams,
-    state: &mut SynthState,
-) -> [i16; SAMPLES_PER_FRAME] {
+pub fn synthesize_tone(params: &MbeParams, state: &mut SynthState) -> [i16; SAMPLES_PER_FRAME] {
     synthesize_frame(params, state)
 }
 
@@ -64,13 +58,8 @@ mod tests {
     fn synthesize_frame_returns_expected_sample_count() {
         let voiced = vec![false; L_MIN as usize];
         let amps = vec![0.0f32; L_MIN as usize];
-        let params = MbeParams::new(
-            2.0 * core::f32::consts::PI / 50.0,
-            L_MIN,
-            &voiced,
-            &amps,
-        )
-        .unwrap();
+        let params =
+            MbeParams::new(2.0 * core::f32::consts::PI / 50.0, L_MIN, &voiced, &amps).unwrap();
         let mut state = SynthState::new();
         let pcm = synthesize_frame(&params, &mut state);
         assert_eq!(pcm.len(), SAMPLES_PER_FRAME);

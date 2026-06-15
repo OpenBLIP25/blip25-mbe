@@ -21,7 +21,7 @@
 
 use core::f32::consts::PI;
 
-use crate::mbe_params::{L_MAX, MbeParams, MbeParamsError};
+use crate::mbe_params::{MbeParams, MbeParamsError, L_MAX};
 
 use super::priority::deprioritize;
 
@@ -94,7 +94,11 @@ pub fn pitch_decode(b0: u8) -> Option<PitchInfo> {
 /// Number of V/UV bands `K̃` for a given harmonic count `L̃` (Eq. 48).
 #[inline]
 pub const fn vuv_band_count(l: u8) -> u8 {
-    if l <= 36 { (l + 2) / 3 } else { 12 }
+    if l <= 36 {
+        (l + 2) / 3
+    } else {
+        12
+    }
 }
 
 /// Band index `k_l ∈ [1, K]` for harmonic `l ∈ [1, L]` per BABA-A §1.3.2.
@@ -109,7 +113,11 @@ pub const fn vuv_band_count(l: u8) -> u8 {
 #[inline]
 pub const fn band_for_harmonic(l: u8, k: u8) -> u8 {
     let raw = if l <= 36 { (l + 2) / 3 } else { 12 };
-    if raw > k { k } else { raw }
+    if raw > k {
+        k
+    } else {
+        raw
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -153,11 +161,19 @@ pub fn encode_gain(g1: f32) -> u8 {
     let mut hi = GAIN_LEVELS - 1;
     while lo + 1 < hi {
         let mid = (lo + hi) / 2;
-        if IMBE_GAIN_LEVELS[mid] <= g1 { lo = mid; } else { hi = mid; }
+        if IMBE_GAIN_LEVELS[mid] <= g1 {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
     }
     let lo_dist = (g1 - IMBE_GAIN_LEVELS[lo]).abs();
     let hi_dist = (IMBE_GAIN_LEVELS[hi] - g1).abs();
-    if hi_dist < lo_dist { hi as u8 } else { lo as u8 }
+    if hi_dist < lo_dist {
+        hi as u8
+    } else {
+        lo as u8
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -303,8 +319,7 @@ fn dct6_cos() -> &'static [f32; 36] {
         let mut t = [0f32; 36];
         for m_0 in 0..6 {
             for i_0 in 0..6 {
-                t[m_0 * 6 + i_0] =
-                    (PI * (m_0 as f32) * (i_0 as f32 + 0.5) / 6.0).cos();
+                t[m_0 * 6 + i_0] = (PI * (m_0 as f32) * (i_0 as f32 + 0.5) / 6.0).cos();
             }
         }
         t
@@ -322,11 +337,7 @@ fn dct6_cos() -> &'static [f32; 36] {
 ///
 /// Output is a 6×`MAX_BLOCK_SIZE` matrix; only `[i][0..J̃_i]` is
 /// populated for each block.
-pub fn assemble_hoc_matrix(
-    b: &[u16; 59],
-    l: u8,
-    r_i: &[f32; 6],
-) -> [[f32; MAX_BLOCK_SIZE]; 6] {
+pub fn assemble_hoc_matrix(b: &[u16; 59], l: u8, r_i: &[f32; 6]) -> [[f32; MAX_BLOCK_SIZE]; 6] {
     debug_assert!((9..=56).contains(&l));
     let l_idx = (l - 9) as usize;
     let (off, len) = IMBE_HOC_OFFSETS[l_idx];
@@ -526,10 +537,9 @@ pub fn apply_log_prediction(
         let log_lo = state.prev_m_at(k_floor as u8).log2();
         let log_hi = state.prev_m_at(k_floor as u8 + 1).log2();
         let rho = imbe_rho(l);
-        log_m[l_h as usize] = t[(l_h - 1) as usize]
-            + rho * (1.0 - delta) * log_lo
-            + rho * delta * log_hi
-            - rho * mean;
+        log_m[l_h as usize] =
+            t[(l_h - 1) as usize] + rho * (1.0 - delta) * log_lo + rho * delta * log_hi
+                - rho * mean;
     }
 
     log_m
@@ -626,10 +636,7 @@ pub fn reconstruct_amplitudes_from_bits(
 /// Decode a full-rate IMBE info-vector bundle (`û₀..û₇`) into
 /// [`MbeParams`], using and updating the receiver-side `state` per
 /// §1.7–§1.10.
-pub fn dequantize(
-    u: &[u16; 8],
-    state: &mut DecoderState,
-) -> Result<MbeParams, DecodeError> {
+pub fn dequantize(u: &[u16; 8], state: &mut DecoderState) -> Result<MbeParams, DecodeError> {
     let b0 = extract_pitch_index(u);
     let pitch = pitch_decode(b0).ok_or(DecodeError::BadPitch)?;
     let l = pitch.l;
@@ -861,11 +868,7 @@ pub fn forward_block_dct(samples: &[f32], n: usize) -> [f32; MAX_BLOCK_SIZE] {
 ///
 /// Writes into `b[8..=L+1]`. The block means `C̃_{i,1}` are produced by
 /// the gain DCT path and are not encoded here.
-pub fn disassemble_hoc_matrix(
-    c: &[[f32; MAX_BLOCK_SIZE]; 6],
-    l: u8,
-    b: &mut [u16; 59],
-) {
+pub fn disassemble_hoc_matrix(c: &[[f32; MAX_BLOCK_SIZE]; 6], l: u8, b: &mut [u16; 59]) {
     debug_assert!((9..=56).contains(&l));
     let l_idx = (l - 9) as usize;
     let (off, len) = IMBE_HOC_OFFSETS[l_idx];
@@ -917,10 +920,8 @@ pub fn forward_log_prediction(
         let log_lo = state.prev_m_at(k_floor as u8).log2();
         let log_hi = state.prev_m_at(k_floor as u8 + 1).log2();
         let rho = imbe_rho(l);
-        t[(l_h - 1) as usize] = log_m[l_h as usize]
-            - rho * (1.0 - delta) * log_lo
-            - rho * delta * log_hi
-            + rho * mean;
+        t[(l_h - 1) as usize] =
+            log_m[l_h as usize] - rho * (1.0 - delta) * log_lo - rho * delta * log_hi + rho * mean;
     }
 
     t
@@ -951,10 +952,7 @@ pub enum EncodeError {
 /// 9. Update `state.prev_m_linear` with the matched-decoder reconstruction
 ///    of `b` (closed-loop predictor feedback), plus `state.prev_l` and
 ///    `state.prev_sync`.
-pub fn quantize(
-    params: &MbeParams,
-    state: &mut DecoderState,
-) -> Result<[u16; 59], EncodeError> {
+pub fn quantize(params: &MbeParams, state: &mut DecoderState) -> Result<[u16; 59], EncodeError> {
     let l = params.harmonic_count();
     let omega_0 = params.omega_0();
     let b0 = encode_pitch(omega_0).ok_or(EncodeError::PitchOutOfRange)?;
@@ -1334,8 +1332,7 @@ mod tests {
         g[2] = 1.0; // G̃_3 only (m_0 = 2)
         let r = gain_to_residuals(&g);
         for i_0 in 0..6usize {
-            let expected =
-                2.0 * (std::f32::consts::PI * 2.0 * (i_0 as f32 + 0.5) / 6.0).cos();
+            let expected = 2.0 * (std::f32::consts::PI * 2.0 * (i_0 as f32 + 0.5) / 6.0).cos();
             assert!(
                 (r[i_0] - expected).abs() < 1e-5,
                 "R̃_{}: got {}, expected {}",
@@ -1352,7 +1349,11 @@ mod tests {
     fn block_dct_forward_then_inverse_is_identity() {
         for &n in &[1usize, 2, 3, 5, 7, 10] {
             let samples: [f32; MAX_BLOCK_SIZE] = std::array::from_fn(|i| {
-                if i < n { (i as f32 + 1.0).sin() * 2.0 } else { 0.0 }
+                if i < n {
+                    (i as f32 + 1.0).sin() * 2.0
+                } else {
+                    0.0
+                }
             });
             let c = forward_block_dct(&samples, n);
             // Place c into block 0 of a 6-block matrix; rest empty.
@@ -1400,7 +1401,9 @@ mod tests {
         let c = assemble_hoc_matrix(&b, 9, &r);
 
         // All block means are zero (r = 0).
-        for i in 0..6 { assert_eq!(c[i][0], 0.0); }
+        for i in 0..6 {
+            assert_eq!(c[i][0], 0.0);
+        }
         // Non-zero entries at the routed positions only.
         assert_ne!(c[3][1], 0.0, "(C_i=4, C_k=2)");
         assert_ne!(c[4][1], 0.0, "(C_i=5, C_k=2)");
@@ -1481,7 +1484,9 @@ mod tests {
         }
         state.prev_m_linear[0] = 1.0; // M̃_0 is always 1
         let mut t = [0f32; L_MAX as usize];
-        for i in 0..15 { t[i] = 0.5; }
+        for i in 0..15 {
+            t[i] = 0.5;
+        }
         let log_m = apply_log_prediction(&t, 15, &state);
         // Per-harmonic prediction term uses M̃_l(−1) for l>=1 (= 4.0).
         // Mean term averages the same 4.0 values.
@@ -1530,10 +1535,7 @@ mod tests {
         b[0] = 220; // reserved
         let u = crate::imbe7200::priority::prioritize(&b, 9);
         let mut state = DecoderState::new();
-        assert_eq!(
-            dequantize(&u, &mut state),
-            Err(DecodeError::BadPitch)
-        );
+        assert_eq!(dequantize(&u, &mut state), Err(DecodeError::BadPitch));
     }
 
     #[test]
@@ -1719,8 +1721,13 @@ mod tests {
         // Check that the public forward_block_dct is the proper inverse
         // of inverse_block_dct (paired exact inversion).
         for &n in &[1usize, 2, 3, 5, 7, 10] {
-            let samples: [f32; MAX_BLOCK_SIZE] =
-                std::array::from_fn(|i| if i < n { (i as f32 + 1.0).sin() * 2.0 } else { 0.0 });
+            let samples: [f32; MAX_BLOCK_SIZE] = std::array::from_fn(|i| {
+                if i < n {
+                    (i as f32 + 1.0).sin() * 2.0
+                } else {
+                    0.0
+                }
+            });
             let c = forward_block_dct(&samples, n);
             let mut matrix = [[0f32; MAX_BLOCK_SIZE]; 6];
             matrix[0] = c;
@@ -1856,7 +1863,8 @@ mod tests {
             // to be numerically identical.
             assert_eq!(
                 enc.prev_l, dec.prev_l,
-                "frame {i}: prev_l {} vs {}", enc.prev_l, dec.prev_l
+                "frame {i}: prev_l {} vs {}",
+                enc.prev_l, dec.prev_l
             );
             for k in 0..=l as usize {
                 assert!(
@@ -1896,9 +1904,15 @@ mod tests {
         // L=9, K=3, b̂₁ = 0b101 (band 1 voiced, band 2 unvoiced, band 3 voiced).
         // Bands cover harmonics: 1..=3, 4..=6, 7..=9.
         let v = expand_vuv(0b101, 9, 3);
-        for l in 1..=3 { assert!(v[l - 1], "band 1: l={l}"); }
-        for l in 4..=6 { assert!(!v[l - 1], "band 2: l={l}"); }
-        for l in 7..=9 { assert!(v[l - 1], "band 3: l={l}"); }
+        for l in 1..=3 {
+            assert!(v[l - 1], "band 1: l={l}");
+        }
+        for l in 4..=6 {
+            assert!(!v[l - 1], "band 2: l={l}");
+        }
+        for l in 7..=9 {
+            assert!(v[l - 1], "band 3: l={l}");
+        }
     }
 
     #[test]
@@ -1906,8 +1920,12 @@ mod tests {
         // L=9, K=3, b̂₁ bit positions: bit 2 = band 1, bit 1 = band 2,
         // bit 0 = band 3. Set only band 1 (bit 2 = 1).
         let v = expand_vuv(0b100, 9, 3);
-        for l in 1..=3 { assert!(v[l - 1], "band 1 MSB→bit K-1, l={l}"); }
-        for l in 4..=9 { assert!(!v[l - 1], "expected unvoiced, l={l}"); }
+        for l in 1..=3 {
+            assert!(v[l - 1], "band 1 MSB→bit K-1, l={l}");
+        }
+        for l in 4..=9 {
+            assert!(!v[l - 1], "expected unvoiced, l={l}");
+        }
     }
 
     #[test]
@@ -1917,8 +1935,12 @@ mod tests {
         let mut b1 = 0u16;
         b1 |= 1 << 0; // band 12 voiced
         let v = expand_vuv(b1, 56, 12);
-        for l in 1..=33 { assert!(!v[l - 1], "low band, l={l}"); }
-        for l in 34..=56 { assert!(v[l - 1], "band 12 absorbing, l={l}"); }
+        for l in 1..=33 {
+            assert!(!v[l - 1], "low band, l={l}");
+        }
+        for l in 34..=56 {
+            assert!(v[l - 1], "band 12 absorbing, l={l}");
+        }
     }
 
     #[test]
@@ -1930,8 +1952,12 @@ mod tests {
         b1 |= 1 << 0; // band 12 voiced
         let v = expand_vuv(b1, 37, 12);
         assert!(v[36], "harmonic 37 should be band 12 (voiced)");
-        for l in 1..=33 { assert!(!v[l - 1], "low band, l={l}"); }
-        for l in 34..=37 { assert!(v[l - 1], "band 12, l={l}"); }
+        for l in 1..=33 {
+            assert!(!v[l - 1], "low band, l={l}");
+        }
+        for l in 34..=37 {
+            assert!(v[l - 1], "band 12, l={l}");
+        }
     }
 
     #[test]
@@ -1939,9 +1965,13 @@ mod tests {
         // For L=36, K=12 — all band indices floor((l+2)/3) for l=1..36
         // produce values 1..12, no clamping happens.
         let v_all_v = expand_vuv(0xFFFu16, 36, 12);
-        for l in 1..=36 { assert!(v_all_v[l - 1], "l={l}"); }
+        for l in 1..=36 {
+            assert!(v_all_v[l - 1], "l={l}");
+        }
         let v_all_uv = expand_vuv(0, 36, 12);
-        for l in 1..=36 { assert!(!v_all_uv[l - 1], "l={l}"); }
+        for l in 1..=36 {
+            assert!(!v_all_uv[l - 1], "l={l}");
+        }
     }
 
     #[test]

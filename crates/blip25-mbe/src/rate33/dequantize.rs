@@ -34,13 +34,13 @@
 use core::f64::consts::{LN_2, PI as PI64, SQRT_2};
 
 use crate::imbe7200::dequantize::DecodeError;
+use crate::mbe_params::{MbeParams, L_MAX};
 use crate::rate33::frame::{
-    AMBE_BLOCK_LENGTHS, AMBE_GAIN_LEVELS, AMBE_HOC_B5, AMBE_HOC_B6, AMBE_HOC_B7,
-    AMBE_HOC_B8, AMBE_PITCH_TABLE, AMBE_PRBA24, AMBE_PRBA58, AMBE_VUV_CODEBOOK,
-    ANNEX_T, PitchEntry, ToneParams,
+    PitchEntry, ToneParams, AMBE_BLOCK_LENGTHS, AMBE_GAIN_LEVELS, AMBE_HOC_B5, AMBE_HOC_B6,
+    AMBE_HOC_B7, AMBE_HOC_B8, AMBE_PITCH_TABLE, AMBE_PRBA24, AMBE_PRBA58, AMBE_VUV_CODEBOOK,
+    ANNEX_T,
 };
 use crate::rate33::priority::{deprioritize, prioritize};
-use crate::mbe_params::{L_MAX, MbeParams};
 
 /// Maximum per-block length observed in Annex N (`L̃ = 56` row has
 /// `J̃₄ = 17`). Sized generously to cover the full table.
@@ -429,11 +429,10 @@ pub fn apply_log_prediction(
         let delta = k_l - k_floor;
         let log_lo = state.prev_lambda_at(k_floor as u8);
         let log_hi = state.prev_lambda_at(k_floor as u8 + 1);
-        lambda[l_h as usize] = t[(l_h - 1) as usize]
-            + 0.65 * (1.0 - delta) * log_lo
-            + 0.65 * delta * log_hi
-            - 0.65 * mean
-            + gamma_intercept;
+        lambda[l_h as usize] =
+            t[(l_h - 1) as usize] + 0.65 * (1.0 - delta) * log_lo + 0.65 * delta * log_hi
+                - 0.65 * mean
+                + gamma_intercept;
     }
     lambda
 }
@@ -473,10 +472,7 @@ pub fn compute_m_tilde(
 /// Returns `DecodeError::BadPitch` for `b̂₀ ∈ [120, 255]` — the caller
 /// should switch to the tone path (§2.10) for `b̂₀ ∈ [120, 127]` and
 /// treat `[128, 255]` as an erasure condition.
-pub fn dequantize(
-    u: &[u16; 4],
-    state: &mut DecoderState,
-) -> Result<MbeParams, DecodeError> {
+pub fn dequantize(u: &[u16; 4], state: &mut DecoderState) -> Result<MbeParams, DecodeError> {
     let b = deprioritize(u);
     let b0 = b[0] as u8;
     let pitch = decode_pitch(b0).ok_or(DecodeError::BadPitch)?;
@@ -494,12 +490,7 @@ pub fn dequantize(
 
     let blocks = AMBE_BLOCK_LENGTHS[(l - 9) as usize];
     let c = assemble_hoc_matrix(
-        &pair,
-        b[5] as u8,
-        b[6] as u8,
-        b[7] as u8,
-        b[8] as u8,
-        &blocks,
+        &pair, b[5] as u8, b[6] as u8, b[7] as u8, b[8] as u8, &blocks,
     );
 
     let t = inverse_block_dct(&c, &blocks);
@@ -643,7 +634,11 @@ pub fn encode_gain(delta_gamma: f64) -> u8 {
     }
     let d_lo = (delta_gamma - f64::from(AMBE_GAIN_LEVELS[lo])).abs();
     let d_hi = (f64::from(AMBE_GAIN_LEVELS[hi]) - delta_gamma).abs();
-    if d_hi < d_lo { hi as u8 } else { lo as u8 }
+    if d_hi < d_lo {
+        hi as u8
+    } else {
+        lo as u8
+    }
 }
 
 /// Inverse of [`pair_split`] — encoder Eq. 159–160 from BABA-A §13.3.1.
@@ -726,10 +721,7 @@ fn quantize_hoc_block(c_block: &[f64; MAX_BLOCK_SIZE], j_i: u8, book: &[[f32; 4]
 }
 
 /// Populate `(b̂₅..b̂₈)` from the per-block HOC coefficients.
-pub fn quantize_hoc_all(
-    c: &[[f64; MAX_BLOCK_SIZE]; 4],
-    blocks: &[u8; 4],
-) -> (u8, u8, u8, u8) {
+pub fn quantize_hoc_all(c: &[[f64; MAX_BLOCK_SIZE]; 4], blocks: &[u8; 4]) -> (u8, u8, u8, u8) {
     (
         quantize_hoc_block(&c[0], blocks[0], &AMBE_HOC_B5),
         quantize_hoc_block(&c[1], blocks[1], &AMBE_HOC_B6),
@@ -813,10 +805,7 @@ pub fn forward_log_prediction(
     let mut t = [0f64; L_MAX as usize];
     for l_h in 1..=l {
         let idx = (l_h - 1) as usize;
-        t[idx] = lambda[l_h as usize]
-            - 0.65 * pred[idx]
-            + 0.65 * mean_pred
-            - gamma_intercept;
+        t[idx] = lambda[l_h as usize] - 0.65 * pred[idx] + 0.65 * mean_pred - gamma_intercept;
     }
     (t, gamma)
 }
@@ -854,10 +843,7 @@ pub fn m_tilde_to_lambda(
 /// encode, state advances exactly as the decoder would advance after
 /// re-parsing the produced bits, keeping encoder and decoder
 /// synchronized for multi-frame bit-exact roundtrips.
-pub fn quantize(
-    params: &MbeParams,
-    state: &mut DecoderState,
-) -> Result<[u16; 4], DecodeError> {
+pub fn quantize(params: &MbeParams, state: &mut DecoderState) -> Result<[u16; 4], DecodeError> {
     let l = params.harmonic_count();
     let omega_0 = params.omega_0();
 
@@ -867,11 +853,7 @@ pub fn quantize(
     let b1 = u16::from(encode_vuv(voiced_slice, omega_0));
 
     // Target Λ̃_l from linear M̃_l, then forward log-mag prediction.
-    let lambda = m_tilde_to_lambda(
-        params.amplitudes_slice(),
-        voiced_slice,
-        omega_0,
-    );
+    let lambda = m_tilde_to_lambda(params.amplitudes_slice(), voiced_slice, omega_0);
     let (t, gamma) = forward_log_prediction(&lambda, l, state);
 
     // Quantize gain: Δ̃_γ = γ̃(0) − 0.5·γ̃(−1); argmin over Annex O.
@@ -1063,9 +1045,7 @@ pub fn encode_tone_frame_info(id: u8, amplitude: u8) -> [u16; 4] {
     u[2] = (id_lo_nibble << 7) | u16::from(id >> 1);
     // û₃: bit 13 = I_D(0); bits (12..5) = copy 4 full 8 bits;
     //     bit 4 = A_D(0); bits (3..0) = 0 (fixed trailer).
-    u[3] = (u16::from(id & 1) << 13)
-        | (u16::from(id) << 5)
-        | (u16::from(ad_lo) << 4);
+    u[3] = (u16::from(id & 1) << 13) | (u16::from(id) << 5) | (u16::from(ad_lo) << 4);
     u
 }
 
@@ -1103,7 +1083,13 @@ pub fn tone_to_mbe_params(id: u8, amplitude: u8) -> Option<MbeParams> {
         }
     }
 
-    MbeParams::new(omega_0 as f32, l, &voiced[..l as usize], &amps[..l as usize]).ok()
+    MbeParams::new(
+        omega_0 as f32,
+        l,
+        &voiced[..l as usize],
+        &amps[..l as usize],
+    )
+    .ok()
 }
 
 /// Top-level half-rate frame decoder that handles all three frame kinds.
@@ -1116,10 +1102,7 @@ pub fn tone_to_mbe_params(id: u8, amplitude: u8) -> Option<MbeParams> {
 ///   voice-path state.
 /// - Erasure: returns `Decoded::Erasure`. Caller repeats the
 ///   previous voice frame (or emits silence on cold start).
-pub fn decode_to_params(
-    u: &[u16; 4],
-    state: &mut DecoderState,
-) -> Result<Decoded, DecodeError> {
+pub fn decode_to_params(u: &[u16; 4], state: &mut DecoderState) -> Result<Decoded, DecodeError> {
     match classify_ambe_plus2_frame(u) {
         FrameKind::Voice => {
             let params = dequantize(u, state)?;
@@ -1127,8 +1110,8 @@ pub fn decode_to_params(
         }
         FrameKind::Tone => {
             let fields = parse_tone_frame(u).ok_or(DecodeError::BadPitch)?;
-            let params = tone_to_mbe_params(fields.id, fields.amplitude)
-                .ok_or(DecodeError::BadPitch)?;
+            let params =
+                tone_to_mbe_params(fields.id, fields.amplitude).ok_or(DecodeError::BadPitch)?;
             Ok(Decoded::Tone { fields, params })
         }
         FrameKind::Erasure => Ok(Decoded::Erasure),
@@ -1243,12 +1226,7 @@ mod tests {
         // Encoder (§13.3.1): R̂_{2i-1} = Ĉ_{i,1} + √2·Ĉ_{i,2};
         //                   R̂_{2i}   = Ĉ_{i,1} − √2·Ĉ_{i,2}.
         // Decoder pair_split must invert this on any C̃.
-        let c_in: [(f64, f64); 4] = [
-            (1.5, 0.3),
-            (2.0, -0.5),
-            (-1.0, 0.7),
-            (0.5, -0.2),
-        ];
+        let c_in: [(f64, f64); 4] = [(1.5, 0.3), (2.0, -0.5), (-1.0, 0.7), (0.5, -0.2)];
         let mut r = [0f64; 8];
         for i in 0..4 {
             r[2 * i] = c_in[i].0 + core::f64::consts::SQRT_2 * c_in[i].1;
@@ -1257,10 +1235,7 @@ mod tests {
         let c_out = pair_split(&r);
         for i in 0..4 {
             assert!((c_out[i].0 - c_in[i].0).abs() < 1e-12, "block {i} mean");
-            assert!(
-                (c_out[i].1 - c_in[i].1).abs() < 1e-12,
-                "block {i} k=2"
-            );
+            assert!((c_out[i].1 - c_in[i].1).abs() < 1e-12, "block {i} k=2");
         }
     }
 
@@ -1296,10 +1271,7 @@ mod tests {
         // Block 1 (i=0, B5): k=3..=6 → C̃_{1,3}..C̃_{1,6}.
         for k in 3..=6 {
             let expected = f64::from(AMBE_HOC_B5[0][k - 3]);
-            assert!(
-                (c[0][k - 1] - expected).abs() < 1e-6,
-                "block 1, k={k}"
-            );
+            assert!((c[0][k - 1] - expected).abs() < 1e-6, "block 1, k={k}");
         }
         // Coefficients beyond k=6 are zero.
         for k in 7..MAX_BLOCK_SIZE {
@@ -1390,10 +1362,7 @@ mod tests {
         b[0] = 120; // tone frame
         let u = prioritize(&b);
         let mut state = DecoderState::new();
-        assert_eq!(
-            dequantize(&u, &mut state),
-            Err(DecodeError::BadPitch)
-        );
+        assert_eq!(dequantize(&u, &mut state), Err(DecodeError::BadPitch));
     }
 
     #[test]
@@ -1434,9 +1403,7 @@ mod tests {
         let id_lo_nibble = u16::from(id & 0x0F);
         u[2] = (id_lo_nibble << 7) | u16::from(id >> 1);
         // û₃: bit 13 = I_D(0); bits (12..5) = copy 4 full 8 bits; bit 4 = A_D(0).
-        u[3] = (u16::from(id & 1) << 13)
-            | (u16::from(id) << 5)
-            | (u16::from(ad_lo) << 4);
+        u[3] = (u16::from(id & 1) << 13) | (u16::from(id) << 5) | (u16::from(ad_lo) << 4);
         u
     }
 
@@ -1487,9 +1454,8 @@ mod tests {
         for id in [5u8, 64, 128, 144, 162, 255] {
             for amp in [0u8, 1, 63, 64, 126, 127] {
                 let u = build_tone_frame_u(id, amp);
-                let fields = parse_tone_frame(&u).unwrap_or_else(|| {
-                    panic!("parse failed for id={id}, amp={amp}")
-                });
+                let fields = parse_tone_frame(&u)
+                    .unwrap_or_else(|| panic!("parse failed for id={id}, amp={amp}"));
                 assert_eq!(fields.id, id, "id={id} amp={amp}");
                 assert_eq!(fields.amplitude, amp, "id={id} amp={amp}");
             }
@@ -1570,7 +1536,11 @@ mod tests {
         let p126 = tone_to_mbe_params(5, 126).unwrap();
         let a127 = f64::from(p127.amplitude(1));
         let a126 = f64::from(p126.amplitude(1));
-        assert!((a126 / a127 - step).abs() < 1e-4, "a126/a127 = {}", a126 / a127);
+        assert!(
+            (a126 / a127 - step).abs() < 1e-4,
+            "a126/a127 = {}",
+            a126 / a127
+        );
     }
 
     // ---- Top-level dispatch ---------------------------------------------
@@ -1654,7 +1624,10 @@ mod tests {
         // Re-decode and check per-harmonic output is all unvoiced.
         let expanded = expand_vuv(idx, omega_0, 9);
         for l_h in 0..9 {
-            assert!(!expanded[l_h], "l={l_h} should decode unvoiced for encoded b̂₁={idx}");
+            assert!(
+                !expanded[l_h],
+                "l={l_h} should decode unvoiced for encoded b̂₁={idx}"
+            );
         }
     }
 
@@ -1789,10 +1762,7 @@ mod tests {
                 b_back[0], b[0],
                 "b̂₀ pitch (seed b0={b0_seed}, b1={b1_seed})"
             );
-            assert_eq!(
-                b_back[1], b[1],
-                "b̂₁ V/UV (seed b0={b0_seed}, b1={b1_seed})"
-            );
+            assert_eq!(b_back[1], b[1], "b̂₁ V/UV (seed b0={b0_seed}, b1={b1_seed})");
         }
     }
 

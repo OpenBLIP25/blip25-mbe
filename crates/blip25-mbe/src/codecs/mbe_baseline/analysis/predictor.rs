@@ -7,7 +7,7 @@
 //! M̃_l(−1)/L̃(−1) from the prior frame (closed-loop feedback per
 //! §0.6.6: encoder runs the decoder internally).
 
-use super::{L_HAT_MAX, SpectralAmplitudes, VuvResult, band_for_harmonic};
+use super::{band_for_harmonic, SpectralAmplitudes, VuvResult, L_HAT_MAX};
 
 /// Cold-start value of `L̃(−1)` per BABA-A §6.3 (page 25): mid-range
 /// harmonic count that keeps `k̂_l` well-distributed on frame 0.
@@ -290,10 +290,7 @@ mod imbe_tests {
         st.commit(&m_same, 16);
         let t_hat = compute_prediction_residual(&m_same, 16, &st);
 
-        let log_mean: f64 = (1..=16u32)
-            .map(|l| m_same[l as usize].log2())
-            .sum::<f64>()
-            / 16.0;
+        let log_mean: f64 = (1..=16u32).map(|l| m_same[l as usize].log2()).sum::<f64>() / 16.0;
         let rho = imbe_rho_f64(16);
         for l in 1..=16u32 {
             let log_m = m_same[l as usize].log2();
@@ -326,7 +323,11 @@ mod imbe_tests {
         // Current frame has more harmonics than the past frame.
         let t_hat = compute_prediction_residual(&m_hat, 25, &st);
         for l in 1..=25u32 {
-            assert!(t_hat[l as usize].is_finite(), "T̂_{l} = {}", t_hat[l as usize]);
+            assert!(
+                t_hat[l as usize].is_finite(),
+                "T̂_{l} = {}",
+                t_hat[l as usize]
+            );
         }
         // And the other direction: current frame has fewer harmonics.
         let t_hat_shrink = compute_prediction_residual(&m_hat, 5, &st);
@@ -444,12 +445,7 @@ impl HalfratePredictorState {
     ///
     /// `lambda_tilde_curr` is 1-indexed with `[0]` ignored; the
     /// caller supplies at least `l_tilde_curr + 1` entries.
-    pub fn commit(
-        &mut self,
-        lambda_tilde_curr: &[f64],
-        l_tilde_curr: u8,
-        gamma_tilde_curr: f64,
-    ) {
+    pub fn commit(&mut self, lambda_tilde_curr: &[f64], l_tilde_curr: u8, gamma_tilde_curr: f64) {
         assert!(l_tilde_curr as usize <= L_HAT_MAX as usize);
         assert!(lambda_tilde_curr.len() > l_tilde_curr as usize);
         for l in 1..=l_tilde_curr as usize {
@@ -568,8 +564,7 @@ pub fn compute_prediction_residual_ambe_plus2(
 
     // Eq. 155 mean-removed form (sign convention matches Eq. 54).
     for l in 1..=l_hat_u32 {
-        t_hat[l as usize] =
-            lambda_hat[l as usize] - RHO_HALFRATE * (p[l as usize] - p_mean);
+        t_hat[l as usize] = lambda_hat[l as usize] - RHO_HALFRATE * (p[l as usize] - p_mean);
     }
     t_hat
 }
@@ -667,8 +662,7 @@ mod ambe_plus2_tests {
         m_hat[1] = 16.0;
         let vuv = zero_vuv(4);
         let lambda_hat = lambda_hat_from_m_hat(&m_hat, &vuv, 0.3, l_hat);
-        let expected =
-            (16.0_f64).log2() + 0.5 * (0.3_f64 * 10.0).log2() + LAMBDA_HAT_UNVOICED_BIAS;
+        let expected = (16.0_f64).log2() + 0.5 * (0.3_f64 * 10.0).log2() + LAMBDA_HAT_UNVOICED_BIAS;
         assert!(
             (lambda_hat[1] - expected).abs() < 1e-12,
             "lambda_hat[1] = {} vs expected {}",
@@ -711,11 +705,7 @@ mod ambe_plus2_tests {
         let st = HalfratePredictorState::cold_start();
         let t_hat = compute_prediction_residual_ambe_plus2(&lambda_hat, l_hat, &st);
         for l in 1..=l_hat as usize {
-            assert!(
-                (t_hat[l] - 3.0).abs() < 1e-12,
-                "l={l}: {} vs 3.0",
-                t_hat[l]
-            );
+            assert!((t_hat[l] - 3.0).abs() < 1e-12, "l={l}: {} vs 3.0", t_hat[l]);
         }
     }
 

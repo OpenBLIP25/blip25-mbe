@@ -132,7 +132,10 @@ impl Timings {
     /// Per-stage sample (cumulative ns, frame count) with the matching
     /// [`Stage`] label.
     pub fn entries(&self) -> impl Iterator<Item = (Stage, u64)> + '_ {
-        Stage::ALL.iter().enumerate().map(|(i, &s)| (s, self.total_ns[i]))
+        Stage::ALL
+            .iter()
+            .enumerate()
+            .map(|(i, &s)| (s, self.total_ns[i]))
     }
 
     /// Sum across all stages.

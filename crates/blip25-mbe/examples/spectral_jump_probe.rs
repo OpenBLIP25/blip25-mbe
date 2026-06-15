@@ -8,7 +8,7 @@
 //!   low_b0 / high_b0: pitch index 0-119 (60 ≈ pitch 100 Hz)
 //!   b2 (default 20): gain index 0-31 (held same on both)
 
-use blip25_mbe::rate33::dequantize::{DecoderState, Decoded, decode_to_params};
+use blip25_mbe::rate33::dequantize::{decode_to_params, Decoded, DecoderState};
 use blip25_mbe::rate33::frame::{encode_frame, DIBITS_PER_FRAME};
 use blip25_mbe::rate33::priority::{prioritize, AMBE_B_COUNT};
 
@@ -51,8 +51,10 @@ fn main() {
 
     let (low_bytes, low_l) = build_frame(low_b0, b2);
     let (high_bytes, high_l) = build_frame(high_b0, b2);
-    eprintln!("low: b0={} → L={}; high: b0={} → L={}; b2={} on both",
-              low_b0, low_l, high_b0, high_l, b2);
+    eprintln!(
+        "low: b0={} → L={}; high: b0={} → L={}; b2={} on both",
+        low_b0, low_l, high_b0, high_l, b2
+    );
 
     let mut out = Vec::with_capacity(100 * 9);
     for i in 0..100 {

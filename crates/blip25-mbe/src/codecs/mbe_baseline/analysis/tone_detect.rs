@@ -80,9 +80,9 @@ fn hann_window() -> &'static [f64; FFT_SIZE] {
 /// and `floor` is the 25th-percentile bin power (broadband baseline).
 /// Hann-windowed, 256-point zero-padded FFT.
 fn compute_psd(pcm: &[i16; TONE_DETECT_FRAME]) -> ([f64; FFT_SIZE / 2 + 1], f64) {
-    use std::sync::OnceLock;
     use num_complex::Complex;
     use rustfft::{Fft, FftPlanner};
+    use std::sync::OnceLock;
 
     static FFT: OnceLock<std::sync::Arc<dyn Fft<f64>>> = OnceLock::new();
     let fft = FFT.get_or_init(|| {
@@ -204,14 +204,15 @@ pub fn detect_single_tone(pcm: &[i16]) -> Option<ToneDetection> {
         }
         let expected_hz = f64::from(t.l1) * f64::from(t.f0);
         let diff = (f_hz - expected_hz).abs();
-        if diff < MATCH_TOLERANCE_HZ
-            && best.map_or(true, |(_, prev)| diff < prev)
-        {
+        if diff < MATCH_TOLERANCE_HZ && best.map_or(true, |(_, prev)| diff < prev) {
             best = Some((id, diff));
         }
     }
     let id = best?.0 as u8;
-    Some(ToneDetection { id, amplitude: magnitude_to_amplitude(peak_p.sqrt()) })
+    Some(ToneDetection {
+        id,
+        amplitude: magnitude_to_amplitude(peak_p.sqrt()),
+    })
 }
 
 /// Detect a DTMF (two-tone) Annex T entry in `pcm`. Returns the
@@ -283,9 +284,7 @@ pub fn detect_dtmf(pcm: &[i16]) -> Option<ToneDetection> {
         let expected_lo = l_lo * f0;
         let expected_hi = l_hi * f0;
         let err = (expected_lo - f_lo).abs() + (expected_hi - f_hi).abs();
-        if err < 2.0 * MATCH_TOLERANCE_HZ
-            && best.map_or(true, |(_, prev)| err < prev)
-        {
+        if err < 2.0 * MATCH_TOLERANCE_HZ && best.map_or(true, |(_, prev)| err < prev) {
             best = Some((id, err));
         }
     }
@@ -293,7 +292,10 @@ pub fn detect_dtmf(pcm: &[i16]) -> Option<ToneDetection> {
     // Use the larger of the two peak magnitudes for amplitude (DTMF
     // tones are typically equal-amplitude; a one-off pick is fine).
     let mag = peak1_p.sqrt().max(peak2_p.sqrt());
-    Some(ToneDetection { id, amplitude: magnitude_to_amplitude(mag) })
+    Some(ToneDetection {
+        id,
+        amplitude: magnitude_to_amplitude(mag),
+    })
 }
 
 /// Try DTMF detection first, then single-tone. Returns whichever
@@ -337,7 +339,11 @@ mod tests {
         let pcm = pure_sine(312.5, 8000);
         let det = detect_single_tone(&pcm).expect("clean tone should be detected");
         assert_eq!(det.id, 10);
-        assert!(det.amplitude > 50, "amplitude clamped to >0: {}", det.amplitude);
+        assert!(
+            det.amplitude > 50,
+            "amplitude clamped to >0: {}",
+            det.amplitude
+        );
     }
 
     #[test]
@@ -473,8 +479,8 @@ mod tests {
                 continue;
             }
             let pcm = dtmf_pair(f_lo, f_hi, 6000);
-            let det = detect_dtmf(&pcm)
-                .unwrap_or_else(|| panic!("Knox ID {knox_id} should detect"));
+            let det =
+                detect_dtmf(&pcm).unwrap_or_else(|| panic!("Knox ID {knox_id} should detect"));
             assert_eq!(
                 det.id, knox_id,
                 "Knox ID {knox_id} (f_lo={f_lo:.1} Hz, f_hi={f_hi:.1} Hz) misdetected as {}",

@@ -70,8 +70,11 @@ mod tests {
             let u = prioritize(&b);
             for (i, &w) in AMBE_VECTOR_WIDTHS.iter().enumerate() {
                 let mask = ((1u16 << w) - 1) as u16;
-                assert_eq!(u[i] & !mask, 0,
-                    "seed 0x{seed:08x}: û{i} has bits beyond width {w}");
+                assert_eq!(
+                    u[i] & !mask,
+                    0,
+                    "seed 0x{seed:08x}: û{i} has bits beyond width {w}"
+                );
             }
             let b2 = deprioritize(&u);
             assert_eq!(b2, b, "seed 0x{seed:08x}");
@@ -99,7 +102,16 @@ mod tests {
 
     #[test]
     fn widths_sum_to_49() {
-        assert_eq!(AMBE_PARAM_WIDTHS.iter().map(|&w| u16::from(w)).sum::<u16>(), 49);
-        assert_eq!(AMBE_VECTOR_WIDTHS.iter().map(|&w| u16::from(w)).sum::<u16>(), 49);
+        assert_eq!(
+            AMBE_PARAM_WIDTHS.iter().map(|&w| u16::from(w)).sum::<u16>(),
+            49
+        );
+        assert_eq!(
+            AMBE_VECTOR_WIDTHS
+                .iter()
+                .map(|&w| u16::from(w))
+                .sum::<u16>(),
+            49
+        );
     }
 }

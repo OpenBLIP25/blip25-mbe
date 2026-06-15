@@ -13,9 +13,7 @@
 //!   --steady_b2    gain index of steady frames (default 16)
 //!   --spike_b2     gain index of f=49 (default 28 — louder)
 
-use blip25_mbe::rate33::dequantize::{
-    DecoderState, Decoded, decode_to_params,
-};
+use blip25_mbe::rate33::dequantize::{decode_to_params, Decoded, DecoderState};
 use blip25_mbe::rate33::frame::{deinterleave, encode_frame, interleave, DIBITS_PER_FRAME};
 use blip25_mbe::rate33::priority::{prioritize, AMBE_B_COUNT};
 
@@ -56,7 +54,9 @@ fn inject_errors_in_c0(bytes: [u8; 9], n_errors: u32) -> [u8; 9] {
 
 fn build_frame(b0: u16, b2: u16) -> [u8; 9] {
     let mut b = [0u16; AMBE_B_COUNT];
-    b[0] = b0; b[1] = 0; b[2] = b2;
+    b[0] = b0;
+    b[1] = 0;
+    b[2] = b2;
     let info = prioritize(&b);
     let mut _dec = DecoderState::new();
     if !matches!(decode_to_params(&info, &mut _dec), Ok(Decoded::Voice(_))) {
@@ -68,7 +68,9 @@ fn build_frame(b0: u16, b2: u16) -> [u8; 9] {
 
 fn arg(args: &[String], flag: &str, dflt: u16) -> u16 {
     for w in args.windows(2) {
-        if w[0] == flag { return w[1].parse().unwrap_or(dflt); }
+        if w[0] == flag {
+            return w[1].parse().unwrap_or(dflt);
+        }
     }
     dflt
 }
@@ -76,13 +78,13 @@ fn arg(args: &[String], flag: &str, dflt: u16) -> u16 {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let steady_b0 = arg(&args, "--steady_b0", 30);
-    let spike_b0  = arg(&args, "--spike_b0",  110);
+    let spike_b0 = arg(&args, "--spike_b0", 110);
     let steady_b2 = arg(&args, "--steady_b2", 16);
-    let spike_b2  = arg(&args, "--spike_b2",  28);
+    let spike_b2 = arg(&args, "--spike_b2", 28);
     let binary = args.iter().any(|a| a == "--binary");
 
     let steady = build_frame(steady_b0, steady_b2);
-    let spike  = build_frame(spike_b0, spike_b2);
+    let spike = build_frame(spike_b0, spike_b2);
 
     let mut out = Vec::with_capacity(100 * 9);
     for i in 0..100 {

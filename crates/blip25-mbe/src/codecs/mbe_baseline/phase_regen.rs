@@ -62,10 +62,7 @@ fn phase_kernel() -> &'static [f64; PHASE_KERNEL_D + 1] {
 /// §5.4. (The spec leaves this unspecified between "floor" and "zero";
 /// the floor is chosen to match observed OSS-MBE behavior, pending
 /// empirical chip validation.)
-pub fn ambe_phase_regen(
-    m_bar: &[f32],
-    phi_regen: &mut [f64; L_MAX as usize + 1],
-) {
+pub fn ambe_phase_regen(m_bar: &[f32], phi_regen: &mut [f64; L_MAX as usize + 1]) {
     let l_hat = m_bar.len();
     debug_assert!(l_hat <= L_MAX as usize, "phase_regen: L̃ > L_MAX");
 
@@ -89,7 +86,11 @@ pub fn ambe_phase_regen(
         let mut acc = 0.0_f64;
         for m in 1..=PHASE_KERNEL_D {
             // Antisymmetric sum: γ·h(m) · (B_{l+m} − B_{l−m}).
-            let b_plus = if l + m <= L_MAX as usize { b[l + m] } else { 0.0 };
+            let b_plus = if l + m <= L_MAX as usize {
+                b[l + m]
+            } else {
+                0.0
+            };
             // l ≥ 1, so l - m is either >= 1 (use b[l-m]) or <= 0 (use 0).
             let b_minus = if l > m { b[l - m] } else { 0.0 };
             acc += kernel[m] * (b_plus - b_minus);

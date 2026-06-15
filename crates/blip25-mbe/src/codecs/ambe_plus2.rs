@@ -42,10 +42,7 @@ pub const SAMPLES_PER_FRAME: usize = FRAME_SAMPLES;
 /// voicing, US8315860's pulsed-voicing / tone detection / spectral
 /// subtraction) live on the **encode** side; decode-side this module
 /// mirrors AMBE+.
-pub fn synthesize_frame(
-    params: &MbeParams,
-    state: &mut SynthState,
-) -> [i16; SAMPLES_PER_FRAME] {
+pub fn synthesize_frame(params: &MbeParams, state: &mut SynthState) -> [i16; SAMPLES_PER_FRAME] {
     let err = state.err;
     let gamma_w = state.gamma_w;
     baseline_synthesize_ambe_plus(params, &err, gamma_w, state)
@@ -54,10 +51,7 @@ pub fn synthesize_frame(
 /// Synthesize one tone frame of PCM from `params`. Delegates to
 /// [`synthesize_frame`]; a future dedicated DTMF / ringback renderer
 /// for P25 Phase 2 half-rate tone frames can land here.
-pub fn synthesize_tone(
-    params: &MbeParams,
-    state: &mut SynthState,
-) -> [i16; SAMPLES_PER_FRAME] {
+pub fn synthesize_tone(params: &MbeParams, state: &mut SynthState) -> [i16; SAMPLES_PER_FRAME] {
     synthesize_frame(params, state)
 }
 
@@ -75,13 +69,7 @@ mod tests {
     fn silence_params() -> MbeParams {
         let voiced = vec![false; L_MIN as usize];
         let amps = vec![0.0_f32; L_MIN as usize];
-        MbeParams::new(
-            2.0 * core::f32::consts::PI / 50.0,
-            L_MIN,
-            &voiced,
-            &amps,
-        )
-        .unwrap()
+        MbeParams::new(2.0 * core::f32::consts::PI / 50.0, L_MIN, &voiced, &amps).unwrap()
     }
 
     #[test]
@@ -124,7 +112,10 @@ mod tests {
         // First-call repeat with no `last_good` goes through the
         // cold-start fallback (silence MbeParams).
         let energy: i64 = pcm.iter().map(|&s| i64::from(s).pow(2)).sum();
-        assert!(energy < 1_000_000, "cold-start repeat should be near-silent, got energy {energy}");
+        assert!(
+            energy < 1_000_000,
+            "cold-start repeat should be near-silent, got energy {energy}"
+        );
     }
 
     #[test]

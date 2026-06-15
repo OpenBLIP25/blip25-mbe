@@ -43,5 +43,10 @@ fn main() {
     for s in pcm {
         f.write_all(&s.to_le_bytes()).unwrap();
     }
-    eprintln!("Wrote {} ({} frames, chip_compat: {})", args[2], n / 160, chip_compat);
+    eprintln!(
+        "Wrote {} ({} frames, chip_compat: {})",
+        args[2],
+        n / 160,
+        chip_compat
+    );
 }

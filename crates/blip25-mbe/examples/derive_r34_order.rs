@@ -15,7 +15,7 @@
 
 use std::path::Path;
 
-use blip25_mbe::rate33::frame::{decode_frame, INFO_WIDTHS, DIBITS_PER_FRAME};
+use blip25_mbe::rate33::frame::{decode_frame, DIBITS_PER_FRAME, INFO_WIDTHS};
 
 const FEC_BYTES: usize = 9; // r33
 const NOFEC_BYTES: usize = 7; // r34
@@ -122,12 +122,21 @@ fn main() {
     for i in 0..INFO_BITS {
         let cands = &mapping[i];
         let varies = nat_sig[i].iter().any(|&b| b != nat_sig[i][0]);
-        let mark = if cands.len() == 1 { " " } else { clean = false; "*" };
+        let mark = if cands.len() == 1 {
+            " "
+        } else {
+            clean = false;
+            "*"
+        };
         println!(
             "{mark} nat[{i:2}]   {:8} -> {:?}{}",
             labels[i],
             cands,
-            if varies { "" } else { "  (CONSTANT natural bit — ambiguous)" }
+            if varies {
+                ""
+            } else {
+                "  (CONSTANT natural bit — ambiguous)"
+            }
         );
     }
 

@@ -64,7 +64,10 @@ fn slice_streaming(pcm: &[i16]) {
         .encode_stream(pcm)
         .collect::<Result<Vec<_>, _>>()
         .expect("encode-stream");
-    println!("encode_stream: produced {} half-rate frames (9 bytes each)", bits.len());
+    println!(
+        "encode_stream: produced {} half-rate frames (9 bytes each)",
+        bits.len()
+    );
 
     // Flatten bits + decode through a fresh channel.
     let bytes: Vec<u8> = bits.into_iter().flatten().collect();
@@ -130,20 +133,27 @@ fn parameter_layer(pcm: &[i16]) {
 
 fn builder_demo(pcm: &[i16]) {
     let mut tx = Vocoder::builder(Rate::AmbePlus2_3600x2450)
-        .tone_detection(true)            // opt-in: emit Annex T tone frames on detected tones
-        .repeat_reset_after(Some(3))     // beyond-spec, JMBE-style chip-interop
-        .silence_dispatch(false)         // spec default
+        .tone_detection(true) // opt-in: emit Annex T tone frames on detected tones
+        .repeat_reset_after(Some(3)) // beyond-spec, JMBE-style chip-interop
+        .silence_dispatch(false) // spec default
         .pitch_silence_override(false)
         .build();
 
-    println!("Built: rate={:?} tone_detection={} repeat_reset_after={:?}",
-        tx.rate(), tx.tone_detection(), tx.repeat_reset_after());
+    println!(
+        "Built: rate={:?} tone_detection={} repeat_reset_after={:?}",
+        tx.rate(),
+        tx.tone_detection(),
+        tx.repeat_reset_after()
+    );
 
     let mut frame_buf: Vec<u8> = Vec::new();
     for chunk in pcm.chunks_exact(tx.frame_samples()) {
         frame_buf.extend(tx.encode_pcm(chunk).expect("encode"));
     }
-    println!("Encoded {} bytes via builder-configured channel", frame_buf.len());
+    println!(
+        "Encoded {} bytes via builder-configured channel",
+        frame_buf.len()
+    );
 }
 
 fn transcode_demo(pcm: &[i16]) {
@@ -179,8 +189,7 @@ fn synthetic_speech(n_frames: usize) -> Vec<i16> {
     let mut pcm = vec![0i16; total];
     let half = total / 2;
     for (n, slot) in pcm[..half].iter_mut().enumerate() {
-        let s = 4000.0
-            * (2.0 * core::f64::consts::PI * 312.5 * n as f64 / 8000.0).sin();
+        let s = 4000.0 * (2.0 * core::f64::consts::PI * 312.5 * n as f64 / 8000.0).sin();
         *slot = s.round() as i16;
     }
     // Second half stays at 0.

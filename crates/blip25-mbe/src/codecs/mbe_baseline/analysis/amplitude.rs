@@ -8,8 +8,8 @@
 
 use super::basis::floor_i32;
 use super::{
-    Complex64, DFT_SIZE, HarmonicBasis, L_HAT_MAX, PitchRefinement, VuvResult,
-    WINDOW_DFT_SIZE, packed_index,
+    packed_index, Complex64, HarmonicBasis, PitchRefinement, VuvResult, DFT_SIZE, L_HAT_MAX,
+    WINDOW_DFT_SIZE,
 };
 
 /// Per-harmonic spectral amplitudes. Index 0 unused; amplitudes live
@@ -128,11 +128,11 @@ pub fn estimate_spectral_amplitudes(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::{
-        K_HAT_MAX, VuvState, W_R_HALF, XI_MAX_FLOOR, band_count_for, determine_vuv, refine_pitch,
-        signal_spectrum,
+        band_count_for, determine_vuv, refine_pitch, signal_spectrum, VuvState, K_HAT_MAX,
+        W_R_HALF, XI_MAX_FLOOR,
     };
+    use super::*;
 
     fn broadband_periodic(period: f64, max_h: u32) -> [f64; (2 * W_R_HALF + 1) as usize] {
         let mut signal = [0.0f64; (2 * W_R_HALF + 1) as usize];
@@ -189,7 +189,7 @@ mod tests {
         assert_eq!(band_for_harmonic(33, 12), 11);
         assert_eq!(band_for_harmonic(34, 12), 12);
         assert_eq!(band_for_harmonic(56, 12), 12); // capped at K̂
-        // Smaller K̂: everything above 3(K̂−1) goes to the highest band.
+                                                   // Smaller K̂: everything above 3(K̂−1) goes to the highest band.
         assert_eq!(band_for_harmonic(9, 3), 3);
         assert_eq!(band_for_harmonic(10, 3), 3);
         assert_eq!(band_for_harmonic(5, 3), 2);

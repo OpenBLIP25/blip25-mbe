@@ -3,7 +3,9 @@
 use blip25_mbe::vocoder::{Rate, Vocoder};
 
 fn main() {
-    let path = std::env::args().nth(1).expect("usage: disp_trace <in.ambe9>");
+    let path = std::env::args()
+        .nth(1)
+        .expect("usage: disp_trace <in.ambe9>");
     let bytes = std::fs::read(&path).unwrap();
     let mut v = Vocoder::new(Rate::AmbePlus2_3600x2450);
     let nf = bytes.len() / 9;
@@ -19,7 +21,11 @@ fn main() {
     for i in 0..nf {
         let frame = &bytes[i * 9..i * 9 + 9];
         let pcm = v.decode_bits(frame).unwrap();
-        let peak = pcm.iter().map(|s| s.unsigned_abs() as u32).max().unwrap_or(0);
+        let peak = pcm
+            .iter()
+            .map(|s| s.unsigned_abs() as u32)
+            .max()
+            .unwrap_or(0);
         peak_log[i] = peak;
         let disp = v.last_disposition();
         let stats = v.last_stats();
@@ -36,7 +42,9 @@ fn main() {
         };
         disp_log.push((s0, st, label));
         if win.contains(&i) {
-            let rms = (pcm.iter().map(|&s| (s as f64) * (s as f64)).sum::<f64>() / pcm.len() as f64).sqrt();
+            let rms = (pcm.iter().map(|&s| (s as f64) * (s as f64)).sum::<f64>()
+                / pcm.len() as f64)
+                .sqrt();
             println!(
                 "f={:4} disp={:7}  ε₀={} ε_T={}  peak={:5} rms={:6.1}",
                 i, label, s0, st, peak, rms

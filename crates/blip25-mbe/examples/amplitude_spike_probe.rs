@@ -11,7 +11,7 @@
 //! Usage: amplitude_spike_probe <low_b2> <high_b2>
 //! Output: 100 × 9 bytes = 900 bytes .ambe9 stream on stdout.
 
-use blip25_mbe::rate33::dequantize::{DecoderState, Decoded, decode_to_params};
+use blip25_mbe::rate33::dequantize::{decode_to_params, Decoded, DecoderState};
 use blip25_mbe::rate33::frame::{encode_frame, DIBITS_PER_FRAME};
 use blip25_mbe::rate33::priority::{prioritize, AMBE_B_COUNT};
 
@@ -31,7 +31,7 @@ fn pack_dibits(dibits: &[u8; DIBITS_PER_FRAME]) -> [u8; 9] {
 fn build_frame(b2: u16) -> [u8; 9] {
     let mut b = [0u16; AMBE_B_COUNT];
     b[0] = 60; // pitch
-    b[1] = 0;  // all voiced
+    b[1] = 0; // all voiced
     b[2] = b2; // gain (varied)
     let info = prioritize(&b);
     let mut _dec = DecoderState::new();
@@ -57,5 +57,8 @@ fn main() {
     }
     use std::io::Write;
     std::io::stdout().write_all(&out).unwrap();
-    eprintln!("Wrote 100 frames: low b̂₂={} except f=50 with b̂₂={}", low, high);
+    eprintln!(
+        "Wrote 100 frames: low b̂₂={} except f=50 with b̂₂={}",
+        low, high
+    );
 }

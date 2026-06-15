@@ -13,9 +13,7 @@
 //!   b̂₂ = 16     mid-range Annex O gain index
 //!   b̂₃..b̂₈ = 0  lowest-index codebooks (flat M̃ where possible)
 
-use blip25_mbe::rate33::dequantize::{
-    DecoderState, Decoded, decode_to_params,
-};
+use blip25_mbe::rate33::dequantize::{decode_to_params, Decoded, DecoderState};
 use blip25_mbe::rate33::frame::{encode_frame, DIBITS_PER_FRAME};
 use blip25_mbe::rate33::priority::{prioritize, AMBE_B_COUNT};
 
@@ -38,10 +36,10 @@ fn main() {
     let binary = std::env::args().any(|a| a == "--binary");
 
     let mut b = [0u16; AMBE_B_COUNT];
-    b[0] = 60;  // pitch
-    b[1] = 0;   // V/UV → all-voiced
-    b[2] = 16;  // gain
-    // b[3..=8] = 0
+    b[0] = 60; // pitch
+    b[1] = 0; // V/UV → all-voiced
+    b[2] = 16; // gain
+               // b[3..=8] = 0
 
     let info = prioritize(&b);
     let mut decoder = DecoderState::new();

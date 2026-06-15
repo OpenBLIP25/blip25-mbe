@@ -47,17 +47,16 @@
 
 use crate::codecs::ambe_plus2;
 use crate::codecs::mbe_baseline::analysis::{
-    AnalysisError, AnalysisOutput, AnalysisState, DenoiseKind, HumNotch, PreDenoise, ToneDetection,
-    detect_tone, encode as analysis_encode,
-    encode_ambe_plus2 as analysis_encode_ambe_plus2,
-    profile as analysis_profile,
+    detect_tone, encode as analysis_encode, encode_ambe_plus2 as analysis_encode_ambe_plus2,
+    profile as analysis_profile, AnalysisError, AnalysisOutput, AnalysisState, DenoiseKind,
+    HumNotch, PreDenoise, ToneDetection,
 };
 use crate::codecs::mbe_baseline::{
-    FrameDisposition, FrameErrorContext, GAMMA_W, SynthState, UnvoicedNoiseGen, synthesize_frame,
+    synthesize_frame, FrameDisposition, FrameErrorContext, SynthState, UnvoicedNoiseGen, GAMMA_W,
 };
 use crate::enhancement::{self, EnhancementMode, EnhancementState};
-use crate::mbe_params::MbeParams;
 use crate::imbe7200;
+use crate::mbe_params::MbeParams;
 use crate::rate33;
 
 /// 8 kHz mono — the only sample rate the vocoder produces.
@@ -397,10 +396,7 @@ impl Vocoder {
     /// façade's reported config matches what actually executes.
     fn production_analysis_state(rate: Rate) -> AnalysisState {
         let mut analysis = AnalysisState::new();
-        if matches!(
-            rate,
-            Rate::AmbePlus2_3600x2450 | Rate::AmbePlus2_2450x2450
-        ) {
+        if matches!(rate, Rate::AmbePlus2_3600x2450 | Rate::AmbePlus2_2450x2450) {
             analysis.set_pitch_decide_escape(true);
             analysis.set_pitch_subsample(true);
             analysis.set_pitch_refine(false);
@@ -923,7 +919,11 @@ impl Vocoder {
     /// assert_eq!(bits.unwrap().len(), 5);
     /// ```
     pub fn encode_stream<'a>(&'a mut self, pcm: &'a [i16]) -> EncodeStream<'a> {
-        EncodeStream { vocoder: self, pcm, pos: 0 }
+        EncodeStream {
+            vocoder: self,
+            pcm,
+            pos: 0,
+        }
     }
 
     /// Run the analysis encoder on one PCM frame and return the
@@ -952,9 +952,7 @@ impl Vocoder {
         }
         let frame = pcm.try_into().expect("length already validated");
         let analysis_out = match self.rate {
-            Rate::Imbe7200x4400 | Rate::Imbe4400x4400 => {
-                analysis_encode(frame, &mut self.analysis)
-            }
+            Rate::Imbe7200x4400 | Rate::Imbe4400x4400 => analysis_encode(frame, &mut self.analysis),
             Rate::AmbePlus2_3600x2450 | Rate::AmbePlus2_2450x2450 => {
                 analysis_encode_ambe_plus2(frame, &mut self.analysis)
             }
@@ -1005,7 +1003,9 @@ impl Vocoder {
             }
             Rate::AmbePlus2_3600x2450 | Rate::AmbePlus2_2450x2450 => match self.ambe_plus2_synth {
                 AmbePlus2Synth::AmbePlus => ambe_plus2::synthesize_frame(params, &mut self.synth),
-                AmbePlus2Synth::Baseline => synthesize_frame(params, &err, gamma_w, &mut self.synth),
+                AmbePlus2Synth::Baseline => {
+                    synthesize_frame(params, &err, gamma_w, &mut self.synth)
+                }
             },
         };
         self.synth.err = prev_err;
@@ -1037,7 +1037,11 @@ impl Vocoder {
     /// assert_eq!(pcm_frames.unwrap().len(), 5);
     /// ```
     pub fn decode_stream<'a>(&'a mut self, bits: &'a [u8]) -> DecodeStream<'a> {
-        DecodeStream { vocoder: self, bits, pos: 0 }
+        DecodeStream {
+            vocoder: self,
+            bits,
+            pos: 0,
+        }
     }
 }
 
@@ -1528,9 +1532,7 @@ impl VocoderBuilder {
             spectral_subtraction: false,
             amp_ema_alpha: 0.0,
             ambe_plus2_synth: AmbePlus2Synth::AmbePlus,
-            enhancement: EnhancementMode::Classical(
-                crate::enhancement::ClassicalConfig::default(),
-            ),
+            enhancement: EnhancementMode::Classical(crate::enhancement::ClassicalConfig::default()),
         }
     }
 
@@ -1655,7 +1657,7 @@ impl core::fmt::Debug for Vocoder {
 mod imbe_pipeline {
     use super::*;
     use crate::imbe7200::dequantize::{dequantize, quantize};
-    use crate::imbe7200::frame::{INFO_WIDTHS, decode_frame, encode_frame};
+    use crate::imbe7200::frame::{decode_frame, encode_frame, INFO_WIDTHS};
     use crate::imbe7200::priority::{deprioritize, prioritize};
 
     pub(super) fn encode(
@@ -1673,12 +1675,11 @@ mod imbe_pipeline {
             None
         };
         let frame = pcm.try_into().expect("length already validated");
-        let (kind, params) = match analysis_encode(frame, &mut vocoder.analysis)
-            .map_err(VocoderError::Analysis)?
-        {
-            AnalysisOutput::Voice(p) => (AnalysisOutputKind::Voice, p),
-            AnalysisOutput::Silence => (AnalysisOutputKind::Silence, MbeParams::silence()),
-        };
+        let (kind, params) =
+            match analysis_encode(frame, &mut vocoder.analysis).map_err(VocoderError::Analysis)? {
+                AnalysisOutput::Voice(p) => (AnalysisOutputKind::Voice, p),
+                AnalysisOutput::Silence => (AnalysisOutputKind::Silence, MbeParams::silence()),
+            };
         let mut snapshot = vocoder.imbe_dec.clone();
         let b = quantize(&params, &mut vocoder.imbe_dec)
             .map_err(|e| VocoderError::Quantize(format!("{e:?}")))?;
@@ -1696,7 +1697,14 @@ mod imbe_pipeline {
         } else {
             pack_info_full(&info).to_vec()
         };
-        Ok((bytes, AnalysisStats { output: kind, params, tone_detect }))
+        Ok((
+            bytes,
+            AnalysisStats {
+                output: kind,
+                params,
+                tone_detect,
+            },
+        ))
     }
 
     pub(super) fn decode(
@@ -1806,7 +1814,7 @@ mod imbe_pipeline {
 mod ambe_plus2_pipeline {
     use super::*;
     use crate::rate33::dequantize::{
-        Decoded, decode_to_params, encode_tone_frame_info, quantize, tone_to_mbe_params,
+        decode_to_params, encode_tone_frame_info, quantize, tone_to_mbe_params, Decoded,
     };
     use crate::rate33::frame::{decode_frame, encode_frame, pack_no_fec, unpack_no_fec};
 
@@ -1832,8 +1840,8 @@ mod ambe_plus2_pipeline {
             // tone_to_mbe_params returns Some for any valid Annex T
             // row; for the unlikely None case (reserved id), fall
             // back to a half-rate-friendly silence placeholder.
-            let params = tone_to_mbe_params(id, amplitude)
-                .unwrap_or_else(MbeParams::silence_ambe_plus2);
+            let params =
+                tone_to_mbe_params(id, amplitude).unwrap_or_else(MbeParams::silence_ambe_plus2);
             return Ok((
                 bytes,
                 AnalysisStats {
@@ -1849,12 +1857,21 @@ mod ambe_plus2_pipeline {
             .map_err(VocoderError::Analysis)?
         {
             AnalysisOutput::Voice(p) => (AnalysisOutputKind::Voice, p),
-            AnalysisOutput::Silence => (AnalysisOutputKind::Silence, MbeParams::silence_ambe_plus2()),
+            AnalysisOutput::Silence => {
+                (AnalysisOutputKind::Silence, MbeParams::silence_ambe_plus2())
+            }
         };
         let info = quantize(&params, &mut vocoder.ambe_plus2_dec)
             .map_err(|e| VocoderError::Quantize(format!("{e:?}")))?;
         let bytes = pack_info_or_fec(&info, apply_fec);
-        Ok((bytes, AnalysisStats { output: kind, params, tone_detect }))
+        Ok((
+            bytes,
+            AnalysisStats {
+                output: kind,
+                params,
+                tone_detect,
+            },
+        ))
     }
 
     fn pack_info_or_fec(info: &[u16; 4], apply_fec: bool) -> Vec<u8> {
@@ -1895,11 +1912,13 @@ mod ambe_plus2_pipeline {
             // climbing to 0.27 and Muting ~20 frames.
             const E0_UNCORRECTABLE_CAP: u8 = 4;
             let raw_e0 = frame.errors[0];
-            let s0: u8 = if raw_e0 == u8::MAX { E0_UNCORRECTABLE_CAP } else { raw_e0 };
+            let s0: u8 = if raw_e0 == u8::MAX {
+                E0_UNCORRECTABLE_CAP
+            } else {
+                raw_e0
+            };
             let s1: u8 = frame.errors[1];
-            let st: u8 = u16::from(s0)
-                .saturating_add(u16::from(s1))
-                .min(255) as u8;
+            let st: u8 = u16::from(s0).saturating_add(u16::from(s1)).min(255) as u8;
             let e3: u8 = frame.errors[3];
             (frame.info, s0, st, e3)
         } else {
@@ -1932,7 +1951,9 @@ mod ambe_plus2_pipeline {
                 }
             },
             Ok(Decoded::Tone { params, .. }) => match vocoder.ambe_plus2_synth {
-                AmbePlus2Synth::AmbePlus => ambe_plus2::synthesize_tone(&params, &mut vocoder.synth),
+                AmbePlus2Synth::AmbePlus => {
+                    ambe_plus2::synthesize_tone(&params, &mut vocoder.synth)
+                }
                 AmbePlus2Synth::Baseline => {
                     let gamma_w = vocoder.synth.gamma_w;
                     synthesize_frame(&params, &err, gamma_w, &mut vocoder.synth)
@@ -2070,7 +2091,11 @@ mod tests {
         for _ in 0..5 {
             let pcm = periodic_pcm(40, 8000);
             let bits = tx.encode_pcm(&pcm).expect("encode");
-            assert_eq!(bits.len(), 11, "no-FEC IMBE wire frame is 11 bytes (88 info bits)");
+            assert_eq!(
+                bits.len(),
+                11,
+                "no-FEC IMBE wire frame is 11 bytes (88 info bits)"
+            );
             let out = rx.decode_bits(&bits).expect("decode");
             assert_eq!(out.len(), FRAME_SAMPLES);
         }
@@ -2216,7 +2241,13 @@ mod tests {
     fn wrong_pcm_length_errors() {
         let mut v = Vocoder::new(Rate::Imbe7200x4400);
         let r = v.encode_pcm(&[0i16; 159]);
-        assert!(matches!(r, Err(VocoderError::WrongPcmLength { expected: 160, got: 159 })));
+        assert!(matches!(
+            r,
+            Err(VocoderError::WrongPcmLength {
+                expected: 160,
+                got: 159
+            })
+        ));
     }
 
     #[test]
@@ -2224,12 +2255,18 @@ mod tests {
         let mut a = Vocoder::new(Rate::Imbe7200x4400);
         assert!(matches!(
             a.decode_bits(&[0u8; 9]),
-            Err(VocoderError::WrongBitsLength { expected: 18, got: 9 })
+            Err(VocoderError::WrongBitsLength {
+                expected: 18,
+                got: 9
+            })
         ));
         let mut b = Vocoder::new(Rate::AmbePlus2_3600x2450);
         assert!(matches!(
             b.decode_bits(&[0u8; 18]),
-            Err(VocoderError::WrongBitsLength { expected: 9, got: 18 })
+            Err(VocoderError::WrongBitsLength {
+                expected: 9,
+                got: 18
+            })
         ));
     }
 
@@ -2392,7 +2429,7 @@ mod tests {
         // Decoder side: parse the bits and confirm it classifies as
         // a tone frame (FrameKind::Tone via the §2.10.1 signature
         // dispatch).
-        use crate::rate33::dequantize::{FrameKind, classify_ambe_plus2_frame};
+        use crate::rate33::dequantize::{classify_ambe_plus2_frame, FrameKind};
         use crate::rate33::frame::decode_frame;
         let mut dibits = [0u8; 36];
         let mut bit = 0;
@@ -2612,7 +2649,10 @@ mod tests {
         let mut tx = Transcoder::new(Rate::Imbe7200x4400, Rate::AmbePlus2_3600x2450).unwrap();
         assert!(matches!(
             tx.transcode(&[0u8; 9]),
-            Err(VocoderError::WrongBitsLength { expected: 18, got: 9 })
+            Err(VocoderError::WrongBitsLength {
+                expected: 18,
+                got: 9
+            })
         ));
     }
 
@@ -2635,10 +2675,8 @@ mod tests {
     #[test]
     fn transcoder_full_fec_to_info_roundtrip_is_lossless() {
         let mut enc = Vocoder::new(Rate::Imbe7200x4400);
-        let mut strip =
-            Transcoder::new(Rate::Imbe7200x4400, Rate::Imbe4400x4400).unwrap();
-        let mut add =
-            Transcoder::new(Rate::Imbe4400x4400, Rate::Imbe7200x4400).unwrap();
+        let mut strip = Transcoder::new(Rate::Imbe7200x4400, Rate::Imbe4400x4400).unwrap();
+        let mut add = Transcoder::new(Rate::Imbe4400x4400, Rate::Imbe7200x4400).unwrap();
         for k in 0..4 {
             let pcm = periodic_pcm(40 + k, 7000);
             let fec = enc.encode_pcm(&pcm).unwrap();
@@ -2779,8 +2817,12 @@ mod tests {
             for chunk in bits_buf.chunks_exact(9) {
                 out_pcm.extend(rx.decode_bits(chunk).unwrap());
             }
-            let rms = (out_pcm.iter().map(|&s| (s as f64) * (s as f64)).sum::<f64>()
-                / out_pcm.len() as f64).sqrt();
+            let rms = (out_pcm
+                .iter()
+                .map(|&s| (s as f64) * (s as f64))
+                .sum::<f64>()
+                / out_pcm.len() as f64)
+                .sqrt();
             assert!(rms > 50.0, "{gen:?} output too quiet: rms={rms}");
         }
     }

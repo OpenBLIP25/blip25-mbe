@@ -15,7 +15,10 @@ fn main() {
     let mode = match args[3].as_str() {
         "AmbePlus" | "ambeplus" => AmbePlus2Synth::AmbePlus,
         "Baseline" | "baseline" => AmbePlus2Synth::Baseline,
-        other => { eprintln!("unknown synth mode: {}", other); std::process::exit(2); }
+        other => {
+            eprintln!("unknown synth mode: {}", other);
+            std::process::exit(2);
+        }
     };
     let spectral_clamp = args.iter().any(|a| a == "--spectral-clamp");
     let bits = std::fs::read(&args[1]).unwrap();
@@ -48,5 +51,8 @@ fn main() {
     for s in pcm {
         f.write_all(&s.to_le_bytes()).unwrap();
     }
-    eprintln!("Wrote {} (synth mode: {:?}, spectral_clamp: {})", args[2], mode, spectral_clamp);
+    eprintln!(
+        "Wrote {} (synth mode: {:?}, spectral_clamp: {})",
+        args[2], mode, spectral_clamp
+    );
 }

@@ -12,5 +12,5 @@
 //! the DVSI chip protocol carries additional framing that the
 //! over-the-air P25 modulators strip off.
 
-pub mod rate_tables;
 pub mod frame;
+pub mod rate_tables;
