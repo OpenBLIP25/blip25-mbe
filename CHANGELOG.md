@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-06-21
+
+### Added
+
+- **Opt-in encode-quality smoothing levers** (all default-off and
+  byte-identical to prior output): `AnalysisState::set_hf_amp_ema`
+  (band-selective upper-harmonic / L4–L5 amplitude EMA),
+  `AnalysisState::set_vuv_stickiness` (sticky per-band voicing), and
+  `DecoderState::set_gain_smooth_beta` (quantize-time gain hysteresis).
+  Also exposed as `halfrate-ab-matrix` flags. Measured net-neutral-to-
+  negative on offline PESQ, so they remain opt-in/diagnostic, not defaults.
+- **IDAS/NXDN transport pitch-pair mode**:
+  `AnalysisState::set_forced_pitch_omega` forces a frame's pitch onto a
+  supplied fundamental so the IDAS odd-slot dual-permutation is lossless;
+  plus the `idas_pairmode` example.
+- **`halfrate_field_dump` example**: dumps the deprioritized `b̂₀..b̂₈`
+  fields from either 9-byte FEC frames or 7-byte natural-order (AMBE_d)
+  frames, for apples-to-apples per-field encoder comparison.
+
+### Fixed
+
+- `Rate::AmbePlus2_2450x2450` doc comment: the 7-byte no-FEC frame is the
+  DVSI **r34 column interleave** (`R34_BIT_ORDER`), not "naive sequential".
+  Consumers needing natural / AMBE_d order (mbelib, IDAS/NXDN over-the-air)
+  must `unpack_no_fec` first.
+
+### Notes
+
+- OTA/IDAS quality investigation (`QUALITY_FINDINGS.md` §3.1/§3.3):
+  confirmed the half-rate bit order is correct; the encoder gap vs DVSI is
+  parameter-value estimation accuracy + the decoder, not frame-to-frame
+  trajectory smoothness (an earlier per-field "jumpiness" reading was a
+  bit-field-mapping artifact).
+
 ## [0.2.0] - 2026-06-14
 
 ### Changed
