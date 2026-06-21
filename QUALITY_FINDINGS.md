@@ -586,6 +586,93 @@ amplitudes with limited windows/precision; a modern multi-resolution or
 reassigned-spectrum estimate can place harmonic energy more accurately. The
 *encoder is where modern DSP most cleanly beats 1990s silicon.*
 
+> **OTA forensics — Miranda / VE-PG4 IDAS field report (2026-06-21).** An
+> external integrator running blip25 v0.2.0 over a real Icom IDAS repeater
+> back-traced the on-air "robotic" defect to the encoder, independent of our
+> chip work, and it converges with the §0a −0.23 encoder attribution. Method:
+> same source PCM through blip25 v0.2.0 vs the VE-PG4 (real DVSI silicon),
+> compared at the AMBE_d field level on 422 matched frame pairs, plus an
+> mbelib loopback A/B (both bitstreams decoded by the *same* mbelib, so the
+> delta is encoder-only). **First she decisively ruled out the bridge:** our
+> `R34_BIT_ORDER` is byte-identical to her de-interleave table, `vu_flip`
+> bit-10 is correct (0.00% even-slot disagreement), and a full single-bit +
+> C(49,2) 2-bit-pair flip search finds no transform improving OTA fit by
+> ≥0.5%. **The gap is parameter-trajectory jumpiness at quantize time:**
+>
+> | field | blip25 lag-1 autocorr | PG4 lag-1 autocorr | blip25 mean \|Δ\| | PG4 mean \|Δ\| |
+> |---|---|---|---|---|
+> | B0 gain  | 0.31 | 0.40 | 4.76 | 3.58 |
+> | L4 (HF mag) | **0.05** | 0.24 | 20.7 | 18.4 |
+> | L5 (HF mag) | **0.04** | 0.14 | 10.9 | 9.5 |
+> | V (voicing) | **0.087** | 0.205 | — | — |
+> | UV transitions | — | — | **3.5× too frequent** | baseline |
+>
+> mbelib-decoded frame-RMS deviates **13.7 dB** from the source envelope
+> (PG4: 6.9 dB). Upper-band L4/L5 are essentially a random walk in our
+> output where PG4 keeps real frame-to-frame coherence. This is the
+> encode-side twin of §2.1/§1.10 upper-band decode work — both point at the
+> HF spectral tail. **Caveat before "just add smoothing":** naive temporal
+> smoothing has repeatedly tested net-negative on PESQ here
+> (trusted-A_M EMA reverted 2026-05-14; §0.5 amp-EMA flag is default-off
+> because it regressed speech), and her own transport-side pitch-pair fix
+> (forcing odd-slot pitch = preceding even slot) was **null/slightly worse on
+> the on-air A/B** (+1.8–3.4% pitch error, not better) despite a clean +0.15
+> –0.21 PESQ offline — the real radio's pitch concealment doesn't match the
+> "copy prev even" sim. So treat hysteresis on B0/L4/L5/V/UV as candidate
+> levers to **PESQ/STOI-validate on a diverse corpus**, not as known wins;
+> the highest-value, lowest-risk target is restoring L4/L5 frame coherence
+> (autocorr 0.05→~0.2) without flattening genuine HF transitions. Corpus +
+> her scripts/CSVs: `Miranda/` and the share folder
+> `P25-IQ-Samples/blip25-pitch-pair-AB-2026-06-20/`.
+>
+> **CORRECTION (2026-06-21, same session — supersedes the per-field table
+> above).** The per-field numbers above are an ARTIFACT of her field map.
+> Her `pg4_vs_blip25_comprehensive.py` defines fields by *flat-slicing* the
+> 49-bit prioritized info vector (`B0 gain = natural_bits[9:14]`, `L4 =
+> [38:44]`, …). But that vector is the PRIORITIZED `û₀‖û₁‖û₂‖û₃` order; the
+> real `b̂₀..b̂₈` fields are recovered by `deprioritize()` — a non-contiguous
+> bit *gather*, NOT a flat slice. So her "gain"/"L4"/"L5" are scrambled
+> priority-rank bit groups, not the actual parameters. Reproduced her exact
+> flat-slice numbers (gain ac1 0.38/|Δ| 4.24 ≈ her 0.31/4.76; L4 ac1 0.008 ≈
+> her 0.05), then recomputed on TRUE deprioritized fields — deprioritizing
+> PG4's natural-order canonical too (validated: pitch shows high ac1, HOC
+> near-zero — physically correct field separation; tool
+> `examples/halfrate_field_dump.rs {fec9|natural7}`). Corrected per-field
+> comparison, PG4 vs blip25 **promoted production stack**, 422 matched pairs:
+>
+> | true field | PG4 ac1 | blip25 ac1 | reading |
+> |---|---|---|---|
+> | b̂₀ pitch | 0.633 | 0.546 | blip25 modestly LESS coherent — the one real gap |
+> | b̂₁ voicing | 0.666 | 0.703 | blip25 MORE coherent (vuv_mxi promoted helps) |
+> | b̂₂ gain | 0.441 | 0.554 | blip25 MORE coherent — NOT jumpy |
+> | b̂₃/b̂₄ prba | 0.387/0.258 | 0.402/0.290 | ≈ equal |
+> | b̂₅–b̂₈ hoc | ~0.0 | ~0.0 | near-memoryless for BOTH — codec-inherent, not a defect |
+>
+> So: gain isn't jumpy, the HF tail is memoryless for the silicon too, and
+> voicing is fine on the production stack. Frame-to-frame VALUE mismatch is
+> high across all fields (gain 96%), so the real encoder gap is
+> **parameter-estimation accuracy** (§3.1 amplitude / pitch) + the §2.1
+> decoder deficit — **not trajectory smoothness**. This explains the
+> campaign result below. The only genuine trajectory item is a small pitch
+> coherence gap (b̂₀ 0.546 vs 0.633).
+>
+> **Smoothing campaign result (2026-06-21).** Three quantize-time hysteresis
+> levers were implemented behind default-off `AnalysisState`/`DecoderState`
+> setters + `halfrate-ab-matrix` flags and swept on Miranda's clip + 4 tv-rc
+> vectors (our_enc→our_dec PESQ-nb):
+> - `--hf-amp-ema-alpha` (band-selective L4/L5 amp EMA): NET-NEGATIVE on all
+>   speech (mean −0.06…−0.34); rejected.
+> - `--vuv-stickiness`: slightly negative (mean −0.01…−0.03); rejected.
+> - `--gain-smooth-beta`: β=0.1 is offline-NEUTRAL (mean −0.001 PESQ, +0.031
+>   on clean) and provably reduces gain |Δ|, but gain wasn't the problem, so
+>   it's not a quality win — it just over-smooths an already-coherent field.
+>
+> Verdict: NO default change. Smoothing toward "PG4's trajectory" does not
+> improve offline quality and the per-field premise was a measurement
+> artifact. Levers retained as opt-in/diagnostic (and for an on-air A/B of
+> the trajectory-coherence hypothesis, which only Miranda can run). The real
+> levers remain §3.1 (encoder estimation accuracy) and §2.1 (decoder).
+
 > **Chip-parity decomposition (ambe3000-clone, 2026-06-04).** Differential
 > r34 measurement vs the chip's own bits localizes this deficit precisely.
 > The voicing-agreed realized-envelope SHAPE divergence (~3.2 dB) is **uniform
@@ -923,6 +1010,14 @@ Wrong voicing → buzzy (false-voiced) or noisy (false-unvoiced) artifacts,
 very audible. Audit `analysis::vuv` band decisions against the chip on borderline
 (breathy / fricative) frames. **Measure:** per-band V/UV agreement vs chip on
 labelled speech; PESQ on breathy/fricative-heavy clips.
+
+> **OTA corroboration (Miranda 2026-06-21, see §3.1 note).** Independent of
+> the chip, the IDAS field comparison shows blip25 *flips voicing too often*:
+> V lag-1 autocorr 0.087 vs PG4 0.205, and UV transitions 3.5× more frequent
+> than PG4. This is a TEMPORAL (sticky-decision) deficit distinct from the
+> high-band UNDER-voicing rule below — our voicing both leans wrong on highs
+> *and* chatters frame-to-frame. A sticky/hysteresis V/UV step is a candidate
+> lever, PESQ-validate it (smoothing has historically regressed speech here).
 
 > **Chip-parity finding + REALIZED lever (ambe3000-clone, 2026-06-10,
 > `encode_b1_gain_2026-06-10/`).** Measured on 14 cached + 2 fresh live-chip

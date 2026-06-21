@@ -97,18 +97,22 @@ pub enum Rate {
     AmbePlus2_3600x2450,
     /// AMBE+2 half-rate info-only — same 49 info bits as
     /// [`Self::AmbePlus2_3600x2450`] with the Golay/Hamming/PN FEC
-    /// layer stripped. 7-byte wire frame (49 info bits packed
-    /// MSB-first in u₀..u₃ order, 7 trailing pad bits). 2 450 bps
-    /// total (= voice).
+    /// layer stripped. 7-byte wire frame: the 49 info bits in DVSI
+    /// **r34 order** plus 7 trailing pad bits. 2 450 bps total
+    /// (= voice).
     ///
-    /// **Byte layout caveat.** DVSI's chip rate-index 34 emits the
-    /// same 49 info bits in a *different* (chip-internal, permuted)
-    /// byte order. This crate's layout is self-consistent (ours-to-
-    /// ours round-trip is lossless) but is not byte-equal to DVSI's
-    /// r34 stream. If you need byte-exact DVSI r34 interop, see the
-    /// future `blip25-chip-shim` crate; here this variant is for
-    /// compact ours-to-ours archival. Recommended storage format is
-    /// the FEC-bearing [`Self::AmbePlus2_3600x2450`] — see
+    /// **Byte layout — IMPORTANT, this is NOT naive sequential.** The
+    /// bytes are packed by [`crate::rate33::frame::pack_no_fec`], which
+    /// applies the DVSI r34 **3-way column interleave**
+    /// ([`crate::rate33::frame::R34_BIT_ORDER`]) over the
+    /// û₀‖û₁‖û₂‖û₃ bits — NOT a plain MSB-first sequential packing. This
+    /// layout is byte-exact with DVSI's chip rate-index 34 no-FEC stream
+    /// (the table was derived and validated against the DVSI RC r33↔r34
+    /// reference vectors). Consumers that need natural / "AMBE_d" order —
+    /// e.g. mbelib, or an IDAS/NXDN over-the-air wire, both of which use
+    /// the *sequential* order — MUST de-interleave first via
+    /// [`crate::rate33::frame::unpack_no_fec`]. For storage, the
+    /// FEC-bearing [`Self::AmbePlus2_3600x2450`] is recommended — see
     /// `docs/wire_formats_and_storage.md`.
     AmbePlus2_2450x2450,
 }

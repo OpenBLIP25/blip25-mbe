@@ -55,6 +55,16 @@ pub struct VuvState {
     /// confident-pitch (`E(P̂_I) < 0.5`) loud frames. Hard-bounded, never
     /// mutes (see [`VUV_MXI_GRADE_MAX_GAIN`]). Opt-in, default false.
     mxi_grade_enabled: bool,
+    /// Sticky-voicing strength `s ∈ [0, 1)`. `0.0` (default) = spec.
+    /// When `> 0`, the per-band threshold Θ is biased toward the
+    /// previous frame's decision: `Θ·(1+s)` if `v̂_k(−1)=1` (easier to
+    /// stay voiced), `Θ·(1−s)` if `v̂_k(−1)=0` (easier to stay
+    /// unvoiced) — widening the existing voiced/unvoiced base-threshold
+    /// hysteresis. Targets the OTA-measured voicing chatter (V lag-1
+    /// autocorr 0.087 vs DVSI 0.205; UV transitions 3.5× too frequent,
+    /// Miranda 2026-06-21, `QUALITY_FINDINGS.md` §3.3). The Eq. 37
+    /// `E(P̂_I)>0.5` force-unvoice case (Θ=0) is unaffected.
+    stickiness: f64,
 }
 
 impl VuvState {
@@ -67,7 +77,24 @@ impl VuvState {
             k_prev: 0,
             pitch_band_coef: THETA_PITCH_BAND_COEF,
             mxi_grade_enabled: false,
+            stickiness: 0.0,
         }
+    }
+
+    /// Set the sticky-voicing strength `s` (clamped to `[0, 0.99]`).
+    /// `0.0` (default) restores spec behavior. See [`VuvState::stickiness`].
+    pub fn set_stickiness(&mut self, s: f64) {
+        self.stickiness = if s.is_finite() {
+            s.clamp(0.0, 0.99)
+        } else {
+            0.0
+        };
+    }
+
+    /// Current sticky-voicing strength.
+    #[inline]
+    pub fn stickiness(&self) -> f64 {
+        self.stickiness
     }
 
     /// Override the Eq. 37 pitch/band Θ rolloff coefficient
@@ -289,6 +316,21 @@ pub fn determine_vuv(
             } else {
                 theta_base
             }
+        };
+
+        // Sticky V/UV: widen the hysteresis band around the existing
+        // voiced/unvoiced base thresholds toward the previous frame's
+        // decision, to cut the OTA-measured voicing chatter. `0.0`
+        // (default) = spec. The force-unvoice case (Θ=0) is unaffected
+        // because `0 · (1±s) = 0`.
+        let theta = if state.stickiness > 0.0 {
+            if state.vuv_prev[k as usize] == 1 {
+                theta * (1.0 + state.stickiness)
+            } else {
+                theta * (1.0 - state.stickiness)
+            }
+        } else {
+            theta
         };
 
         theta_k[k as usize] = theta;

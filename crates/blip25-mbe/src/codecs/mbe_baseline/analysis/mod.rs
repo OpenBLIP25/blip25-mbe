@@ -559,6 +559,36 @@ pub struct AnalysisState {
     /// gain + V/UV) so silence quantizes to the near-zero PRBA cells the
     /// chip parks in, instead of rendering noise-floor timbre. Default off.
     silence_shape_zero_enabled: bool,
+    /// Transport mode (IDAS/NXDN odd-slot dual-permutation): when
+    /// `Some(ω)`, this frame's refined pitch is overridden to the
+    /// continuous fundamental `ω` (rad/sample) BEFORE V/UV + amplitude
+    /// estimation, while `L̂`/`b̂₀` are re-derived from `ω` exactly as the
+    /// normal path does. Passing the *continuous* ω (not the grid center)
+    /// preserves the sub-cell precision the amplitude estimator relies on
+    /// — forcing the grid center instead costs ~0.4 PESQ on its own. The
+    /// IDAS wire drops an odd slot's b̂₀ and the radio copies the
+    /// preceding even slot's; forcing the odd frame onto the even frame's
+    /// refined ω makes the permutation lossless. `None` (default) = the
+    /// §0.4 refined pitch is used as-is.
+    forced_pitch_omega: Option<f64>,
+    /// Band-selective amplitude EMA weight for the UPPER harmonics
+    /// (the L4/L5 high-frequency spectral tail). `0.0` (default)
+    /// disables it. When `> 0`, harmonics with `l/L̂ ≥
+    /// hf_amp_ema_band_frac` blend `M̂_l(t) = α·raw + (1−α)·M̂_l(t−1)`
+    /// using THIS α instead of the global [`Self::amp_ema_alpha`],
+    /// while the low harmonics are left at full responsiveness.
+    /// Targets the OTA-measured upper-band random-walk (lag-1 autocorr
+    /// 0.05 vs DVSI's 0.24, Miranda 2026-06-21, `QUALITY_FINDINGS.md`
+    /// §3.1) — the surgical version of [`Self::amp_ema_alpha`], which
+    /// smooths all bands and flattens low-band formant motion. Shares
+    /// the same pitch + V/UV gates and `prev_m_hat` history. General-DSP
+    /// magnitude smoothing, outside BABA-A clean-room scope.
+    hf_amp_ema_alpha: f64,
+    /// Normalized harmonic-index threshold for [`Self::hf_amp_ema_alpha`]:
+    /// only harmonics with `l/L̂ ≥` this fraction are smoothed. Default
+    /// `0.5` (smooth the upper half ≈ L4/L5 region). Ignored when
+    /// `hf_amp_ema_alpha == 0`.
+    hf_amp_ema_band_frac: f64,
 }
 
 /// `BLIP25_LEVEL_SCALE` flat broadband level normalization, applied to
@@ -674,7 +704,38 @@ impl AnalysisState {
             amp_frac_band_edges: false,
             level_scale_enabled: false,
             silence_shape_zero_enabled: false,
+            forced_pitch_omega: None,
+            hf_amp_ema_alpha: 0.0,
+            hf_amp_ema_band_frac: 0.5,
         }
+    }
+
+    /// Band-selective UPPER-harmonic amplitude EMA (the L4/L5
+    /// high-frequency tail). `alpha` in `(0, 1)` enables it; `0.0`
+    /// (default) disables. `band_frac` is the normalized harmonic-index
+    /// threshold (`l/L̂ ≥ band_frac` are smoothed); pass `None` to keep
+    /// the current value (default `0.5`). See the `hf_amp_ema_alpha` field.
+    pub fn set_hf_amp_ema(&mut self, alpha: f64, band_frac: Option<f64>) {
+        self.hf_amp_ema_alpha = if alpha.is_finite() {
+            alpha.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        if let Some(f) = band_frac {
+            if f.is_finite() {
+                self.hf_amp_ema_band_frac = f.clamp(0.0, 1.0);
+            }
+        }
+    }
+
+    /// IDAS/NXDN transport mode: force the next encoded frame's pitch to
+    /// the continuous fundamental `omega` (rad/sample) — typically the
+    /// preceding even slot's *refined* ω — so the odd-slot
+    /// dual-permutation is lossless. `L̂`/`b̂₀` are re-derived from `omega`
+    /// as in the normal path. Pass `None` to restore normal §0.4 pitch
+    /// behavior. See the `forced_pitch_omega` field.
+    pub fn set_forced_pitch_omega(&mut self, omega: Option<f64>) {
+        self.forced_pitch_omega = omega;
     }
 
     /// Enable or disable §0.8.4 silence dispatch. When enabled,
@@ -870,6 +931,13 @@ impl AnalysisState {
         self.vuv.set_mxi_grade(on);
     }
 
+    /// Sticky-voicing strength (default `0.0` = spec). Biases the per-band
+    /// V/UV threshold toward the previous frame's decision to cut voicing
+    /// chatter. Forwards into the [`VuvState`]. See [`VuvState::stickiness`].
+    pub fn set_vuv_stickiness(&mut self, s: f64) {
+        self.vuv.set_stickiness(s);
+    }
+
     /// Whether the M(ξ) graded Θ relaxation is enabled.
     #[inline]
     pub fn vuv_mxi_grade_enabled(&self) -> bool {
@@ -1022,13 +1090,17 @@ impl AnalysisState {
         omega_hat: f64,
         vuv: &VuvResult,
     ) {
-        let alpha = self.amp_ema_alpha;
-        if alpha > 0.0 && alpha < 1.0 && self.prev_l_hat > 0 && self.prev_omega_hat > 0.0 {
+        let g_alpha = self.amp_ema_alpha;
+        let hf_alpha = self.hf_amp_ema_alpha;
+        let g_on = g_alpha > 0.0 && g_alpha < 1.0;
+        let hf_on = hf_alpha > 0.0 && hf_alpha < 1.0;
+        if (g_on || hf_on) && self.prev_l_hat > 0 && self.prev_omega_hat > 0.0 {
             let rel = (omega_hat - self.prev_omega_hat).abs() / self.prev_omega_hat;
             if rel < AMP_EMA_PITCH_GATE {
                 let overlap = u32::from(l_hat.min(self.prev_l_hat));
                 let k_hat = vuv.k_hat;
                 let prev_k_hat = self.prev_k_hat;
+                let l_curr = f64::from(l_hat).max(1.0);
                 for l in 1..=overlap {
                     let k_now = amplitude::band_for_harmonic(l, k_hat);
                     let k_prev = amplitude::band_for_harmonic(l, prev_k_hat);
@@ -1038,6 +1110,18 @@ impl AnalysisState {
                     if vuv.vuv[k_now as usize] != self.prev_vuv_bits[k_prev as usize] {
                         continue;
                     }
+                    // Per-harmonic α: the upper-band (L4/L5) tail uses the
+                    // band-selective `hf_alpha` when enabled; everything
+                    // else uses the global `g_alpha`. With `hf_alpha == 0`
+                    // this is identical to the original global smoother.
+                    let frac = f64::from(l) / l_curr;
+                    let alpha = if hf_on && frac >= self.hf_amp_ema_band_frac {
+                        hf_alpha
+                    } else if g_on {
+                        g_alpha
+                    } else {
+                        continue;
+                    };
                     let raw = m_hat[l as usize];
                     let prev = self.prev_m_hat[l as usize];
                     m_hat[l as usize] = alpha * raw + (1.0 - alpha) * prev;
@@ -1482,7 +1566,7 @@ pub fn encode_ambe_plus2(
             Ok(Some(refinement))
         },
     );
-    let refinement = match refinement_result? {
+    let mut refinement = match refinement_result? {
         Some(r) => r,
         None => {
             state.reset_amp_ema_history();
@@ -1491,6 +1575,24 @@ pub fn encode_ambe_plus2(
             return Ok(AnalysisOutput::Silence);
         }
     };
+    // IDAS/NXDN transport: override this frame's pitch onto a supplied
+    // b̂₀ grid entry (the preceding even slot's pitch) BEFORE V/UV +
+    // amplitude estimation, so the odd-slot dual-permutation — wire drops
+    // bits 0-6, radio copies the even slot's — is lossless. Without this
+    // the spectral/gain bits assume the frame's own pitch and get
+    // garbled when the receiver swaps in the even slot's pitch.
+    if let Some(omega) = state.forced_pitch_omega {
+        use crate::rate33::dequantize::{decode_pitch, encode_pitch};
+        if let Some(b0) = encode_pitch(omega as f32) {
+            if let Some(p) = decode_pitch(b0) {
+                // Keep the continuous ω for amplitude estimation (sub-cell
+                // precision); derive L̂/b̂₀ from it as the normal path does.
+                refinement.omega_hat = omega;
+                refinement.l_hat = p.l;
+                refinement.b0 = b0;
+            }
+        }
+    }
     let vuv_result = profile::time(profile::Stage::Vuv, || {
         determine_vuv(&sw, basis, &refinement, e_p_hat_i, &mut state.vuv)
     });
