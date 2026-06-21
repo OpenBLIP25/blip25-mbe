@@ -108,6 +108,17 @@ pub struct DecoderState {
     /// Previous voice frame's reconstructed gain `γ̃(−1)`. Init: 0.
     /// Tone/silence/erasure frames do not update this.
     prev_gamma: f64,
+    /// Encoder-only gain hysteresis `β ∈ [0, 1)` (read in [`quantize`],
+    /// ignored on the decode path). `0.0` (default) = spec. When `> 0`,
+    /// the current absolute log-gain `γ̃(0)` is blended toward the
+    /// previous frame's reconstructed gain before differential
+    /// quantization: `γ_eff = (1−β)·γ̃(0) + β·γ̃(−1)`, smoothing the
+    /// frame-to-frame loudness envelope. Targets the OTA-measured jumpy
+    /// gain (mean |Δ| 4.76 vs DVSI 3.58; mbelib-RMS dev 13.7 dB vs
+    /// 6.9 dB, Miranda 2026-06-21, `QUALITY_FINDINGS.md` §3.1).
+    /// Encoder/decoder stay in lockstep because the produced `b̂₂` bits
+    /// (and therefore the reconstructed gain) carry the smoothed value.
+    gain_smooth_beta: f64,
 }
 
 impl DecoderState {
@@ -118,7 +129,20 @@ impl DecoderState {
             prev_lambda: [1.0; L_MAX as usize + 2],
             prev_l: INIT_PREV_L,
             prev_gamma: 0.0,
+            gain_smooth_beta: 0.0,
         }
+    }
+
+    /// Set the encoder-only gain hysteresis `β` (clamped to `[0, 0.99]`).
+    /// `0.0` (default) = spec. Only affects [`quantize`]; the decode path
+    /// reconstructs gain from the bits and ignores this. See the
+    /// `gain_smooth_beta` field.
+    pub fn set_gain_smooth_beta(&mut self, beta: f64) {
+        self.gain_smooth_beta = if beta.is_finite() {
+            beta.clamp(0.0, 0.99)
+        } else {
+            0.0
+        };
     }
 
     /// Read `Λ̃_l(−1)` with the §2.13 edge cases:
@@ -857,7 +881,16 @@ pub fn quantize(params: &MbeParams, state: &mut DecoderState) -> Result<[u16; 4]
     let (t, gamma) = forward_log_prediction(&lambda, l, state);
 
     // Quantize gain: Δ̃_γ = γ̃(0) − 0.5·γ̃(−1); argmin over Annex O.
-    let delta_gamma = gamma - 0.5 * state.prev_gamma;
+    // Optional encoder-only hysteresis: blend the current absolute
+    // log-gain toward the previous reconstructed gain to smooth the
+    // loudness envelope (β = 0 default = spec). Enc/dec stay in lockstep
+    // because the resulting b̂₂ carries the smoothed value.
+    let gamma_eff = if state.gain_smooth_beta > 0.0 {
+        gamma + state.gain_smooth_beta * (state.prev_gamma - gamma)
+    } else {
+        gamma
+    };
+    let delta_gamma = gamma_eff - 0.5 * state.prev_gamma;
     let b2 = u16::from(encode_gain(delta_gamma));
 
     // Forward block DCT → C̃_{i,k}.

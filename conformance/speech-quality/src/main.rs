@@ -260,6 +260,22 @@ enum Cmd {
         /// relaxation on confident-pitch loud frames (measure-first).
         #[arg(long)]
         vuv_mxi_grade: bool,
+        /// IDAS/OTA smoothing campaign (Miranda 2026-06-21): band-selective
+        /// UPPER-harmonic (L4/L5) amplitude EMA weight. 0 (default) = off.
+        #[arg(long, default_value_t = 0.0)]
+        hf_amp_ema_alpha: f64,
+        /// Normalized harmonic-index threshold for `--hf-amp-ema-alpha`
+        /// (smooth `l/L̂ ≥` this). Default 0.5 (upper half).
+        #[arg(long, default_value_t = 0.5)]
+        hf_amp_ema_band_frac: f64,
+        /// IDAS/OTA smoothing campaign: sticky-voicing strength s∈[0,0.99].
+        /// 0 (default) = spec. Biases V/UV toward the previous decision.
+        #[arg(long, default_value_t = 0.0)]
+        vuv_stickiness: f64,
+        /// IDAS/OTA smoothing campaign: gain hysteresis β∈[0,0.99]. 0
+        /// (default) = spec. Blends γ̃(0) toward γ̃(−1) at quantize time.
+        #[arg(long, default_value_t = 0.0)]
+        gain_smooth_beta: f64,
         /// §3.4 EXCEED lever: enable the pre-analysis denoiser front-end
         /// (STFT log-MMSE + minimum-statistics noise tracking). For noisy
         /// input, pair with `--ref-pcm <clean>` so cells score vs clean.
@@ -532,6 +548,10 @@ fn main() -> Result<()> {
             silence_shape_zero,
             vuv_pitch_coef,
             vuv_mxi_grade,
+            hf_amp_ema_alpha,
+            hf_amp_ema_band_frac,
+            vuv_stickiness,
+            gain_smooth_beta,
             denoise,
             denoise_mode,
             hum_notch,
@@ -565,6 +585,10 @@ fn main() -> Result<()> {
                 silence_shape_zero,
                 vuv_pitch_coef,
                 vuv_mxi_grade,
+                hf_amp_ema_alpha,
+                hf_amp_ema_band_frac,
+                vuv_stickiness,
+                gain_smooth_beta,
                 denoise,
                 denoise_mode: denoise_mode.map(DenoiseModeCli::to_kind),
                 hum_notch,
@@ -1074,6 +1098,15 @@ struct LeverFlags {
     silence_shape_zero: bool,
     vuv_pitch_coef: Option<f64>,
     vuv_mxi_grade: bool,
+    /// IDAS/OTA smoothing campaign (Miranda 2026-06-21): band-selective
+    /// upper-harmonic (L4/L5) amplitude EMA weight; 0 = off.
+    hf_amp_ema_alpha: f64,
+    /// Normalized harmonic-index threshold for `hf_amp_ema_alpha`.
+    hf_amp_ema_band_frac: f64,
+    /// IDAS/OTA smoothing campaign: sticky-voicing strength; 0 = spec.
+    vuv_stickiness: f64,
+    /// IDAS/OTA smoothing campaign: gain hysteresis β; 0 = spec.
+    gain_smooth_beta: f64,
     /// §3.4 pre-analysis denoiser front-end (exceed lever).
     denoise: bool,
     /// Gain rule when `denoise` is on; `None` = LogMmse default.
@@ -1381,6 +1414,14 @@ fn our_encode_ambe_plus2(
         state.set_vuv_pitch_coef(c);
     }
     state.set_vuv_mxi_grade(levers.vuv_mxi_grade);
+    // IDAS/OTA smoothing campaign (Miranda 2026-06-21): parameter-
+    // trajectory hysteresis levers. All default-off (spec).
+    if levers.hf_amp_ema_alpha > 0.0 {
+        state.set_hf_amp_ema(levers.hf_amp_ema_alpha, Some(levers.hf_amp_ema_band_frac));
+    }
+    if levers.vuv_stickiness > 0.0 {
+        state.set_vuv_stickiness(levers.vuv_stickiness);
+    }
     // §3.4 pre-analysis front-ends (opt-in). Mirrors the production Vocoder
     // hook: mains-hum notch first, then the denoiser, before analysis.
     let mut humnotch = levers.hum_notch.then(HumNotch::new_60_120);
@@ -1388,6 +1429,9 @@ fn our_encode_ambe_plus2(
         .denoise
         .then(|| PreDenoise::new(levers.denoise_mode.unwrap_or(DenoiseKind::LogMmse)));
     let mut decoder_state = HalfDecoderState::new();
+    if levers.gain_smooth_beta > 0.0 {
+        decoder_state.set_gain_smooth_beta(levers.gain_smooth_beta);
+    }
     let mut out = Vec::with_capacity(n_frames * HALF_BYTES_PER_FEC_FRAME);
     for f in 0..n_frames {
         let raw = &pcm[f * FRAME_SAMPLES..(f + 1) * FRAME_SAMPLES];
