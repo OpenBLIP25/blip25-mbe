@@ -672,6 +672,26 @@ reassigned-spectrum estimate can place harmonic energy more accurately. The
 > artifact. Levers retained as opt-in/diagnostic (and for an on-air A/B of
 > the trajectory-coherence hypothesis, which only Miranda can run). The real
 > levers remain §3.1 (encoder estimation accuracy) and §2.1 (decoder).
+>
+> **Integrator confirmation (Miranda, 2026-06-21, post-fix).** Re-ran her
+> `pg4_vs_blip25_comprehensive.py` with the deprioritized extractors
+> (`rate33::fields_from_natural` on the PG4 canonical, `fields_from_no_fec`
+> on the blip25 `LiveEncoder` output) and independently reproduced the table
+> above (b̂₀ 0.633/0.546, b̂₂ gain 0.441/0.554 "smoother not jumpier", HOC
+> ~0 both). She **retracted** the v0.2.0 jumpiness/memoryless diagnosis and
+> the smoothing-lever recommendations that followed — matching our campaign
+> verdict. Surviving cross-checks (her side): R34 table byte-identical,
+> vu_flip polarity 0% bit-10 error on even slots, no hidden 1-/2-bit
+> transform across all 1176 pairs, bit-stability↔FEC-error corr +0.625
+> (layout correct). New corroborating datum for the §3.1 *value*-accuracy
+> gap: gain code-preference distributions differ (PG4 top-3 {2,3,5}, blip25
+> {6,5,7} — blip25 sits in higher gain codes), consistent with the
+> 6.89 dB vs 13.72 dB mean-deviation-from-source-dB from her mbelib RMS test
+> (now read as analysis accuracy, not trajectory). On-air A/B is **paused**:
+> her SDR-Connect IQ recorder failed and needs reinstalling; no new test
+> transmissions until it's back. The `fields_from_*` one-liners ship public
+> (see CHANGELOG / `examples/halfrate_field_dump.rs` `nofec7`) so the
+> apples-to-apples extraction is reproducible anywhere going forward.
 
 > **Chip-parity decomposition (ambe3000-clone, 2026-06-04).** Differential
 > r34 measurement vs the chip's own bits localizes this deficit precisely.
@@ -1011,13 +1031,18 @@ very audible. Audit `analysis::vuv` band decisions against the chip on borderlin
 (breathy / fricative) frames. **Measure:** per-band V/UV agreement vs chip on
 labelled speech; PESQ on breathy/fricative-heavy clips.
 
-> **OTA corroboration (Miranda 2026-06-21, see §3.1 note).** Independent of
-> the chip, the IDAS field comparison shows blip25 *flips voicing too often*:
-> V lag-1 autocorr 0.087 vs PG4 0.205, and UV transitions 3.5× more frequent
-> than PG4. This is a TEMPORAL (sticky-decision) deficit distinct from the
-> high-band UNDER-voicing rule below — our voicing both leans wrong on highs
-> *and* chatters frame-to-frame. A sticky/hysteresis V/UV step is a candidate
-> lever, PESQ-validate it (smoothing has historically regressed speech here).
+> **~~OTA corroboration (Miranda 2026-06-21)~~ — RETRACTED, see §3.1
+> correction.** The earlier "blip25 flips voicing too often" claim (V lag-1
+> 0.087 vs 0.205, UV transitions 3.5× more frequent) was the SAME flat-slice
+> artifact as the gain/L4 numbers: the voicing field was sliced out of the
+> prioritized 49-bit vector instead of via `deprioritize()`. On the TRUE
+> deprioritized field, b̂₁ voicing ac1 is **0.703 (blip25) vs 0.666 (PG4)** —
+> blip25 is *more* frame-to-frame coherent, not chattering — and the top
+> voicing code (16) agrees in ~60% of frames (Miranda confirmed, post-fix,
+> via `rate33::fields_from_natural`/`fields_from_no_fec`). There is NO
+> temporal V/UV chatter deficit. The `set_vuv_stickiness` sweep was
+> net-negative and is rejected as a default. The real V/UV item is the
+> high-band UNDER-voicing rule below (a *value* error, not trajectory).
 
 > **Chip-parity finding + REALIZED lever (ambe3000-clone, 2026-06-10,
 > `encode_b1_gain_2026-06-10/`).** Measured on 14 cached + 2 fresh live-chip

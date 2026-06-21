@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-06-21
+
+### Added
+
+- **Public per-field extractors** `rate33::fields_from_no_fec`,
+  `rate33::fields_from_natural`, and `rate33::fields_from_fec`:
+  one-liners returning the nine deprioritized half-rate parameters
+  `[b̂₀..b̂₈]` (pitch, V/UV, gain, PRBA, HOC) from a half-rate frame —
+  `fields_from_no_fec` for a 7-byte R34 column-interleaved wire (blip25
+  `LiveEncoder` / NXDN / Fusion), `fields_from_natural` for a 7-byte
+  natural-order AMBE_d frame (mbelib, Icom VE-PG4 canonical), and
+  `fields_from_fec` for a 9-byte Annex-S FEC frame (full Golay decode
+  first). This brings the crates.io crate to parity with the PyPI
+  `blip25_mbe.rate33` Python API (0.2.2). They exist so integrators
+  compare encoder output per-parameter without flat-slicing the
+  prioritized 49-bit vector, which mixes parameters per slice and
+  produces misleading per-field statistics (the artifact behind the
+  retracted v0.2.0 "gain jumpier / L4–L5 memoryless" OTA diagnosis).
+  The `halfrate_field_dump` example gains a matching `nofec7` mode.
+
 ## [0.2.1] - 2026-06-21
 
 ### Added

@@ -122,6 +122,12 @@ pub fn unpack_no_fec(bytes: &[u8]) -> [u16; 4] {
     for (j, &dst) in R34_BIT_ORDER.iter().enumerate() {
         natural[dst as usize] = (bytes[j / 8] >> (7 - (j % 8))) & 1;
     }
+    natural_to_info(&natural)
+}
+
+/// Slice 49 MSB-first natural info bits into `û₀..û₃` per [`INFO_WIDTHS`]
+/// (`û₀(12)‖û₁(12)‖û₂(11)‖û₃(14)`). Inverse of [`natural_bits`].
+fn natural_to_info(natural: &[u8; INFO_BITS_TOTAL as usize]) -> [u16; 4] {
     let mut out = [0u16; 4];
     let mut idx = 0;
     for (oi, &w) in INFO_WIDTHS.iter().enumerate() {
@@ -133,6 +139,52 @@ pub fn unpack_no_fec(bytes: &[u8]) -> [u16; 4] {
         out[oi] = v;
     }
     out
+}
+
+/// Extract the nine deprioritized half-rate parameters `[b̂₀..b̂₈]` from a
+/// 7-byte **R34 column-interleaved** no-FEC frame — the layout produced by
+/// blip25's [`crate::Vocoder`] / `LiveEncoder` at `Rate::AmbePlus2_2450x2450`
+/// and emitted over the air by NXDN / Fusion consoles. Undoes the
+/// [`R34_BIT_ORDER`] interleave (via [`unpack_no_fec`]), then deprioritizes.
+///
+/// The returned fields are `b̂₀` = pitch, `b̂₁` = V/UV, `b̂₂` = differential
+/// gain, and `b̂₃..b̂₈` = PRBA + HOC spectral. This is the apples-to-apples
+/// representation for per-field encoder comparison: flat-slicing the raw
+/// 49-bit *prioritized* info vector instead mixes multiple parameters per
+/// slice and yields misleading per-field statistics.
+pub fn fields_from_no_fec(bytes: &[u8]) -> [u16; super::priority::AMBE_B_COUNT] {
+    super::priority::deprioritize(&unpack_no_fec(bytes))
+}
+
+/// Extract the nine deprioritized half-rate parameters `[b̂₀..b̂₈]` from a
+/// 7-byte **natural-order** (AMBE_d) no-FEC frame — the MSB-first
+/// `û₀(12)‖û₁(12)‖û₂(11)‖û₃(14)` layout used by mbelib and the Icom VE-PG4
+/// canonical. Unlike [`fields_from_no_fec`], this assumes the bits are *not*
+/// R34-interleaved; bits 49..55 (byte padding) are ignored.
+///
+/// See [`fields_from_no_fec`] for field meanings and why deprioritizing
+/// (rather than flat-slicing the prioritized vector) is required.
+pub fn fields_from_natural(bytes: &[u8]) -> [u16; super::priority::AMBE_B_COUNT] {
+    let mut natural = [0u8; INFO_BITS_TOTAL as usize];
+    for (i, slot) in natural.iter_mut().enumerate() {
+        *slot = (bytes[i / 8] >> (7 - (i % 8))) & 1;
+    }
+    super::priority::deprioritize(&natural_to_info(&natural))
+}
+
+/// Extract the nine deprioritized half-rate parameters `[b̂₀..b̂₈]` from a
+/// 9-byte FEC half-rate frame — the 72-bit Annex-S-interleaved P25 wire
+/// (the `our.bit` format from `halfrate-ab-matrix`). Runs the full FEC
+/// decode ([`decode_frame`]: deinterleave, PN demod, Golay correction)
+/// before deprioritizing. See [`fields_from_no_fec`] for field meanings.
+pub fn fields_from_fec(bytes: &[u8]) -> [u16; super::priority::AMBE_B_COUNT] {
+    let mut dibits = [0u8; DIBITS_PER_FRAME];
+    for (i, slot) in dibits.iter_mut().enumerate() {
+        let hi = (bytes[(2 * i) / 8] >> (7 - ((2 * i) % 8))) & 1;
+        let lo = (bytes[(2 * i + 1) / 8] >> (7 - ((2 * i + 1) % 8))) & 1;
+        *slot = (hi << 1) | lo;
+    }
+    super::priority::deprioritize(&decode_frame(&dibits).info)
 }
 
 /// Flatten `û₀..û₃` into the 49 natural info bits, MSB-first per field.
@@ -517,6 +569,60 @@ mod tests {
                 "trailing pad bits not zero for {info:?}"
             );
             assert_eq!(unpack_no_fec(&bytes), info, "roundtrip failed for {info:?}");
+        }
+    }
+
+    #[test]
+    fn fields_from_extractors_recover_deprioritized_params() {
+        use super::super::priority::{prioritize, AMBE_B_COUNT, AMBE_PARAM_WIDTHS};
+
+        // Pack 49 natural MSB-first bits into 7 bytes (the AMBE_d layout).
+        fn natural7_bytes(info: &[u16; 4]) -> [u8; 7] {
+            let natural = natural_bits(info);
+            let mut out = [0u8; 7];
+            for (j, &bit) in natural.iter().enumerate() {
+                out[j / 8] |= bit << (7 - (j % 8));
+            }
+            out
+        }
+
+        for seed in [1u32, 0xDEADBEEF, 0xCAFEBABE, 0xA5A5A5A5, 42] {
+            // Build a valid b̂₀..b̂₈ within each field's width.
+            let mut b = [0u16; AMBE_B_COUNT];
+            let mut state = seed;
+            for i in 0..AMBE_B_COUNT {
+                state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+                let mask = (1u16 << AMBE_PARAM_WIDTHS[i]) - 1;
+                b[i] = (state as u16) & mask;
+            }
+            let info = prioritize(&b);
+
+            // R34-interleaved path (blip25 / NXDN wire).
+            assert_eq!(
+                fields_from_no_fec(&pack_no_fec(&info)),
+                b,
+                "no_fec seed {seed:#x}"
+            );
+            // Natural-order path (mbelib / VE-PG4 canonical).
+            assert_eq!(
+                fields_from_natural(&natural7_bytes(&info)),
+                b,
+                "natural seed {seed:#x}"
+            );
+            // 9-byte FEC path (Annex-S interleaved): pack dibits MSB-first.
+            let dibits = encode_frame(&info);
+            let mut fec9 = [0u8; 9];
+            for (i, &d) in dibits.iter().enumerate() {
+                fec9[(2 * i) / 8] |= (d >> 1) << (7 - ((2 * i) % 8));
+                fec9[(2 * i + 1) / 8] |= (d & 1) << (7 - ((2 * i + 1) % 8));
+            }
+            assert_eq!(fields_from_fec(&fec9), b, "fec seed {seed:#x}");
+            // The two layouts carry the same 49 info bits → same fields.
+            assert_eq!(
+                fields_from_no_fec(&pack_no_fec(&info)),
+                fields_from_natural(&natural7_bytes(&info)),
+                "layouts disagree seed {seed:#x}"
+            );
         }
     }
 
