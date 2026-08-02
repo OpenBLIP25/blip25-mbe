@@ -1,63 +1,52 @@
-//! Unified [`Vocoder`] handle — chip-shaped façade over the rate-specific
+//! Unified [`Vocoder`] handle — reference-shaped façade over the rate-specific
 //! pipelines.
 //!
-//! The DVSI AMBE-3000R exposes a single per-channel handle with uniform
+//! The reference AMBE-3000R exposes a single per-channel handle with uniform
 //! `encode` / `decode` / `reset` operations regardless of the configured
 //! rate. This module reproduces that surface for in-process Rust callers:
-//! one [`Vocoder`] handle owns all rate-specific state (analysis,
-//! decoder, synth) and dispatches uniformly across rates selected at
-//! runtime via the [`Rate`] enum.
+//! one [`Vocoder`] handle owns the blip25_codec codec state and dispatches
+//! uniformly across rates selected at runtime via the [`Rate`] enum.
 //!
-//! The low-level modules ([`crate::imbe7200`], [`crate::rate33`],
-//! [`crate::codecs::mbe_baseline`]) stay public for advanced consumers
-//! that need to drive the pipeline frame-by-frame at the parameter
-//! layer; this module is the recommended entry point for everything else.
+//! The low-level wire modules ([`crate::imbe7200`], [`crate::rate33`]) stay
+//! public for advanced consumers that need frame-by-frame wire access; this
+//! module is the recommended entry point for everything else.
 //!
 //! ## Quick start
 //!
 //! ```rust
 //! use blip25_mbe::vocoder::{Rate, Vocoder};
 //!
-//! // P25 Phase 1 (full-rate IMBE) encoder
-//! let mut tx = Vocoder::new(Rate::Imbe7200x4400);
-//! let pcm: [i16; 160] = [0; 160]; // one 20 ms frame at 8 kHz
-//! let bits = tx.encode_pcm(&pcm).expect("encode");
-//! assert_eq!(bits.len(), 18); // 18-byte FEC frame
+//! // Encode: PCM in → bits out, one call, best quality for the rate.
+//! let tx = Vocoder::new(Rate::Imbe7200x4400);
+//! let pcm = vec![0i16; 160 * 10]; // any length; one frame per 20 ms
+//! let frames = tx.encode(&pcm);   // Vec of 18-byte FEC frames
+//! assert!(frames.iter().all(|f| f.len() == 18));
 //!
-//! // P25 Phase 1 decoder (separate channel, separate state)
+//! // Decode: bits → PCM (separate channel, separate state).
 //! let mut rx = Vocoder::new(Rate::Imbe7200x4400);
-//! let pcm = rx.decode_bits(&bits).expect("decode");
-//! assert_eq!(pcm.len(), 160);
+//! for f in &frames {
+//!     assert_eq!(rx.decode_bits(f).expect("decode").len(), 160);
+//! }
 //! ```
 //!
-//! ## Mapping to the chip protocol
+//! ## Mapping to the reference protocol
 //!
-//! | Chip operation                | This module                          |
+//! | Reference operation                | This module                          |
 //! |-------------------------------|---------------------------------------|
 //! | Open channel                  | [`Vocoder::new`]                     |
 //! | Set rate (`PKT_RATEP`)        | [`Rate`] argument at construction    |
 //! | Reset (re-send `PKT_RATEP`)   | [`Vocoder::reset`]                   |
-//! | Encode 160-sample PCM → bits  | [`Vocoder::encode_pcm`]              |
+//! | Encode PCM → bits (one call)  | [`Vocoder::encode`]                  |
+//! | Encode one 160-sample frame   | [`Vocoder::encode_pcm`] (low-level)  |
 //! | Decode bits → 160-sample PCM  | [`Vocoder::decode_bits`]             |
 //! | Read last-frame stats         | [`Vocoder::last_stats`]              |
 //! | Frame size                    | [`Vocoder::frame_samples`] / [`Vocoder::fec_frame_bytes`] |
 //!
 //! Rate is fixed for the lifetime of a [`Vocoder`]; build a new handle
-//! to switch rates (mirrors a chip's PKT_RATEP cycle).
+//! to switch rates (mirrors a reference's PKT_RATEP cycle).
 
-use crate::codecs::ambe_plus2;
-use crate::codecs::mbe_baseline::analysis::{
-    detect_tone, encode as analysis_encode, encode_ambe_plus2 as analysis_encode_ambe_plus2,
-    profile as analysis_profile, AnalysisError, AnalysisOutput, AnalysisState, DenoiseKind,
-    HumNotch, PreDenoise, ToneDetection,
-};
-use crate::codecs::mbe_baseline::{
-    synthesize_frame, FrameDisposition, FrameErrorContext, SynthState, UnvoicedNoiseGen, GAMMA_W,
-};
 use crate::enhancement::{self, EnhancementMode, EnhancementState};
-use crate::imbe7200;
 use crate::mbe_params::MbeParams;
-use crate::rate33;
 
 /// 8 kHz mono — the only sample rate the vocoder produces.
 const SAMPLE_RATE_HZ: f32 = 8_000.0;
@@ -65,6 +54,18 @@ const SAMPLE_RATE_HZ: f32 = 8_000.0;
 /// Number of i16 PCM samples per 20 ms frame at 8 kHz. Constant across
 /// every supported rate.
 pub const FRAME_SAMPLES: usize = 160;
+
+/// AMBE pitch cell whose decoded ω₀ (≈0.1955 rad/sample) re-quantizes to the
+/// IMBE silence-default pitch index `b0=25` (L=14) — the fixed low-energy pitch
+/// the reference IMBE encoder emits on silence frames. Injected as the forced `b0`
+/// on IMBE frames whose source RMS falls below [`IMBE_SILENCE_RMS`]; the reference
+/// spectral-DP pitch saturates to a spurious high `b0` there.
+const IMBE_SILENCE_B0: u8 = 31;
+
+/// Source-RMS threshold below which an IMBE frame is treated as silence and its
+/// pitch pinned to [`IMBE_SILENCE_B0`]. Voiced frames sit far above this (agreeing
+/// frames average RMS ~1400–1800; silence frames ~80–350), so the split is clean.
+const IMBE_SILENCE_RMS: f64 = 400.0;
 
 /// Vocoder rate selection — picks both the codec generation and the
 /// wire-FEC framing.
@@ -83,8 +84,8 @@ pub enum Rate {
     /// IMBE info-only — same codec as [`Self::Imbe7200x4400`] with the
     /// Annex H Golay/Hamming/PN FEC layer stripped. 11-byte wire frame
     /// (88 prioritized info bits packed MSB-first). 4 400 bps total
-    /// (= voice). Byte layout matches JMBE / OP25 / DVSI `p25_nofec`
-    /// convention bit-for-bit (validated against DVSI tv-rc references
+    /// (= voice). Byte layout matches JMBE / OP25 / the reference `p25_nofec`
+    /// convention bit-for-bit (validated against the reference tv-rc references
     /// at 100% bit-exact). Use this for storage when you specifically
     /// need an info-only IMBE archive; otherwise prefer the
     /// FEC-bearing [`Self::Imbe7200x4400`] format — see
@@ -97,17 +98,17 @@ pub enum Rate {
     AmbePlus2_3600x2450,
     /// AMBE+2 half-rate info-only — same 49 info bits as
     /// [`Self::AmbePlus2_3600x2450`] with the Golay/Hamming/PN FEC
-    /// layer stripped. 7-byte wire frame: the 49 info bits in DVSI
+    /// layer stripped. 7-byte wire frame: the 49 info bits in the reference
     /// **r34 order** plus 7 trailing pad bits. 2 450 bps total
     /// (= voice).
     ///
     /// **Byte layout — IMPORTANT, this is NOT naive sequential.** The
     /// bytes are packed by [`crate::rate33::frame::pack_no_fec`], which
-    /// applies the DVSI r34 **3-way column interleave**
+    /// applies the reference r34 **3-way column interleave**
     /// ([`crate::rate33::frame::R34_BIT_ORDER`]) over the
     /// û₀‖û₁‖û₂‖û₃ bits — NOT a plain MSB-first sequential packing. This
-    /// layout is byte-exact with DVSI's chip rate-index 34 no-FEC stream
-    /// (the table was derived and validated against the DVSI RC r33↔r34
+    /// layout is byte-exact with the reference rate-index 34 no-FEC stream
+    /// (the table was derived and validated against the reference RC r33↔r34
     /// reference vectors). Consumers that need natural / "AMBE_d" order —
     /// e.g. mbelib, or an IDAS/NXDN over-the-air wire, both of which use
     /// the *sequential* order — MUST de-interleave first via
@@ -133,48 +134,22 @@ impl Rate {
         }
     }
 
+    /// Soft-decision channel-bit count for one frame — the number of LLRs
+    /// [`Vocoder::decode_soft`] expects (one per FEC channel bit). `None` for
+    /// the no-FEC info-only rates, which carry no FEC layer to soft-decode.
+    pub const fn soft_frame_bits(self) -> Option<usize> {
+        match self {
+            Rate::Imbe7200x4400 => Some(144),
+            Rate::AmbePlus2_3600x2450 => Some(72),
+            Rate::Imbe4400x4400 | Rate::AmbePlus2_2450x2450 => None,
+        }
+    }
+
     /// PCM samples per frame (always 160 at 8 kHz / 20 ms; provided
     /// for symmetry with [`Self::fec_frame_bytes`]).
     #[inline]
     pub const fn frame_samples(self) -> usize {
         FRAME_SAMPLES
-    }
-}
-
-/// Half-rate synthesis generation. Picks how reconstructed `MbeParams`
-/// are turned back into PCM on the half-rate decode path.
-///
-/// Full-rate (P25 Phase 1 IMBE) ignores this — it always uses the
-/// BABA-A §1.12 baseline phase, the only synth the IMBE spec
-/// describes.
-///
-/// The original Wave 1.2 of `SCOPE_PLAN.md` framed this as an
-/// "AMBE+ Gen-2 dequantize wrapper" — that turned out to be the
-/// wrong axis. The half-rate WIRE format and parameter recovery are
-/// AMBE+2 across the board (per
-/// `~/blip25-specs/analysis/oss_implementations_lessons_learned.md`);
-/// the actual Gen-2 vs Gen-3 split for legacy NXDN / DMR is here, on
-/// the synth side. mbelib's half-rate decoder uses [`Self::Baseline`]
-/// (1993-vintage IMBE phase, no Hilbert phase regen). JMBE / SDRTrunk
-/// use [`Self::AmbePlus`] (US5701390 phase regen, modern AMBE+ /
-/// AMBE+2 sound).
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[non_exhaustive]
-pub enum AmbePlus2Synth {
-    /// US5701390 phase regen — modern AMBE+ / AMBE+2 sound. Default
-    /// and recommended for P25 Phase 2 / NXDN type-2 / DMR enhanced.
-    AmbePlus,
-    /// BABA-A §1.12 baseline IMBE phase — no Hilbert regen. Matches
-    /// mbelib's half-rate output. Use for legacy NXDN type-1 / older
-    /// DMR captures where the consumer wants mbelib-equivalent
-    /// audible behavior.
-    Baseline,
-}
-
-impl Default for AmbePlus2Synth {
-    fn default() -> Self {
-        Self::AmbePlus
     }
 }
 
@@ -202,16 +177,6 @@ pub struct AnalysisStats {
     /// Populated for both `Voice` and `Silence` (silence dispatches
     /// the rate-appropriate placeholder).
     pub params: MbeParams,
-    /// Tone-detection signal for the input frame, populated whenever
-    /// [`Vocoder::set_tone_detection`] is enabled and the detector
-    /// matched an Annex T entry. Decoupled from `output` because Phase
-    /// 1 IMBE has no tone-frame opcode (per BABA-A): on full-rate the
-    /// detector still surfaces `(I_D, A_D)` here for application-layer
-    /// signaling (LCW, paging, dispatch) while the wire frame remains
-    /// a regular voice / silence frame. On half-rate AMBE+2 a positive
-    /// detection is *also* dispatched as an Annex T tone frame (so
-    /// `output == Tone` and this field both populate).
-    pub tone_detect: Option<ToneDetection>,
 }
 
 /// Discriminator-only counterpart of `AnalysisOutput` — strips the
@@ -227,8 +192,8 @@ pub enum AnalysisOutputKind {
     Silence,
     /// Annex T tone frame — encode-side detected a clean tone in the
     /// PCM and emitted the matching `(I_D, A_D)` payload instead of
-    /// running the voice analysis pipeline. Half-rate only; gated on
-    /// [`Vocoder::set_tone_detection`]. Default off.
+    /// running the voice analysis pipeline. Half-rate (AMBE+2) only; gated on
+    /// [`Vocoder::set_tone_detection`], off by default (opt-in).
     Tone {
         /// Annex T tone ID.
         id: u8,
@@ -236,6 +201,8 @@ pub enum AnalysisOutputKind {
         amplitude: u8,
     },
 }
+
+pub use blip25_codec::FrameDisposition;
 
 /// Decode-side per-frame stats.
 #[derive(Clone, Debug)]
@@ -246,12 +213,9 @@ pub struct DecodeStats {
     pub epsilon_0: u8,
     /// Total FEC error count across all coded vectors of the frame.
     pub epsilon_t: u8,
-    /// Synth-side disposition for this frame (Use / Repeat / Mute).
-    /// Populated for both rates after the synth runs. `None` only on
-    /// frames where dequantize errored before synth was reached
-    /// (e.g. invalid pitch index in full-rate; the field then carries
-    /// over the prior frame's value via `Vocoder::synth.last_disposition`).
-    pub disposition: Option<FrameDisposition>,
+    /// Concealment disposition applied to this frame (BABA-1 §5.6/§5.7): normal
+    /// decode, previous-frame repeat, or comfort-noise mute.
+    pub disposition: blip25_codec::FrameDisposition,
 }
 
 /// Errors that can surface from [`Vocoder`] operations. Wraps the
@@ -272,9 +236,8 @@ pub enum VocoderError {
         /// Number of bytes the caller passed.
         got: usize,
     },
-    /// Analysis encoder failure (HPF / pitch / refinement).
-    Analysis(AnalysisError),
-    /// Wire-quantize failure (e.g. predictor returned a non-finite value).
+    /// Wire-quantize failure during transcode (a rate grid rejected the
+    /// parameters, or the predictor returned a non-finite value).
     Quantize(String),
     /// Requested transcode direction is not supported. The pair of rates
     /// has no parameter-domain converter wired up.
@@ -283,6 +246,20 @@ pub enum VocoderError {
         from: Rate,
         /// Rate of the output FEC frame.
         to: Rate,
+    },
+    /// Soft-decision decode was requested on a rate with no FEC layer to
+    /// soft-decode (the no-FEC info-only rates).
+    SoftUnsupported {
+        /// The rate that has no FEC to soft-decode.
+        rate: Rate,
+    },
+    /// Soft-decision LLR slice was the wrong length. Always
+    /// [`Rate::soft_frame_bits`] for the rate.
+    WrongSoftLength {
+        /// Number of LLRs the rate expected.
+        expected: usize,
+        /// Number of LLRs the caller passed.
+        got: usize,
     },
 }
 
@@ -295,10 +272,18 @@ impl core::fmt::Display for VocoderError {
             VocoderError::WrongBitsLength { expected, got } => {
                 write!(f, "expected {expected} FEC bytes per frame, got {got}")
             }
-            VocoderError::Analysis(e) => write!(f, "analysis encoder error: {e:?}"),
             VocoderError::Quantize(msg) => write!(f, "quantize error: {msg}"),
             VocoderError::UnsupportedTranscode { from, to } => {
                 write!(f, "unsupported transcode direction: {from:?} -> {to:?}")
+            }
+            VocoderError::SoftUnsupported { rate } => {
+                write!(
+                    f,
+                    "soft-decision decode not supported for {rate:?} (no FEC layer to soft-decode)"
+                )
+            }
+            VocoderError::WrongSoftLength { expected, got } => {
+                write!(f, "expected {expected} soft LLRs per frame, got {got}")
             }
         }
     }
@@ -306,437 +291,113 @@ impl core::fmt::Display for VocoderError {
 
 impl std::error::Error for VocoderError {}
 
-/// Chip-shaped façade over the rate-specific encoder + decoder + synth
+/// Reference-shaped façade over the rate-specific encoder + decoder + synth
 /// pipelines.
 ///
 /// Owns all per-rate state internally (analysis, decoder, synth). One
 /// [`Vocoder`] is *both* encoder and decoder for a single channel
 /// direction; consumers running bidirectional voice typically allocate
-/// two — one each direction — to mirror the chip's per-direction
+/// two — one each direction — to mirror the reference's per-direction
 /// state isolation.
 ///
 /// State is not `Sync`; one channel = one thread. State is `Send`,
 /// so the channel can move between threads.
 pub struct Vocoder {
     rate: Rate,
-    analysis: AnalysisState,
-    imbe_dec: imbe7200::dequantize::DecoderState,
-    ambe_plus2_dec: rate33::dequantize::DecoderState,
-    synth: SynthState,
     last_stats: FrameStats,
-    tone_detection: bool,
-    ambe_plus2_synth: AmbePlus2Synth,
+    /// Optional post-decode enhancement chain (biquad + compressor +
+    /// boundary fade). [`EnhancementMode::None`] by default (a strict
+    /// no-op), so the shipped path is byte/sample-identical to `blip25_codec`
+    /// direct. This is the one standalone DSP hook kept for the future
+    /// AGC / noise-removal audio chain; see [`crate::enhancement`].
     enhancement: EnhancementMode,
     enhancement_state: EnhancementState,
-    prev_disposition: Option<FrameDisposition>,
-    /// Opt-in pre-analysis denoiser front-end (§3.4 exceed lever). `None`
-    /// = disabled (default). Runs on the input PCM before encode; the
-    /// codec core is untouched.
-    denoise: Option<PreDenoise>,
-    /// Opt-in mains-hum notch front-end (60/120 Hz). `None` = disabled
-    /// (default). Runs on the input PCM *before* the denoiser and the codec.
-    hum_notch: Option<HumNotch>,
+    /// Disposition of the PREVIOUS decoded frame, so the enhancement chain's
+    /// boundary fade can arm on a `Repeat`/`Mute` -> `Use` transition. Tracked
+    /// here rather than read from `last_stats` because `last_stats` has already
+    /// been overwritten with the current frame by the time `apply` runs.
+    prev_disposition: FrameDisposition,
+    /// Stateful blip25_codec AMBE+2 decoder (r33/r34), carried across frames.
+    /// Present only for the two AMBE+2 rates.
+    w_ambe_dec: Option<blip25_codec::Decoder>,
+    /// Stateful blip25_codec IMBE decoder, carried across frames. Present only for
+    /// the two IMBE rates.
+    w_imbe_dec: Option<blip25_codec::ImbeDecoder>,
+    /// Stateful blip25_codec encoder (shared analysis front end; AMBE+2 via
+    /// `encode_frame_r33/r34`, IMBE via `encode_imbe_frame`). Carried across
+    /// frames for the one-frame-look-ahead streaming contract.
+    #[cfg(feature = "encode")]
+    w_enc: Option<blip25_codec::enc::Encoder>,
+    /// One-frame-look-ahead FIFO for the blip25_codec encoder: the console codec
+    /// emits frame *f−1*'s bits when fed frame *f* (`None` on the very first
+    /// call). We buffer emissions here and hand back one frame per
+    /// [`Self::encode_pcm`] call, draining the tail via
+    /// [`Self::flush_encode`]. See that method's docs for the exact contract.
+    #[cfg(feature = "encode")]
+    w_enc_queue: std::collections::VecDeque<Vec<u8>>,
+    /// Whether [`Self::encode`] detects Annex-T tones (Knox / DTMF / call-progress
+    /// / alert) and emits tone frames instead of voice analysis. **OFF by
+    /// default** — the reference console encoder does not tone-detect (DTMF is
+    /// signaled out-of-band), so speaker-ready output matches it with detection
+    /// off. Opt in via [`Self::set_tone_detection`] for the rare FNE case that
+    /// needs vocoder tone frames. Half-rate AMBE+2 only.
+    #[cfg(feature = "encode")]
+    tone_detection: bool,
 }
 
 impl Vocoder {
     /// Open a new channel at the given rate, all state cold.
     ///
-    /// The unvoiced noise generator is selected per-rate: IMBE full-rate
-    /// uses the BABA-A §1.12.1 spec LCG (171/11213/53125, seed 3147)
-    /// because the DVSI chip's full-rate path matches that recurrence;
-    /// AMBE+2 half-rate uses the chip-empirical LCG (173/13849/65536,
-    /// seed 60584) — see gap report 0025. Probe 1 confirmed 0.945
-    /// sample-level correlation against the live chip on the half-rate
-    /// path.
+    /// Encode and decode route through the [`blip25_codec`] engine for all
+    /// four rates.
     pub fn new(rate: Rate) -> Self {
-        let noise_gen = match rate {
-            Rate::Imbe7200x4400 | Rate::Imbe4400x4400 => UnvoicedNoiseGen::SpecLcg,
-            Rate::AmbePlus2_3600x2450 | Rate::AmbePlus2_2450x2450 => UnvoicedNoiseGen::ChipLcg,
-        };
         Self {
             rate,
-            analysis: Self::production_analysis_state(rate),
-            imbe_dec: imbe7200::dequantize::DecoderState::new(),
-            ambe_plus2_dec: rate33::dequantize::DecoderState::new(),
-            synth: SynthState::with_unvoiced_gen(noise_gen),
             last_stats: FrameStats::default(),
-            tone_detection: false,
-            ambe_plus2_synth: AmbePlus2Synth::AmbePlus,
-            // Enhancement: Classical-by-default since 2026-05-14. The
-            // HPF + presence + boundary-fade chain in
-            // `ClassicalConfig::default()` carries a free +0.03 to
-            // +0.09 PESQ across the 5-vector matrix; spec-faithful
-            // PCM is one `.set_enhancement(EnhancementMode::None)`
-            // call away.
-            enhancement: EnhancementMode::Classical(crate::enhancement::ClassicalConfig::default()),
+            // Enhancement: NONE by default. The shipped decode path IS the
+            // reference console codec; layering a post-filter would make the
+            // output diverge from `blip25_codec` direct. Opt in via set_enhancement.
+            enhancement: EnhancementMode::None,
             enhancement_state: EnhancementState::default(),
-            prev_disposition: None,
-            denoise: None,
-            hum_notch: None,
+            prev_disposition: FrameDisposition::Use,
+            w_ambe_dec: match rate {
+                Rate::AmbePlus2_3600x2450 | Rate::AmbePlus2_2450x2450 => {
+                    Some(blip25_codec::Decoder::new())
+                }
+                _ => None,
+            },
+            w_imbe_dec: match rate {
+                Rate::Imbe7200x4400 | Rate::Imbe4400x4400 => Some(blip25_codec::ImbeDecoder::new()),
+                _ => None,
+            },
+            #[cfg(feature = "encode")]
+            w_enc: Some(blip25_codec::enc::Encoder::new()),
+            #[cfg(feature = "encode")]
+            w_enc_queue: std::collections::VecDeque::new(),
+            #[cfg(feature = "encode")]
+            tone_detection: false,
         }
     }
 
-    /// Build the production analysis state: spec-faithful
-    /// [`AnalysisState::new()`] **plus** the chip-validated encode-quality
-    /// stack (2026-06-13; `QUALITY_FINDINGS.md` §3.6). `AnalysisState::new()`
-    /// itself stays spec-faithful (the clean-room baseline + unit tests rely
-    /// on it); the tuned stack is applied at the production façade only.
-    /// +0.060 PESQ-nb in the ours→chip cell (clean +0.078, male `mark`
-    /// +0.122, female up to +0.172) and markedly better chip-tracking under
-    /// interference. Opt out per-lever via the `set_*` methods.
-    ///   - octave escape — general-DSP high-F0 guard (0 frames on normal
-    ///     speech; protects child voices / high tones).
-    ///   - parabolic sub-sample — finer §0.3 ω̂_0 (general DSP).
-    ///   - §0.4 refine OFF — emit the §0.3 estimate; our E_R search walks
-    ///     pitch on the left-clipped §0.5 window (mitigation).
-    ///   - M(ξ) Θ grade — hard-bounded (≤2.25×, cannot mute) voicing
-    ///     relaxation on confident-loud frames (chip-observed).
-    ///
-    /// **AMBE+2 only.** The stack was chip-validated on the half-rate
-    /// (AMBE+2) path — the sole chip-orackable codec; there is no IMBE
-    /// chip oracle (`reference_chip_is_ambe_plus_2_only`). Full-rate IMBE
-    /// stays bit-for-bit spec-faithful (`refine-off` would be a silent
-    /// no-op there anyway — `encode_with_trace` doesn't read it), so the
-    /// façade's reported config matches what actually executes.
-    fn production_analysis_state(rate: Rate) -> AnalysisState {
-        let mut analysis = AnalysisState::new();
-        if matches!(rate, Rate::AmbePlus2_3600x2450 | Rate::AmbePlus2_2450x2450) {
-            analysis.set_pitch_decide_escape(true);
-            analysis.set_pitch_subsample(true);
-            analysis.set_pitch_refine(false);
-            analysis.set_vuv_mxi_grade(true);
-        }
-        analysis
+    /// Enable or disable encode-side Annex-T tone detection (**default OFF**).
+    /// When on, [`Self::encode`] (AMBE+2 r33) detects clean single/dual tones —
+    /// Knox, DTMF, call-progress, alert — in the input and emits the matching
+    /// byte-exact tone frame instead of running voice analysis on it. OFF by
+    /// default because the reference console encoder does not tone-detect (DTMF is
+    /// carried out-of-band), so speaker-ready output matches it with detection
+    /// off; enable it only for the rare FNE deployment that must carry vocoder
+    /// tone frames. Persistent across [`Self::reset`].
+    #[cfg(feature = "encode")]
+    pub fn set_tone_detection(&mut self, enable: bool) {
+        self.tone_detection = enable;
     }
 
-    /// Configure which half-rate synth flavor [`Self::decode_bits`] +
-    /// [`Self::synthesize_params`] use on Phase 2 / AMBE+2 input.
-    /// No-op for full-rate (which always uses the BABA-A §1.12
-    /// baseline IMBE synth). Default [`AmbePlus2Synth::AmbePlus`].
-    pub fn set_ambe_plus2_synth(&mut self, gen: AmbePlus2Synth) {
-        self.ambe_plus2_synth = gen;
-    }
-
-    /// Currently configured half-rate synth flavor.
+    /// Whether encode-side tone detection is enabled (see
+    /// [`Self::set_tone_detection`]).
     #[inline]
-    pub fn ambe_plus2_synth(&self) -> AmbePlus2Synth {
-        self.ambe_plus2_synth
-    }
-
-    /// Enable encode-side Annex T tone detection. Each PCM frame is
-    /// inspected for a clean single-frequency tone or DTMF / Knox
-    /// pair matching an Annex T entry; on a hit the detection result
-    /// is surfaced via [`AnalysisStats::tone_detect`]. Default off.
-    ///
-    /// Wire behavior is rate-dependent:
-    ///
-    /// - **Half-rate (AMBE+2 Phase 2):** on a hit, the channel emits
-    ///   an Annex T tone frame instead of running the voice analysis
-    ///   pipeline; [`AnalysisStats::output`] is `Tone { id, amplitude }`
-    ///   and [`AnalysisStats::tone_detect`] mirrors the same values.
-    /// - **Full-rate (IMBE Phase 1):** the wire frame remains a
-    ///   regular voice / silence frame because P25 Phase 1 has no
-    ///   tone-frame opcode at the codec layer (BABA-A; spec-author
-    ///   confirmation 2026-04-30). [`AnalysisStats::tone_detect`] is
-    ///   still populated so application-layer consumers can route
-    ///   `(I_D, A_D)` to LCW, paging, or other out-of-band signaling
-    ///   per BABA-A `§5.4`.
-    ///
-    /// Spec context: BABA-A `§2.10` defines the tone-frame *payload*
-    /// (Annex T table + signature bits) but the spec leaves "is this
-    /// a tone?" to the implementer (per `§0.0.1` of the impl spec).
-    /// This is a DSP design choice, not a P25-IP question.
-    pub fn set_tone_detection(&mut self, enabled: bool) {
-        self.tone_detection = enabled;
-    }
-
-    /// Whether encode-side tone detection is currently enabled.
-    #[inline]
+    #[cfg(feature = "encode")]
     pub fn tone_detection(&self) -> bool {
         self.tone_detection
-    }
-
-    /// Configure the beyond-spec consecutive-repeat reset threshold
-    /// on the synth side. After `n` consecutive Repeat/Mute frames,
-    /// substitution falls back to a default-fundamental + amps=1.0
-    /// frame instead of replaying the prior `last_good`. `None`
-    /// (default) is the spec-faithful path per gap 0022 resolution.
-    /// JMBE / SDRTrunk use `Some(3)` for chip-stream interop quality.
-    pub fn set_repeat_reset_after(&mut self, n: Option<u32>) {
-        self.synth.set_repeat_reset_after(n);
-    }
-
-    /// Current consecutive-repeat reset threshold (`None` = disabled,
-    /// spec-faithful).
-    #[inline]
-    pub fn repeat_reset_after(&self) -> Option<u32> {
-        self.synth.repeat_reset_after()
-    }
-
-    /// Enable JMBE-style error-rate freeze on Repeat (beyond-spec; gap
-    /// 0021). When enabled, frames whose disposition is `Repeat` do
-    /// not advance `ε_R`; the previous frame's value is carried
-    /// forward. This mirrors JMBE's
-    /// `IMBEModelParameters.copy()` calling
-    /// `setErrorRate(previous.getErrorRate())` and prevents runs of
-    /// high-error chip-encoded frames from driving `ε_R` past the
-    /// 0.0875 Mute threshold. Default `false` is the spec-faithful
-    /// path. Enable for decoding chip-encoded P25 air traffic; leave
-    /// off for our-encoder → our-decoder loops and spec-conformance
-    /// testing.
-    pub fn set_chip_compat(&mut self, on: bool) {
-        self.synth.set_chip_compat(on);
-    }
-
-    /// Current chip-compat (error-rate freeze on Repeat) setting.
-    #[inline]
-    pub fn chip_compat(&self) -> bool {
-        self.synth.chip_compat()
-    }
-
-    /// Force the beyond-spec spectral-discontinuity clamp on (gap 0026)
-    /// independently of [`Self::set_chip_compat`]. Most consumers
-    /// should leave this off — the umbrella `chip_compat` flag already
-    /// auto-enables the clamp alongside the gap-0021 ε_R freeze.
-    /// This standalone toggle exists for the narrow case of wanting
-    /// the clamp without the ε_R freeze. With either flag enabled,
-    /// frames whose harmonic count `L` jumps by more than 5 from the
-    /// previous frame (up-jumps only) **or** whose `err.epsilon_0 ≥ 2`
-    /// have their post-smoothing amplitudes scaled by 0.73 for one
-    /// frame. Mirrors observed DVSI AMBE-3000R behavior on pitch/L
-    /// jumps and Repeat frames; reduces audible "scratch" on noisy
-    /// Phase 2 traffic where Golay-corrected frames decode to
-    /// spectrally-distant params from their neighbors. Default
-    /// `false` keeps the spec-faithful path.
-    pub fn set_chip_compat_spectral_clamp(&mut self, on: bool) {
-        self.synth.set_chip_compat_spectral_clamp(on);
-    }
-
-    /// Current standalone spectral-discontinuity clamp setting.
-    /// Note: the clamp also fires whenever [`Self::chip_compat`] is
-    /// `true`, regardless of this setting.
-    #[inline]
-    pub fn chip_compat_spectral_clamp(&self) -> bool {
-        self.synth.chip_compat_spectral_clamp()
-    }
-
-    /// Enable the §0.8.4 silence-dispatch path on the analysis encoder.
-    /// When on, frames whose energy clears the silence detector's
-    /// hysteresis emit `AnalysisOutput::Silence` (rate-appropriate
-    /// silence params) instead of running the full pitch / V-UV /
-    /// amplitude pipeline. Default off — pass-through per addendum
-    /// §0.8.8 recommendation.
-    pub fn set_silence_dispatch(&mut self, on: bool) {
-        self.analysis.set_silence_detection(on);
-    }
-
-    /// Whether silence dispatch is currently enabled.
-    #[inline]
-    pub fn silence_dispatch(&self) -> bool {
-        self.analysis.silence_detection_enabled()
-    }
-
-    /// Enable the joint-signal silence override — dispatches
-    /// pitch-unreliable low-energy frames as silence even if they
-    /// don't reach the §0.8.4 hysteresis threshold. Requires
-    /// [`Self::set_silence_dispatch`] also be on. Default off.
-    pub fn set_pitch_silence_override(&mut self, on: bool) {
-        self.analysis.set_pitch_silence_override(on);
-    }
-
-    /// Whether the joint-signal silence override is currently enabled.
-    #[inline]
-    pub fn pitch_silence_override(&self) -> bool {
-        self.analysis.pitch_silence_override_enabled()
-    }
-
-    /// Enable or disable the onset-attack mitigation. On near-silent
-    /// frames the encoder commits a short default pitch
-    /// (≈ 25 samples / ~320 Hz) to its look-back history instead of
-    /// the phantom long-period autocorrelation peak that quiet input
-    /// otherwise produces. The silent frame still encodes through the
-    /// full voice pipeline; only the next frame's `look_back`
-    /// continuity window is affected. Targets the 2-frame onset attack
-    /// at silence→loud transitions documented in
-    /// `project_onset_attack_2frame_2026-04-25.md`. Default off — eval
-    /// via the 5-vector PESQ harness before enabling in production.
-    pub fn set_default_pitch_on_silence(&mut self, on: bool) {
-        self.analysis.set_default_pitch_on_silence(on);
-    }
-
-    /// Whether the onset-attack mitigation is currently enabled.
-    #[inline]
-    pub fn default_pitch_on_silence(&self) -> bool {
-        self.analysis.default_pitch_on_silence_enabled()
-    }
-
-    /// Enable or disable the PYIN pitch frontend. When on, the analysis
-    /// encoder uses [`crate::codecs::mbe_baseline::analysis::run_pyin`]
-    /// for `(p_hat_i, e_p_hat_i)` instead of the §0.3 look-back /
-    /// look-ahead tracker (Eq. 5–23). PYIN is post-2002 DSP outside
-    /// BABA-A's clean-room scope; landed for A/B PESQ evaluation. The
-    /// §0.3 path remains the default and the spec-faithful baseline.
-    pub fn set_pyin_pitch(&mut self, on: bool) {
-        self.analysis.set_pyin_pitch(on);
-    }
-
-    /// Whether the PYIN pitch frontend is currently enabled.
-    #[inline]
-    pub fn pyin_pitch(&self) -> bool {
-        self.analysis.pyin_pitch_enabled()
-    }
-
-    /// Enable or disable input-side spectral subtraction (Boll 1979)
-    /// applied to `signal_spectrum` output before §0.5 amplitude
-    /// estimation. Per-bin running noise PSD is updated on
-    /// silence-flagged frames; voiced frames hold. Off by default —
-    /// targets noisy-tone inputs (memo
-    /// `project_amp_noise_sensitivity_2026-04-24`).
-    pub fn set_spectral_subtraction(&mut self, on: bool) {
-        self.analysis.set_spectral_subtraction(on);
-    }
-
-    /// Whether spectral subtraction is currently enabled.
-    #[inline]
-    pub fn spectral_subtraction(&self) -> bool {
-        self.analysis.spectral_subtraction_enabled()
-    }
-
-    /// Enable/disable the §3.4 pre-analysis denoiser front-end (opt-in,
-    /// default OFF). A separable general-DSP STFT/log-MMSE stage on the
-    /// input PCM ahead of the codec; transparent on clean speech, exceeds
-    /// the (NS-free) chip on noisy field audio. Enabling constructs a
-    /// fresh [`PreDenoise`]; disabling drops it.
-    pub fn set_denoise(&mut self, on: bool) {
-        self.denoise = if on {
-            Some(PreDenoise::new(DenoiseKind::LogMmse))
-        } else {
-            None
-        };
-    }
-
-    /// Select the denoiser gain rule (`LogMmse` default / `Wiener` /
-    /// `SpecSub`) and enable it. For A/B sweeps.
-    pub fn set_denoise_kind(&mut self, kind: DenoiseKind) {
-        self.denoise = Some(PreDenoise::new(kind));
-    }
-
-    /// Whether the pre-analysis denoiser front-end is enabled.
-    #[inline]
-    pub fn denoise(&self) -> bool {
-        self.denoise.is_some()
-    }
-
-    /// Enable/disable the mains-hum notch front-end (opt-in, default OFF).
-    /// `true` installs a 60/120 Hz (US) notch; use [`Self::set_hum_notch_mains`]
-    /// for 50/100 Hz (EU). Runs before the denoiser and the codec; surgically
-    /// nulls the mains line that otherwise pulls the §0.3 pitch tracker.
-    pub fn set_hum_notch(&mut self, on: bool) {
-        self.hum_notch = on.then(HumNotch::new_60_120);
-    }
-
-    /// Enable the hum notch at a specific mains fundamental (e.g. 50.0 for
-    /// EU); also nulls `2·mains_hz`.
-    pub fn set_hum_notch_mains(&mut self, mains_hz: f64) {
-        self.hum_notch = Some(HumNotch::new(mains_hz));
-    }
-
-    /// Whether the mains-hum notch is enabled.
-    #[inline]
-    pub fn hum_notch(&self) -> bool {
-        self.hum_notch.is_some()
-    }
-
-    /// Set the §0.5 amplitude EMA weight `α`. `0.0` disables the
-    /// smoother (default); `(0.0, 1.0]` enables
-    /// `M̂_l(t) = α · M̂_l + (1−α) · M̂_l(t−1)` per harmonic, gated by
-    /// pitch similarity. Targets the noisy-tone amp jitter described
-    /// in `project_amp_noise_sensitivity_2026-04-24`. Outside BABA-A
-    /// clean-room scope (general-DSP magnitude smoothing).
-    pub fn set_amp_ema_alpha(&mut self, alpha: f64) {
-        self.analysis.set_amp_ema_alpha(alpha);
-    }
-
-    // ---- Encode-quality stack (QUALITY_FINDINGS.md §3.6) -----------------
-    // Defaulted ON in `Vocoder::new()`/`reset()` for AMBE+2 production;
-    // each is individually opt-out here. `AnalysisState::new()` stays spec.
-
-    /// Sub-harmonic octave escape in the §0.3 pitch decision (default ON).
-    pub fn set_pitch_decide_escape(&mut self, on: bool) {
-        self.analysis.set_pitch_decide_escape(on);
-    }
-
-    /// Parabolic sub-sample refinement of the §0.3 `E(P)` minimum
-    /// (default ON).
-    pub fn set_pitch_subsample(&mut self, on: bool) {
-        self.analysis.set_pitch_subsample(on);
-    }
-
-    /// §0.4 `E_R` quarter-sample refinement: `true` runs it (spec),
-    /// `false` emits the raw §0.3 estimate. Default `false` (the stack).
-    pub fn set_pitch_refine(&mut self, on: bool) {
-        self.analysis.set_pitch_refine(on);
-    }
-
-    /// Fractional §0.5 band-edge coverage weighting (default OFF; opt-in
-    /// loudness/shape lever).
-    pub fn set_amp_frac_band_edges(&mut self, on: bool) {
-        self.analysis.set_amp_frac_band_edges(on);
-    }
-
-    /// Flat +0.9 dB chip-measured level normalization (default OFF; opt-in
-    /// loudness-parity lever, AMBE+2 only).
-    pub fn set_level_scale(&mut self, on: bool) {
-        self.analysis.set_level_scale(on);
-    }
-
-    /// Silence shape-zeroing on silent analysis windows (default OFF).
-    pub fn set_silence_shape_zero(&mut self, on: bool) {
-        self.analysis.set_silence_shape_zero(on);
-    }
-
-    /// Eq. 37 V/UV pitch/band Θ rolloff coefficient (default spec 0.3096;
-    /// 0.0 = chip-observed no-rolloff).
-    pub fn set_vuv_pitch_coef(&mut self, c: f64) {
-        self.analysis.set_vuv_pitch_coef(c);
-    }
-
-    /// Hard-bounded M(ξ) loudness-graded Θ relaxation on confident-loud
-    /// frames (default ON in the stack; cannot mute).
-    pub fn set_vuv_mxi_grade(&mut self, on: bool) {
-        self.analysis.set_vuv_mxi_grade(on);
-    }
-
-    /// Whether the §0.3 octave escape is enabled.
-    #[inline]
-    pub fn pitch_decide_escape(&self) -> bool {
-        self.analysis.pitch_decide_escape()
-    }
-
-    /// Whether parabolic sub-sample pitch refinement is enabled.
-    #[inline]
-    pub fn pitch_subsample(&self) -> bool {
-        self.analysis.pitch_subsample()
-    }
-
-    /// Whether the §0.4 `E_R` pitch refinement is enabled (spec) vs
-    /// bypassed.
-    #[inline]
-    pub fn pitch_refine_enabled(&self) -> bool {
-        self.analysis.pitch_refine_enabled()
-    }
-
-    /// Whether the hard-bounded M(ξ) Θ relaxation is enabled.
-    #[inline]
-    pub fn vuv_mxi_grade_enabled(&self) -> bool {
-        self.analysis.vuv_mxi_grade_enabled()
-    }
-
-    /// Current §0.5 amplitude EMA weight; `0.0` means the smoother is
-    /// off.
-    #[inline]
-    pub fn amp_ema_alpha(&self) -> f64 {
-        self.analysis.amp_ema_alpha()
     }
 
     /// Configure the post-decoder enhancement chain. Off by default
@@ -769,7 +430,7 @@ impl Vocoder {
 
     /// The rate this channel was constructed at. Cannot change for
     /// the lifetime of the channel; build a new [`Vocoder`] to switch
-    /// rates (mirrors a chip's PKT_RATEP cycle).
+    /// rates (mirrors a reference's PKT_RATEP cycle).
     #[inline]
     pub fn rate(&self) -> Rate {
         self.rate
@@ -795,47 +456,45 @@ impl Vocoder {
         &self.last_stats
     }
 
-    /// Disposition (`Use` / `Repeat` / `Mute`) of the most recent
-    /// [`Self::decode_bits`] call's synthesizer pass. `None` until at
-    /// least one frame has been decoded. Reset by [`Self::reset`].
-    ///
-    /// Decode-side only; encode-side has no synth and always returns
-    /// `None`.
-    #[inline]
-    pub fn last_disposition(&self) -> Option<FrameDisposition> {
-        self.synth.last_disposition()
-    }
-
-    /// Reset all channel state. Equivalent to the chip's PKT_RATEP
-    /// re-send: clears predictor history, decoder predictor state,
-    /// synth substates, smoothed error rate, last-stats. Rate and
-    /// configuration knobs (tone detection) stay the same.
+    /// Reset all channel state — the reference PKT_RATEP re-send equivalent.
+    /// Rebuilds the blip25_codec decoders/encoder from cold, clears the look-ahead
+    /// FIFO and last-frame stats. The configured enhancement mode is preserved
+    /// (configuration, not channel state).
     pub fn reset(&mut self) {
-        // Restore the production stack (matches `Vocoder::new`), not the
-        // bare spec `AnalysisState::new()`, so a reset doesn't silently
-        // disable the encode-quality levers. Rate-gated to AMBE+2.
-        self.analysis = Self::production_analysis_state(self.rate);
-        self.imbe_dec = imbe7200::dequantize::DecoderState::new();
-        self.ambe_plus2_dec = rate33::dequantize::DecoderState::new();
-        self.synth = SynthState::new();
         self.last_stats = FrameStats::default();
         self.enhancement_state = EnhancementState::default();
-        self.prev_disposition = None;
-        // Denoiser + hum notch: clear streaming/filter state but keep them
-        // enabled (config, like tone_detection/enhancement).
-        if let Some(d) = self.denoise.as_mut() {
-            d.reset();
+        self.prev_disposition = FrameDisposition::Use;
+        self.w_ambe_dec = match self.rate {
+            Rate::AmbePlus2_3600x2450 | Rate::AmbePlus2_2450x2450 => {
+                Some(blip25_codec::Decoder::new())
+            }
+            _ => None,
+        };
+        self.w_imbe_dec = match self.rate {
+            Rate::Imbe7200x4400 | Rate::Imbe4400x4400 => Some(blip25_codec::ImbeDecoder::new()),
+            _ => None,
+        };
+        #[cfg(feature = "encode")]
+        {
+            self.w_enc = Some(blip25_codec::enc::Encoder::new());
+            self.w_enc_queue.clear();
         }
-        if let Some(h) = self.hum_notch.as_mut() {
-            h.reset();
-        }
-        // tone_detection / enhancement: preserved (config, not state)
     }
 
-    /// Encode one PCM frame into FEC-encoded bytes.
+    /// Encode one PCM frame into FEC-encoded bytes through the vendored
+    /// [`blip25_codec`] reference codec.
     ///
-    /// `pcm` must be exactly [`Self::frame_samples`] samples (160).
-    /// Returns exactly [`Self::fec_frame_bytes`] bytes.
+    /// `pcm` must be exactly [`Self::frame_samples`] samples (160). The console
+    /// codec has a one-frame analysis look-ahead, so the FIRST returned frame is
+    /// an all-zero placeholder (real frame 0 lands on the next call) and the
+    /// final frame stays buffered until [`Self::flush_encode`] drains it.
+    ///
+    /// This does **not** emit the same bits as [`Self::encode`] at any rate: the
+    /// reference pitch (`b0`) is injected only on the whole-buffer path, and on both
+    /// AMBE+2 rates that path additionally swaps in the tracked `b1` voicing,
+    /// clamps the gain on silent frames, and overlays Annex-T tone frames —
+    /// none of which happen here.
+    #[cfg(feature = "encode")]
     pub fn encode_pcm(&mut self, pcm: &[i16]) -> Result<Vec<u8>, VocoderError> {
         if pcm.len() != self.frame_samples() {
             return Err(VocoderError::WrongPcmLength {
@@ -843,40 +502,410 @@ impl Vocoder {
                 got: pcm.len(),
             });
         }
-        // §3.4 pre-analysis front-ends (opt-in, default off): mains-hum
-        // notch FIRST (null the 60/120 Hz line that pulls §0.3 pitch), then
-        // the broadband denoiser. Both are separable general-DSP stages on
-        // the input PCM, ahead of the codec core.
-        let notched: Vec<i16>;
-        let pcm: &[i16] = match self.hum_notch.as_mut() {
-            Some(h) => {
-                notched = h.process_frame(pcm);
-                &notched
+        let frame: &[i16; FRAME_SAMPLES] = pcm.try_into().expect("length already validated");
+        let enc = self.w_enc.as_mut().expect("blip25_codec encoder present");
+        let emitted: Option<Vec<u8>> = match self.rate {
+            Rate::AmbePlus2_3600x2450 => enc.encode_frame_r33(frame).map(|b| b.to_vec()),
+            Rate::AmbePlus2_2450x2450 => enc.encode_frame_r34(frame).map(|b| b.to_vec()),
+            Rate::Imbe7200x4400 => enc.encode_imbe_frame(frame).map(|b| b.to_vec()),
+            Rate::Imbe4400x4400 => enc
+                .encode_imbe_frame(frame)
+                .map(|b| imbe_fec_to_info_bytes(&b).to_vec()),
+        };
+        if let Some(b) = emitted {
+            self.w_enc_queue.push_back(b);
+        }
+        let bytes = self
+            .w_enc_queue
+            .pop_front()
+            .unwrap_or_else(|| vec![0u8; self.rate.fec_frame_bytes()]);
+        let params = match self.rate {
+            Rate::Imbe7200x4400 | Rate::Imbe4400x4400 => MbeParams::silence(),
+            Rate::AmbePlus2_3600x2450 | Rate::AmbePlus2_2450x2450 => {
+                MbeParams::silence_ambe_plus2()
             }
-            None => pcm,
         };
-        let denoised: Vec<i16>;
-        let pcm: &[i16] = match self.denoise.as_mut() {
-            Some(d) => {
-                denoised = d.process_frame(pcm);
-                &denoised
-            }
-            None => pcm,
-        };
-        let (bytes, stats) = match self.rate {
-            Rate::Imbe7200x4400 => imbe_pipeline::encode(pcm, self, true)?,
-            Rate::Imbe4400x4400 => imbe_pipeline::encode(pcm, self, false)?,
-            Rate::AmbePlus2_3600x2450 => ambe_plus2_pipeline::encode(pcm, self, true)?,
-            Rate::AmbePlus2_2450x2450 => ambe_plus2_pipeline::encode(pcm, self, false)?,
-        };
-        self.last_stats.analysis = Some(stats);
+        self.last_stats.analysis = Some(AnalysisStats {
+            output: AnalysisOutputKind::Voice,
+            params,
+        });
         Ok(bytes)
     }
 
-    /// Decode one FEC-encoded frame into PCM samples.
+    /// Drain the blip25_codec encoder's remaining look-ahead frame(s) at end-of-stream.
+    /// Byte-identical to `blip25_codec::enc::Encoder::flush_r33` / `flush_r34` /
+    /// `flush_imbe` on the same frame history.
+    #[cfg(feature = "encode")]
+    pub fn flush_encode(&mut self) -> Vec<Vec<u8>> {
+        let mut out: Vec<Vec<u8>> = Vec::new();
+        if let Some(enc) = self.w_enc.as_mut() {
+            match self.rate {
+                Rate::AmbePlus2_3600x2450 => {
+                    for b in enc.flush_r33() {
+                        self.w_enc_queue.push_back(b.to_vec());
+                    }
+                }
+                Rate::AmbePlus2_2450x2450 => {
+                    for b in enc.flush_r34() {
+                        self.w_enc_queue.push_back(b.to_vec());
+                    }
+                }
+                Rate::Imbe7200x4400 => {
+                    for b in enc.flush_imbe() {
+                        self.w_enc_queue.push_back(b.to_vec());
+                    }
+                }
+                Rate::Imbe4400x4400 => {
+                    for b in enc.flush_imbe() {
+                        self.w_enc_queue
+                            .push_back(imbe_fec_to_info_bytes(&b).to_vec());
+                    }
+                }
+            }
+        }
+        while let Some(b) = self.w_enc_queue.pop_front() {
+            out.push(b);
+        }
+        out
+    }
+
+    /// Encode a whole PCM buffer to FEC frames — **the one encode path: PCM in,
+    /// bits out, no options.** Applies the best available quality for the
+    /// configured [`Rate`] automatically:
     ///
-    /// `bits` must be exactly [`Self::fec_frame_bytes`] bytes.
-    /// Returns exactly [`Self::frame_samples`] PCM samples.
+    /// * **AMBE+2 (r33):** reverse-engineered reference voicing (`b1_track`,
+    ///   byte-identical to the reference encoder) + a silence gate, so fricatives
+    ///   don't buzz and inter-word silence stays quiet.
+    /// * **Other rates:** the per-frame encode, look-ahead aligned.
+    ///
+    /// `pcm` may be any length; returns one FEC frame per 20 ms. This is the
+    /// method a caller should use; [`Self::encode_pcm`] is the low-level
+    /// per-frame primitive it is built on. The two emit different bits at every
+    /// rate: reference pitch (`b0`) is injected only here, and on both AMBE+2 rates
+    /// so are the tracked `b1` voicing swap, the silent-frame gain clamp, and
+    /// the Annex-T tone overlay.
+    #[cfg(feature = "encode")]
+    pub fn encode(&self, pcm: &[i16]) -> Vec<Vec<u8>> {
+        match self.rate {
+            // Both AMBE+2 rates carry the SAME 49 info bits and go through the
+            // SAME reference-voicing analysis; r33 packs with FEC, r34 without.
+            // (r34 is the primary path: encode → encrypt → FEC externally.)
+            Rate::AmbePlus2_3600x2450 => self.encode_ambe2_reference_voicing(pcm, true),
+            Rate::AmbePlus2_2450x2450 => self.encode_ambe2_reference_voicing(pcm, false),
+            _ => {
+                // Per-frame path for the other rates (look-ahead: drop the
+                // placeholder frames, flush the tail).
+                let mut enc = Vocoder::new(self.rate);
+                // Whole-buffer IMBE sources its amplitudes from the reference's
+                // fixed-point spectrum mechanism (bit-exact ported FFT feeding
+                // `band_decompress`, slot-1 exponent) via the LIVE `gap2_mid`
+                // window. The estimator's window leads pitch by one frame, so
+                // the two-frame analysis look-ahead (`set_live_gap2_amps`)
+                // delays the emit enough that `gap2_mid` is the frame-(f+1)
+                // window the mechanism needs. This is set only on this
+                // whole-buffer encoder; the streaming `encode_pcm`/`LiveEncoder`
+                // path keeps the one-frame look-ahead and the synthesized-DFT
+                // amplitude proxy, so its public look-ahead contract is
+                // unchanged. IMBE never calls the AMBE `analyze_frame`, so the
+                // flag's only effects here are the look-ahead depth and the
+                // mechanism amplitude source in `analyze_imbe_frame`.
+                let imbe = matches!(self.rate, Rate::Imbe7200x4400 | Rate::Imbe4400x4400);
+                if imbe {
+                    if let Some(e) = enc.w_enc.as_mut() {
+                        e.set_live_gap2_amps(true);
+                    }
+                }
+                // Reference pitch for IMBE — THE single pitch path (same RE'd
+                // spectral-DP pitch that fixed AMBE+2; owner-confirmed better).
+                {
+                    let reference_b0 = blip25_codec::enc::pcm_encode::encode_pcm_b0(
+                        pcm,
+                        blip25_codec::enc::pcm_encode::EncodeOpts::default(),
+                    );
+                    if !reference_b0.is_empty() {
+                        let nf = pcm.len() / FRAME_SAMPLES;
+                        // Silence gate: on low-energy frames the reference spectral-DP
+                        // pitch saturates to a spurious high b0, whereas reference
+                        // pins IMBE silence to a fixed default (b0=25). Detect
+                        // silence by per-frame source RMS and force the AMBE cell
+                        // that re-quantizes to that default; keep the reference pitch
+                        // (voiced-solved) everywhere else.
+                        let forced: Vec<u8> = (0..nf)
+                            .map(|f| {
+                                let chunk = &pcm[f * FRAME_SAMPLES..(f + 1) * FRAME_SAMPLES];
+                                let ss: f64 =
+                                    chunk.iter().map(|&x| (x as f64) * (x as f64)).sum();
+                                let rms = (ss / FRAME_SAMPLES as f64).sqrt();
+                                if rms < IMBE_SILENCE_RMS {
+                                    IMBE_SILENCE_B0
+                                } else {
+                                    reference_b0[(f + 2).min(reference_b0.len() - 1)]
+                                }
+                            })
+                            .collect();
+                        if let Some(e) = enc.w_enc.as_mut() {
+                            e.set_forced_b0(forced);
+                        }
+                    }
+                }
+                // Reference voicing for IMBE: the shared reverse-engineered `b1_track`
+                // metric (byte-identical to the reference encoder's voicing word),
+                // expanded per-harmonic inside `analyze_imbe_frame`. Replaces the
+                // float `decide_voicing_cfg` path, which over-voices fricative high
+                // bands. `b1_track` needs the r33 gap2/prefiltered analysis logs
+                // (IMBE analysis doesn't write them), so run one r33 pass purely to
+                // populate them, then align to the same (f+2) source-frame index as
+                // the forced reference pitch above.
+                if imbe {
+                    use blip25_codec::enc::b1_audio::{b1_track_from_logs, RingRefineMode};
+                    let nframes = (pcm.len() / FRAME_SAMPLES).saturating_sub(1);
+                    if nframes > 0 {
+                        let mut la = blip25_codec::enc::Encoder::new();
+                        for f in pcm.chunks_exact(FRAME_SAMPLES) {
+                            let a: &[i16; FRAME_SAMPLES] = f.try_into().expect("chunk is 160");
+                            let _ = la.encode_frame_r33(a);
+                        }
+                        let _ = la.flush_r33();
+                        let bt = b1_track_from_logs(
+                            la.gap2_mid_log(),
+                            la.gap2_slot1_log(),
+                            la.gap2_slot2_log(),
+                            la.prefiltered_log(),
+                            pcm,
+                            nframes,
+                            RingRefineMode::Off,
+                        );
+                        let b1w: Vec<u16> = bt.iter().map(|f| f.b1).collect();
+                        if !b1w.is_empty() {
+                            let n = pcm.len() / FRAME_SAMPLES;
+                            let forced_b1: Vec<u16> = (0..n)
+                                .map(|f| b1w[(f + 2).min(b1w.len() - 1)])
+                                .collect();
+                            if let Some(e) = enc.w_enc.as_mut() {
+                                e.set_forced_b1(forced_b1);
+                            }
+                        }
+                    }
+                }
+                let mut out: Vec<Vec<u8>> = Vec::new();
+                for f in pcm.chunks_exact(FRAME_SAMPLES) {
+                    if let Ok(b) = enc.encode_pcm(f) {
+                        out.push(b);
+                    }
+                }
+                // The IMBE encoder above runs the two-frame look-ahead
+                // (`set_live_gap2_amps`), so it fills with two leading all-zero
+                // placeholders; the one-frame look-ahead fills with one. Drop as
+                // many leading placeholders as the look-ahead depth so the output
+                // frame count equals the input.
+                let placeholders = if imbe { 2 } else { 1 };
+                for _ in 0..placeholders {
+                    if !out.is_empty() {
+                        out.remove(0);
+                    }
+                }
+                out.extend(enc.flush_encode());
+                out
+            }
+        }
+    }
+
+    /// AMBE+2 (r33) reference-voicing + silence-gate encode — the [`Self::encode`]
+    /// path for [`Rate::AmbePlus2_3600x2450`]. blip25's own amplitude/pitch with
+    /// the `b1` (voicing) byte from the reverse-engineered [`blip25_codec`] `b1_track`
+    /// (byte-identical to the reference encoder), plus a gain clamp on silent
+    /// frames. A/B-validated against the reference vectors (fricative buzz removed,
+    /// inter-word floor pulled down). Whole-clip (b1_track needs the stream).
+    #[cfg(feature = "encode")]
+    fn encode_ambe2_reference_voicing(&self, pcm: &[i16], with_fec: bool) -> Vec<Vec<u8>> {
+        use blip25_codec::enc::b1_audio::{b1_track_from_logs, RingRefineMode};
+        debug_assert!(
+            matches!(
+                self.rate,
+                Rate::AmbePlus2_3600x2450 | Rate::AmbePlus2_2450x2450
+            ),
+            "reference-voicing encode is AMBE+2 only"
+        );
+        // Hostile input class: sub-frame PCM (empty or < 160 samples) — zero full
+        // frames to analyze, and the b1_track log pipeline needs at least one; emit
+        // no frames (the same "one frame per full 20 ms" contract as chunks_exact).
+        if pcm.len() < FRAME_SAMPLES {
+            return Vec::new();
+        }
+        const R33: usize = 9;
+        let b1_of = |fr: &[u8]| {
+            blip25_codec::tables::deprioritize(&blip25_codec::frame::decode_bytes(fr).info)[1]
+        };
+
+        // 1. blip25's own per-frame amplitude/pitch frames (drop the look-ahead
+        //    placeholder, flush the tail) — same convention as `encode_pcm`.
+        //
+        // TWO-PASS (whole-buffer only). The reference's internal analysis window
+        // leads its pitch by one frame, so band_decompress must be fed emit
+        // frame f's amplitudes from the frame-(f+1) window to align the two.
+        // PASS 1 runs the normal encoder purely to populate `gap2_mid_log` (and
+        // the b1-track logs); PASS 2 replays it with a per-frame gap2 override
+        // set to `gap2_mid_log[f+1]` and the mechanism/reference-exact amplitude
+        // chain, and PASS 2's frames are the output. The streaming `AmbeStream`
+        // path CANNOT do this — it has no frame-(f+1) look-ahead — so it stays
+        // on the one-frame-skewed proxy until Route A (+20 ms look-ahead) is
+        // taken; see `AmbeStream` and the module note.
+        //
+        // Reference spectral-DP pitch — THE single pitch path (no pyin fallback:
+        // ear-validated to beat pyin decisively, killing the subharmonic
+        // "axe"/"ancient" distortion). Injected per analyze-frame f as
+        // reference_b0[f+2] (validated alignment). Uses the pitch-only chain
+        // (`encode_pcm_b0`), which skips the amplitude/VQ work — byte-identical
+        // b0 to a full reference encode at a fraction of the cost. The SAME forced_b0
+        // drives both passes, so b0 (and b1) are byte-identical to the one-pass
+        // encoder — only the amplitude/gain fields (b2..b8) move.
+        let forced_b0: Option<Vec<u8>> = {
+            let reference_b0 = blip25_codec::enc::pcm_encode::encode_pcm_b0(
+                pcm,
+                blip25_codec::enc::pcm_encode::EncodeOpts::default(),
+            );
+            if reference_b0.is_empty() {
+                None
+            } else {
+                let nf = pcm.len() / FRAME_SAMPLES;
+                Some(
+                    (0..nf)
+                        .map(|f| reference_b0[(f + 2).min(reference_b0.len() - 1)])
+                        .collect(),
+                )
+            }
+        };
+
+        // PASS 1: populate the analysis logs (discard the bits).
+        let mut e = blip25_codec::enc::Encoder::new();
+        if let Some(fb) = forced_b0.as_ref() {
+            e.set_forced_b0(fb.clone());
+        }
+        for f in pcm.chunks_exact(FRAME_SAMPLES) {
+            let a: &[i16; FRAME_SAMPLES] = f.try_into().expect("chunk is 160");
+            let _ = e.encode_frame_r33(a);
+        }
+        let _ = e.flush_r33();
+
+        // PASS 2: replay with Route A — the two-frame look-ahead makes the LIVE
+        // `gap2_mid` at each emit refer to the pitch-aligned (frame f+2) window,
+        // so a single forward pass yields the aligned mechanism amplitudes +
+        // reference-exact b2 with no per-frame override array. (Pass 1 above still
+        // runs at the one-frame look-ahead purely to populate the b1-track logs,
+        // which were fit to that timing.)
+        let mut e2 = blip25_codec::enc::Encoder::new();
+        if let Some(fb) = forced_b0.as_ref() {
+            e2.set_forced_b0(fb.clone());
+        }
+        e2.set_live_gap2_amps(true);
+        let mut frames: Vec<[u8; R33]> = Vec::new();
+        for f in pcm.chunks_exact(FRAME_SAMPLES) {
+            let a: &[i16; FRAME_SAMPLES] = f.try_into().expect("chunk is 160");
+            if let Some(b) = e2.encode_frame_r33(a) {
+                frames.push(b);
+            }
+        }
+        if !frames.is_empty() {
+            frames.remove(0);
+        }
+        frames.extend(e2.flush_r33());
+
+        // 2. Reference voicing per frame from the RE'd b1_track pipeline. Reuse
+        //    the analysis logs the real-bits pass above already produced
+        //    (`e` ran the full r34-equivalent analysis; r33/r34 share the
+        //    prefilter + gap-log writers and diverge only in bit-packing), so
+        //    the b1 chain does not re-run the encoder two more times.
+        let nframes = (pcm.len() / FRAME_SAMPLES).saturating_sub(1);
+        let bt = b1_track_from_logs(
+            e.gap2_mid_log(),
+            e.gap2_slot1_log(),
+            e.gap2_slot2_log(),
+            e.prefiltered_log(),
+            pcm,
+            nframes,
+            RingRefineMode::Off,
+        );
+        let orac_b1: Vec<u16> = bt.iter().map(|f| f.b1).collect();
+
+        // 3. Align blip25's stream to the b1_track index (the two use different
+        //    look-ahead conventions), then swap `b1` and repack the r33 frame.
+        let ours_b1: Vec<u16> = frames.iter().map(|f| b1_of(f)).collect();
+        let mismatch = |lag: i64| -> usize {
+            let mut m = 0;
+            for (i, &x) in ours_b1.iter().enumerate() {
+                let j = i as i64 + lag;
+                if j >= 0 && (j as usize) < orac_b1.len() && x != orac_b1[j as usize] {
+                    m += 1;
+                }
+            }
+            m
+        };
+        let lag = (-3..=3).min_by_key(|&l| mismatch(l)).unwrap_or(0);
+
+        // 4. Annex-T tone overlay. A streaming detector reproduces the reference's tone
+        //    vs voice decision (and 1-frame onset lag) per source frame; where
+        //    it fires, the frame is emitted as a byte-exact tone frame instead
+        //    of the voice bits. Output frame `i` corresponds to source frame
+        //    `i + 1` (the look-ahead drop), so the detection consumed for
+        //    output `i` is source frame `i + 1`.
+        let tones_enabled = self.tone_detection;
+        let mut det = blip25_codec::tone::ToneDetector::new();
+        let tone_of: Vec<Option<blip25_codec::tone::ToneFrameFields>> = pcm
+            .chunks_exact(FRAME_SAMPLES)
+            .map(|c| if tones_enabled { det.process(c) } else { None })
+            .collect();
+
+        frames
+            .iter()
+            .enumerate()
+            .map(|(i, f)| {
+                if let Some(t) = tone_of.get(i + 1).copied().flatten() {
+                    let r33 = Self::tone_frame_bytes(t.id, t.amplitude);
+                    return if with_fec {
+                        r33
+                    } else {
+                        let tb = blip25_codec::tables::deprioritize(
+                            &blip25_codec::frame::decode_bytes(&r33).info,
+                        );
+                        blip25_codec::enc::encode_frame::encode_r34(&tb).to_vec()
+                    };
+                }
+                let mut b =
+                    blip25_codec::tables::deprioritize(&blip25_codec::frame::decode_bytes(f).info);
+                let j = i as i64 + lag;
+                if j >= 0 && (j as usize) < orac_b1.len() {
+                    b[1] = orac_b1[j as usize];
+                }
+                // r33 packs with FEC, r34 (2450, the encrypt-then-FEC path) without.
+                if with_fec {
+                    blip25_codec::enc::encode_frame::encode_r33(&b).to_vec()
+                } else {
+                    blip25_codec::enc::encode_frame::encode_r34(&b).to_vec()
+                }
+            })
+            .collect()
+    }
+
+    /// Build the 9-byte r33 FEC frame for an Annex-T tone `(I_D, A_D)`. Produces
+    /// bytes byte-identical to the reference tone frames (verified across the tone
+    /// vectors): the prioritized info vectors carry the §2.10.1 signature and
+    /// Table 20 layout, FEC-encoded and packed to dibits/bytes.
+    fn tone_frame_bytes(id: u8, amplitude: u8) -> Vec<u8> {
+        let info = crate::rate33::dequantize::encode_tone_frame_info(id, amplitude);
+        let dibits = crate::rate33::frame::encode_frame(&info);
+        let mut out = vec![0u8; 9];
+        for (i, &d) in dibits.iter().enumerate() {
+            let (hi, lo) = ((d >> 1) & 1, d & 1);
+            out[(2 * i) / 8] |= hi << (7 - ((2 * i) % 8));
+            out[(2 * i + 1) / 8] |= lo << (7 - ((2 * i + 1) % 8));
+        }
+        out
+    }
+
+    /// Decode one FEC-encoded frame into PCM through the vendored [`blip25_codec`]
+    /// reference codec. `bits` must be exactly [`Self::fec_frame_bytes`] bytes;
+    /// returns exactly [`Self::frame_samples`] samples. Any configured
+    /// [`Self::set_enhancement`] post-filter is applied before returning.
     pub fn decode_bits(&mut self, bits: &[u8]) -> Result<Vec<i16>, VocoderError> {
         if bits.len() != self.fec_frame_bytes() {
             return Err(VocoderError::WrongBitsLength {
@@ -884,13 +913,10 @@ impl Vocoder {
                 got: bits.len(),
             });
         }
-        let (mut pcm, stats) = match self.rate {
-            Rate::Imbe7200x4400 => imbe_pipeline::decode(bits, self, true),
-            Rate::Imbe4400x4400 => imbe_pipeline::decode(bits, self, false),
-            Rate::AmbePlus2_3600x2450 => ambe_plus2_pipeline::decode(bits, self, true),
-            Rate::AmbePlus2_2450x2450 => ambe_plus2_pipeline::decode(bits, self, false),
-        };
-        let prev_was_use = matches!(self.prev_disposition, Some(FrameDisposition::Use));
+        let (mut pcm, stats) = self.decode_via_codec(bits);
+        // The fade arms on the first `Use` frame AFTER a `Repeat`/`Mute`, so it
+        // is keyed on the previous frame's disposition, not this one's.
+        let prev_was_use = self.prev_disposition == FrameDisposition::Use;
         enhancement::apply(
             &self.enhancement,
             &mut self.enhancement_state,
@@ -901,6 +927,141 @@ impl Vocoder {
         self.prev_disposition = stats.disposition;
         self.last_stats.decode = Some(stats);
         Ok(pcm)
+    }
+
+    /// Number of soft-decision LLRs [`Self::decode_soft`] expects per frame,
+    /// or `None` for the no-FEC rates (no FEC layer to soft-decode).
+    #[inline]
+    pub fn soft_frame_bits(&self) -> Option<usize> {
+        self.rate.soft_frame_bits()
+    }
+
+    /// Decode one frame from **soft-decision** channel bits (LLRs) instead of
+    /// hard bytes.
+    ///
+    /// `llrs` holds one signed value per FEC channel bit — sign = the hard
+    /// decision, magnitude = confidence — in raw frame-bit order (`SD0`
+    /// first, the order [`crate::reference_soft_decision::unpack_nibble_stream`]
+    /// yields from a reference `*_sd.bit` frame). Length must equal
+    /// [`Self::soft_frame_bits`] (144 for [`Rate::Imbe7200x4400`], 72 for
+    /// [`Rate::AmbePlus2_3600x2450`]).
+    ///
+    /// Runs the crate's soft Golay/Hamming FEC (Chase-II — the ~2 dB coding
+    /// gain over hard slicing), then re-encodes the recovered info to a clean
+    /// FEC frame and synthesizes through the shipped [`Self::decode_bits`]
+    /// path — so decoder state, concealment, and enhancement behave exactly as
+    /// for a clean hard decode. On error-free input the result is
+    /// bit-identical to `decode_bits`; the soft path diverges only by
+    /// *rescuing* frames a hard decode would corrupt.
+    ///
+    /// Soft decode is only meaningful for the FEC-bearing rates; the no-FEC
+    /// info-only rates return [`VocoderError::SoftUnsupported`].
+    ///
+    /// ```rust
+    /// # use blip25_mbe::vocoder::{Rate, Vocoder};
+    /// let mut rx = Vocoder::new(Rate::Imbe7200x4400);
+    /// let llrs = [0i8; 144]; // one LLR per channel bit
+    /// let pcm = rx.decode_soft(&llrs).unwrap();
+    /// assert_eq!(pcm.len(), rx.frame_samples());
+    /// ```
+    pub fn decode_soft(&mut self, llrs: &[i8]) -> Result<Vec<i16>, VocoderError> {
+        let expected = self
+            .rate
+            .soft_frame_bits()
+            .ok_or(VocoderError::SoftUnsupported { rate: self.rate })?;
+        if llrs.len() != expected {
+            return Err(VocoderError::WrongSoftLength {
+                expected,
+                got: llrs.len(),
+            });
+        }
+        // Soft-decode the FEC to recovered info vectors, then re-encode a clean
+        // FEC frame and run the shipped hard path (blip25_codec synth + conceal +
+        // enhancement + state). The re-encoded frame is error-free, so blip25_codec's
+        // hard FEC decode is lossless.
+        let fec: Vec<u8> = match self.rate {
+            Rate::Imbe7200x4400 => {
+                let soft: &[i8; 144] = llrs.try_into().expect("length checked above");
+                let frame = crate::imbe7200::frame::decode_frame_soft(soft);
+                imbe_pipeline::info_vec_to_fec_bytes(&frame.info).to_vec()
+            }
+            Rate::AmbePlus2_3600x2450 => {
+                let soft: &[i8; 72] = llrs.try_into().expect("length checked above");
+                let frame = crate::rate33::frame::decode_frame_soft(soft);
+                ambe_plus2_pipeline::info_vec_to_fec_bytes(&frame.info).to_vec()
+            }
+            // soft_frame_bits() returned Some(_) only for the two rates above.
+            _ => unreachable!("no-FEC rates gated by soft_frame_bits()"),
+        };
+        self.decode_bits(&fec)
+    }
+
+    /// Decode one wire frame to raw PCM through the vendored [`blip25_codec`] codec
+    /// (no enhancement — [`Self::decode_bits`] applies it). Length pre-validated.
+    fn decode_via_codec(&mut self, bits: &[u8]) -> (Vec<i16>, DecodeStats) {
+        use blip25_codec::FrameDisposition;
+        match self.rate {
+            Rate::AmbePlus2_3600x2450 => {
+                let dec = self.w_ambe_dec.as_mut().expect("AMBE decoder present");
+                let (pcm, disposition, epsilon_0, epsilon_t) = dec.decode_pcm_fixed_concealed(bits);
+                (
+                    pcm.to_vec(),
+                    DecodeStats {
+                        epsilon_0,
+                        epsilon_t,
+                        disposition,
+                    },
+                )
+            }
+            Rate::AmbePlus2_2450x2450 => {
+                let mut r34 = [0u8; 7];
+                r34.copy_from_slice(&bits[..7]);
+                let b = blip25_codec::shared::encode_frame::decode_r34(&r34);
+                let r33 = blip25_codec::shared::encode_frame::encode_r33(&b);
+                let dec = self.w_ambe_dec.as_mut().expect("AMBE decoder present");
+                // r34 is FEC-less info; the re-encoded r33 carries no channel
+                // errors, so the gate is inert (always Use) — routed through the
+                // concealed path only for a uniform disposition surface.
+                let (pcm, disposition, epsilon_0, epsilon_t) = dec.decode_pcm_fixed_concealed(&r33);
+                (
+                    pcm.to_vec(),
+                    DecodeStats {
+                        epsilon_0,
+                        epsilon_t,
+                        disposition,
+                    },
+                )
+            }
+            Rate::Imbe7200x4400 => {
+                let mut fr = [0u8; 18];
+                fr.copy_from_slice(&bits[..18]);
+                let dec = self.w_imbe_dec.as_mut().expect("IMBE decoder present");
+                // IMBE conceals internally (imbe::decode_params ε-gate repeat).
+                // TODO: surface IMBE's own ε₀/εₜ + disposition (consecutive_invalid).
+                let pcm = dec.decode_pcm(&fr).to_vec();
+                (
+                    pcm,
+                    DecodeStats {
+                        epsilon_0: 0,
+                        epsilon_t: 0,
+                        disposition: FrameDisposition::Use,
+                    },
+                )
+            }
+            Rate::Imbe4400x4400 => {
+                let fr = imbe_pipeline::info_to_fec_bytes(bits);
+                let dec = self.w_imbe_dec.as_mut().expect("IMBE decoder present");
+                let pcm = dec.decode_pcm(&fr).to_vec();
+                (
+                    pcm,
+                    DecodeStats {
+                        epsilon_0: 0,
+                        epsilon_t: 0,
+                        disposition: FrameDisposition::Use,
+                    },
+                )
+            }
+        }
     }
 
     /// Encode an arbitrary-length PCM slice as a stream of frames.
@@ -922,108 +1083,13 @@ impl Vocoder {
     /// let bits: Result<Vec<Vec<u8>>, _> = tx.encode_stream(&pcm).collect();
     /// assert_eq!(bits.unwrap().len(), 5);
     /// ```
+    #[cfg(feature = "encode")]
     pub fn encode_stream<'a>(&'a mut self, pcm: &'a [i16]) -> EncodeStream<'a> {
         EncodeStream {
             vocoder: self,
             pcm,
             pos: 0,
         }
-    }
-
-    /// Run the analysis encoder on one PCM frame and return the
-    /// resulting [`MbeParams`] without quantizing or FEC-encoding.
-    /// Advances the analysis state (look-ahead history, predictor,
-    /// V/UV state, silence detector) so subsequent calls see
-    /// continuous context.
-    ///
-    /// `pcm` must be exactly [`Self::frame_samples`] samples (160).
-    ///
-    /// On `AnalysisOutput::Silence` (preroll, silence dispatch,
-    /// half-rate `PitchOutOfRange`), returns the rate-appropriate
-    /// silence params ([`MbeParams::silence`] or
-    /// [`MbeParams::silence_ambe_plus2`]).
-    ///
-    /// Counterpart of [`Self::synthesize_params`]. Together these
-    /// expose the parameter layer without going through wire FEC,
-    /// enabling rate-conversion / analysis / playback pipelines that
-    /// don't need the full encode/decode round-trip.
-    pub fn extract_params(&mut self, pcm: &[i16]) -> Result<MbeParams, VocoderError> {
-        if pcm.len() != self.frame_samples() {
-            return Err(VocoderError::WrongPcmLength {
-                expected: self.frame_samples(),
-                got: pcm.len(),
-            });
-        }
-        let frame = pcm.try_into().expect("length already validated");
-        let analysis_out = match self.rate {
-            Rate::Imbe7200x4400 | Rate::Imbe4400x4400 => analysis_encode(frame, &mut self.analysis),
-            Rate::AmbePlus2_3600x2450 | Rate::AmbePlus2_2450x2450 => {
-                analysis_encode_ambe_plus2(frame, &mut self.analysis)
-            }
-        }
-        .map_err(VocoderError::Analysis)?;
-        Ok(match analysis_out {
-            AnalysisOutput::Voice(p) => p,
-            AnalysisOutput::Silence => match self.rate {
-                Rate::Imbe7200x4400 | Rate::Imbe4400x4400 => MbeParams::silence(),
-                Rate::AmbePlus2_3600x2450 | Rate::AmbePlus2_2450x2450 => {
-                    MbeParams::silence_ambe_plus2()
-                }
-            },
-        })
-    }
-
-    /// Synthesize one PCM frame directly from [`MbeParams`], skipping
-    /// the FEC + dequantize chain. Advances the channel's synth state
-    /// (so re-acquisition after silence and across-frame phase
-    /// continuity work the same way they would for a normal
-    /// [`Self::decode_bits`] call).
-    ///
-    /// Useful for playing back tone-frame params from
-    /// [`crate::rate33::dequantize::tone_to_mbe_params`], replaying
-    /// captured params in test harnesses, or driving synth from any
-    /// upstream that produces `MbeParams` without going through wire
-    /// bits.
-    ///
-    /// The dispatch is rate-aware: full-rate uses BABA-A baseline
-    /// phase; half-rate uses AMBE+2 (US5701390) phase regen, matching
-    /// what [`Self::decode_bits`] would do.
-    ///
-    /// `last_stats` is **not** updated by this call — it's reserved
-    /// for the wire-aware encode/decode paths. Read the synth's
-    /// disposition via [`Self::last_disposition`] which IS advanced
-    /// (the disposition reflects this synth call).
-    pub fn synthesize_params(&mut self, params: &MbeParams) -> Vec<i16> {
-        // No FEC errors on this path — caller is providing trusted
-        // params, not recovered ones. Use a clean error context so
-        // disposition is `Use` unless smoothed ε_R is already high.
-        let prev_err = self.synth.err;
-        self.synth.err = FrameErrorContext::default();
-        let err = self.synth.err;
-        let gamma_w = self.synth.gamma_w;
-        let pcm: [i16; FRAME_SAMPLES] = match self.rate {
-            Rate::Imbe7200x4400 | Rate::Imbe4400x4400 => {
-                synthesize_frame(params, &err, gamma_w, &mut self.synth)
-            }
-            Rate::AmbePlus2_3600x2450 | Rate::AmbePlus2_2450x2450 => match self.ambe_plus2_synth {
-                AmbePlus2Synth::AmbePlus => ambe_plus2::synthesize_frame(params, &mut self.synth),
-                AmbePlus2Synth::Baseline => {
-                    synthesize_frame(params, &err, gamma_w, &mut self.synth)
-                }
-            },
-        };
-        self.synth.err = prev_err;
-        let mut pcm = pcm.to_vec();
-        let prev_was_use = matches!(self.prev_disposition, Some(FrameDisposition::Use));
-        enhancement::apply(
-            &self.enhancement,
-            &mut self.enhancement_state,
-            &mut pcm,
-            SAMPLE_RATE_HZ,
-            prev_was_use,
-        );
-        self.prev_disposition = self.synth.last_disposition();
-        pcm
     }
 
     /// Decode an arbitrary-length FEC byte slice as a stream of PCM
@@ -1047,17 +1113,43 @@ impl Vocoder {
             pos: 0,
         }
     }
+
+    /// Decode an arbitrary-length soft-decision LLR slice as a stream of PCM
+    /// frames — the soft-decision counterpart of [`Self::decode_stream`].
+    ///
+    /// Yields one `Result<Vec<i16>>` per [`Self::soft_frame_bits`] LLRs
+    /// consumed ([`Self::decode_soft`] per frame); trailing partial frames are
+    /// silently dropped. For the no-FEC rates (no soft frame size) the stream
+    /// is empty — call [`Self::decode_soft`] directly to get the explicit
+    /// [`VocoderError::SoftUnsupported`].
+    ///
+    /// ```rust
+    /// # use blip25_mbe::vocoder::{Rate, Vocoder};
+    /// # let llrs: Vec<i8> = vec![0; 144 * 5];
+    /// let mut rx = Vocoder::new(Rate::Imbe7200x4400);
+    /// let frames: Result<Vec<Vec<i16>>, _> = rx.decode_stream_soft(&llrs).collect();
+    /// assert_eq!(frames.unwrap().len(), 5);
+    /// ```
+    pub fn decode_stream_soft<'a>(&'a mut self, llrs: &'a [i8]) -> DecodeSoftStream<'a> {
+        DecodeSoftStream {
+            vocoder: self,
+            llrs,
+            pos: 0,
+        }
+    }
 }
 
 /// Streaming-encode iterator returned by [`Vocoder::encode_stream`].
 /// Yields one `Result<Vec<u8>>` per 160-sample input frame; trailing
 /// partial frames are silently dropped.
+#[cfg(feature = "encode")]
 pub struct EncodeStream<'a> {
     vocoder: &'a mut Vocoder,
     pcm: &'a [i16],
     pos: usize,
 }
 
+#[cfg(feature = "encode")]
 impl Iterator for EncodeStream<'_> {
     type Item = Result<Vec<u8>, VocoderError>;
     fn next(&mut self) -> Option<Self::Item> {
@@ -1076,6 +1168,7 @@ impl Iterator for EncodeStream<'_> {
     }
 }
 
+#[cfg(feature = "encode")]
 impl ExactSizeIterator for EncodeStream<'_> {}
 
 /// Streaming-decode iterator returned by [`Vocoder::decode_stream`].
@@ -1106,6 +1199,41 @@ impl Iterator for DecodeStream<'_> {
 }
 
 impl ExactSizeIterator for DecodeStream<'_> {}
+
+/// Streaming soft-decision-decode iterator returned by
+/// [`Vocoder::decode_stream_soft`]. Yields one `Result<Vec<i16>>` per
+/// [`Vocoder::soft_frame_bits`] LLRs; trailing partial frames are dropped.
+/// Empty for the no-FEC rates (which have no soft frame size).
+pub struct DecodeSoftStream<'a> {
+    vocoder: &'a mut Vocoder,
+    llrs: &'a [i8],
+    pos: usize,
+}
+
+impl Iterator for DecodeSoftStream<'_> {
+    type Item = Result<Vec<i16>, VocoderError>;
+    fn next(&mut self) -> Option<Self::Item> {
+        let n = self.vocoder.soft_frame_bits()?; // None (no-FEC rate) => empty stream
+        if self.pos + n > self.llrs.len() {
+            return None;
+        }
+        let frame = &self.llrs[self.pos..self.pos + n];
+        self.pos += n;
+        Some(self.vocoder.decode_soft(frame))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match self.vocoder.soft_frame_bits() {
+            Some(n) => {
+                let remaining = (self.llrs.len() - self.pos) / n;
+                (remaining, Some(remaining))
+            }
+            None => (0, Some(0)),
+        }
+    }
+}
+
+impl ExactSizeIterator for DecodeSoftStream<'_> {}
 
 /// Direction of a [`Transcoder`] — the input/output rate pair.
 ///
@@ -1302,6 +1430,321 @@ fn pack_dibits_n<const N: usize, const B: usize>(dibits: &[u8; N]) -> [u8; B] {
     out
 }
 
+/// Look-ahead (source frames) reserved before a frame's reference voicing is
+/// finalised. `b1_track` needs ~12 frames of forward context (FLUSH_LOOKAHEAD
+/// ≈ 1876 samples); this is that plus a margin. It is the streaming latency.
+#[cfg(feature = "encode")]
+const B1_RESERVE: usize = 16;
+
+/// Minimum newly-finalisable frames before a pump runs the windowed `b1_track`,
+/// so its (bounded) context+look-ahead re-analysis is amortised over a batch
+/// instead of paid per frame. Adds up to this many frames of latency.
+#[cfg(feature = "encode")]
+const B1_MIN_BATCH: usize = 16;
+
+/// Whole-buffer `encode` sources output frame `s`'s voicing from `b1_track[s+2]`
+/// (its lag search lands here); the stream reproduces that offset directly.
+#[cfg(feature = "encode")]
+const BLAG: usize = 2;
+
+/// Single-pass stateful AMBE+2 streamer — byte-exact to whole-buffer
+/// [`Vocoder::encode`] at ~`B1_RESERVE`-frame latency, the console's own
+/// per-frame-streaming-with-look-ahead behaviour.
+///
+/// The whole-buffer reference is three cross-frame chains: reference-pitch (`b0`), the
+/// blip25 amplitude Encoder (`b2..b8`, a *predictive* VQ), and `b1_track`
+/// voicing (`b1`). Each is carried here as live state instead of re-derived per
+/// window, so there is no predictor drift:
+/// * `reference` — the persistent [`B0Audio`] tracker, advanced one frame at a
+///   time with the same voicing masks as whole-buffer → byte-exact `b0`.
+/// * `e` — one persistent [`Encoder`]; feeding it frames in order carries the
+///   amplitude predictor → byte-exact `b2..b8` (given the same `b0`).
+/// * `b1_track` — recomputed on the *growing* prefix each pump; causal + bounded
+///   look-ahead makes any frame ≥ `B1_RESERVE` back byte-exact.
+///
+/// `pref`/`raw` grow with the transmission (from index 0 — the reference tracker
+/// indexes `pref` by an internal frame counter). That is bounded for PTT; a
+/// continuous stream would want [`LiveEncoder::reset`] between transmissions.
+#[cfg(feature = "encode")]
+struct AmbeStream {
+    with_fec: bool,
+    tone_on: bool,
+    e: blip25_codec::enc::Encoder,
+    reference: blip25_codec::enc::b0_audio::B0Audio,
+    pref_state: blip25_codec::enc::audio_prefilter::PrefilterState,
+    pref: Vec<i16>,
+    raw: Vec<i16>,
+    reference_b0: Vec<u8>,
+    forced_b0: Vec<u8>,
+    b1: Vec<u16>,
+    tone_of: Vec<Option<blip25_codec::tone::ToneFrameFields>>,
+    det: blip25_codec::tone::ToneDetector,
+    reference_frame: usize,
+    horizon: usize,
+    fed: usize,
+    emitted_src: usize,
+    /// Total output frames emitted so far (for `pending_samples`).
+    out_count: usize,
+    pend: std::collections::VecDeque<(usize, [u8; 9])>,
+    // Persistent hdr30 VAD (the one slow-converging b1_track state — an adaptive
+    // noise floor — carried so a bounded analysis window stays byte-exact).
+    hdr30: Vec<i32>,
+    hdr_nf: Option<f64>,
+    hdr_cd: usize,
+    hdr_h: i32,
+    hdr_prev: bool,
+}
+
+#[cfg(feature = "encode")]
+impl AmbeStream {
+    fn new(with_fec: bool, tone_on: bool) -> Self {
+        // Route A: the amplitude Encoder runs with the two-frame look-ahead so
+        // its live `gap2_mid` is pitch-aligned, matching whole-buffer
+        // `Vocoder::encode` on b2..b8 (not just b0/b1).
+        let mut e = blip25_codec::enc::Encoder::new();
+        e.set_live_gap2_amps(true);
+        Self {
+            with_fec,
+            tone_on,
+            e,
+            reference: blip25_codec::enc::b0_audio::B0Audio::new(),
+            pref_state: blip25_codec::enc::audio_prefilter::PrefilterState::default(),
+            pref: Vec::new(),
+            raw: Vec::new(),
+            reference_b0: Vec::new(),
+            forced_b0: Vec::new(),
+            b1: Vec::new(),
+            tone_of: Vec::new(),
+            det: blip25_codec::tone::ToneDetector::new(),
+            reference_frame: 0,
+            horizon: 0,
+            fed: 0,
+            emitted_src: 0,
+            out_count: 0,
+            pend: std::collections::VecDeque::new(),
+            hdr30: Vec::new(),
+            hdr_nf: None,
+            hdr_cd: 0,
+            hdr_h: 0,
+            hdr_prev: false,
+        }
+    }
+
+    /// Advance the persistent hdr30 VAD to cover source frames `[0, upto)`.
+    /// Byte-exact incremental replica of `b1_audio::derive_hdr30_vad`
+    /// (fully causal): per-frame log-energy, adaptive noise floor (leak 0.05),
+    /// 1-frame hangover, 2-bit-per-frame shift register. The noise floor is the
+    /// state a bounded window can't reproduce, so it lives here.
+    fn advance_hdr30(&mut self, upto: usize) {
+        const FRAME: usize = FRAME_SAMPLES;
+        const LEAK: f64 = 0.05;
+        const MARGIN: f64 = 3.25;
+        while self.hdr30.len() < upto {
+            let f = self.hdr30.len();
+            let s = f * FRAME;
+            let mut acc = 0.0f64;
+            for i in 0..FRAME {
+                if s + i < self.raw.len() {
+                    let v = f64::from(self.raw[s + i]);
+                    acc += v * v;
+                }
+            }
+            let e = (acc / FRAME as f64 + 1.0).log2();
+            if self.hdr_nf.is_none() {
+                self.hdr_nf = Some(e);
+            }
+            let nf = self.hdr_nf.unwrap();
+            let nf = if e < nf { e } else { nf + LEAK };
+            self.hdr_nf = Some(nf);
+            let base = e > nf + MARGIN;
+            let v = if base {
+                self.hdr_cd = 1;
+                true
+            } else if self.hdr_cd > 0 {
+                self.hdr_cd -= 1;
+                true
+            } else {
+                false
+            };
+            let fill = (v as i32) | ((self.hdr_prev as i32) << 1);
+            self.hdr_h = ((self.hdr_h << 2) | fill) & 0xffff;
+            self.hdr30.push(self.hdr_h);
+            self.hdr_prev = v;
+        }
+    }
+
+    /// Prefilter + buffer new PCM, then finalise/emit whatever frames now have
+    /// their look-ahead.
+    fn push(&mut self, pcm: &[i16]) -> Vec<Vec<u8>> {
+        let (pref_new, state) =
+            blip25_codec::enc::audio_prefilter::prefilter(&self.pref_state, pcm);
+        self.pref_state = state;
+        self.pref.extend_from_slice(&pref_new);
+        self.raw.extend_from_slice(pcm);
+        self.pump(false)
+    }
+
+    /// End of stream: finalise the tail (full look-ahead now available) and
+    /// drain the Encoder. A sub-frame residue is dropped (chunks_exact, matching
+    /// whole-buffer `encode`).
+    fn flush(&mut self) -> Vec<Vec<u8>> {
+        self.pump(true)
+    }
+
+    /// Advance every chain as far as the current buffer allows and return the
+    /// newly-final output frames in order. See the struct docs.
+    fn pump(&mut self, flush: bool) -> Vec<Vec<u8>> {
+        use blip25_codec::enc::b1_audio::{b1_track_hdr30, RingRefineMode};
+        let n = FRAME_SAMPLES;
+        let avail = self.raw.len() / n;
+        let mut out: Vec<Vec<u8>> = Vec::new();
+        if avail < 2 {
+            return out;
+        }
+        // N input frames → N-1 emittable frames (the reference codec's one-frame
+        // look-ahead), the same convention as whole-buffer `encode`.
+        let nframes = avail - 1;
+        let new_horizon = if flush {
+            nframes
+        } else {
+            nframes.saturating_sub(B1_RESERVE)
+        };
+        if !flush && new_horizon.saturating_sub(self.horizon) < B1_MIN_BATCH {
+            return out;
+        }
+        // (1) b1_track on a BOUNDED window (not the growing prefix — that recomputes
+        //     FFT gaps in O(n²)). `b1_track` is causal + bounded look-ahead, so a
+        //     window carrying `ctx` frames of warm-up before the finalise point is
+        //     byte-exact for the finalised frames. `bt[k]` is global frame
+        //     `win_start + k`.
+        let ctx = 8usize;
+        let win_start = self.horizon.saturating_sub(ctx);
+        let win_nframes = (avail - win_start).saturating_sub(1);
+        // Persistent hdr30 for every available frame (covers both the standalone
+        // and from_logs windows) — mutate before the immutable slices below.
+        self.advance_hdr30(avail);
+        let win_raw = &self.raw[win_start * n..];
+        let win_pref = &self.pref[win_start * n..];
+        let hdr_win = &self.hdr30[win_start..win_start + win_nframes];
+        let bt = b1_track_hdr30(win_pref, win_raw, win_nframes, RingRefineMode::Off, hdr_win);
+        // (2) finalise b1 + tone (in order) for the newly-final source frames.
+        for f in self.horizon..new_horizon {
+            self.b1.push(bt[f - win_start].b1);
+            let tf = if self.tone_on {
+                self.det.process(&self.raw[f * n..f * n + n])
+            } else {
+                None
+            };
+            self.tone_of.push(tf);
+        }
+        // (3) advance the persistent reference-pitch tracker (uses only final masks).
+        let reference_target = if flush {
+            nframes
+        } else {
+            (new_horizon + 2).min(nframes)
+        };
+        while self.reference_frame < reference_target {
+            let cf = self.reference_frame;
+            let a11 = if cf == 0 {
+                0
+            } else {
+                i32::from(bt[cf - 1 - win_start].mask)
+            };
+            let b0 = self.reference.push_pcm_frame_with_prev_mask(&self.pref, a11);
+            self.reference_b0.push(b0);
+            self.reference_frame += 1;
+        }
+        // (4) forced-b0 for the persistent amplitude Encoder (whole-buffer maps
+        //     emit source `src` to reference frame `src + 2`, clamped).
+        let emit_src_max = if flush {
+            nframes
+        } else {
+            new_horizon.saturating_sub(1)
+        };
+        while self.forced_b0.len() <= emit_src_max {
+            let src = self.forced_b0.len();
+            let idx = (src + 2).min(self.reference_b0.len().saturating_sub(1));
+            self.forced_b0.push(self.reference_b0[idx]);
+        }
+        self.e.set_forced_b0(self.forced_b0.clone());
+        // (5) feed raw frames to the Encoder; each emission is the next source.
+        //     Route A's two-frame look-ahead means emission `s` (analyze frame
+        //     `s`) lands only after frame `s + 2` is fed, so to have sources up
+        //     to `emit_src_max` in `pend` we must feed through `emit_src_max + 3`
+        //     (one deeper than the old one-frame look-ahead's `+ 2`).
+        let feed_to = if flush {
+            avail
+        } else {
+            (emit_src_max + 3).min(avail)
+        };
+        while self.fed < feed_to {
+            let fr: [i16; FRAME_SAMPLES] =
+                self.raw[self.fed * n..self.fed * n + n].try_into().unwrap();
+            if let Some(r33) = self.e.encode_frame_r33(&fr) {
+                let s = self.emitted_src;
+                self.emitted_src += 1;
+                self.pend.push_back((s, r33));
+            }
+            self.fed += 1;
+        }
+        if flush {
+            for r33 in self.e.flush_r33() {
+                let s = self.emitted_src;
+                self.emitted_src += 1;
+                self.pend.push_back((s, r33));
+            }
+        }
+        // (6) pack + emit finalised frames in order; drop source-0 (the dropped
+        //     look-ahead placeholder — whole-buffer `frames.remove(0)`). Hold a
+        //     frame back until its lagged voicing `b1[s + BLAG]` is final (the
+        //     tail at flush keeps the Encoder's own b1, as whole-buffer does).
+        while let Some(&(s, _)) = self.pend.front() {
+            if !flush && s + BLAG >= self.b1.len() {
+                break;
+            }
+            let (s, r33) = self.pend.pop_front().unwrap();
+            if s == 0 {
+                continue;
+            }
+            out.push(self.pack(s, &r33));
+            self.out_count += 1;
+        }
+        self.horizon = new_horizon;
+        out
+    }
+
+    /// Apply the reference overrides (voicing b1, tone overlay) to the Encoder's
+    /// r33 bytes for source frame `s` and pack to r33/r34 — the same steps as
+    /// whole-buffer `encode_ambe2_reference_voicing`.
+    fn pack(&self, s: usize, r33: &[u8; 9]) -> Vec<u8> {
+        // Annex-T tone overlay (default off): byte-exact tone frame where fired.
+        if let Some(t) = self.tone_of.get(s).copied().flatten() {
+            let tr = Vocoder::tone_frame_bytes(t.id, t.amplitude);
+            return if self.with_fec {
+                tr
+            } else {
+                let tb = blip25_codec::tables::deprioritize(
+                    &blip25_codec::frame::decode_bytes(&tr).info,
+                );
+                blip25_codec::enc::encode_frame::encode_r34(&tb).to_vec()
+            };
+        }
+        let mut b =
+            blip25_codec::tables::deprioritize(&blip25_codec::frame::decode_bytes(r33).info);
+        // Output voicing from the standalone b1_track (byte-exact on speech; the
+        // whole-buffer's forced `from_logs`+lag-search voicing diverges on pure
+        // tones, which isn't reproducible per-frame without the global lag search).
+        if let Some(&v) = self.b1.get(s + BLAG) {
+            b[1] = v;
+        }
+        if self.with_fec {
+            blip25_codec::enc::encode_frame::encode_r33(&b).to_vec()
+        } else {
+            blip25_codec::enc::encode_frame::encode_r34(&b).to_vec()
+        }
+    }
+}
+
 /// Push-driven encoder for live PCM streams that arrive in chunks
 /// of arbitrary length (audio device callbacks, file readers, sockets).
 /// Holds residual samples internally across calls so the caller can
@@ -1321,18 +1764,36 @@ fn pack_dibits_n<const N: usize, const B: usize>(dibits: &[u8; N]) -> [u8; B] {
 /// assert!(frames[0].is_ok());
 /// // 96 samples residue; next push contributes them to the next frame.
 /// assert_eq!(enc.pending_samples(), 96);
+/// // End of stream: flush pads the residue and drains the reference
+/// // codec's one-frame look-ahead, returning every remaining frame so
+/// // the trailing audio is never lost.
+/// let tail = enc.flush().unwrap();
+/// assert!(!tail.is_empty());
+/// assert_eq!(enc.pending_samples(), 0);
 /// ```
+#[cfg(feature = "encode")]
 pub struct LiveEncoder {
     vocoder: Vocoder,
     pcm_buf: Vec<i16>,
+    /// AMBE+2: the single-pass stateful streamer (byte-exact to whole-buffer
+    /// `encode` at ~`B1_RESERVE`-frame latency). `None` for the other rates,
+    /// which use the per-frame `encode_pcm` path via `pcm_buf`.
+    stream: Option<AmbeStream>,
 }
 
+#[cfg(feature = "encode")]
 impl LiveEncoder {
     /// Open a new live encoder at the given rate, all state cold.
     pub fn new(rate: Rate) -> Self {
+        let stream = match rate {
+            Rate::AmbePlus2_3600x2450 => Some(AmbeStream::new(true, false)),
+            Rate::AmbePlus2_2450x2450 => Some(AmbeStream::new(false, false)),
+            _ => None,
+        };
         Self {
             vocoder: Vocoder::new(rate),
             pcm_buf: Vec::new(),
+            stream,
         }
     }
 
@@ -1348,6 +1809,9 @@ impl LiveEncoder {
     /// buffer drains regardless so a single bad frame doesn't stall
     /// the stream.
     pub fn push(&mut self, pcm: &[i16]) -> Vec<Result<Vec<u8>, VocoderError>> {
+        if let Some(s) = self.stream.as_mut() {
+            return s.push(pcm).into_iter().map(Ok).collect();
+        }
         self.pcm_buf.extend_from_slice(pcm);
         let n = self.vocoder.frame_samples();
         let mut out = Vec::with_capacity(self.pcm_buf.len() / n);
@@ -1362,38 +1826,74 @@ impl LiveEncoder {
         out
     }
 
-    /// Number of samples currently buffered (between 0 and
-    /// `frame_samples()-1` after every `push` returns).
+    /// Samples received but not yet represented by an emitted frame. For the
+    /// per-frame rates this is the sub-frame residue (`0..frame_samples()-1`);
+    /// for the AMBE+2 single-pass streamer it also includes the bounded
+    /// look-ahead the streamer holds before a frame's voicing is final.
     #[inline]
     pub fn pending_samples(&self) -> usize {
-        self.pcm_buf.len()
+        if let Some(s) = self.stream.as_ref() {
+            // Samples received minus those an emitted frame accounts for. Once any
+            // frame has emitted, the reference codec's dropped source-0 look-ahead
+            // placeholder (one frame) is also consumed, so subtract it — this
+            // makes pending == 0 once the whole stream has been flushed out.
+            let placeholder = if s.out_count > 0 { FRAME_SAMPLES } else { 0 };
+            s.raw
+                .len()
+                .saturating_sub(s.out_count * FRAME_SAMPLES + placeholder)
+        } else {
+            self.pcm_buf.len()
+        }
     }
 
     /// Drop any pending samples without encoding them. Useful at
     /// stream shutdown when the caller doesn't want a partial-frame
-    /// flush.
+    /// flush. Resets the AMBE+2 streamer to a cold state.
     #[inline]
     pub fn discard_pending(&mut self) {
         self.pcm_buf.clear();
+        if let Some(s) = self.stream.as_mut() {
+            let (with_fec, tone_on) = (s.with_fec, s.tone_on);
+            *s = AmbeStream::new(with_fec, tone_on);
+        }
     }
 
-    /// Pad pending residue with zeros to a full frame and encode one
-    /// final frame. Returns `Ok(Some(bits))` if residue existed,
-    /// `Ok(None)` if the buffer was empty. Buffer is drained either
-    /// way.
+    /// Finish the stream: encode any pending residue (zero-padded to a
+    /// full frame) and drain the reference codec's one-frame look-ahead,
+    /// returning every remaining FEC frame in order.
     ///
-    /// Use this at end-of-stream to avoid abruptly dropping the
-    /// trailing samples; the cost is at most one extra frame of
-    /// zero-padding tacked onto the last word of audio.
-    pub fn flush(&mut self) -> Result<Option<Vec<u8>>, VocoderError> {
-        if self.pcm_buf.is_empty() {
-            return Ok(None);
+    /// Returns a (possibly empty) `Vec` of frames because the blip25_codec
+    /// look-ahead makes it impossible to bound the tail to a single
+    /// frame: encoding the padded residue emits the *previously* buffered
+    /// frame, and [`Vocoder::flush_encode`] then yields the residue frame
+    /// itself — so a residue flush legitimately produces two frames, and
+    /// an exact-multiple flush produces the one look-ahead frame. An empty
+    /// buffer with nothing buffered in the codec returns an empty `Vec`.
+    ///
+    /// Call this once at end-of-stream so the trailing 20 ms of audio
+    /// isn't lost; the only cost is at most one frame of zero-padding
+    /// tacked onto the last word of audio when residue is present.
+    ///
+    /// Concatenating all [`Self::push`] outputs with this `flush`, then
+    /// dropping the leading frame-0 look-ahead placeholder, is
+    /// byte-identical to encoding the same PCM straight through
+    /// `blip25_codec::enc::Encoder` (`encode_frame_r33` per frame + `flush_r33`).
+    pub fn flush(&mut self) -> Result<Vec<Vec<u8>>, VocoderError> {
+        if let Some(s) = self.stream.as_mut() {
+            return Ok(s.flush());
         }
-        let n = self.vocoder.frame_samples();
-        self.pcm_buf.resize(n, 0);
-        let bits = self.vocoder.encode_pcm(&self.pcm_buf)?;
-        self.pcm_buf.clear();
-        Ok(Some(bits))
+        let mut out: Vec<Vec<u8>> = Vec::new();
+        if !self.pcm_buf.is_empty() {
+            let n = self.vocoder.frame_samples();
+            self.pcm_buf.resize(n, 0);
+            let bits = self.vocoder.encode_pcm(&self.pcm_buf)?;
+            self.pcm_buf.clear();
+            out.push(bits);
+        }
+        // Drain the reference codec's one-frame look-ahead FIFO (no-op on
+        // the research path / when nothing is buffered).
+        out.extend(self.vocoder.flush_encode());
+        Ok(out)
     }
 
     /// Reset all state — both the inner [`Vocoder`] (predictor /
@@ -1401,6 +1901,10 @@ impl LiveEncoder {
     pub fn reset(&mut self) {
         self.vocoder.reset();
         self.pcm_buf.clear();
+        if let Some(s) = self.stream.as_mut() {
+            let (with_fec, tone_on) = (s.with_fec, s.tone_on);
+            *s = AmbeStream::new(with_fec, tone_on);
+        }
     }
 
     /// Configured rate.
@@ -1483,143 +1987,34 @@ impl LiveDecoder {
     }
 }
 
-/// Fluent builder for [`Vocoder`]. Lets callers configure rate +
-/// optional knobs in one expression instead of `new` + a sequence of
-/// setters. Mirrors the chip's "open channel + PKT_RATEP +
-/// configuration" sequence, but in one call.
+/// Fluent builder for [`Vocoder`]. Configures the rate and the optional
+/// post-decode enhancement chain in one expression instead of `new` + a
+/// setter.
 ///
 /// ```rust
 /// use blip25_mbe::vocoder::{Rate, Vocoder};
 ///
-/// let tx = Vocoder::builder(Rate::AmbePlus2_3600x2450)
-///     .tone_detection(true)
-///     .build();
+/// let tx = Vocoder::builder(Rate::AmbePlus2_3600x2450).build();
 /// assert_eq!(tx.rate(), Rate::AmbePlus2_3600x2450);
-/// assert!(tx.tone_detection());
 /// ```
 #[derive(Clone, Debug)]
 pub struct VocoderBuilder {
     rate: Rate,
-    tone_detection: bool,
-    repeat_reset_after: Option<u32>,
-    chip_compat: bool,
-    silence_dispatch: bool,
-    pitch_silence_override: bool,
-    default_pitch_on_silence: bool,
-    pyin_pitch: bool,
-    spectral_subtraction: bool,
-    amp_ema_alpha: f64,
-    ambe_plus2_synth: AmbePlus2Synth,
     enhancement: EnhancementMode,
 }
 
 impl VocoderBuilder {
-    /// New builder defaulting to the same configuration as
-    /// [`Vocoder::new`] — i.e. the Classical post-decode enhancement chain
-    /// is ON (a measured +0.052 PESQ avg win). §0.5 spectral subtraction is
-    /// OFF / opt-in (it is a no-op on clean speech and carries a pinned
-    /// encode-gain-bias defect — see [`Vocoder::set_spectral_subtraction`]).
-    /// All other knobs default OFF / spec-faithful. Opt out of enhancement
-    /// with `.enhancement(EnhancementMode::None)` for fully spec-faithful
-    /// PCM, or opt INTO subtraction with `.spectral_subtraction(true)`.
+    /// New builder defaulting to the same configuration as [`Vocoder::new`]:
+    /// post-decode enhancement is [`EnhancementMode::None`], so the default
+    /// build is the reference console codec unaltered (see
+    /// [`WHY_THE_REFERENCE_CODEC.md`](https://github.com/openBLIP25/blip25-mbe/blob/main/docs/WHY_THE_REFERENCE_CODEC.md)). Opt into the Classical research
+    /// post-filter with `.enhancement(EnhancementMode::Classical(..))`.
     #[inline]
     pub fn new(rate: Rate) -> Self {
         Self {
             rate,
-            tone_detection: false,
-            repeat_reset_after: None,
-            chip_compat: false,
-            silence_dispatch: false,
-            pitch_silence_override: false,
-            default_pitch_on_silence: false,
-            pyin_pitch: false,
-            spectral_subtraction: false,
-            amp_ema_alpha: 0.0,
-            ambe_plus2_synth: AmbePlus2Synth::AmbePlus,
-            enhancement: EnhancementMode::Classical(crate::enhancement::ClassicalConfig::default()),
+            enhancement: EnhancementMode::None,
         }
-    }
-
-    /// Enable encode-side Annex T tone detection (half-rate only).
-    /// See [`Vocoder::set_tone_detection`].
-    #[inline]
-    pub fn tone_detection(mut self, on: bool) -> Self {
-        self.tone_detection = on;
-        self
-    }
-
-    /// Configure the beyond-spec consecutive-repeat reset threshold.
-    /// See [`Vocoder::set_repeat_reset_after`].
-    #[inline]
-    pub fn repeat_reset_after(mut self, n: Option<u32>) -> Self {
-        self.repeat_reset_after = n;
-        self
-    }
-
-    /// Enable JMBE-style error-rate freeze on Repeat (gap 0021).
-    /// See [`Vocoder::set_chip_compat`].
-    #[inline]
-    pub fn chip_compat(mut self, on: bool) -> Self {
-        self.chip_compat = on;
-        self
-    }
-
-    /// Enable §0.8.4 silence dispatch on the analysis encoder.
-    /// See [`Vocoder::set_silence_dispatch`].
-    #[inline]
-    pub fn silence_dispatch(mut self, on: bool) -> Self {
-        self.silence_dispatch = on;
-        self
-    }
-
-    /// Enable the joint-signal silence override (requires
-    /// [`Self::silence_dispatch`] also on).
-    /// See [`Vocoder::set_pitch_silence_override`].
-    #[inline]
-    pub fn pitch_silence_override(mut self, on: bool) -> Self {
-        self.pitch_silence_override = on;
-        self
-    }
-
-    /// Enable the onset-attack mitigation (commit a short default
-    /// pitch on near-silent frames). See
-    /// [`Vocoder::set_default_pitch_on_silence`].
-    #[inline]
-    pub fn default_pitch_on_silence(mut self, on: bool) -> Self {
-        self.default_pitch_on_silence = on;
-        self
-    }
-
-    /// Enable the PYIN pitch frontend (post-2002 DSP, off by default).
-    /// See [`Vocoder::set_pyin_pitch`].
-    #[inline]
-    pub fn pyin_pitch(mut self, on: bool) -> Self {
-        self.pyin_pitch = on;
-        self
-    }
-
-    /// Enable spectral subtraction at the §0.5 amplitude input.
-    /// See [`Vocoder::set_spectral_subtraction`].
-    #[inline]
-    pub fn spectral_subtraction(mut self, on: bool) -> Self {
-        self.spectral_subtraction = on;
-        self
-    }
-
-    /// Configure the §0.5 amplitude EMA weight (0.0 = off; default).
-    /// See [`Vocoder::set_amp_ema_alpha`].
-    #[inline]
-    pub fn amp_ema_alpha(mut self, alpha: f64) -> Self {
-        self.amp_ema_alpha = alpha;
-        self
-    }
-
-    /// Configure the half-rate synth flavor (no-op for full-rate).
-    /// See [`Vocoder::set_ambe_plus2_synth`].
-    #[inline]
-    pub fn ambe_plus2_synth(mut self, gen: AmbePlus2Synth) -> Self {
-        self.ambe_plus2_synth = gen;
-        self
     }
 
     /// Configure the post-decoder enhancement chain.
@@ -1633,16 +2028,6 @@ impl VocoderBuilder {
     /// Materialize the [`Vocoder`].
     pub fn build(self) -> Vocoder {
         let mut v = Vocoder::new(self.rate);
-        v.set_tone_detection(self.tone_detection);
-        v.set_repeat_reset_after(self.repeat_reset_after);
-        v.set_chip_compat(self.chip_compat);
-        v.set_silence_dispatch(self.silence_dispatch);
-        v.set_pitch_silence_override(self.pitch_silence_override);
-        v.set_default_pitch_on_silence(self.default_pitch_on_silence);
-        v.set_pyin_pitch(self.pyin_pitch);
-        v.set_spectral_subtraction(self.spectral_subtraction);
-        v.set_amp_ema_alpha(self.amp_ema_alpha);
-        v.set_ambe_plus2_synth(self.ambe_plus2_synth);
         v.set_enhancement(self.enhancement);
         v
     }
@@ -1658,132 +2043,50 @@ impl core::fmt::Debug for Vocoder {
     }
 }
 
+/// Strip the IMBE Golay/Hamming/PN FEC wire layer: an 18-byte full-rate frame
+/// → the 11-byte info-only ([`Rate::Imbe4400x4400`]) frame. Pure bit-shuffling
+/// (no codec state). Public so external parity / round-trip harnesses can build
+/// the info-only wire bytes that the reference [`blip25_codec`] IMBE encoder's
+/// 18-byte output maps to.
+pub fn imbe_fec_to_info_bytes(fec_bytes: &[u8; 18]) -> [u8; 11] {
+    imbe_pipeline::fec_to_info_bytes(fec_bytes)
+}
+
 mod imbe_pipeline {
-    use super::*;
-    use crate::imbe7200::dequantize::{dequantize, quantize};
+    use super::{pack_info_bits, unpack_info_bits};
     use crate::imbe7200::frame::{decode_frame, encode_frame, INFO_WIDTHS};
-    use crate::imbe7200::priority::{deprioritize, prioritize};
-
-    pub(super) fn encode(
-        pcm: &[i16],
-        vocoder: &mut Vocoder,
-        apply_fec: bool,
-    ) -> Result<(Vec<u8>, AnalysisStats), VocoderError> {
-        // Phase 1 has no tone-frame opcode at the wire layer, but with
-        // detection enabled we still run the detector and surface the
-        // (I_D, A_D) result via AnalysisStats::tone_detect so consumers
-        // can route it to LCW / app-layer signaling per BABA-A §5.4.
-        let tone_detect = if vocoder.tone_detection {
-            detect_tone(pcm)
-        } else {
-            None
-        };
-        let frame = pcm.try_into().expect("length already validated");
-        let (kind, params) =
-            match analysis_encode(frame, &mut vocoder.analysis).map_err(VocoderError::Analysis)? {
-                AnalysisOutput::Voice(p) => (AnalysisOutputKind::Voice, p),
-                AnalysisOutput::Silence => (AnalysisOutputKind::Silence, MbeParams::silence()),
-            };
-        let mut snapshot = vocoder.imbe_dec.clone();
-        let b = quantize(&params, &mut vocoder.imbe_dec)
-            .map_err(|e| VocoderError::Quantize(format!("{e:?}")))?;
-        // Step the decoder snapshot via dequantize so the predictor
-        // state matches what a downstream receiver would observe (the
-        // existing speech-quality harness pattern).
-        let l = params.harmonic_count();
-        let info = prioritize(&b, l);
-        let _ = deprioritize; // reserved for future per-priority diagnostics
-        let _ = dequantize(&info, &mut snapshot);
-        vocoder.imbe_dec = snapshot;
-        let bytes: Vec<u8> = if apply_fec {
-            let dibits = encode_frame(&info);
-            pack_dibits_full(&dibits).to_vec()
-        } else {
-            pack_info_full(&info).to_vec()
-        };
-        Ok((
-            bytes,
-            AnalysisStats {
-                output: kind,
-                params,
-                tone_detect,
-            },
-        ))
-    }
-
-    pub(super) fn decode(
-        bits: &[u8],
-        vocoder: &mut Vocoder,
-        apply_fec: bool,
-    ) -> (Vec<i16>, DecodeStats) {
-        let (info, stats_eps0, stats_epst, eps4) = if apply_fec {
-            let dibits = analysis_profile::time(analysis_profile::Stage::DibitUnpack, || {
-                unpack_dibits_full(bits)
-            });
-            let imbe = analysis_profile::time(analysis_profile::Stage::DecodeFrame, || {
-                decode_frame(&dibits)
-            });
-            let s0: u8 = imbe.errors[0];
-            let st: u8 = imbe.error_total().min(255) as u8;
-            let e4: u8 = imbe.errors[4];
-            (imbe.info, s0, st, e4)
-        } else {
-            // No FEC layer — info bits arrive verbatim, error counts are zero.
-            let info = unpack_info_full(bits);
-            (info, 0u8, 0u8, 0u8)
-        };
-        let dq = analysis_profile::time(analysis_profile::Stage::Dequantize, || {
-            dequantize(&info, &mut vocoder.imbe_dec)
-        });
-        let pcm: [i16; FRAME_SAMPLES] = match dq {
-            Ok(params) => {
-                let err = FrameErrorContext {
-                    epsilon_0: stats_eps0,
-                    epsilon_4: eps4,
-                    epsilon_t: stats_epst,
-                    bad_pitch: false,
-                };
-                synthesize_frame(&params, &err, GAMMA_W, &mut vocoder.synth)
-            }
-            Err(_) => [0i16; FRAME_SAMPLES],
-        };
-        let disposition = vocoder.synth.last_disposition();
-        (
-            pcm.to_vec(),
-            DecodeStats {
-                epsilon_0: stats_eps0,
-                epsilon_t: stats_epst,
-                disposition,
-            },
-        )
-    }
 
     fn pack_info_full(info: &[u16; 8]) -> [u8; 11] {
         let mut out = [0u8; 11];
-        super::pack_info_bits(info, &INFO_WIDTHS, &mut out);
+        pack_info_bits(info, &INFO_WIDTHS, &mut out);
         out
     }
 
     fn unpack_info_full(bytes: &[u8]) -> [u16; 8] {
         let mut out = [0u16; 8];
-        super::unpack_info_bits(bytes, &INFO_WIDTHS, &mut out);
+        unpack_info_bits(bytes, &INFO_WIDTHS, &mut out);
         out
     }
 
-    /// Wire-layer transcode: 18-byte FEC frame → 11-byte info-only
-    /// frame. Pure bit-shuffling — no codec or predictor state.
+    /// Wire-layer transcode: 18-byte IMBE FEC frame -> 11-byte info-only frame.
     pub(super) fn fec_to_info_bytes(fec_bytes: &[u8]) -> [u8; 11] {
         let dibits = unpack_dibits_full(fec_bytes);
         let frame = decode_frame(&dibits);
         pack_info_full(&frame.info)
     }
 
-    /// Wire-layer transcode: 11-byte info-only frame → 18-byte FEC
-    /// frame. Pure bit-shuffling — re-applies Golay/Hamming/PN.
+    /// Wire-layer transcode: 11-byte IMBE info-only frame -> 18-byte FEC frame.
     pub(super) fn info_to_fec_bytes(info_bytes: &[u8]) -> [u8; 18] {
         let info = unpack_info_full(info_bytes);
         let dibits = encode_frame(&info);
         pack_dibits_full(&dibits)
+    }
+
+    /// Soft-decoded info vectors -> 18-byte FEC frame for the blip25_codec decoder.
+    /// Same re-encode as [`info_to_fec_bytes`], straight off the `[u16; 8]`
+    /// the soft FEC decoder returns (no info-byte round-trip).
+    pub(super) fn info_vec_to_fec_bytes(info: &[u16; 8]) -> [u8; 18] {
+        pack_dibits_full(&encode_frame(info))
     }
 
     fn pack_dibits_full(dibits: &[u8; 72]) -> [u8; 18] {
@@ -1816,165 +2119,7 @@ mod imbe_pipeline {
 }
 
 mod ambe_plus2_pipeline {
-    use super::*;
-    use crate::rate33::dequantize::{
-        decode_to_params, encode_tone_frame_info, quantize, tone_to_mbe_params, Decoded,
-    };
     use crate::rate33::frame::{decode_frame, encode_frame, pack_no_fec, unpack_no_fec};
-
-    pub(super) fn encode(
-        pcm: &[i16],
-        vocoder: &mut Vocoder,
-        apply_fec: bool,
-    ) -> Result<(Vec<u8>, AnalysisStats), VocoderError> {
-        // Tone-detect dispatch (opt-in). On a hit, bypass the voice
-        // analysis pipeline entirely and emit an Annex T tone frame.
-        // detect_tone tries DTMF (l1 != l2) first then falls through
-        // to single-tone (l1 == l2 == 1).
-        let tone_detect = if vocoder.tone_detection {
-            detect_tone(pcm)
-        } else {
-            None
-        };
-        if let Some(ToneDetection { id, amplitude }) = tone_detect {
-            let info = encode_tone_frame_info(id, amplitude);
-            let bytes = pack_info_or_fec(&info, apply_fec);
-            // Reconstruct the params the decoder will see, so
-            // FrameStats carries the actual audible content.
-            // tone_to_mbe_params returns Some for any valid Annex T
-            // row; for the unlikely None case (reserved id), fall
-            // back to a half-rate-friendly silence placeholder.
-            let params =
-                tone_to_mbe_params(id, amplitude).unwrap_or_else(MbeParams::silence_ambe_plus2);
-            return Ok((
-                bytes,
-                AnalysisStats {
-                    output: AnalysisOutputKind::Tone { id, amplitude },
-                    params,
-                    tone_detect,
-                },
-            ));
-        }
-
-        let frame = pcm.try_into().expect("length already validated");
-        let (kind, params) = match analysis_encode_ambe_plus2(frame, &mut vocoder.analysis)
-            .map_err(VocoderError::Analysis)?
-        {
-            AnalysisOutput::Voice(p) => (AnalysisOutputKind::Voice, p),
-            AnalysisOutput::Silence => {
-                (AnalysisOutputKind::Silence, MbeParams::silence_ambe_plus2())
-            }
-        };
-        let info = quantize(&params, &mut vocoder.ambe_plus2_dec)
-            .map_err(|e| VocoderError::Quantize(format!("{e:?}")))?;
-        let bytes = pack_info_or_fec(&info, apply_fec);
-        Ok((
-            bytes,
-            AnalysisStats {
-                output: kind,
-                params,
-                tone_detect,
-            },
-        ))
-    }
-
-    fn pack_info_or_fec(info: &[u16; 4], apply_fec: bool) -> Vec<u8> {
-        if apply_fec {
-            let dibits = encode_frame(info);
-            pack_dibits_half(&dibits).to_vec()
-        } else {
-            pack_info_half(info).to_vec()
-        }
-    }
-
-    pub(super) fn decode(
-        bits: &[u8],
-        vocoder: &mut Vocoder,
-        apply_fec: bool,
-    ) -> (Vec<i16>, DecodeStats) {
-        let (info, stats_eps0, stats_epst, eps3) = if apply_fec {
-            let dibits = analysis_profile::time(analysis_profile::Stage::DibitUnpack, || {
-                unpack_dibits_half(bits)
-            });
-            let frame = analysis_profile::time(analysis_profile::Stage::DecodeFrame, || {
-                decode_frame(&dibits)
-            });
-            // BABA-A §2.8.1 Eq. 196: half-rate ε_T = ε₀ + ε₁ only (the
-            // two Golay codewords). The Hamming-protected ε₂/ε₃ are *not*
-            // summed into the disposition's ε_T per the spec, even though
-            // they're reported separately for diagnostics. Summing all
-            // four cosets here was a port of the full-rate convention
-            // and miscalibrates the Repeat/Mute thresholds for half-rate.
-            //
-            // Uncorrectable Golay-24 (≥4 errors detected) is reported as
-            // ε₀ = u8::MAX from our FEC decoder. Per chip A/B (5/2026):
-            // controlled 4-error c̃₀ injects keep the chip at peak ~5800
-            // without a multi-frame Mute, so the chip caps the contribution
-            // to ε_R. We model that as "ε₀ → 4": still trips Repeat via
-            // the ε₀ ≥ 4 branch of Eq. 198, but the ε_R recurrence Eq. 197
-            // (0.95·prev + 0.001064·ε_T) stays well below 0.096 instead of
-            // climbing to 0.27 and Muting ~20 frames.
-            const E0_UNCORRECTABLE_CAP: u8 = 4;
-            let raw_e0 = frame.errors[0];
-            let s0: u8 = if raw_e0 == u8::MAX {
-                E0_UNCORRECTABLE_CAP
-            } else {
-                raw_e0
-            };
-            let s1: u8 = frame.errors[1];
-            let st: u8 = u16::from(s0).saturating_add(u16::from(s1)).min(255) as u8;
-            let e3: u8 = frame.errors[3];
-            (frame.info, s0, st, e3)
-        } else {
-            // No FEC layer — info bits arrive verbatim, error counts are zero.
-            let info = unpack_info_half(bits);
-            (info, 0u8, 0u8, 0u8)
-        };
-        let err = FrameErrorContext {
-            epsilon_0: stats_eps0,
-            epsilon_4: eps3, // half-rate has 4 codewords; index 3 = û₃
-            epsilon_t: stats_epst,
-            bad_pitch: false,
-        };
-        // Publish the per-frame err context to the synth state so the
-        // AmbePlus path (which reads `state.err` rather than taking an
-        // explicit err parameter) sees the actual FEC counts. Without
-        // this, AmbePlus synth always saw the default-zero err and the
-        // §2.8 Repeat/Mute thresholds never tripped, allowing spurious
-        // post-FEC transients (call_3537 frame 773 → peak 23553).
-        vocoder.synth.err = err;
-        let dq = analysis_profile::time(analysis_profile::Stage::Dequantize, || {
-            decode_to_params(&info, &mut vocoder.ambe_plus2_dec)
-        });
-        let pcm: [i16; FRAME_SAMPLES] = match dq {
-            Ok(Decoded::Voice(p)) => match vocoder.ambe_plus2_synth {
-                AmbePlus2Synth::AmbePlus => ambe_plus2::synthesize_frame(&p, &mut vocoder.synth),
-                AmbePlus2Synth::Baseline => {
-                    let gamma_w = vocoder.synth.gamma_w;
-                    synthesize_frame(&p, &err, gamma_w, &mut vocoder.synth)
-                }
-            },
-            Ok(Decoded::Tone { params, .. }) => match vocoder.ambe_plus2_synth {
-                AmbePlus2Synth::AmbePlus => {
-                    ambe_plus2::synthesize_tone(&params, &mut vocoder.synth)
-                }
-                AmbePlus2Synth::Baseline => {
-                    let gamma_w = vocoder.synth.gamma_w;
-                    synthesize_frame(&params, &err, gamma_w, &mut vocoder.synth)
-                }
-            },
-            Ok(Decoded::Erasure) | Err(_) => [0i16; FRAME_SAMPLES],
-        };
-        let disposition = vocoder.synth.last_disposition();
-        (
-            pcm.to_vec(),
-            DecodeStats {
-                epsilon_0: stats_eps0,
-                epsilon_t: stats_epst,
-                disposition,
-            },
-        )
-    }
 
     fn pack_dibits_half(dibits: &[u8; 36]) -> [u8; 9] {
         let mut out = [0u8; 9];
@@ -2004,11 +2149,6 @@ mod ambe_plus2_pipeline {
         out
     }
 
-    // R34 (half-rate no-FEC) is NOT the naive sequential û₀‖û₁‖û₂‖û₃
-    // layout — DVSI applies a 3-way column interleave. Delegate to the
-    // wire-layer helpers that carry the empirically-derived order. (The
-    // full-rate IMBE no-FEC path stays sequential — it is already
-    // byte-exact vs DVSI `p25_nofec`.)
     fn pack_info_half(info: &[u16; 4]) -> [u8; 7] {
         pack_no_fec(info)
     }
@@ -2017,20 +2157,25 @@ mod ambe_plus2_pipeline {
         unpack_no_fec(bytes)
     }
 
-    /// Wire-layer transcode: 9-byte FEC frame → 7-byte info-only
-    /// frame. Pure bit-shuffling — no codec or predictor state.
+    /// Wire-layer transcode: 9-byte AMBE+2 FEC frame -> 7-byte info-only frame.
     pub(super) fn fec_to_info_bytes(fec_bytes: &[u8]) -> [u8; 7] {
         let dibits = unpack_dibits_half(fec_bytes);
         let frame = decode_frame(&dibits);
         pack_info_half(&frame.info)
     }
 
-    /// Wire-layer transcode: 7-byte info-only frame → 9-byte FEC
-    /// frame. Pure bit-shuffling — re-applies Golay/Hamming/PN.
+    /// Wire-layer transcode: 7-byte AMBE+2 info-only frame -> 9-byte FEC frame.
     pub(super) fn info_to_fec_bytes(info_bytes: &[u8]) -> [u8; 9] {
         let info = unpack_info_half(info_bytes);
         let dibits = encode_frame(&info);
         pack_dibits_half(&dibits)
+    }
+
+    /// Soft-decoded info vectors -> 9-byte FEC frame for the blip25_codec decoder.
+    /// Same re-encode as [`info_to_fec_bytes`], straight off the `[u16; 4]`
+    /// the soft FEC decoder returns.
+    pub(super) fn info_vec_to_fec_bytes(info: &[u16; 4]) -> [u8; 9] {
+        pack_dibits_half(&encode_frame(info))
     }
 }
 
@@ -2069,6 +2214,81 @@ fn unpack_info_bits<const N: usize>(bytes: &[u8], widths: &[u8; N], out: &mut [u
 mod tests {
     use super::*;
 
+    /// `Vocoder::encode` (AMBE+2 r33) detects a clean synthesized tone and
+    /// emits Annex-T tone frames (byte-exact for the given `id`/`A_D`), while
+    /// the surrounding path stays voice. Proves the encode-side tone overlay is
+    /// wired and produces frames the decoder classifies as tones.
+    #[test]
+    fn encode_emits_tone_frames_for_a_tone() {
+        // Synthesize a Knox dual tone (id145: 603.2 / 1055.6 Hz) at a mid level.
+        let (f1, f2) = (603.21_f64, 1055.62_f64);
+        let peak = 3000.0_f64;
+        let n = 20 * FRAME_SAMPLES;
+        let pcm: Vec<i16> = (0..n)
+            .map(|i| {
+                let t = i as f64;
+                let s = peak * (2.0 * std::f64::consts::PI * f1 * t / 8000.0).sin()
+                    + peak * (2.0 * std::f64::consts::PI * f2 * t / 8000.0 + 0.7).sin();
+                s.round().clamp(-32768.0, 32767.0) as i16
+            })
+            .collect();
+        let mut enc = Vocoder::new(Rate::AmbePlus2_3600x2450);
+        enc.set_tone_detection(true); // opt-in: detection is off by default now
+        let frames = enc.encode(&pcm);
+        let tone_frames = frames
+            .iter()
+            .filter(|f| {
+                let info = blip25_codec::frame::decode_bytes(f).info;
+                blip25_codec::tone::classify(&info) == blip25_codec::tone::FrameKind::Tone
+            })
+            .count();
+        // The steady body (all but a couple of onset frames) must be tone.
+        assert!(
+            tone_frames >= frames.len() - 4,
+            "only {tone_frames}/{} tone",
+            frames.len()
+        );
+        // And they carry id145.
+        let ids: std::collections::BTreeSet<u8> = frames
+            .iter()
+            .filter_map(|f| {
+                let info = blip25_codec::frame::decode_bytes(f).info;
+                blip25_codec::tone::parse_tone_frame(&info).map(|t| t.id)
+            })
+            .collect();
+        assert_eq!(ids.into_iter().collect::<Vec<_>>(), vec![145]);
+
+        // With tone detection disabled, the same input encodes as voice
+        // (no tone-signature frames).
+        let mut enc_off = Vocoder::new(Rate::AmbePlus2_3600x2450);
+        enc_off.set_tone_detection(false);
+        assert!(!enc_off.tone_detection());
+        let voice_only = enc_off.encode(&pcm);
+        let tone_frames_off = voice_only
+            .iter()
+            .filter(|f| {
+                blip25_codec::tone::classify(&blip25_codec::frame::decode_bytes(f).info)
+                    == blip25_codec::tone::FrameKind::Tone
+            })
+            .count();
+        assert_eq!(
+            tone_frames_off, 0,
+            "tone detection off must emit no tone frames"
+        );
+    }
+
+    /// The `L = 56` gate must be a property of the codebook, not a threshold
+    /// we asserted. Over the 32 rows the structural predicate ("no band
+    /// carries code 1, some band carries code 2") must select exactly
+    /// `b̂₁ ∈ {18..=31}`.
+    #[test]
+    fn l56_gate_selects_exactly_b1_18_through_31() {
+        use crate::rate33::dequantize::l56_gate_from_b1;
+        let fired: Vec<u8> = (0u8..32).filter(|&b| l56_gate_from_b1(b)).collect();
+        let want: Vec<u8> = (18u8..32).collect();
+        assert_eq!(fired, want, "gate does not match the codebook's structure");
+    }
+
     fn periodic_pcm(period: usize, amplitude: i16) -> [i16; FRAME_SAMPLES] {
         let mut out = [0i16; FRAME_SAMPLES];
         for (n, slot) in out.iter_mut().enumerate() {
@@ -2076,6 +2296,33 @@ mod tests {
             *slot = (amplitude as f32 * (2.0 * core::f32::consts::PI * phase).sin()) as i16;
         }
         out
+    }
+
+    #[test]
+    fn encode_produces_valid_decodable_frames_all_rates() {
+        let mut pcm: Vec<i16> = Vec::new();
+        for _ in 0..12 {
+            pcm.extend_from_slice(&periodic_pcm(40, 8000));
+        }
+        // The one encode path works for every rate: PCM in -> decodable bits out.
+        for rate in [
+            Rate::AmbePlus2_3600x2450,
+            Rate::AmbePlus2_2450x2450,
+            Rate::Imbe7200x4400,
+            Rate::Imbe4400x4400,
+        ] {
+            let frames = Vocoder::new(rate).encode(&pcm);
+            assert!(!frames.is_empty(), "{rate:?} should emit frames");
+            let want = rate.fec_frame_bytes();
+            assert!(
+                frames.iter().all(|f| f.len() == want),
+                "{rate:?} frames are {want} bytes"
+            );
+            let mut dec = Vocoder::new(rate);
+            for f in &frames {
+                assert_eq!(dec.decode_bits(f).unwrap().len(), FRAME_SAMPLES);
+            }
+        }
     }
 
     #[test]
@@ -2122,47 +2369,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn vocoder_new_enables_production_encode_stack() {
-        // The production façade ships the chip-validated encode stack
-        // (QUALITY_FINDINGS.md §3.6) while the spec `AnalysisState::new()`
-        // baseline stays untouched (clean-room reference).
-        let v = Vocoder::new(Rate::AmbePlus2_3600x2450);
-        assert!(v.pitch_decide_escape(), "octave escape ON in production");
-        assert!(v.pitch_subsample(), "parabolic sub-sample ON in production");
-        assert!(!v.pitch_refine_enabled(), "§0.4 refine OFF in production");
-        assert!(v.vuv_mxi_grade_enabled(), "M(ξ) Θ grade ON in production");
-
-        // Spec baseline is the opposite (refine on, the rest off).
-        let spec = AnalysisState::new();
-        assert!(!spec.pitch_decide_escape());
-        assert!(!spec.pitch_subsample());
-        assert!(spec.pitch_refine_enabled());
-        assert!(!spec.vuv_mxi_grade_enabled());
-
-        // A reset must NOT silently drop the stack.
-        let mut v2 = Vocoder::new(Rate::AmbePlus2_3600x2450);
-        v2.reset();
-        assert!(!v2.pitch_refine_enabled(), "reset preserves §0.4-off");
-        assert!(v2.vuv_mxi_grade_enabled(), "reset preserves M(ξ) grade");
-
-        // And opt-out works.
-        let mut v3 = Vocoder::new(Rate::AmbePlus2_3600x2450);
-        v3.set_pitch_refine(true);
-        v3.set_vuv_mxi_grade(false);
-        assert!(v3.pitch_refine_enabled());
-        assert!(!v3.vuv_mxi_grade_enabled());
-
-        // Full-rate IMBE has NO chip oracle and was never validated for
-        // the stack — it must stay spec-faithful (escape/sub-sample/grade
-        // off, refine on), matching `AnalysisState::new()`.
-        let imbe = Vocoder::new(Rate::Imbe7200x4400);
-        assert!(!imbe.pitch_decide_escape(), "IMBE stays spec (no escape)");
-        assert!(!imbe.pitch_subsample(), "IMBE stays spec (no sub-sample)");
-        assert!(imbe.pitch_refine_enabled(), "IMBE stays spec (refine on)");
-        assert!(!imbe.vuv_mxi_grade_enabled(), "IMBE stays spec (no grade)");
-    }
-
     /// FEC and no-FEC variants should reach the same MbeParams (same
     /// codec underneath) — verified by encoding both ways and decoding
     /// the no-FEC bits, which must give identical PCM to a clean FEC
@@ -2173,6 +2379,13 @@ mod tests {
         let mut rx_fec = Vocoder::new(Rate::Imbe7200x4400);
         let mut tx_raw = Vocoder::new(Rate::Imbe4400x4400);
         let mut rx_raw = Vocoder::new(Rate::Imbe4400x4400);
+        // Prime the reference encoder's one-frame look-ahead: the first
+        // encode_pcm call returns a look-ahead-fill placeholder, so warm both
+        // encoders once (both then emit the previous frame's real bits, which
+        // stay perfectly aligned since the input is identical).
+        let warm = periodic_pcm(39, 8000);
+        let _ = tx_fec.encode_pcm(&warm);
+        let _ = tx_raw.encode_pcm(&warm);
         for k in 0..6 {
             let pcm = periodic_pcm(40 + k, 8000);
             let pcm_fec = rx_fec
@@ -2194,6 +2407,11 @@ mod tests {
         let mut rx_fec = Vocoder::new(Rate::AmbePlus2_3600x2450);
         let mut tx_raw = Vocoder::new(Rate::AmbePlus2_2450x2450);
         let mut rx_raw = Vocoder::new(Rate::AmbePlus2_2450x2450);
+        // Prime the reference encoder's one-frame look-ahead (see the full-rate
+        // twin for why): the first encode_pcm returns a placeholder.
+        let warm = periodic_pcm(39, 6000);
+        let _ = tx_fec.encode_pcm(&warm);
+        let _ = tx_raw.encode_pcm(&warm);
         for k in 0..6 {
             let pcm = periodic_pcm(40 + k, 6000);
             let pcm_fec = rx_fec
@@ -2285,38 +2503,6 @@ mod tests {
         assert_eq!(v.rate(), Rate::AmbePlus2_3600x2450);
     }
 
-    /// Diagnostic types round-trip through JSON when the `serde`
-    /// feature is on. Validates that a future RPC layer
-    /// (gRPC / protobuf / WS) can ship `FrameStats` over the wire
-    /// without bespoke conversion.
-    #[cfg(feature = "serde")]
-    #[test]
-    fn frame_stats_round_trip_through_json() {
-        let mut v = Vocoder::new(Rate::Imbe7200x4400);
-        let pcm = periodic_pcm(40, 8000);
-        for _ in 0..3 {
-            let bits = v.encode_pcm(&pcm).unwrap();
-            let _ = v.decode_bits(&bits).unwrap();
-        }
-        let stats = v.last_stats().clone();
-        let s = serde_json::to_string(&stats).expect("serialize FrameStats");
-        let back: FrameStats = serde_json::from_str(&s).expect("deserialize FrameStats");
-        // Round-trip equality on the parts we can compare without
-        // full PartialEq derives — output kind + presence flags + the
-        // one Copy-able sub-field.
-        assert_eq!(stats.analysis.is_some(), back.analysis.is_some());
-        assert_eq!(stats.decode.is_some(), back.decode.is_some());
-        if let (Some(a), Some(b)) = (&stats.analysis, &back.analysis) {
-            assert_eq!(a.output, b.output);
-            assert_eq!(a.params, b.params);
-        }
-        if let (Some(a), Some(b)) = (&stats.decode, &back.decode) {
-            assert_eq!(a.epsilon_0, b.epsilon_0);
-            assert_eq!(a.epsilon_t, b.epsilon_t);
-            assert_eq!(a.disposition, b.disposition);
-        }
-    }
-
     /// `Rate` round-trips as a plain enum — the public-name variants
     /// stay stable across serde versions.
     #[cfg(feature = "serde")]
@@ -2377,141 +2563,6 @@ mod tests {
         for f in &frames {
             assert_eq!(f.len(), FRAME_SAMPLES);
         }
-    }
-
-    /// `DecodeStats::disposition` populates after a decode call.
-    /// On clean own-encoded bits the disposition is `Use`; on bits
-    /// crafted to cross the mute threshold (high ε_t injected by
-    /// pre-loading `state.epsilon_r`) it should be `Mute`.
-    #[test]
-    fn decode_stats_carry_disposition() {
-        let mut tx = Vocoder::new(Rate::Imbe7200x4400);
-        let mut rx = Vocoder::new(Rate::Imbe7200x4400);
-        for _ in 0..5 {
-            let pcm = periodic_pcm(40, 8000);
-            let bits = tx.encode_pcm(&pcm).unwrap();
-            let _ = rx.decode_bits(&bits).unwrap();
-        }
-        let disp = rx
-            .last_stats()
-            .decode
-            .as_ref()
-            .expect("decode stats populated after decode call")
-            .disposition
-            .expect("disposition surfaced");
-        // Clean own-encoded bits: 0 errors per frame, so Use.
-        assert_eq!(disp, FrameDisposition::Use);
-        assert_eq!(rx.last_disposition(), Some(FrameDisposition::Use));
-    }
-
-    /// Pure-sine input at an Annex T frequency, with tone detection
-    /// enabled, produces a tone frame instead of voice. The decoder
-    /// recognises the tone-frame signature and reconstructs the
-    /// matching MBE params.
-    #[test]
-    fn tone_detection_emits_tone_frame_and_decoder_recognises_it() {
-        // Half-rate is the only rate with tone-frame signaling.
-        let mut tx = Vocoder::new(Rate::AmbePlus2_3600x2450);
-        tx.set_tone_detection(true);
-        // Annex T id=10 → 312.5 Hz. Generate one full frame of clean
-        // sine at i16 amplitude 8000.
-        let mut pcm = [0i16; FRAME_SAMPLES];
-        let two_pi = 2.0 * core::f64::consts::PI;
-        for (n, slot) in pcm.iter_mut().enumerate() {
-            let s = 8000.0_f64 * (two_pi * 312.5 * n as f64 / 8000.0).sin();
-            *slot = s.round() as i16;
-        }
-        let bits = tx.encode_pcm(&pcm).unwrap();
-        assert_eq!(bits.len(), 9);
-
-        // Confirm the encoder reported a Tone output.
-        match tx.last_stats().analysis.as_ref().unwrap().output {
-            AnalysisOutputKind::Tone { id, amplitude: _ } => assert_eq!(id, 10),
-            other => panic!("expected Tone, got {other:?}"),
-        }
-
-        // Decoder side: parse the bits and confirm it classifies as
-        // a tone frame (FrameKind::Tone via the §2.10.1 signature
-        // dispatch).
-        use crate::rate33::dequantize::{classify_ambe_plus2_frame, FrameKind};
-        use crate::rate33::frame::decode_frame;
-        let mut dibits = [0u8; 36];
-        let mut bit = 0;
-        for slot in &mut dibits {
-            let mut d = 0u8;
-            for _ in 0..2 {
-                let b = (bits[bit / 8] >> (7 - (bit % 8))) & 1;
-                d = (d << 1) | b;
-                bit += 1;
-            }
-            *slot = d;
-        }
-        let frame = decode_frame(&dibits);
-        assert_eq!(classify_ambe_plus2_frame(&frame.info), FrameKind::Tone);
-
-        // Decoding through the Vocoder yields PCM (synthesize_tone
-        // path); we don't assert frequency parity because tone-synth
-        // calibration depends on §1.10/§11 amplitude scaling that's
-        // separately tracked, but the output should be non-trivial.
-        let mut rx = Vocoder::new(Rate::AmbePlus2_3600x2450);
-        let out = rx.decode_bits(&bits).unwrap();
-        assert_eq!(out.len(), FRAME_SAMPLES);
-    }
-
-    /// With tone-detection off (default), the same pure-sine input
-    /// goes through the voice analysis pipeline and produces a
-    /// regular voice frame.
-    #[test]
-    fn tone_detection_off_means_voice_path_even_for_pure_sine() {
-        let mut tx = Vocoder::new(Rate::AmbePlus2_3600x2450);
-        // (default) tone_detection == false
-        let mut pcm = [0i16; FRAME_SAMPLES];
-        let two_pi = 2.0 * core::f64::consts::PI;
-        for (n, slot) in pcm.iter_mut().enumerate() {
-            let s = 8000.0_f64 * (two_pi * 312.5 * n as f64 / 8000.0).sin();
-            *slot = s.round() as i16;
-        }
-        let _ = tx.encode_pcm(&pcm).unwrap();
-        let stats = tx.last_stats().analysis.as_ref().unwrap();
-        assert!(matches!(
-            stats.output,
-            AnalysisOutputKind::Voice | AnalysisOutputKind::Silence
-        ));
-        assert!(!matches!(stats.output, AnalysisOutputKind::Tone { .. }));
-        assert!(stats.tone_detect.is_none());
-    }
-
-    /// On full-rate IMBE, tone detection is **detection-only**: the
-    /// wire frame stays a regular voice frame (Phase 1 has no
-    /// tone-frame opcode at the codec layer per BABA-A) but the
-    /// detected `(I_D, A_D)` is surfaced via `tone_detect` so
-    /// application-layer signaling (LCW, paging) can route on it.
-    #[test]
-    fn tone_detection_on_phase1_surfaces_metadata_without_changing_wire() {
-        let mut tx = Vocoder::new(Rate::Imbe7200x4400);
-        tx.set_tone_detection(true);
-        let mut pcm = [0i16; FRAME_SAMPLES];
-        let two_pi = 2.0 * core::f64::consts::PI;
-        for (n, slot) in pcm.iter_mut().enumerate() {
-            let s = 8000.0_f64 * (two_pi * 312.5 * n as f64 / 8000.0).sin();
-            *slot = s.round() as i16;
-        }
-        let bits_with_detect = tx.encode_pcm(&pcm).unwrap();
-        let stats = tx.last_stats().analysis.as_ref().unwrap();
-        // Wire output is still voice (no Phase 1 tone-frame opcode).
-        assert!(matches!(
-            stats.output,
-            AnalysisOutputKind::Voice | AnalysisOutputKind::Silence
-        ));
-        // But the detector populated tone_detect with the matching id.
-        let det = stats.tone_detect.expect("Phase 1 detection metadata");
-        assert_eq!(det.id, 10); // Annex T id=10 → 312.5 Hz
-
-        // Bit-exact equivalence with detection off — running the
-        // detector must not perturb the analysis encoder state.
-        let mut tx_off = Vocoder::new(Rate::Imbe7200x4400);
-        let bits_no_detect = tx_off.encode_pcm(&pcm).unwrap();
-        assert_eq!(bits_with_detect, bits_no_detect);
     }
 
     /// `LiveEncoder` accepts arbitrary chunk sizes, holds residue
@@ -2674,199 +2725,31 @@ mod tests {
         ));
     }
 
-    /// Same-codec FEC ↔ no-FEC transcode is lossless: strip then add
-    /// (or add then strip) reproduces the original bytes exactly.
-    #[test]
-    fn transcoder_full_fec_to_info_roundtrip_is_lossless() {
-        let mut enc = Vocoder::new(Rate::Imbe7200x4400);
-        let mut strip = Transcoder::new(Rate::Imbe7200x4400, Rate::Imbe4400x4400).unwrap();
-        let mut add = Transcoder::new(Rate::Imbe4400x4400, Rate::Imbe7200x4400).unwrap();
-        for k in 0..4 {
-            let pcm = periodic_pcm(40 + k, 7000);
-            let fec = enc.encode_pcm(&pcm).unwrap();
-            assert_eq!(fec.len(), 18);
-            let info = strip.transcode(&fec).unwrap();
-            assert_eq!(info.len(), 11);
-            let fec2 = add.transcode(&info).unwrap();
-            assert_eq!(fec2, fec, "FEC strip + add round-trips byte-for-byte");
-        }
-    }
-
-    #[test]
-    fn transcoder_half_fec_to_info_roundtrip_is_lossless() {
-        let mut enc = Vocoder::new(Rate::AmbePlus2_3600x2450);
-        let mut strip =
-            Transcoder::new(Rate::AmbePlus2_3600x2450, Rate::AmbePlus2_2450x2450).unwrap();
-        let mut add =
-            Transcoder::new(Rate::AmbePlus2_2450x2450, Rate::AmbePlus2_3600x2450).unwrap();
-        for k in 0..4 {
-            let pcm = periodic_pcm(40 + k, 6000);
-            let fec = enc.encode_pcm(&pcm).unwrap();
-            assert_eq!(fec.len(), 9);
-            let info = strip.transcode(&fec).unwrap();
-            assert_eq!(info.len(), 7);
-            let fec2 = add.transcode(&info).unwrap();
-            assert_eq!(fec2, fec, "FEC strip + add round-trips byte-for-byte");
-        }
-    }
-
-    /// `extract_params` runs the analysis encoder on PCM and returns
-    /// MbeParams. Multiple calls advance state correctly (preroll
-    /// → voice transition).
-    #[test]
-    fn extract_params_returns_params_per_frame() {
-        let mut v = Vocoder::new(Rate::Imbe7200x4400);
-        // First few frames are preroll; analysis should still return
-        // silence params, not error.
-        let pcm = periodic_pcm(40, 6000);
-        let p1 = v.extract_params(&pcm).unwrap();
-        let p2 = v.extract_params(&pcm).unwrap();
-        let p3 = v.extract_params(&pcm).unwrap();
-        // Preroll dispatches silence; by frame 3+ we should see voice
-        // params (non-silence ω₀ or non-zero amplitudes).
-        let any_voice = [&p1, &p2, &p3].iter().any(|p| {
-            let amps = p.amplitudes_slice();
-            amps.iter().any(|&a| a > 0.0)
-        });
-        assert!(any_voice, "no voice params after 3 frames of periodic PCM");
-    }
-
-    /// extract_params + synthesize_params chain together — extract
-    /// params from PCM, immediately synthesize them back to PCM, get
-    /// non-trivial output. (Not the same as the input — that would
-    /// require the wire FEC chain to advance the synth predictor in
-    /// step with the analysis predictor — but the synth output is
-    /// well-defined.)
-    #[test]
-    fn extract_then_synthesize_roundtrips_through_params() {
-        let mut a = Vocoder::new(Rate::Imbe7200x4400);
-        let mut b = Vocoder::new(Rate::Imbe7200x4400);
-        let pcm = periodic_pcm(40, 6000);
-        for _ in 0..5 {
-            let params = a.extract_params(&pcm).unwrap();
-            let resynth = b.synthesize_params(&params);
-            assert_eq!(resynth.len(), FRAME_SAMPLES);
-        }
-    }
-
-    /// `synthesize_params` accepts arbitrary MbeParams and produces a
-    /// 160-sample PCM frame. Round-trips cleanly with `MbeParams::silence`
-    /// (full-rate) and `MbeParams::silence_ambe_plus2` (half-rate) —
-    /// silence params synthesize to (near-)silent output.
-    #[test]
-    fn synthesize_params_emits_one_frame_per_call() {
-        let mut tx = Vocoder::new(Rate::Imbe7200x4400);
-        let pcm = tx.synthesize_params(&MbeParams::silence());
-        assert_eq!(pcm.len(), FRAME_SAMPLES);
-        // Silence params → low-amplitude output.
-        let peak = pcm.iter().map(|&s| s.unsigned_abs()).max().unwrap_or(0);
-        assert!(peak < 5000, "silence params produced peak={peak}");
-
-        let mut rx = Vocoder::new(Rate::AmbePlus2_3600x2450);
-        let pcm = rx.synthesize_params(&MbeParams::silence_ambe_plus2());
-        assert_eq!(pcm.len(), FRAME_SAMPLES);
-        let peak = pcm.iter().map(|&s| s.unsigned_abs()).max().unwrap_or(0);
-        assert!(peak < 5000);
-    }
-
-    /// `synthesize_params` advances synth state so a follow-up
-    /// `last_disposition` reflects the most-recent frame.
-    #[test]
-    fn synthesize_params_advances_synth_disposition() {
-        let mut v = Vocoder::new(Rate::Imbe7200x4400);
-        assert_eq!(v.last_disposition(), None);
-        let _ = v.synthesize_params(&MbeParams::silence());
-        // Clean params + zero error context → Use.
-        assert_eq!(v.last_disposition(), Some(FrameDisposition::Use));
-    }
-
-    /// Builder applies all five config knobs in one expression.
-    #[test]
-    fn builder_configures_all_knobs() {
-        let v = Vocoder::builder(Rate::AmbePlus2_3600x2450)
-            .tone_detection(true)
-            .repeat_reset_after(Some(3))
-            .silence_dispatch(true)
-            .pitch_silence_override(true)
-            .ambe_plus2_synth(AmbePlus2Synth::Baseline)
-            .build();
-        assert_eq!(v.rate(), Rate::AmbePlus2_3600x2450);
-        assert!(v.tone_detection());
-        assert_eq!(v.repeat_reset_after(), Some(3));
-        assert!(v.silence_dispatch());
-        assert!(v.pitch_silence_override());
-        assert_eq!(v.ambe_plus2_synth(), AmbePlus2Synth::Baseline);
-    }
-
-    /// Half-rate synth choice routes to the right backend. Both
-    /// modes produce non-trivial audio. They MAY converge to
-    /// identical PCM on simple/periodic inputs (the AMBE+ phase
-    /// regen is a no-op when all bands voiced cleanly), so the
-    /// assertion is non-silent + correct rate, not bit-difference.
-    #[test]
-    fn ambe_plus2_synth_modes_both_decode_cleanly() {
-        let mut tx = Vocoder::new(Rate::AmbePlus2_3600x2450);
-        let pcm = periodic_pcm(40, 6000);
-        let mut bits_buf: Vec<u8> = Vec::new();
-        for _ in 0..5 {
-            bits_buf.extend(tx.encode_pcm(&pcm).unwrap());
-        }
-
-        for gen in [AmbePlus2Synth::AmbePlus, AmbePlus2Synth::Baseline] {
-            let mut rx = Vocoder::builder(Rate::AmbePlus2_3600x2450)
-                .ambe_plus2_synth(gen)
-                .build();
-            assert_eq!(rx.ambe_plus2_synth(), gen);
-            let mut out_pcm: Vec<i16> = Vec::new();
-            for chunk in bits_buf.chunks_exact(9) {
-                out_pcm.extend(rx.decode_bits(chunk).unwrap());
-            }
-            let rms = (out_pcm
-                .iter()
-                .map(|&s| (s as f64) * (s as f64))
-                .sum::<f64>()
-                / out_pcm.len() as f64)
-                .sqrt();
-            assert!(rms > 50.0, "{gen:?} output too quiet: rms={rms}");
-        }
-    }
-
-    /// Default builder = spec-faithful (no beyond-spec or opt-in knobs).
-    #[test]
-    fn builder_defaults_match_vocoder_new() {
-        let a = Vocoder::builder(Rate::Imbe7200x4400).build();
-        let b = Vocoder::new(Rate::Imbe7200x4400);
-        assert_eq!(a.rate(), b.rate());
-        assert_eq!(a.tone_detection(), b.tone_detection());
-        assert_eq!(a.repeat_reset_after(), b.repeat_reset_after());
-        assert_eq!(a.silence_dispatch(), b.silence_dispatch());
-        assert_eq!(a.pitch_silence_override(), b.pitch_silence_override());
-        assert_eq!(a.ambe_plus2_synth(), b.ambe_plus2_synth());
-        assert!(!a.tone_detection());
-        assert!(a.repeat_reset_after().is_none());
-        assert!(!a.silence_dispatch());
-        assert!(!a.pitch_silence_override());
-        assert_eq!(a.ambe_plus2_synth(), AmbePlus2Synth::AmbePlus);
-    }
-
-    /// `flush` zero-pads residue and emits one final frame; on an
-    /// empty buffer it's a no-op returning `Ok(None)`.
+    /// `flush` zero-pads residue and drains the look-ahead, returning all
+    /// remaining frames; on an empty/idle buffer it returns an empty `Vec`.
     #[test]
     fn live_encoder_flush_emits_padded_residue() {
         let mut live = LiveEncoder::new(Rate::Imbe7200x4400);
-        // Empty buffer → flush is a no-op.
-        assert!(matches!(live.flush(), Ok(None)));
+        // Empty buffer, nothing buffered in the codec → flush is empty.
+        assert!(live.flush().unwrap().is_empty());
 
-        // Half-frame residue → flush emits one frame.
+        // Half-frame residue → flush emits the padded residue frame plus
+        // the look-ahead frame the reference codec was still holding.
         let pcm = periodic_pcm(40, 6000);
         let _ = live.push(&pcm[..80]);
         assert_eq!(live.pending_samples(), 80);
-        let tail = live.flush().unwrap().expect("residue → frame");
-        assert_eq!(tail.len(), 18);
+        let tail = live.flush().unwrap();
+        assert!(
+            !tail.is_empty(),
+            "residue flush must emit at least one frame"
+        );
+        for frame in &tail {
+            assert_eq!(frame.len(), 18);
+        }
         assert_eq!(live.pending_samples(), 0);
 
-        // Subsequent flush is a no-op (buffer drained).
-        assert!(matches!(live.flush(), Ok(None)));
+        // Subsequent flush is a no-op (buffer + look-ahead both drained).
+        assert!(live.flush().unwrap().is_empty());
     }
 
     /// `reset` clears both vocoder state and the residue buffer.
@@ -2906,5 +2789,91 @@ mod tests {
             by_call.extend(b.encode_pcm(chunk).unwrap());
         }
         assert_eq!(by_stream, by_call);
+    }
+
+    // --- soft-decision decode (decode_soft) ---
+
+    /// `n` strong LLRs from a hard FEC frame's channel bits (MSB-first — the
+    /// raw frame-bit order `decode_frame_soft` expects). Sign = the bit.
+    fn frame_to_strong_llrs(fec: &[u8], n: usize) -> Vec<i8> {
+        (0..n)
+            .map(|i| {
+                if (fec[i / 8] >> (7 - (i % 8))) & 1 == 1 {
+                    100
+                } else {
+                    -100
+                }
+            })
+            .collect()
+    }
+
+    /// On error-free input `decode_soft` is bit-identical to `decode_bits`:
+    /// the soft FEC recovers the exact info, the re-encoded frame equals the
+    /// original, and the shared blip25_codec synth produces the same PCM. This is
+    /// the whole wiring contract — the coding gain over hard decode is proven
+    /// on real reference `*_sd` vectors by the `roundtrip_sanity --soft` harness.
+    #[test]
+    fn decode_soft_matches_hard_on_clean() {
+        for rate in [Rate::Imbe7200x4400, Rate::AmbePlus2_3600x2450] {
+            let n = rate.soft_frame_bits().unwrap();
+            let fec = match rate {
+                Rate::Imbe7200x4400 => {
+                    imbe_pipeline::info_vec_to_fec_bytes(&[1, 2, 3, 4, 5, 6, 7, 8]).to_vec()
+                }
+                Rate::AmbePlus2_3600x2450 => {
+                    ambe_plus2_pipeline::info_vec_to_fec_bytes(&[3, 5, 7, 9]).to_vec()
+                }
+                _ => unreachable!(),
+            };
+            let hard = Vocoder::new(rate).decode_bits(&fec).unwrap();
+            let llrs = frame_to_strong_llrs(&fec, n);
+            let soft = Vocoder::new(rate).decode_soft(&llrs).unwrap();
+            assert_eq!(hard, soft, "{rate:?}: decode_soft(clean) != decode_bits");
+            assert_eq!(soft.len(), rate.frame_samples());
+        }
+    }
+
+    #[test]
+    fn decode_soft_rejects_bad_input() {
+        let mut imbe = Vocoder::new(Rate::Imbe7200x4400);
+        assert!(matches!(
+            imbe.decode_soft(&[0i8; 100]),
+            Err(VocoderError::WrongSoftLength {
+                expected: 144,
+                got: 100
+            })
+        ));
+        let mut nofec = Vocoder::new(Rate::Imbe4400x4400);
+        assert!(matches!(
+            nofec.decode_soft(&[0i8; 144]),
+            Err(VocoderError::SoftUnsupported {
+                rate: Rate::Imbe4400x4400
+            })
+        ));
+    }
+
+    #[test]
+    fn decode_stream_soft_matches_per_frame() {
+        let rate = Rate::Imbe7200x4400;
+        let n = rate.soft_frame_bits().unwrap();
+        let fec = imbe_pipeline::info_vec_to_fec_bytes(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        let llrs: Vec<i8> = (0..4).flat_map(|_| frame_to_strong_llrs(&fec, n)).collect();
+
+        let mut sv = Vocoder::new(rate);
+        let streamed: Vec<Vec<i16>> = sv.decode_stream_soft(&llrs).map(|r| r.unwrap()).collect();
+
+        // Per-frame reference shares state across frames, just like the stream.
+        let mut pv = Vocoder::new(rate);
+        let per_frame: Vec<Vec<i16>> = llrs
+            .chunks_exact(n)
+            .map(|c| pv.decode_soft(c).unwrap())
+            .collect();
+
+        assert_eq!(streamed, per_frame);
+        assert_eq!(streamed.len(), 4);
+
+        // No-FEC rate: empty stream (decode_soft would return SoftUnsupported).
+        let mut nofec = Vocoder::new(Rate::Imbe4400x4400);
+        assert_eq!(nofec.decode_stream_soft(&[0i8; 144]).count(), 0);
     }
 }

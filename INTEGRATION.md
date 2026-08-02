@@ -7,7 +7,7 @@ consumer.
 
 ## The Boundary Principle
 
-`blip25-mbe` is a **software chip**. The mental model is the DVSI AMBE-3000
+`blip25-mbe` is a **software chip**. The mental model is the reference AMBE-3000
 on a ThumbDV: the consumer hands it framed wire bits and gets PCM back
 (or the reverse). The chip has no knowledge of:
 
@@ -21,7 +21,7 @@ on a ThumbDV: the consumer hands it framed wire bits and gets PCM back
 The chip knows three things:
 
 1. **Wire format** — how to parse a 144-bit IMBE frame, a 72-bit AMBE+2
-   frame, or a DVSI r0..r63 rate-configured frame into parameters.
+   frame, or a reference r0..r63 rate-configured frame into parameters.
 2. **Parameter model** — the common `MbeParams` interchange type
    (ω₀, V/UV, M_l).
 3. **Codec** — analysis/synthesis between `MbeParams` and 8 kHz PCM,
@@ -43,13 +43,16 @@ exact signatures) is:
 imbe7200::frame::decode_frame(&[u8; 72]) -> Frame                  // full-rate IMBE, 7200 bps
 imbe7200::frame::decode_frame_soft(&[i8; SOFT_BITS]) -> Frame
 imbe7200::dequantize::dequantize(&frame.info, &mut DecoderState) -> Result<MbeParams>
-rate33::frame::decode_frame(&[u8; DIBITS_PER_FRAME]) -> Frame      // half-rate AMBE+2, DVSI rate 33
+rate33::frame::decode_frame(&[u8; DIBITS_PER_FRAME]) -> Frame      // half-rate AMBE+2, reference rate 33
 rate33::frame::decode_frame_soft(&[i8; SOFT_BITS]) -> Frame
 rate33::dequantize::dequantize(&frame.info, &mut DecoderState) -> Result<MbeParams>
 
-// Codec layer — MbeParams ↔ PCM. <gen> ∈ { mbe_baseline, ambe, ambe_plus, ambe_plus2 }.
-codecs::<gen>::synthesize_frame(&MbeParams, &mut SynthState) -> [i16; SAMPLES_PER_FRAME]
-codecs::mbe_baseline::analysis::{encode, encode_with_trace, encode_ambe_plus2}  // PCM → params/bits
+// Codec layer — MbeParams → PCM, over the blip25-codec engine.
+synth::synthesize_frame(&MbeParams, &mut SynthState) -> [i16; SAMPLES_PER_FRAME]
+synth::synthesize_tone(&MbeParams, &mut SynthState)   -> [i16; SAMPLES_PER_FRAME]
+synth::synthesize_repeat(&mut SynthState)             -> [i16; SAMPLES_PER_FRAME]
+// PCM → bits has no free-function form: analysis state is owned by the codec
+// engine, so encode goes through `Vocoder::encode_pcm` / `LiveEncoder`.
 
 // Parameter layer — the common interchange type
 mbe_params::MbeParams
@@ -61,9 +64,6 @@ rate_conversion::{FullToHalfConverter, HalfToFullConverter}  // ::new(); .conver
 fec::{golay_23_12_decode, golay_24_12_decode, hamming_15_11_decode,
       golay_23_12_decode_soft, golay_24_12_decode_soft, hamming_15_11_decode_soft, FecDecoded}
 ```
-
-(`dvsi_3000::frame`, a generic r0..r63 rate-configured wire parser, is a
-planned module — currently a stub, not yet a usable entry point.)
 
 `decode_frame` is authoritative for its wire. Consumers should not
 re-implement interleave patterns, FEC polynomial application, or priority
@@ -132,15 +132,13 @@ These are chip-protocol concerns that don't exist at the codec layer:
 - **Multi-channel multiplex.** The chip can multiplex multiple
   channels over one serial port; `Vocoder` is one channel. Caller
   allocates as many handles as they need.
-- **Tone-frame emission** (encode side). Half-rate decode handles
-  `Decoded::Tone` already; encode-side tone dispatch (analyzing PCM
-  and emitting an Annex T tone frame instead of voice) is not
-  implemented. A real chip would.
-- **Beyond-spec heuristics** (max-headroom-reset, error-rate-freeze
-  on repeat). Available as opt-in flags on the lower-level paths
-  (`SynthState::set_repeat_reset_after`); not on `Vocoder` because
-  the chip-shaped API stays spec-faithful by default. See gap 0021 /
-  0022 for the spec-vs-chip divergence story.
+- **Audio-domain DSP** (AGC, noise removal). The optional post-decode
+  enhancement chain (`set_enhancement`) is the seed of this, but the
+  crate does not otherwise condition audio — that is radio-side.
+
+Tone frames, by contrast, *are* modeled on both sides: half-rate decode
+dispatches `Decoded::Tone` to Annex-T synthesis, and encode-side tone
+detection is available via `set_tone_detection` / `VocoderBuilder`.
 
 ### Wire-format support matrix
 
@@ -149,14 +147,14 @@ These are chip-protocol concerns that don't exist at the codec layer:
 | `Imbe7200x4400`       |         18 | IMBE Gen 1   | ✅        | P25 Phase 1 FDMA voice                         |
 | `Imbe4400x4400`       |         11 | IMBE Gen 1   | ✅        | IMBE codec, FEC layer stripped (88 prioritized info bits packed MSB-first). For lossless transports or diagnostic / cross-decoder tooling |
 | `AmbePlus2_3600x2450` |          9 | AMBE+2 Gen 3 | ✅        | P25 Phase 2 TDMA voice; carrier-agnostic for any AMBE+2 sink that lays its post-FEC info as 4 vectors of widths {12,12,12,12} (NXDN type-2 typical, DMR enhanced) |
-| `AmbePlus2_2450x2450` |          7 | AMBE+2 Gen 3 | ✅        | AMBE+2 half-rate codec, FEC layer stripped (49 info bits + 7 pad bits, MSB-first). DVSI PKT_RATEP rate 34 |
+| `AmbePlus2_2450x2450` |          7 | AMBE+2 Gen 3 | ✅        | AMBE+2 half-rate codec, FEC layer stripped (49 info bits + 7 pad bits, MSB-first). Reference PKT_RATEP rate 34 |
 
 For carriers whose post-FEC info layout differs (older DMR, AMBE+
 Gen 2 NXDN, D-STAR's specific bit layout), drop down a layer to
-`decode-raw-mbe` (raw 9-value `b̂₀..b̂₈`) or `decode-raw-ambe-plus2`
-(post-FEC 4-vector info) — both are available as CLI subcommands of
-`conformance-speech-quality` and as direct library calls into
-`rate33::dequantize` + `codecs::ambe_plus2`.
+the parameter layer directly: `rate33::dequantize` yields `MbeParams`,
+which `synth::synthesize_frame` renders to PCM. That pair is the
+carrier-agnostic seam — anything that can produce the post-FEC info
+vectors can drive it.
 
 ## What Stays in the Consumer (p25-decoder example)
 
@@ -169,9 +167,9 @@ These responsibilities are radio-side, not chip-side. They never migrate.
 | TDMA burst classification             | `crates/blip25-core/src/tdma/{burst,duid,isch,facch,ess}.rs` | Burst protocol parsing                                        |
 | **LFSR descrambling (Phase 2)**       | `crates/blip25-core/src/tdma/lfsr.rs`                        | Keyed by WACN/SYSID/NAC; runs *before* 72-bit frames exist    |
 | Call lifecycle, per-call WAV, SSTP    | `crates/blip25-vocoder/src/{lib,tdma}.rs`                    | Project-specific orchestration around the chip                |
-| DVSI ThumbDV TCP client               | `crates/ambe-client/`                                        | Real-hardware peer of the software chip (useful for A/B)      |
+| ThumbDV TCP client                    | `crates/ambe-client/`                                        | Real-hardware peer of the software chip (useful for A/B)      |
 
-The LFSR case is the clearest test of the boundary: a real DVSI chip
+The LFSR case is the clearest test of the boundary: a real reference chip
 does not know about WACN/NAC either. The host feeds it already-descrambled
 72-bit frames. Same contract for `blip25-mbe`.
 
@@ -191,8 +189,7 @@ writers, SSTP emitters) is unchanged.
 
 ## Design Decisions at the Boundary
 
-These came up concretely during the p25-decoder boundary mapping. Documented
-so future protocol consumers do not re-derive them.
+Recorded so future protocol consumers do not re-derive them.
 
 ### Tone frames
 
@@ -203,19 +200,19 @@ frame). Synthesis is codec-layer (dual-sinusoid DTMF / ringback).
   classifies a frame as `Voice`, `Tone`, or `Erasure`; `parse_tone_frame`
   extracts the `ToneFrameFields` and `tone_to_mbe_params(id, amplitude)`
   converts a detected tone into synthesizable `MbeParams`.
-- `codecs::<gen>::synthesize_tone(&MbeParams, &mut SynthState)` renders audio.
+- `synth::synthesize_tone(&MbeParams, &mut SynthState)` renders audio.
 
 ### Spectral enhancement
 
 The enhancement and phase-regeneration algorithms (US5701390, US8595002,
 US8315860) are codec-internal quality logic, not wire format. They live
-in `codecs/ambe_plus` and `codecs/ambe_plus2`. They do not live in
-`mbe_params/` and they do not live in any wire submodule.
+inside the `blip25-codec` engine, reached through `synth`. They do not
+live in `mbe_params/` and they do not live in any wire submodule.
 
 A wire submodule's only contract with the codec is `bits ↔ MbeParams`.
-Pairing the `imbe7200` wire with the `codecs::ambe_plus2` codec is a
+Pairing the `imbe7200` wire with the half-rate codec path is therefore a
 valid combination (the SCBA-mask deployment pattern); the wire layer
-should make that combination expressible.
+makes that combination expressible.
 
 ### Soft-decision FEC
 
@@ -227,27 +224,24 @@ crate both depend on. Do not factor preemptively.
 
 ### Loudness calibration reference
 
-`blip25-mbe` targets **DVSI chip PCM parity per BABA-A**. The only
-valid calibration references are:
-
-1. **Canonical DVSI test-vector PCM** — `DVSI/Vectors/tv-rc/r33/*.pcm`
-   (half-rate) and `DVSI/Vectors/tv-std/tv/*.pcm` (full-rate).
-2. **Live DVSI chip PCM** via `conformance/chip/` (subject to the
-   chip-oracle caveats in `~/blip25-specs/analysis/ambe3000_chip_oracle_caveats.md`).
+`blip25-mbe` targets **reference PCM parity per BABA-A**. The only valid
+calibration reference is the canonical reference test-vector PCM —
+`reference-material/Vectors/tv-rc/r33/*.pcm` (half-rate) and
+`reference-material/Vectors/tv-std/tv/*.pcm` (full-rate).
 
 **Other P25 open-source decoders (SDRTrunk / JMBE / OP25) are NOT
 valid references.** Their PCM output contains post-synthesis gain
 (typically ~8× for SDRTrunk) that is layered on top of the BABA-A
 synthesis pipeline. Calibrating `γ_w` or any other codec constant
 against those outputs would require values far outside the spec's
-plausible range and would break DVSI-chip conformance.
+plausible range and would break reference-chip conformance.
 
-Measured 2026-04-19 on canonical DVSI tv-rc/r33 half-rate reference
-PCM across 5 vectors (`alert`, `clean`, `cp0`, `cp1`, `cp31`): our
-output RMS is **0.999× to 1.067× of DVSI reference** — within the
-§1.10+§1.12 processing envelope documented in the chip-oracle
-caveats analysis. This is the correct target; loudness parity with
-SDRTrunk is not.
+Against the canonical reference tv-rc/r33 half-rate PCM on the
+`alert`, `clean`, `cp0`, `cp1` and `cp31` vectors, output RMS is
+**0.999× to 1.067× of the reference** — within the §1.10+§1.12
+processing envelope documented in
+`~/blip25-specs/analysis/ambe3000_chip_reference_caveats.md`. That is the
+correct target; loudness parity with SDRTrunk is not.
 
 **Consumers requiring SDRTrunk-parity loudness for operational UX**
 have two options:
@@ -260,7 +254,7 @@ have two options:
    stages, so it composes cleanly with the HPF + peaking defaults.
 
 Either is an application-layer choice — the codec itself stays
-calibrated against DVSI parity per BABA-A.
+calibrated against reference parity per BABA-A.
 
 #### Tones vs speech: random-phase reconstruction artifact
 
@@ -282,27 +276,15 @@ Peak amplitude is preserved; RMS is consistently ~5 dB lower
 because the reconstructed waveform has higher crest factor than a
 pure sine. **This is structural to MBE-class codecs** — fixing it
 would require beyond-spec phase tracking. On real speech, RMS
-round-trip is within ~0.3 dB (verified on the 5-vector PESQ
-harness's `clean.pcm`); the random-phase RMS drop only manifests
-on monotone / near-monotone inputs.
+round-trip is within ~0.3 dB (`clean.pcm`); the random-phase RMS
+drop only manifests on monotone / near-monotone inputs.
 
 For Phase 2 (AMBE+2) the **Annex T tone-frame path bypasses MBE
 synthesis entirely** and reconstructs deterministic sines from a
-lookup table — round-trip on a sine is unity (±0.3 dB) post-2026-04-30
-amplitude calibration fix. Use `Vocoder::set_tone_detection(true)`
-for half-rate consumers carrying DTMF/Knox/single-tone content.
-Phase 1 IMBE has no equivalent fast path; tones over Phase 1 will
-always exhibit the random-phase RMS drop.
-
-Reproducing the DVSI-parity measurement:
-
-```
-cargo run -p blip25-conformance-vectors --release -- \
-    decode-pcm-ambe-plus2 clean --write-pcm /tmp/ours.pcm
-```
-
-and compare RMS to `DVSI/Vectors/tv-rc/r33/clean.pcm` — expect
-ratio ≈ 1.0×.
+lookup table — round-trip on a sine is unity (±0.3 dB). Use
+`Vocoder::set_tone_detection(true)` for half-rate consumers carrying
+DTMF/Knox/single-tone content. Phase 1 IMBE has no equivalent fast
+path; tones over Phase 1 always exhibit the random-phase RMS drop.
 
 ### Parameter type unification
 
@@ -320,7 +302,7 @@ Fixtures move with the code that tests them.
 - Hex-encoded wire frames (`ambe_dump_*.txt`, IMBE frame dumps)
 - Soft-decision test vectors (`*.soft8`)
 - Reference PCM (`*.pcm`, `*.wav`) for end-to-end synthesis checks
-- DVSI TIA-102 test vectors, when present
+- Reference TIA-102 test vectors, when present
 
 **Stays in the consumer:**
 - Raw IQ captures (RF-layer)

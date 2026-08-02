@@ -14,8 +14,7 @@
 //!    `b̂_{L+2}`.
 //! 6. Inverse log-magnitude prediction (BABA-A §7) → `M̃_l`.
 //!
-//! This module currently implements steps 1 and 2. Steps 3–6 land as
-//! the Annex E/F/G/J CSVs are wired through `build.rs`.
+//! The Annex E/F/G/J tables it reads are frozen in `src/generated/`.
 //!
 //! [`MbeParams`]: crate::mbe_params::MbeParams
 
@@ -25,7 +24,7 @@ use crate::mbe_params::{MbeParams, MbeParamsError, L_MAX};
 
 use super::priority::deprioritize;
 
-include!(concat!(env!("OUT_DIR"), "/annex_e_gain.rs"));
+include!("../generated/annex_e_gain.rs");
 
 /// One row of Annex F: bit count and uniform-quantizer step size for
 /// gain DCT coefficient `b̂_m` (`m ∈ {3..7}`).
@@ -48,9 +47,9 @@ pub(crate) struct HocAlloc {
     pub b_m_bits: u8,
 }
 
-include!(concat!(env!("OUT_DIR"), "/annex_f_gain_alloc.rs"));
-include!(concat!(env!("OUT_DIR"), "/annex_g_hoc_alloc.rs"));
-include!(concat!(env!("OUT_DIR"), "/annex_j_blocks.rs"));
+include!("../generated/annex_f_gain_alloc.rs");
+include!("../generated/annex_g_hoc_alloc.rs");
+include!("../generated/annex_j_blocks.rs");
 
 /// Highest valid full-rate pitch index per BABA-A §1.3.1: values
 /// `b̂₀ ∈ [0, 207]` are transmittable; `[208, 255]` are reserved and
@@ -93,9 +92,9 @@ pub fn pitch_decode(b0: u8) -> Option<PitchInfo> {
 
 /// Number of V/UV bands `K̃` for a given harmonic count `L̃` (Eq. 48).
 #[inline]
-pub const fn vuv_band_count(l: u8) -> u8 {
+pub(crate) const fn vuv_band_count(l: u8) -> u8 {
     if l <= 36 {
-        (l + 2) / 3
+        l.div_ceil(3)
     } else {
         12
     }
@@ -111,8 +110,8 @@ pub const fn vuv_band_count(l: u8) -> u8 {
 /// the highest band absorbs any harmonic whose computed band exceeds
 /// the actual band count.
 #[inline]
-pub const fn band_for_harmonic(l: u8, k: u8) -> u8 {
-    let raw = if l <= 36 { (l + 2) / 3 } else { 12 };
+pub(crate) const fn band_for_harmonic(l: u8, k: u8) -> u8 {
+    let raw = if l <= 36 { l.div_ceil(3) } else { 12 };
     if raw > k {
         k
     } else {
@@ -125,7 +124,7 @@ pub const fn band_for_harmonic(l: u8, k: u8) -> u8 {
 // ---------------------------------------------------------------------------
 
 /// Number of entries in the Annex E gain quantizer (6-bit index → 64 levels).
-pub const GAIN_LEVELS: usize = 64;
+pub(crate) const GAIN_LEVELS: usize = 64;
 
 /// Decode the 6-bit gain index `b̂₂` to the overall log-gain `G̃₁`
 /// per BABA-A §6 / impl-spec §12.1.
@@ -135,11 +134,12 @@ pub const GAIN_LEVELS: usize = 64;
 /// coefficients `G̃₂..G̃₆` are reconstructed from `b̂₃..b̂₇` via Annex F
 /// step sizes (next pipeline step).
 ///
-/// Panics in debug builds if `b2 >= 64`.
+/// Over-width `b2` is masked to the 6-bit domain (never panics).
 #[inline]
 pub fn decode_gain(b2: u8) -> f32 {
-    debug_assert!(b2 < 64, "b̂₂ is a 6-bit value");
-    IMBE_GAIN_LEVELS[b2 as usize]
+    // Hostile input class: over-width b̂₂ (corrupted wire / raw u8) — mask to
+    // the 6-bit Annex E index domain instead of indexing past the 64-entry table.
+    IMBE_GAIN_LEVELS[(b2 & 0x3F) as usize]
 }
 
 /// Encode an overall log-gain value `G_1` to the 6-bit Annex E index
@@ -148,7 +148,7 @@ pub fn decode_gain(b2: u8) -> f32 {
 /// The Annex E table is strictly monotone increasing, so this is a
 /// binary search that reports whichever of the two bracketing entries
 /// is closest. Ties go to the lower index.
-pub fn encode_gain(g1: f32) -> u8 {
+pub(crate) fn encode_gain(g1: f32) -> u8 {
     // Saturate at the boundaries.
     if g1 <= IMBE_GAIN_LEVELS[0] {
         return 0;
@@ -188,7 +188,7 @@ pub fn encode_gain(g1: f32) -> u8 {
 /// value = Δ̃_m · (b̃_m − 2^{B̃_m−1} + 0.5)         otherwise
 /// ```
 #[inline]
-pub fn decode_uniform(b_m: u16, b_m_bits: u8, delta_m: f32) -> f32 {
+pub(crate) fn decode_uniform(b_m: u16, b_m_bits: u8, delta_m: f32) -> f32 {
     if b_m_bits == 0 {
         return 0.0;
     }
@@ -214,7 +214,7 @@ const HOC_SIGMA: [f32; 11] = [
 /// HOC step size `Δ̃_m = HOC_STEP[B̃_m] · HOC_SIGMA[k]` per §1.8.2.
 /// `B̃_m` clamps to 10; `k` clamps to 10 (Table 4's last row).
 #[inline]
-pub fn hoc_step_size(b_m_bits: u8, k: u8) -> f32 {
+pub(crate) fn hoc_step_size(b_m_bits: u8, k: u8) -> f32 {
     let step_idx = (b_m_bits as usize).min(10);
     let k_idx = (k as usize).min(10);
     HOC_STEP[step_idx] * HOC_SIGMA[k_idx]
@@ -231,7 +231,7 @@ pub fn hoc_step_size(b_m_bits: u8, k: u8) -> f32 {
 /// via Eq. 68 with step sizes from Annex F (`Δ̃_m`).
 ///
 /// Output indexed 0..6 corresponds to spec `G̃_1..G̃_6` (1-based).
-pub fn decode_gain_dct(b: &[u16; 59], l: u8) -> [f32; 6] {
+pub(crate) fn decode_gain_dct(b: &[u16; 59], l: u8) -> [f32; 6] {
     debug_assert!((9..=56).contains(&l));
     let l_idx = (l - 9) as usize;
     let mut g = [0f32; 6];
@@ -258,9 +258,9 @@ pub fn decode_gain_dct(b: &[u16; 59], l: u8) -> [f32; 6] {
 /// which is genuinely per-block). Eq. 61 (the forward gain DCT) uses
 /// `/6`, and round-trip identity at `L̃ = 36` (where `J̃_i = 6` for all
 /// `i`) requires the inverse to match. See
-/// `analysis/vocoder_decode_disambiguations.md §2` (2026-04-16
-/// correction) for the full derivation.
-pub fn gain_to_residuals(g: &[f32; 6]) -> [f32; 6] {
+/// `analysis/vocoder_decode_disambiguations.md §2` for the full
+/// derivation.
+pub(crate) fn gain_to_residuals(g: &[f32; 6]) -> [f32; 6] {
     let cos_tab = dct6_cos();
     let mut r = [0f32; 6];
     for i_0 in 0..6 {
@@ -371,7 +371,7 @@ pub fn assemble_hoc_matrix(b: &[u16; 59], l: u8, r_i: &[f32; 6]) -> [[f32; MAX_B
 ///
 /// `T̃_l` is the log₂-domain spectral-amplitude prediction residual for
 /// the current frame; it feeds the inverse log-magnitude prediction
-/// step (§1.8.5) which is added in the next commit.
+/// step (§1.8.5).
 ///
 /// Returns an `[f32; L_MAX]` array; only entries `0..L̃` are populated.
 pub fn inverse_block_dct(
@@ -409,7 +409,7 @@ pub fn inverse_block_dct(
 /// current frame's harmonic count), **not** the constant 0.65 that
 /// applies only to half-rate (BABA-A Eq. 200). See spec §1.8.5.
 #[inline]
-pub fn imbe_rho(l: u8) -> f32 {
+pub(crate) fn imbe_rho(l: u8) -> f32 {
     if l <= 15 {
         0.40
     } else if l <= 24 {
@@ -452,26 +452,6 @@ impl DecoderState {
             prev_l: INIT_PREV_L,
             prev_sync: false,
         }
-    }
-
-    /// Construct a DecoderState seeded with explicit `M̃_l(−1)`
-    /// amplitudes and harmonic count. `amplitudes` is 0-indexed
-    /// (entry `i` → harmonic `l = i + 1`), matching the
-    /// [`MbeParams`] / `dequantize` convention. Sync bit starts at 0.
-    ///
-    /// Used by the analysis encoder's closed-loop matched-decoder
-    /// roundtrip (addendum §0.6.6): the encoder syncs a fresh
-    /// `DecoderState` from its own `PredictorState`, calls
-    /// [`quantize`] + [`reconstruct_amplitudes_from_bits`] with a
-    /// snapshot so both sides see identical predictor input.
-    pub fn from_amplitudes(amplitudes: &[f32], l_prev: u8) -> Self {
-        let mut s = Self::new();
-        let n = amplitudes.len().min(l_prev as usize);
-        for i in 0..n {
-            s.prev_m_linear[i + 1] = amplitudes[i];
-        }
-        s.prev_l = l_prev;
-        s
     }
 
     /// Read `M̃_l(−1)` per Eqs. 78–79: index 0 returns 1.0 (virtual),
@@ -569,7 +549,7 @@ pub fn expected_sync_bit(prev_sync: bool) -> bool {
 /// LSBs are uncoded (in `û₇`). This split lets the decoder derive `L`
 /// even when `û₇` errors are present.
 #[inline]
-pub fn extract_pitch_index(u: &[u16; 8]) -> u8 {
+pub(crate) fn extract_pitch_index(u: &[u16; 8]) -> u8 {
     let msbs = ((u[0] >> 6) & 0x3F) as u8; // û₀[11..6] → b̂₀[7..2]
     let lsbs = ((u[7] >> 1) & 0x03) as u8; // û₇[2..1]  → b̂₀[1..0]
     (msbs << 2) | lsbs
@@ -603,6 +583,7 @@ pub enum DecodeError {
 /// 7. Inverse log-magnitude prediction → `log₂ M̃_l(0)` → `M̃_l`.
 /// 8. Update `state.prev_m_linear`, `state.prev_l`, `state.prev_sync`
 ///    for the next frame.
+///
 /// Matched-decoder reconstruction of `M̃_l(0)` from the raw quantized
 /// `b` array produced by [`quantize`]. Runs the inverse pipeline
 /// (`decode_gain_dct` → residuals → HOC matrix → inverse block DCT →
@@ -615,7 +596,7 @@ pub enum DecodeError {
 /// Unlike [`dequantize`], this does not go through priority-
 /// prioritization — the input `b` is the 59-word bitstream as
 /// produced directly by [`quantize`].
-pub fn reconstruct_amplitudes_from_bits(
+pub(crate) fn reconstruct_amplitudes_from_bits(
     b: &[u16; 59],
     l: u8,
     state: &DecoderState,
@@ -666,9 +647,7 @@ pub fn dequantize(u: &[u16; 8], state: &mut DecoderState) -> Result<MbeParams, D
 
     // Update decoder state for the next frame.
     state.prev_m_linear[0] = 1.0;
-    for i in 1..=l as usize {
-        state.prev_m_linear[i] = amplitudes[i - 1];
-    }
+    state.prev_m_linear[1..(l as usize + 1)].copy_from_slice(&amplitudes[..((l as usize - 1) + 1)]);
     state.prev_l = l;
     // Eq. 80 sync bit lives at b̂_{L+2}[0].
     state.prev_sync = (b[(l + 2) as usize] & 1) != 0;
@@ -688,9 +667,17 @@ pub type FullrateDecoderState = DecoderState;
 ///
 /// An `Erasure` tells the consumer to repeat the previous voice frame
 /// (BABA-A §4.1 "Repeat" disposition). Full-rate's `Mute` / `Silence`
-/// dispositions require error-count hysteresis over multiple frames;
-/// that state machine lives in Gap E (frame-repeat / erasure
-/// convention) and is not covered here.
+/// dispositions require error-count hysteresis over multiple frames, so
+/// they live in the shipped decoder rather than in this per-frame
+/// dequantizer: [`blip25_codec::ImbeDecoder`] tracks the smoothed error
+/// rate and the consecutive-invalid count and substitutes comfort noise
+/// when the gate fires. [`crate::vocoder::FrameDisposition`] is the
+/// surfaced form of that decision (reported on the AMBE+2 rates today),
+/// and a non-`Use` frame arms the enhancement boundary fade on the next
+/// good frame.
+// Voice is the overwhelmingly common variant; boxing MbeParams would pessimize the
+// hot path and change this public enum's shape for no runtime benefit.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug)]
 pub enum Decoded {
     /// Normal voice frame with reconstructed [`MbeParams`]. The
@@ -741,7 +728,7 @@ pub fn decode_to_params(
 /// Returns `None` if the result is outside `[0, 207]` — i.e. `ω̃₀` is
 /// outside the pitch estimator's valid range
 /// `(2π/123.125, 2π/19.875)`.
-pub fn encode_pitch(omega_0: f32) -> Option<u8> {
+pub(crate) fn encode_pitch(omega_0: f32) -> Option<u8> {
     if !(omega_0 > 0.0 && omega_0 < PI) {
         return None;
     }
@@ -761,14 +748,14 @@ pub fn encode_pitch(omega_0: f32) -> Option<u8> {
 /// harmonic in the same band must agree. We use the first harmonic
 /// of each band as the band's V/UV (any harmonic in the band would
 /// give the same answer for round-trippable inputs).
-pub fn collapse_vuv(voiced: &[bool], k: u8) -> u16 {
+pub(crate) fn collapse_vuv(voiced: &[bool], k: u8) -> u16 {
     debug_assert!(k > 0 && k <= 12);
     let l = voiced.len() as u8;
     let mut b1 = 0u16;
     for band in 1..=k {
         // First harmonic in the band: smallest `l` with band_for_harmonic(l, k) == band.
         let first = (1..=l).find(|&l_h| band_for_harmonic(l_h, k) == band);
-        let v = first.map_or(false, |l_h| voiced[(l_h - 1) as usize]);
+        let v = first.is_some_and(|l_h| voiced[(l_h - 1) as usize]);
         // Band 1 → MSB at bit (k-1); band K → LSB at bit 0.
         if v {
             b1 |= 1u16 << (k - band);
@@ -787,7 +774,7 @@ pub fn collapse_vuv(voiced: &[bool], k: u8) -> u16 {
 ///
 /// For `B̃_m = 0` the coefficient is not transmitted; this returns 0.
 #[inline]
-pub fn encode_uniform(value: f32, b_m_bits: u8, delta_m: f32) -> u16 {
+pub(crate) fn encode_uniform(value: f32, b_m_bits: u8, delta_m: f32) -> u16 {
     if b_m_bits == 0 {
         return 0;
     }
@@ -800,7 +787,7 @@ pub fn encode_uniform(value: f32, b_m_bits: u8, delta_m: f32) -> u16 {
 /// Encode a 6-element gain DCT vector `G̃_1..G̃_6` to quantizer indices
 /// `b̂₂..b̂₇`. `b̂₂` uses Annex E (argmin via [`encode_gain`]); `b̂₃..b̂₇`
 /// use [`encode_uniform`] with Annex F step sizes.
-pub fn encode_gain_dct(g: &[f32; 6], l: u8) -> [u16; 6] {
+pub(crate) fn encode_gain_dct(g: &[f32; 6], l: u8) -> [u16; 6] {
     debug_assert!((9..=56).contains(&l));
     let l_idx = (l - 9) as usize;
     let mut b = [0u16; 6];
@@ -821,12 +808,12 @@ pub fn encode_gain_dct(g: &[f32; 6], l: u8) -> [u16; 6] {
 ///         for 1 ≤ m ≤ 6
 /// ```
 ///
-/// Exact inverse of [`gain_to_residuals`] post-Eq. 69 correction. Both
-/// directions use denominator `6`; the forward DCT's `1/6` normalization
-/// is what makes the pair self-inverse for 6-element vectors. See
-/// `analysis/vocoder_decode_disambiguations.md` §2 (2026-04-16
-/// correction) for the derivation.
-pub fn residuals_to_gain(r: &[f32; 6]) -> [f32; 6] {
+/// Exact inverse of [`gain_to_residuals`] under the corrected Eq. 69.
+/// Both directions use denominator `6`; the forward DCT's `1/6`
+/// normalization is what makes the pair self-inverse for 6-element
+/// vectors. See `analysis/vocoder_decode_disambiguations.md` §2 for the
+/// derivation.
+pub(crate) fn residuals_to_gain(r: &[f32; 6]) -> [f32; 6] {
     let cos_tab = dct6_cos();
     let mut g = [0f32; 6];
     for m_0 in 0..6 {
@@ -893,7 +880,7 @@ pub fn disassemble_hoc_matrix(c: &[[f32; MAX_BLOCK_SIZE]; 6], l: u8, b: &mut [u1
 ///       − ρ·δ̃_l    ·log₂ M̃_{⌊k̃_l⌋+1}(−1)
 ///       + (ρ / L̃(0)) · Σ_{λ} […]
 /// ```
-pub fn forward_log_prediction(
+pub(crate) fn forward_log_prediction(
     log_m: &[f32; L_MAX as usize + 2],
     l: u8,
     state: &DecoderState,
@@ -979,9 +966,7 @@ pub fn quantize(params: &MbeParams, state: &mut DecoderState) -> Result<[u16; 59
     for i in 0..6 {
         let j_i = blocks[i] as usize;
         let mut block = [0f32; MAX_BLOCK_SIZE];
-        for j in 0..j_i {
-            block[j] = t[l_offset + j];
-        }
+        block[..j_i].copy_from_slice(&t[l_offset..(j_i + l_offset)]);
         c_matrix[i] = forward_block_dct(&block, j_i);
         l_offset += j_i;
     }
@@ -990,9 +975,7 @@ pub fn quantize(params: &MbeParams, state: &mut DecoderState) -> Result<[u16; 59
     let r_i: [f32; 6] = std::array::from_fn(|i| c_matrix[i][0]);
     let g = residuals_to_gain(&r_i);
     let g_indices = encode_gain_dct(&g, l);
-    for m_idx in 0..6 {
-        b[m_idx + 2] = g_indices[m_idx];
-    }
+    b[2..(6 + 2)].copy_from_slice(&g_indices);
 
     // HOC C̃_{i,k≥2} → b̂₈..b̂_{L+1}.
     disassemble_hoc_matrix(&c_matrix, l, &mut b);
@@ -1014,9 +997,7 @@ pub fn quantize(params: &MbeParams, state: &mut DecoderState) -> Result<[u16; 59
     // inverse pipeline the wire decoder will run on the same bits.
     let m_reconstructed = reconstruct_amplitudes_from_bits(&b, l, state);
     state.prev_m_linear[0] = 1.0;
-    for i in 1..=l as usize {
-        state.prev_m_linear[i] = m_reconstructed[i - 1];
-    }
+    state.prev_m_linear[1..(l as usize + 1)].copy_from_slice(&m_reconstructed[..((l as usize - 1) + 1)]);
     state.prev_l = l;
     state.prev_sync = sync;
 
@@ -1124,7 +1105,7 @@ mod tests {
                 assert!(entry.delta_m > 0.0);
             }
         }
-        // L=9, m=3 first row from CSV: B_m=10, Delta_m=0.003100.
+        // L=9, m=3 first row: B_m=10, Delta_m=0.003100.
         let r = IMBE_GAIN_ALLOC[0][0];
         assert_eq!(r.b_m, 10);
         assert!((r.delta_m - 0.003100).abs() < 1e-6);
@@ -1319,8 +1300,8 @@ mod tests {
 
     #[test]
     fn gain_to_residuals_uses_fixed_six_denominator() {
-        // Post-2026-04-16 correction: Eq. 69 uses `/6` uniformly, so the
-        // output does NOT depend on the per-block lengths (Annex J). With
+        // The corrected Eq. 69 uses `/6` uniformly, so the output does
+        // NOT depend on the per-block lengths (Annex J). With
         // only G̃_3 = 1 and α(3) = 2, the six outputs form a cosine
         // sequence at frequency m=3 over the six i-indices.
         //
@@ -1580,7 +1561,7 @@ mod tests {
         assert_eq!(state.previous_l(), p2.harmonic_count());
     }
 
-    // ---- decode_to_params (Gap A) ---------------------------------------
+    // ---- decode_to_params -------------------------------------------------
 
     /// Build a synthetic full-rate [`Frame`] with a given `b̂₀` and
     /// everything else zero. Returns the frame ready for
@@ -1742,8 +1723,8 @@ mod tests {
 
     #[test]
     fn gain_dct_is_self_inverse_post_eq_69_correction() {
-        // Post-2026-04-16 correction: both Eq. 61 (forward) and Eq. 69
-        // (inverse) use denominator 6, so the pair is exact-inverse for
+        // Both Eq. 61 (forward) and the corrected Eq. 69 (inverse) use
+        // denominator 6, so the pair is exact-inverse for
         // all 6-element vectors regardless of the Annex J block layout
         // the decoder later applies downstream.
         let r: [f32; 6] = [1.0, -2.5, 0.3, 0.0, -0.7, 1.8];
@@ -1824,9 +1805,9 @@ mod tests {
     fn quantize_multi_frame_predictor_state_tracks_decoder() {
         // Closed-loop invariant (analysis/ambe_encoder_closed_loop_predictor.md):
         // after each call to quantize(), the encoder's predictor state must
-        // equal what a fresh decoder reconstructs from the same bits. If
-        // the encoder instead stored raw input amplitudes (the pre-2026-04-17
-        // code path), states diverge after the first non-silent frame.
+        // equal what a fresh decoder reconstructs from the same bits. An
+        // encoder that stored raw input amplitudes instead diverges from
+        // the decoder after the first non-silent frame.
         use crate::imbe7200::priority::prioritize;
 
         // Use an ω₀ whose decoder pairing lands at L=9 so encoder's

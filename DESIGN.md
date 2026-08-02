@@ -5,7 +5,7 @@
 A vocoder is commonly described as the thing that turns bits into speech.
 This project rejects that framing.
 
-What actually exists in a digital voice system is three independent
+What actually exists in a digital voice codec is three independent
 translations, each with its own domain, its own literature, and its own
 evolutionary pressures:
 
@@ -64,7 +64,7 @@ This is the architectural commitment that makes rate conversion obvious:
 ```
 
 No synthesis. No re-analysis. No PCM. A single journey through parameter
-space. DVSI calls this "parametric rate conversion" in their own
+space. The reference vendor calls this "parametric rate conversion" in their own
 documentation. It is the project's headline capability, not an afterthought
 bolted onto a decoder.
 
@@ -72,43 +72,43 @@ bolted onto a decoder.
 
 ```
 mbe_params/       — the interchange type. the center.
-codecs/           — analysis/synthesis, one submodule per generation.
-  mbe_baseline/   — TIA-102.BABA-A, 1993. Cannot pass BABG; kept for completeness.
-  ambe/           — AMBE-1000, Generation 1.
-  ambe_plus/      — AMBE-2000, Generation 2. US5701390 phase regeneration.
-  ambe_plus2/     — AMBE-3000, Generation 3. US8595002, US8315860.
-imbe7200/     — P25 Phase 1 FDMA: 144-bit IMBE wire (BABA-A §1–§12).
-rate33/     — P25 Phase 2 TDMA: 72-bit AMBE+2 wire (BABA-A §13–§17 +
+synth/            — params → PCM, over the blip25-codec engine (IMBE + AMBE+2).
+vocoder/          — the chip-shaped façade. owns per-rate state; the entry point.
+imbe7200/         — P25 Phase 1 FDMA: 144-bit IMBE wire (BABA-A §1–§12).
+rate33/           — P25 Phase 2 TDMA: 72-bit AMBE+2 wire (BABA-A §13–§17 +
                     Annexes L–T; renamed "Half-Rate Vocoder" in the spec
-                    to dodge DVSI's trademark, but the wire is AMBE+2).
-dvsi_3000/        — DVSI AMBE-3000 chip protocol (r0..r63 rate configurations).
-                    Distinct from any over-the-air protocol; rates 33/34
-                    happen to align with P25 half-rate but the chip
-                    framing differs from what the P25 modulator emits.
-rate_conversion/  — parameter-domain bits-to-bits. peer of codecs/ and frames/.
+                    to dodge the reference vendor's trademark, but the wire is AMBE+2).
+rate_conversion/  — parameter-domain bits-to-bits. peer of the wire and
+                    codec layers, not a sub-concern of either.
 fec/              — shared FEC primitives (Golay, Hamming, interleavers).
 bits/             — shared bit-packing primitives.
+enhancement/      — optional post-decode filter chain. off by default.
+
+The codec-generation axis (AMBE-1000 / AMBE-2000 / AMBE-3000) has no
+sibling modules: the shipped engine covers IMBE and AMBE+2, the two P25
+wires actually need, and lives behind `synth`. The axis is real; it is
+just not populated past two points.
 ```
 
 Three concerns, three top-level axes, one interchange type.
 
-**Wire layer naming policy.** These modules are named by DVSI *rate*
+**Wire layer naming policy.** These modules are named by reference *rate*
 (`imbe7200` = full-rate IMBE at 7200 bps; `rate33` = half-rate AMBE+2,
-DVSI rate index 33) because they model the **codec channel frame** —
+reference rate index 33) because they model the **codec channel frame** —
 the rate-defined Golay/Hamming/PN/interleave layer sitting directly on
-the parameter bits, the same boundary DVSI's own chip packet draws.
+the parameter bits, the same boundary the reference's own chip packet draws.
 Protocol-specific over-the-air framing (burst layout, scrambling,
 sync) lives *above* mbe in each protocol's CAI/air-interface layer, not
 here.
 
-**DMR/NXDN reuse — resolved 2026-06-04 (was hedged).** The reuse claim
-splits cleanly into two layers, and the seam is now drawn in code:
+**DMR/NXDN reuse.** The reuse claim splits cleanly into two layers, and
+the seam is drawn in code:
 
 - **Codec FEC core — SHARED bit-for-bit.** The 49→72-bit AMBE+2 FEC —
   `[24,12]` extended Golay on `c₀`, `[23,12]` Golay on `c₁`, the
   `û₀`-seeded 24-value LCG PN scramble of `c₁`, uncoded `c₂`/`c₃`, and
   the `û₀..û₃` = `[12,12,11,14]` bit prioritization — is defined by the
-  **DVSI AMBE+2 vocoder at the 3600/2450 operating point**, not by any
+  **reference AMBE+2 vocoder at the 3600/2450 operating point**, not by any
   protocol. P25 Phase 2, DMR, and NXDN (4800/"EHR") all carry exactly
   this codec channel frame. Corroboration: open-source mbelib/DSD
   (general-codec reference, not P25 IP) decode all three through one
@@ -125,10 +125,10 @@ splits cleanly into two layers, and the seam is now drawn in code:
   `[u32;4]` / `SoftCodeVectors`, then calls the shared core above.
 
 So the reuse point is the **post-deinterleave code-vector frame**, not
-the OTA-dibit entry. The codec layer (`codecs/`) is shared across
-protocols regardless. (This supersedes the earlier "wire formats are
-strictly P25-protocol-specific" framing, which predated moving protocol
-burst layout up into the CAI layer.)
+the OTA-dibit entry. The codec layer (`synth/` over `blip25-codec`) is
+shared across protocols regardless. Wire formats are therefore not
+strictly P25-protocol-specific: protocol burst layout lives above this
+crate, in the CAI layer.
 
 **The deeper boundary is rate 34, not rate 33 — and encryption proves
 it.** There are two boundaries here, at two layers, and the *codec*
@@ -149,7 +149,7 @@ follow, and they shape what belongs in mbe vs. above it:
 1. **Encryption sits at the rate-34 boundary**, not below it. P25/DMR/NXDN
    encrypt the *parameter bits*, with FEC wrapping the ciphertext — so a
    keystream XOR has a home only on the 49-bit frame. A real radio (e.g.
-   APX) therefore runs its vocoder at rate 34 and does FEC + encryption in
+   a reference console) therefore runs its vocoder at rate 34 and does FEC + encryption in
    the host; the codec/chip never holds a key. mbe must expose the
    49-bit `Frame` as a first-class seam so a consumer can inject the XOR
    between FEC-decode and synthesis.
@@ -161,7 +161,7 @@ follow, and they shape what belongs in mbe vs. above it:
    FEC-independent fact.
 3. **mbe keeps its own Golay/PN by design.** As a standalone,
    cross-language library it cannot depend on a consumer's FEC crate, and
-   it needs the math to model DVSI chip rate-33 interop. The P25/DMR/NXDN
+   it needs the math to model reference chip rate-33 interop. The P25/DMR/NXDN
    CAI layer holds its *own* shared copy (one FEC — the voice-frame FEC is
    identical across the three — plus per-protocol interleave). The two
    copies are generic coding theory (not P25 IP) and stay bit-exact via a
@@ -173,9 +173,9 @@ consolidation of two independent vocoder specs: the original 1998
 BABA (full-rate IMBE) and the BABA-1 addendum (half-rate AMBE+2).
 The two wires are governed by the same document but they are not the
 same vocoder. P25 Phase 1 fire-channel deployments in particular
-sometimes pair the `imbe7200` wire with the `codecs::ambe_plus2`
-codec for SCBA-mask noise immunity — a valid combination because the
-wire layer's only contract with the codec is `bits ↔ MbeParams`.
+sometimes pair the `imbe7200` wire with the half-rate AMBE+2 codec
+for SCBA-mask noise immunity — a valid combination because the wire
+layer's only contract with the codec is `bits ↔ MbeParams`.
 
 ## What We Do Not Do
 
@@ -185,28 +185,36 @@ algorithms risks reproducing the same collapsed model we are working to
 escape. Our constants and algorithms come from:
 
 - TIA-102 published specifications — public, normative.
-- DVSI public documentation — USB-3000 manual, AMBE-3000 protocol spec.
-- Expired DVSI patents — public-domain technical documentation.
-- Black-box validation against DVSI test vectors and hardware.
+- Reference vendor public documentation — hardware manual, AMBE-3000 protocol spec.
+- Expired reference-vendor patents — public-domain technical documentation.
+- Black-box validation against the reference test vectors.
+- Reverse engineering of a compiled reference vocoder image — the shared
+  analysis/synthesis core (`enc/`, `dec/`, `synth`, `phase_regen`) and the
+  firmware-recovered AMBE+2 VQ codebooks (`blip25-codebooks`), plus
+  `imbe::tables::GAIN_QNT_TBL` / `MONO65_ENCODE`. This is derivation from
+  the reference vocoder, not from anyone's source. See
+  [`ATTRIBUTION.md`](./ATTRIBUTION.md) for the per-component provenance and
+  [`PATENT_NOTICE.md`](./PATENT_NOTICE.md) for what it reads on.
 
-When a spec is ambiguous or incomplete, we report the gap and get the
-spec updated. We do not guess by looking at someone else's guess. An
-incorrect idea repeated a hundred times is not less incorrect for being
-familiar.
+For P25 protocol and wire-format work, when a spec is ambiguous or incomplete,
+we report the gap and get the spec updated. (That workflow governs the wire
+layers only; the shipped codec's correctness target is the reference vocoder,
+so a TIA-102 gap does not block it.) We do not guess by looking at someone
+else's guess. An incorrect idea repeated a hundred times is not less incorrect
+for being familiar.
 
 **We do not conflate correctness with quality.** Correctness is spec
 conformance — every bit in the wire, every coefficient in the FEC,
 every entry in the quantizer. Measured by unit tests against spec examples.
-Quality is perceptual audio fidelity — measured by black-box comparison
-against DVSI hardware and, later, BABG PESQ scoring. These are different
-concerns and live in different places.
+Quality is perceptual audio fidelity — judged by ear against reference
+audio, never by a fidelity score. These are different concerns and live in
+different places.
 
 **We do not require proprietary material to build.** The published crate
-contains no DVSI material, no reference vectors, no recorded hardware
+contains no reference-vendor material, no reference vectors, no recorded hardware
 output. Anyone can clone, `cargo test`, and see green. Conformance against
-DVSI vectors and hardware lives in separate workspace members that are
-never published to crates.io and that gracefully handle the absence of
-the oracle.
+the reference vectors lives in separate workspace members that are never
+published to crates.io and that skip when the corpus is absent.
 
 ## What We Seek
 

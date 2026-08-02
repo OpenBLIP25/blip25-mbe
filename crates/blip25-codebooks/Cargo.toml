@@ -1,0 +1,21 @@
+[package]
+name = "blip25-codebooks"
+description = "Bit-exact half-rate (AMBE+2) vocoder vector-quantizer codebooks — PRBA, HOC, and gain tables with a typed loader. Firmware-recovered and verified against the reference's AMBE+2 software vocoder; see ATTRIBUTION.md in the repository. Self-contained, no allocation at run time. Implementation detail of `blip25-mbe`."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords = ["p25", "mbe", "imbe", "ambe", "vocoder"]
+categories = ["multimedia::audio", "encoding"]
+include = [
+    "src/**/*.rs",
+    "Cargo.toml",
+    "LICENSE",
+]
+
+[lib]
+name = "blip25_codebooks"
+path = "src/codebooks.rs"

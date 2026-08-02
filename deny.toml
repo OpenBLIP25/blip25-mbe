@@ -1,0 +1,36 @@
+# cargo-deny configuration — run in CI by .github/workflows/ci.yml.
+#
+#   cargo deny check advisories bans licenses sources
+
+[graph]
+all-features = true
+
+[advisories]
+# Fail on any unresolved RUSTSEC advisory. With default features this crate has
+# no external runtime dependencies, so the surface here is small by design.
+yanked = "deny"
+ignore = []
+
+[licenses]
+# Everything in the tree must be permissively licensed. The three published
+# crates are MIT; the rest is dev/bin tooling (clap, hound, anyhow, serde) plus
+# their proc-macro deps. This list is deliberately only what the tree actually
+# uses — an unused allowance is an unreviewed licence waiting to slip in.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Unicode-3.0",
+]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# Nothing in this workspace should ever pull in another MBE/vocoder
+# implementation — the codec must stay first-party. See ATTRIBUTION.md.
+deny = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

@@ -3,7 +3,7 @@
 //! Per TIA-102.BABA-A §2.4–§2.6 (originally the BABA-1 addendum,
 //! consolidated into BABA-A). The half-rate vocoder is AMBE+2 in
 //! everything but name; BABA-A renames it "Half-Rate Vocoder" to dodge
-//! DVSI's trademark. Composes the generic Golay primitives from
+//! the reference's trademark. Composes the generic Golay primitives from
 //! [`crate::fec`] into the half-rate wire layout:
 //!
 //! ```text
@@ -20,13 +20,13 @@
 //! `c₃` are uncoded so PN would have nothing meaningful to scramble.
 //!
 //! Annex S interleaves the 72 bits into 36 dibit symbols; the table is
-//! generated at build time from `spec_tables/annex_s_interleave.csv`.
+//! frozen in `src/generated/annex_s.rs`.
 //!
 //! Bit-ordering convention matches the full-rate module: element `k`
 //! at u32 bit `k`, with the highest-indexed bit being the first-
 //! transmitted bit of the codeword (consistent with Annex S's
 //! `c0[23]` → first dibit MSB and with the full-rate PN alignment
-//! verified against DVSI).
+//! verified against the reference).
 
 use crate::fec::{
     golay_23_12_decode, golay_23_12_decode_soft, golay_23_12_encode, golay_24_12_decode,
@@ -47,13 +47,13 @@ pub struct PitchEntry {
     pub omega_0: f32,
 }
 
-include!(concat!(env!("OUT_DIR"), "/annex_l_pitch.rs"));
-include!(concat!(env!("OUT_DIR"), "/annex_m_vuv.rs"));
-include!(concat!(env!("OUT_DIR"), "/annex_n_blocks.rs"));
-include!(concat!(env!("OUT_DIR"), "/annex_o_gain.rs"));
-include!(concat!(env!("OUT_DIR"), "/annex_p_prba24.rs"));
-include!(concat!(env!("OUT_DIR"), "/annex_q_prba58.rs"));
-include!(concat!(env!("OUT_DIR"), "/annex_r_hoc.rs"));
+include!("../generated/annex_l_pitch.rs");
+include!("../generated/annex_m_vuv.rs");
+include!("../generated/annex_n_blocks.rs");
+include!("../generated/annex_o_gain.rs");
+include!("../generated/annex_p_prba24.rs");
+include!("../generated/annex_q_prba58.rs");
+include!("../generated/annex_r_hoc.rs");
 
 /// One row of the Annex T tone-frame parameter table (§2.10.3).
 /// Carries the fundamental frequency and the two harmonic indices
@@ -69,7 +69,7 @@ pub struct ToneParams {
     pub l2: u8,
 }
 
-include!(concat!(env!("OUT_DIR"), "/annex_t_tones.rs"));
+include!("../generated/annex_t_tones.rs");
 
 // ---------------------------------------------------------------------------
 // Widths and constants
@@ -91,15 +91,17 @@ pub const INFO_BITS_TOTAL: u16 = 49;
 /// Bit `j` (MSB-first) of the 7-byte no-FEC frame carries the natural
 /// info bit `R34_BIT_ORDER[j]`, where the natural order is
 /// `û₀(12)‖û₁(12)‖û₂(11)‖û₃(14)` MSB-first. This is NOT the naive
-/// sequential layout — DVSI emits a 3-way column interleave (rows of
+/// sequential layout — the reference emits a 3-way column interleave (rows of
 /// 18/18/13 bits): `0,18,36, 1,19,37, …`. Bits 49..55 of the frame are
 /// zero padding.
 ///
 /// Real-world relevance: AMBE+2 no-FEC half-rate is what an NXDN/Fusion
-/// console emits, so this ordering must match the chip, not just decode
-/// cleanly. Derived empirically from the DVSI RC `r33`↔`r34` vectors and
-/// verified a bijection across alltone/clean/dam/mark/alert (see
-/// `examples/derive_r34_order.rs`).
+/// console emits, so this ordering must match the reference, not just decode
+/// cleanly. The reference RC `r33`↔`r34` vectors pin it: this is the one
+/// ordering that is a bijection across alltone/clean/dam/mark/alert.
+/// `crates/blip25-mbe/examples/r34_layout_probe.rs` re-derives that result
+/// from the vectors alone (110,840 frames; this interleave matches every
+/// clean-vector frame, the natural- and parameter-order packings match none).
 pub const R34_BIT_ORDER: [u8; 49] = [
     0, 18, 36, 1, 19, 37, 2, 20, 38, 3, 21, 39, 4, 22, 40, 5, 23, 41, 6, 24, 42, 7, 25, 43, 8, 26,
     44, 9, 27, 45, 10, 28, 46, 11, 29, 47, 12, 30, 48, 13, 31, 14, 32, 15, 33, 16, 34, 17, 35,
@@ -143,7 +145,7 @@ fn natural_to_info(natural: &[u8; INFO_BITS_TOTAL as usize]) -> [u16; 4] {
 
 /// Extract the nine deprioritized half-rate parameters `[b̂₀..b̂₈]` from a
 /// 7-byte **R34 column-interleaved** no-FEC frame — the layout produced by
-/// blip25's [`crate::Vocoder`] / `LiveEncoder` at `Rate::AmbePlus2_2450x2450`
+/// blip25's [`crate::vocoder::Vocoder`] / `LiveEncoder` at `Rate::AmbePlus2_2450x2450`
 /// and emitted over the air by NXDN / Fusion consoles. Undoes the
 /// [`R34_BIT_ORDER`] interleave (via [`unpack_no_fec`]), then deprioritizes.
 ///
@@ -173,10 +175,10 @@ pub fn fields_from_natural(bytes: &[u8]) -> [u16; super::priority::AMBE_B_COUNT]
 }
 
 /// Extract the nine deprioritized half-rate parameters `[b̂₀..b̂₈]` from a
-/// 9-byte FEC half-rate frame — the 72-bit Annex-S-interleaved P25 wire
-/// (the `our.bit` format from `halfrate-ab-matrix`). Runs the full FEC
-/// decode ([`decode_frame`]: deinterleave, PN demod, Golay correction)
-/// before deprioritizing. See [`fields_from_no_fec`] for field meanings.
+/// 9-byte FEC half-rate frame — the 72-bit Annex-S-interleaved P25 wire.
+/// Runs the full FEC decode ([`decode_frame`]: deinterleave, PN demod,
+/// Golay correction) before deprioritizing. See [`fields_from_no_fec`]
+/// for field meanings.
 pub fn fields_from_fec(bytes: &[u8]) -> [u16; super::priority::AMBE_B_COUNT] {
     let mut dibits = [0u8; DIBITS_PER_FRAME];
     for (i, slot) in dibits.iter_mut().enumerate() {
@@ -222,7 +224,7 @@ pub(crate) struct AnnexSEntry {
     pub bit0_idx: u8,
 }
 
-include!(concat!(env!("OUT_DIR"), "/annex_s.rs"));
+include!("../generated/annex_s.rs");
 
 /// Deinterleave a 72-bit half-rate frame (36 dibits) into the 4 code
 /// vectors `c₀..c₃`.
@@ -257,6 +259,7 @@ pub const SOFT_BITS: usize = 72;
 /// `c̃₀` is 24-bit extended Golay, `c̃₁` is 23-bit Golay, `c̃₂`/`c̃₃`
 /// are uncoded (11 and 14 bits). All MSB-first.
 #[derive(Clone, Copy, Debug)]
+#[derive(Default)]
 pub struct SoftCodeVectors {
     /// `c̃₀` — soft extended Golay(24,12) codeword, MSB at index 0.
     pub c0: [i8; 24],
@@ -268,16 +271,6 @@ pub struct SoftCodeVectors {
     pub c3: [i8; 14],
 }
 
-impl Default for SoftCodeVectors {
-    fn default() -> Self {
-        Self {
-            c0: [0i8; 24],
-            c1: [0i8; 23],
-            c2: [0i8; 11],
-            c3: [0i8; 14],
-        }
-    }
-}
 
 /// Soft-deinterleave a 72-bit soft stream into the 4 MSB-first soft
 /// code vectors per Annex S.
@@ -342,7 +335,9 @@ pub fn soft_demodulate_vector<const W: usize>(soft: &mut [i8; W], mask: u32) {
 /// Seed is `16 · û₀` using the 12-bit info word that emerges from the
 /// `[24, 12]` decode of `c₀`.
 pub fn pn_sequence(u0: u16) -> [u16; PN_SEQ_LEN] {
-    debug_assert!(u0 < 4096, "û₀ is a 12-bit info word");
+    // Hostile input class: over-width û₀ (corrupted wire / raw u16) — mask to
+    // the 12-bit info domain; 16·û₀ mod 2¹⁶ ignores those bits anyway.
+    let u0 = u0 & 0x0FFF;
     let mut pr = [0u16; PN_SEQ_LEN];
     pr[0] = u0.wrapping_mul(16);
     for n in 1..PN_SEQ_LEN {
@@ -357,7 +352,7 @@ pub fn pn_sequence(u0: u16) -> [u16; PN_SEQ_LEN] {
 /// * `m̂₁` — 23 bits from `p_r(1..=23)`; first PN at the highest bit
 ///   (bit 22), last PN at bit 0. Aligns first PN with first-
 ///   transmitted bit per the Annex H convention, consistent with the
-///   full-rate DVSI-verified layout.
+///   full-rate the reference-verified layout.
 /// * `m̂₂ = 0` (11 bits) — `c₂` is uncoded; no PN.
 /// * `m̂₃ = 0` (14 bits) — `c₃` is uncoded; no PN.
 pub fn modulation_masks(u0: u16) -> [u32; 4] {
@@ -627,9 +622,9 @@ mod tests {
     }
 
     #[test]
-    fn r34_matches_dvsi_first_bit_is_u0_msb() {
+    fn r34_matches_reference_first_bit_is_u0_msb() {
         // R34 bit 0 (MSB of byte 0) is the MSB of û₀ — the start of the
-        // DVSI 3-way interleave. Guards against accidental reversion to
+        // the reference 3-way interleave. Guards against accidental reversion to
         // the naive sequential layout (which also starts with û₀ MSB, so
         // also pin bit 1 = û₁ bit 5 and bit 2 = û₃ bit 12).
         assert_eq!(R34_BIT_ORDER[0], 0); // û₀[11]
@@ -812,11 +807,11 @@ mod tests {
 
     #[test]
     fn annex_l_spot_values_match_spec() {
-        // Annex L stores cycles/sample on disk; the build script
-        // converts to rad/sample at load (× 2π) so values here are in
-        // the same units as MbeParams. b₀=0 → (L=9, 0.049971 c/s →
-        // 0.313977 rad/s); b₀=119 → (L=56, 0.008125 c/s → 0.051051
-        // rad/s). See impl-spec §12.8 + analysis §13.
+        // The spec prints Annex L in cycles/sample; the table holds
+        // rad/sample (× 2π) so it is in the same units as MbeParams.
+        // b₀=0 → (L=9, 0.049971 c/s → 0.313977 rad/s); b₀=119 →
+        // (L=56, 0.008125 c/s → 0.051051 rad/s). See impl-spec §12.8 +
+        // analysis §13.
         use core::f32::consts::PI;
         assert_eq!(AMBE_PITCH_TABLE.len(), 120);
         let p0 = AMBE_PITCH_TABLE[0];
@@ -917,7 +912,7 @@ mod tests {
         }
     }
 
-    // ---- Soft-decision path (Gap B) -------------------------------------
+    // ---- Soft-decision path ----------------------------------------------
 
     fn dibits_to_soft(dibits: &[u8; DIBITS_PER_FRAME], confidence: i8) -> [i8; SOFT_BITS] {
         let mut out = [0i8; SOFT_BITS];

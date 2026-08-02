@@ -1,3 +1,6 @@
+// index loops are deliberate: the index is the bin/harmonic/tap/band/bit number
+#![allow(clippy::needless_range_loop)]
+
 //! Forward-error-correction primitives shared across wire formats.
 //!
 //! The P25 IMBE wire uses Golay(23,12) and Hamming(15,11) per
@@ -20,6 +23,7 @@
 //! perfect code.
 
 /// Decoded result of a systematic FEC codeword.
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FecDecoded {
     /// Information bits, LSB-aligned in a `u16`.
@@ -40,6 +44,8 @@ pub struct FecDecoded {
 /// Bit layout within each 23-bit row:
 /// * bits 22..11 — identity portion, row `i` has a 1 at bit `22 - i`
 /// * bits 10..0  — parity portion, bit 10 = x⁰ coefficient, bit 0 = x¹⁰
+// digit grouping is the 12|11 systematic [I12 | P] split, not nibbles
+#[allow(clippy::unusual_byte_groupings)]
 const GOLAY_23_12_GEN: [u32; 12] = [
     0b100000000000_11000111010,
     0b010000000000_01100011101,
@@ -207,10 +213,14 @@ pub fn golay_24_12_decode(codeword: u32) -> FecDecoded {
 
 /// Parity rows for the [15, 11] Hamming code in systematic form `[I₁₁ | P]`.
 ///
-/// Source: TIA-102.BABA-A §1.5.2. Each entry is a 4-bit parity word in
-/// which the MSB is the first parity column (p₀) and the LSB is p₃.
+/// Entry `i` is the 4-bit parity column contributed by information bit `i`
+/// (MSB-first over the 11 info bits): the 11 non-unit nonzero 4-bit
+/// syndromes, in the reference IMBE column order. This is the same assignment as
+/// `blip25_codec::fec::HAMMING_P` — the bit-exact reference for the full-rate
+/// u4..u6 words — so this channel codec and the engine's frame layer agree
+/// on every [15, 11] codeword.
 const HAMMING_15_11_PARITY: [u8; 11] = [
-    0b1111, 0b1110, 0b1101, 0b1100, 0b1011, 0b1010, 0b1001, 0b0111, 0b0110, 0b0101, 0b0011,
+    0b0011, 0b0101, 0b0110, 0b0111, 0b1001, 0b1010, 0b1011, 0b1100, 0b1101, 0b1110, 0b1111,
 ];
 
 /// Encode 11 information bits into a 15-bit Hamming codeword.

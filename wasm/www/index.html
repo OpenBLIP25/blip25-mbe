@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>blip25-mbe — in-browser P25 vocoder (decode-only)</title>
+<style>
+  :root { color-scheme: light dark; }
+  body {
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    max-width: 46rem; margin: 3rem auto; padding: 0 1.25rem; line-height: 1.55;
+  }
+  h1 { font-size: 1.4rem; margin-bottom: 0.25rem; }
+  .sub { opacity: 0.7; margin-top: 0; font-size: 0.95rem; }
+  .card {
+    border: 1px solid color-mix(in srgb, currentColor 18%, transparent);
+    border-radius: 0.6rem; padding: 1.1rem 1.25rem; margin: 1.5rem 0;
+  }
+  .row { display: flex; gap: 0.75rem; align-items: center; flex-wrap: wrap; }
+  button {
+    font: inherit; font-weight: 600; padding: 0.55rem 1.1rem; border-radius: 0.5rem;
+    border: 1px solid color-mix(in srgb, currentColor 30%, transparent);
+    background: color-mix(in srgb, currentColor 8%, transparent);
+    color: inherit; cursor: pointer;
+  }
+  button:disabled { opacity: 0.45; cursor: default; }
+  label { font-size: 0.9rem; }
+  select { font: inherit; padding: 0.3rem 0.4rem; }
+  #status { font-variant-numeric: tabular-nums; opacity: 0.85; font-size: 0.9rem; }
+  .meter { height: 6px; border-radius: 3px; background: color-mix(in srgb, currentColor 15%, transparent); overflow: hidden; margin-top: 0.75rem; }
+  .meter > span { display: block; height: 100%; width: 0; background: currentColor; opacity: 0.6; transition: width 0.05s linear; }
+  code { background: color-mix(in srgb, currentColor 10%, transparent); padding: 0.05rem 0.3rem; border-radius: 0.25rem; }
+  footer { font-size: 0.8rem; opacity: 0.6; margin-top: 2rem; }
+  .pill { font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.05em;
+    border: 1px solid color-mix(in srgb, currentColor 30%, transparent);
+    border-radius: 999px; padding: 0.1rem 0.5rem; opacity: 0.8; }
+</style>
+</head>
+<body>
+  <h1>blip25-mbe — the vocoder, running in your browser <span class="pill">decode-only wasm</span></h1>
+  <p class="sub">A P25 voice bitstream is fetched, framed, and decoded to 8&nbsp;kHz PCM entirely client-side by the Rust MBE codec compiled to WebAssembly — then played through Web Audio. No server-side decode, no network round-trip per frame.</p>
+
+  <div class="card">
+    <div class="row">
+      <button id="play" disabled>▶ Decode &amp; play</button>
+      <label>Rate
+        <select id="rate">
+          <option value="0">0 — IMBE 7200×4400 (P25 Phase 1, 18 B/frame)</option>
+          <option value="1">1 — IMBE 4400×4400 info-only (11 B/frame)</option>
+          <option value="2">2 — AMBE+2 3600×2450 (P25 Phase 2, 9 B/frame)</option>
+          <option value="3">3 — AMBE+2 2450×2450 info-only (7 B/frame)</option>
+        </select>
+      </label>
+    </div>
+    <div class="meter"><span id="bar"></span></div>
+    <p id="status">Loading WebAssembly…</p>
+  </div>
+
+  <p style="font-size:0.9rem">
+    The bundled <code>sample.bits</code> is an <strong>IMBE 7200×4400</strong> stream (rate&nbsp;0),
+    so leave the selector on rate&nbsp;0 to hear speech. The other rates are wired up to
+    demonstrate the full decode API surface; pointing them at this IMBE sample will decode
+    noise (wrong wire format), which is expected.
+  </p>
+
+  <footer>
+    Speech material: Open Speech Repository (https://www.voiptroubleshooter.com/open_speech/),
+    encoded to an IMBE bitstream by <code>blip25-mbe</code>. Decode-only WebAssembly build —
+    the encoder is compiled out.
+  </footer>
+
+<script type="module">
+import init, { WasmDecoder, sampleRateHz } from "./pkg/blip25_wasm_decoder.js";
+
+const $ = (id) => document.getElementById(id);
+const statusEl = $("status"), playBtn = $("play"), rateSel = $("rate"), bar = $("bar");
+
+let wasmReady = false;
+let bitsBuf = null;          // Uint8Array of the raw bitstream
+let audioCtx = null;
+
+function setStatus(t) { statusEl.textContent = t; }
+
+async function boot() {
+  // 1. Instantiate the wasm module (loads pkg/*.wasm).
+  await init();
+  wasmReady = true;
+  // 2. Fetch the sample bitstream.
+  const resp = await fetch("./sample.bits");
+  bitsBuf = new Uint8Array(await resp.arrayBuffer());
+  setStatus(`Ready. sample.bits = ${bitsBuf.length} bytes. Native rate ${sampleRateHz()} Hz.`);
+  playBtn.disabled = false;
+}
+
+async function decodeAndPlay() {
+  if (!wasmReady || !bitsBuf) return;
+  playBtn.disabled = true;
+
+  const rateCode = parseInt(rateSel.value, 10);
+  const dec = new WasmDecoder(rateCode);
+  const frameBytes = dec.frameBytes;
+  const nFrames = Math.floor(bitsBuf.length / frameBytes);
+
+  // 3. Decode frame-by-frame so we can show progress; the decoder carries
+  //    inter-frame state, so feed frames in order through one instance.
+  //    (decodeStreamF32 would do the whole buffer in one call — used here
+  //    per-frame only to animate the meter.)
+  const perFrame = dec.frameSamples;
+  const pcm = new Float32Array(nFrames * perFrame);
+  for (let i = 0; i < nFrames; i++) {
+    const frame = bitsBuf.subarray(i * frameBytes, (i + 1) * frameBytes);
+    const out = dec.decodeFrameF32(frame);
+    pcm.set(out, i * perFrame);
+    if ((i & 31) === 0) bar.style.width = `${(100 * i / nFrames).toFixed(1)}%`;
+  }
+  bar.style.width = "100%";
+  dec.free();
+
+  // 4. Hand the PCM to Web Audio as an 8 kHz AudioBuffer.
+  if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  await audioCtx.resume();
+  const sr = sampleRateHz();
+  const buf = audioCtx.createBuffer(1, pcm.length, sr);
+  buf.copyToChannel(pcm, 0);
+  const src = audioCtx.createBufferSource();
+  src.buffer = buf;
+  src.connect(audioCtx.destination);
+
+  const secs = (pcm.length / sr).toFixed(2);
+  setStatus(`Decoded ${nFrames} frames → ${pcm.length} samples (${secs}s @ ${sr} Hz). Playing…`);
+  src.onended = () => {
+    setStatus(`Done. Decoded ${nFrames} frames (${secs}s) in-browser. Press play to repeat.`);
+    playBtn.disabled = false;
+    bar.style.width = "0";
+  };
+  src.start();
+}
+
+playBtn.addEventListener("click", () => { decodeAndPlay().catch(e => {
+  setStatus("Error: " + e); playBtn.disabled = false;
+}); });
+
+boot().catch(e => setStatus("Failed to load: " + e));
+</script>
+</body>
+</html>

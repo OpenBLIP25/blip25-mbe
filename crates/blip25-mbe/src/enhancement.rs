@@ -3,8 +3,8 @@
 //!
 //! Spec-faithful synthesis emits PCM directly from the BABA-A §1.12
 //! pipeline. Real LMR audio chains add post-processing between the
-//! vocoder output and the speaker (the TI TLV320AIC33 codec on the
-//! Motorola APX, for example, runs PCM through de-emphasis →
+//! vocoder output and the speaker (the TI TLV320AIC33 codec on a
+//! typical LMR handset, for example, runs PCM through de-emphasis →
 //! 2-biquad cascade → digital volume → DAC). This module exposes a
 //! similar chain as an opt-in [`EnhancementMode`].
 //!
@@ -16,7 +16,7 @@
 //! - **High-pass / peaking biquad cascade** — two biquads matching
 //!   AIC33's LB1/LB2 budget. Defaults: HPF at 250 Hz to roll off
 //!   sub-speaker rumble, peaking at 2.5 kHz / +3 dB for intelligibility.
-//! - **Soft-knee compressor** — playback-side DRC. AIC33's on-chip AGC
+//! - **Soft-knee compressor** — playback-side DRC. AIC33's on-reference AGC
 //!   is record-side only, so any decoded-audio loudness control has to
 //!   live here.
 //! - **Boundary smoothing** — short cosine fade at frame seams when
@@ -24,13 +24,12 @@
 //!   suppress click/pop. Mirrors AIC33's soft-mute / soft-unmute around
 //!   filter-coefficient changes.
 //!
-//! All defaults are starting points subject to A/B against the existing
-//! 5-vector PESQ harness. None of this is on the spec path; consumers
-//! that need bit-for-bit BABA-A output keep [`EnhancementMode::None`].
+//! None of this is on the spec path; consumers that need bit-for-bit
+//! BABA-A output keep [`EnhancementMode::None`].
 
 use core::f32::consts::PI;
 
-/// Top-level mode selector. Mirrors the chip-shaped pattern used by
+/// Top-level mode selector. Mirrors the reference-shaped pattern used by
 /// other [`crate::vocoder::Vocoder`] knobs (a single setter, default
 /// off, named alternatives).
 #[derive(Clone, Debug, Default)]
@@ -63,30 +62,24 @@ pub struct ClassicalConfig {
     /// Constant output gain in dB applied after all other stages.
     /// Defaults to `0.0` (no gain change). Use to bring spec-faithful
     /// output up to consumer-style "loud" presentation levels —
-    /// SDRTrunk and similar tools layer ~8-10 dB of post-decode gain
-    /// (project memory `sdrtrunk_scale_decoy_2026-04-19`); set this
-    /// to e.g. `+9.0` to match. Saturates at i16 clip.
+    /// SDRTrunk and similar tools layer ~8-10 dB of post-decode gain, so
+    /// `+9.0` here matches them. Saturates at i16 clip.
     pub output_gain_db: f32,
 }
 
 impl Default for ClassicalConfig {
     fn default() -> Self {
-        // Defaults tuned by 5-vector PESQ stage-isolation A/B
-        // (project_enhancement_classical_tuning_2026-04-30.md):
+        // Stage rationale:
         //
-        // - HPF 250 Hz Q≈0.707: carries the entire knox_1 +0.236 win
-        //   (de-rumbles the noisy-tone reconstruction). Inert on speech.
-        // - Peaking 2.5 kHz Q=1.0 +3 dB: small alert win, neutral on
-        //   speech.
-        // - Compressor: OFF by default. The 3:1 / -18 dBFS / +3 dB
-        //   makeup compressor was a net loss on dam (-0.065 PESQ) and
-        //   inert on knox_1. Kept reachable via the [`Compressor`]
-        //   struct for opt-in use; opt-in via a non-default cfg.
-        // - 5 ms cosine fade after Mute / Repeat: inert on clean test
-        //   vectors (no frame errors) but defensive in real RF chains.
-        //
-        // Net 5-vector avg: +0.052 PESQ over the spec-faithful path,
-        // worst-vector regression -0.013 (alert).
+        // - HPF 250 Hz Q≈0.707: de-rumbles noisy-tone reconstruction.
+        //   Inert on speech.
+        // - Peaking 2.5 kHz Q=1.0 +3 dB: small win on alert tones,
+        //   neutral on speech.
+        // - Compressor: OFF by default. A 3:1 / -18 dBFS / +3 dB makeup
+        //   compressor costs more on speech than it buys elsewhere, so it
+        //   stays reachable through [`Compressor`] for opt-in use only.
+        // - 5 ms cosine fade after Mute / Repeat: inert on clean input
+        //   (no frame errors), defensive in real RF chains.
         Self {
             biquads: [
                 Some(Biquad::high_pass(8_000.0, 250.0, 0.707)),
@@ -145,22 +138,6 @@ impl Biquad {
         let b2 = (1.0 - alpha * a) / a0;
         let a1 = -2.0 * cos_w0 / a0;
         let a2 = (1.0 - alpha / a) / a0;
-        Self { b0, b1, b2, a1, a2 }
-    }
-
-    /// Low-shelf at `fc` Hz, gain `gain_db`. RBJ cookbook coefficients.
-    pub fn low_shelf(fs_hz: f32, fc_hz: f32, gain_db: f32) -> Self {
-        let a = 10f32.powf(gain_db / 40.0);
-        let w0 = 2.0 * PI * fc_hz / fs_hz;
-        let cos_w0 = w0.cos();
-        let alpha = w0.sin() / 2.0 * 2f32.sqrt(); // S=1
-        let two_sqrt_a_alpha = 2.0 * a.sqrt() * alpha;
-        let a0 = (a + 1.0) + (a - 1.0) * cos_w0 + two_sqrt_a_alpha;
-        let b0 = a * ((a + 1.0) - (a - 1.0) * cos_w0 + two_sqrt_a_alpha) / a0;
-        let b1 = 2.0 * a * ((a - 1.0) - (a + 1.0) * cos_w0) / a0;
-        let b2 = a * ((a + 1.0) - (a - 1.0) * cos_w0 - two_sqrt_a_alpha) / a0;
-        let a1 = -2.0 * ((a - 1.0) + (a + 1.0) * cos_w0) / a0;
-        let a2 = ((a + 1.0) + (a - 1.0) * cos_w0 - two_sqrt_a_alpha) / a0;
         Self { b0, b1, b2, a1, a2 }
     }
 }
@@ -227,6 +204,8 @@ pub fn apply(
     sample_rate_hz: f32,
     prev_was_use: bool,
 ) {
+    // `EnhancementMode::None` is the shipped default and IS the reference
+    // console codec's output — it must be returned untouched, unconditionally.
     let cfg = match mode {
         EnhancementMode::None => return,
         EnhancementMode::Classical(c) => c,

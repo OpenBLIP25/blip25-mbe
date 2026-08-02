@@ -5,8 +5,7 @@
 //!
 //! The example walks through every public surface of `Vocoder`:
 //! one-shot encode/decode, slice streaming, live chunk-driven
-//! streaming, the parameter-layer (extract_params / synthesize_params),
-//! the builder, and stats / disposition inspection.
+//! encode/decode, transcoding, the builder, and encode-stats inspection.
 
 use blip25_mbe::vocoder::{LiveEncoder, Rate, Transcoder, Vocoder};
 
@@ -25,7 +24,6 @@ fn main() {
     live_streaming(&pcm);
 
     println!("\n=== Parameter-layer (extract → mutate → synthesize) ===");
-    parameter_layer(&pcm);
 
     println!("\n=== Builder + opt-in knobs ===");
     builder_demo(&pcm);
@@ -48,13 +46,11 @@ fn one_shot(pcm: &[i16]) {
     }
 
     let stats = tx.last_stats();
-    let last_disposition = rx.last_disposition();
     println!(
-        "encoded {} bytes, decoded {} samples; last enc kind = {:?}, last dec disposition = {:?}",
+        "encoded {} bytes, decoded {} samples; last enc kind = {:?}",
         encoded.len(),
         decoded.len(),
         stats.analysis.as_ref().map(|a| a.output),
-        last_disposition,
     );
 }
 
@@ -98,8 +94,9 @@ fn live_streaming(pcm: &[i16]) {
         chunks_pushed += 1;
         pos = end;
     }
-    // Flush the residue tail with zero-pad.
-    if let Some(tail) = enc.flush().expect("flush") {
+    // Flush the residue tail (zero-padded) and drain the look-ahead —
+    // may return more than one frame, so extend from all of them.
+    for tail in enc.flush().expect("flush") {
         bits.extend(tail);
     }
     println!(
@@ -109,42 +106,10 @@ fn live_streaming(pcm: &[i16]) {
     );
 }
 
-fn parameter_layer(pcm: &[i16]) {
-    // Extract params on one channel, optionally tweak, synthesize on another.
-    // Useful for transcoding, analysis-only tooling, or custom synth chains.
-    let mut analyzer = Vocoder::new(Rate::Imbe7200x4400);
-    let mut synth = Vocoder::new(Rate::Imbe7200x4400);
-    let mut got_voice = 0;
-    for chunk in pcm.chunks_exact(analyzer.frame_samples()) {
-        let mut params = analyzer.extract_params(chunk).expect("extract");
-        // (Could mutate params here — lower amps, bias V/UV, etc.)
-        let _ = synth.synthesize_params(&params);
-        if params.amplitudes_slice().iter().any(|&a| a > 0.0) {
-            got_voice += 1;
-        }
-        // Touch params so it isn't elided.
-        let _ = std::hint::black_box(&mut params);
-    }
-    println!(
-        "extract_params + synthesize_params: {got_voice}/{} frames yielded voice params",
-        pcm.len() / 160
-    );
-}
-
 fn builder_demo(pcm: &[i16]) {
-    let mut tx = Vocoder::builder(Rate::AmbePlus2_3600x2450)
-        .tone_detection(true) // opt-in: emit Annex T tone frames on detected tones
-        .repeat_reset_after(Some(3)) // beyond-spec, JMBE-style chip-interop
-        .silence_dispatch(false) // spec default
-        .pitch_silence_override(false)
-        .build();
+    let mut tx = Vocoder::builder(Rate::AmbePlus2_3600x2450).build();
 
-    println!(
-        "Built: rate={:?} tone_detection={} repeat_reset_after={:?}",
-        tx.rate(),
-        tx.tone_detection(),
-        tx.repeat_reset_after()
-    );
+    println!("Built: rate={:?}", tx.rate());
 
     let mut frame_buf: Vec<u8> = Vec::new();
     for chunk in pcm.chunks_exact(tx.frame_samples()) {

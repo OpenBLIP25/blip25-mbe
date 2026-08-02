@@ -1,3 +1,6 @@
+// index loops are deliberate: the index is the bin/harmonic/tap/band/bit number
+#![allow(clippy::needless_range_loop)]
+
 //! Cross-rate magnitude predictor (US7634399 / AMBE-3000 rate-converter §4.5).
 //!
 //! The rate converter maintains a dedicated prior-frame magnitude
@@ -8,7 +11,7 @@
 //! `|R_prev − 1| ≤ 0.01` (the target pitch hasn't shifted more than 1%
 //! frame-to-frame), the fast path passes `current` through unchanged.
 //!
-//! Source: `~/blip25-specs/DVSI/AMBE-3000/AMBE-3000_Rate_Converter_Implementation_Spec.md`
+//! Source: the AMBE-3000 Rate Converter Implementation Spec
 //! §4.5 (blend rule) and §5 (state table), plus
 //! `~/blip25-specs/analysis/ambe_predictor_state_separation.md` (the
 //! invariant that this state must not be shared with the source
@@ -34,11 +37,11 @@ pub const RHO_CROSS_RATE: f64 = 0.65;
 /// Threshold on `|R_prev − 1|` below which the blend falls through to
 /// the current frame's magnitudes unchanged (§4.5 fast path).
 /// US7634399 col. 5 line 50 + col. 7 line 12.
-pub const R_FAST_PATH_THRESHOLD: f64 = 0.01;
+pub(crate) const R_FAST_PATH_THRESHOLD: f64 = 0.01;
 
 /// Minimum magnitude used when taking `log2` (guards against `log2(0)`).
 /// Matches the convention in
-/// `DVSI/AMBE-3000/AMBE-3000_Decoder_Implementation_Spec.md` §5.4.
+/// the AMBE-3000 Decoder Implementation Spec §5.4.
 const LOG2_FLOOR_INPUT: f64 = 1e-10;
 
 /// Dedicated predictor state for one cross-rate conversion direction.
@@ -131,7 +134,7 @@ pub fn blend(
     let l_source = amps_curr.len().min(l_curr as usize);
     let mut blended = [0f32; L_MAX as usize];
     // For target harmonics l ≤ min(L_source, L_target), seed with the
-    // source magnitude (first-cut §4.3.1 fast-path: no resampling).
+    // source magnitude (§4.3.1 fast path: no resampling).
     // For l > L_source the slot stays zero — matches the spec's
     // zero-pad rule when L_B > L_A.
     blended[..l_source].copy_from_slice(&amps_curr[..l_source]);
@@ -148,14 +151,12 @@ pub fn blend(
         }
 
         for l_b in 1..=l_curr as usize {
-            // Map target harmonic l_b to fractional source-grid
-            // position: l_b · ω̂₀_B(0) / ω̂₀_B(−1) = l_b · R_prev.
-            // Wait — the spec's R is defined as R = ω̂₀_B(0) / ω̃₀_A,
-            // pitch shift source→target. For the prior-frame resample
-            // inside the predictor, the equivalent is
-            // R_prev_pred = ω̂₀_B(0) / ω̂₀_B(−1); the position of
-            // the prior-frame harmonic l' that lines up with target
-            // harmonic l_b is l' = l_b · ω̂₀_B(0) / ω̂₀_B(−1) = l_b · R_prev.
+            // Map target harmonic l_b to its fractional position on the
+            // prior-frame grid. The spec's R is the source→target pitch
+            // shift `ω̂₀_B(0) / ω̃₀_A`; the resample inside the predictor
+            // instead runs against the prior *target* frame, so the ratio
+            // is `R_prev = ω̂₀_B(0) / ω̂₀_B(−1)` and the prior-frame
+            // harmonic lining up with l_b sits at `l_b · R_prev`.
             let src_pos = (l_b as f64) * r_prev;
             let prev_log = if src_pos < 1.0 || src_pos > state.l_prev as f64 {
                 // Outside prior-frame grid — zero contribution (floor
@@ -207,9 +208,7 @@ pub fn blend(
     // encoder's dequantize output instead.
     state.m_tilde_prev.fill(0.0);
     state.m_tilde_prev[0] = 1.0;
-    for l in 1..=l_curr as usize {
-        state.m_tilde_prev[l] = blended[l - 1];
-    }
+    state.m_tilde_prev[1..(l_curr as usize + 1)].copy_from_slice(&blended[..((l_curr as usize - 1) + 1)]);
     state.l_prev = l_curr;
     state.omega_0_prev = target_omega_0;
 

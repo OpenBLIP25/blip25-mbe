@@ -10,7 +10,7 @@
 //! This is the operation that preserves intelligibility when bridging
 //! between MBE-family standards (P25, DMR, D-STAR, NXDN) where tandeming
 //! — decoding to PCM and re-encoding — would lose roughly 40% of
-//! intelligibility in noisy conditions per DVSI's ABC-MRT testing
+//! intelligibility in noisy conditions per the reference's ABC-MRT testing
 //! (ANSI/ASA S3.2). Parametric rate conversion keeps the MRT score above
 //! the 75% intelligibility threshold established by NIST/ITS research.
 //!

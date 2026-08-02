@@ -5,24 +5,25 @@
 //! because the half-rate pitch index encodes the `(L, ω₀)` pair via
 //! Annex L rather than occupying variable-width coefficient fields.
 //!
-//! The table is generated at build time from `spec_tables/ambe_bit_prioritization.csv`,
-//! with coverage invariants checked during generation.
+//! The table is frozen into `src/generated/ambe_bit_priority.rs` — normative
+//! TIA-102 Annex data. Do not hand-edit it; the tests below enforce its
+//! coverage invariants.
 
 use crate::bits::BitMap;
 
-include!(concat!(env!("OUT_DIR"), "/ambe_bit_priority.rs"));
+include!("../generated/ambe_bit_priority.rs");
 
 /// Number of half-rate parameters: `b̂₀..b̂₈`.
 pub const AMBE_B_COUNT: usize = 9;
 
 /// Half-rate parameter widths in bits, indexed by `src_param`.
-/// Source: BABA-A §16.7 / `ambe_bit_prioritization.csv` header:
+/// Source: BABA-A §16.7:
 /// `b̂₀=7, b̂₁=5, b̂₂=5, b̂₃=9, b̂₄=7, b̂₅=5, b̂₆=4, b̂₇=4, b̂₈=3`; sum = 49.
 pub const AMBE_PARAM_WIDTHS: [u8; AMBE_B_COUNT] = [7, 5, 5, 9, 7, 5, 4, 4, 3];
 
-/// Half-rate info vector widths. Sum = 49. Note the spec's §2.3 table
-/// wrote these as 12/12/12/13; the CSV corrects to 12/12/11/14 with
-/// coverage invariants enforced at generation time.
+/// Half-rate info vector widths. Sum = 49. The spec's §2.3 table lists these
+/// as 12/12/12/13, which contradicts the §16.7 bit map; 12/12/11/14 is what
+/// the map actually covers, so do not "correct" them back to §2.3.
 pub const AMBE_VECTOR_WIDTHS: [u8; 4] = [12, 12, 11, 14];
 
 /// Prioritize a quantized half-rate parameter array `b̂₀..b̂₈`

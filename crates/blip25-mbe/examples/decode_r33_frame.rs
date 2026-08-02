@@ -2,7 +2,7 @@
 //! on the command line, print its classification and parameters, and show
 //! the equivalent r34 (no-FEC, 7-byte) serialization via the R34_BIT_ORDER
 //! interleave. Independent cross-check of the r34 bit order on a frame
-//! that did NOT come from the DVSI vectors.
+//! that did NOT come from the reference vectors.
 //!
 //! Run: cargo run --release --example decode_r33_frame -- cea8 fe83 acc4 5820 0a
 
@@ -68,7 +68,7 @@ fn main() {
     }
 
     let r34 = pack_no_fec(&frame.info);
-    println!("\nr34 (no-FEC, 7 bytes), DVSI interleave: {r34:02x?}");
+    println!("\nr34 (no-FEC, 7 bytes), the reference interleave: {r34:02x?}");
     print!("r34 as hex: ");
     for b in &r34 {
         print!("{b:02x}");

@@ -1,9 +1,7 @@
 //! Property tests — invariants that must hold across the pipeline.
 //!
-//! These run on synthetic inputs only; no DVSI material required, so
-//! they stay CI-safe. End-to-end validation against DVSI test vectors
-//! lives in the `conformance-vectors` harness (`rate-convert`,
-//! `rate-convert-roundtrip` subcommands).
+//! These run on synthetic inputs only; no reference material required, so
+//! they stay CI-safe.
 //!
 //! ## Rate-conversion regression net
 //!
@@ -12,7 +10,7 @@
 //! 46–47, `b̂₀ ∈ [0, 207]`) and half-rate (Annex L, 120 entries)
 //! grids with comfortable margin, then measures parameter distortion
 //! through the converters. Thresholds are picked from empirical
-//! observation on DVSI `alert` — loose enough for the quantizer's
+//! observation on the reference `alert` — loose enough for the quantizer's
 //! lossy gain/DCT stages, tight enough to catch structural regressions
 //! (e.g. a broken pitch table, a priority-map off-by-one, a sign flip
 //! in `disassemble_hoc_matrix`).
@@ -20,10 +18,9 @@
 //! **Boundary behaviour** — inputs at the extreme edges of either
 //! grid can fall outside the opposite grid after requantization
 //! (e.g. half-rate ω₀=0.051051 maps to full-rate b̂₀=207 → 0.050979,
-//! which is below the half-rate minimum). The test set deliberately
-//! stays inside the intersection of the two grids; the
-//! `conformance-vectors rate-convert-roundtrip` subcommand surfaces
-//! the boundary behaviour on real speech.
+//! which is below the half-rate minimum). The test set therefore stays
+//! inside the intersection of the two grids; boundary behaviour is out
+//! of scope here.
 
 use blip25_mbe::imbe7200::dequantize::{
     dequantize as dequantize_full, quantize as quantize_full, DecoderState,
@@ -187,8 +184,7 @@ fn half_to_full_preserves_voicing_mostly() {
     // some pitches, costing several harmonics — at ω₀=0.21 only 80%
     // of the 28 harmonics match. 75% is tight enough to catch a
     // broken Annex M lookup and loose enough for the worst synthetic
-    // pattern. (DVSI speech runs ≥ 95% in practice; see
-    // `rate-convert --direction half-to-full`.)
+    // pattern. (the reference speech runs ≥ 95% in practice.)
     for &omega_0 in PITCH_SWEEP {
         let params = voice_params(omega_0);
         let (src, dst) = stream_half_to_full(&params, 6);
@@ -247,7 +243,7 @@ fn silence_does_not_panic_either_converter() {
     // sits at the top of the full-rate grid (ω₀ = 4π/39.5), which is
     // above the half-rate grid top. The converter may legitimately
     // return HalfPitchOutOfRange — the invariant is just that nothing
-    // panics (the boundary case is covered by the DVSI harness).
+    // panics.
     let params = MbeParams::silence();
     let mut enc_state = DecoderState::new();
     let mut conv = FullToHalfConverter::new();

@@ -38,9 +38,6 @@ pub const SAMPLE_RATE_HZ: u32 = 8_000;
 /// Samples per 20 ms frame. BABA-A §1.1.
 pub const SAMPLES_PER_FRAME: u16 = 160;
 
-/// Frame duration in milliseconds. BABA-A §1.1.
-pub const FRAME_DURATION_MS: u16 = 20;
-
 /// Storage width for per-harmonic arrays, sized to `L_MAX`.
 const L_CAP: usize = L_MAX as usize;
 
@@ -142,7 +139,7 @@ impl MbeParams {
         if !(omega_0 > 0.0 && omega_0 < PI) {
             return Err(MbeParamsError::OmegaOutOfRange);
         }
-        if l < L_MIN || l > L_MAX {
+        if !(L_MIN..=L_MAX).contains(&l) {
             return Err(MbeParamsError::HarmonicCountOutOfRange);
         }
         let n = l as usize;
@@ -225,12 +222,6 @@ impl MbeParams {
         self.omega_0
     }
 
-    /// Fundamental frequency in Hz, for diagnostics.
-    #[inline]
-    pub fn fundamental_hz(&self) -> f32 {
-        self.omega_0 * (SAMPLE_RATE_HZ as f32) / (2.0 * PI)
-    }
-
     /// Number of harmonics `L`.
     #[inline]
     pub fn harmonic_count(&self) -> u8 {
@@ -277,6 +268,8 @@ impl MbeParams {
     /// the nearest integer with a 0.25 offset before the 0.9254 scale,
     /// so this is **not** the same as `floor(π/ω₀)` — do not simplify.
     pub fn harmonic_count_for(omega_0: f32) -> u8 {
+        // `!(omega_0 > 0.0)` deliberately also catches NaN (NaN <= 0.0 is false); do not rewrite
+        #[allow(clippy::neg_cmp_op_on_partial_ord)]
         if !(omega_0 > 0.0) {
             return L_MIN;
         }

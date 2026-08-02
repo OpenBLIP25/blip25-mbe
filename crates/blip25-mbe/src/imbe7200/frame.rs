@@ -353,7 +353,7 @@ mod tests {
         assert_eq!(INFO_BITS_TOTAL, 88);
     }
 
-    // ---- Soft-decision path (Gap B) -----------------------------------
+    // ---- Soft-decision path --------------------------------------------
 
     /// Inflate a 72-dibit hard stream into 144 soft bits at uniform
     /// confidence. Dibit order: `hi = (d >> 1) & 1`, `lo = d & 1`.

@@ -27,12 +27,11 @@
 //! ~1.3% past its maximum. A half-rate frame at the grid endpoint,
 //! round-tripped through full-rate and back, can pick up enough drift
 //! at the first hop to fall outside half-rate's grid at the second.
-//! We snap the source parameters' ω̃₀ to the destination grid's
-//! representable range (keeping L unchanged — the boundary entries
-//! share L across rates) before calling the destination quantizer,
+//! The source parameters' ω̃₀ is therefore snapped to the destination
+//! grid's representable range (keeping L unchanged — the boundary
+//! entries share L across rates) before the destination quantizer runs,
 //! so boundary frames encode to the nearest grid endpoint instead of
-//! rejecting. See `conformance-vectors rate-convert-roundtrip` for
-//! the diagnostic that surfaces this case on DVSI speech.
+//! rejecting.
 //!
 //! ## Frame-kind handling
 //!
@@ -55,10 +54,10 @@
 //! has nothing new to quantize, so its predictor state must not
 //! drift.
 //!
-//! ## What this first cut does not do
+//! ## Not implemented
 //!
 //! - **Voicing-band normalization** and **magnitude interpolation across
-//!   L mismatches** described in US7634399. The current path relies on
+//!   L mismatches** described in US7634399. This path relies on
 //!   the destination quantizer's own pitch table to pick a representable
 //!   `(ω₀, L)` and resamples per-harmonic amplitudes only via that
 //!   choice. Bridging IMBE full-rate (L = 9..56 from a 208-entry table)
@@ -487,13 +486,12 @@ mod tests {
 
     #[test]
     fn half_grid_minimum_round_trips_without_rejection() {
-        // Regression: before the boundary clamp, a half-rate frame at
-        // the Annex L minimum (b̂₀=119, ω₀=0.051051, L=56) round-tripped
-        // through full-rate → full-rate decoded it as b̂₀=207 →
-        // ω₀=0.050979, which was just below the half-rate grid
-        // minimum, so FullToHalfConverter rejected with
-        // HalfPitchOutOfRange. The clamp snaps ω₀ to the half-rate
-        // grid edge before quantizing.
+        // Boundary case: a half-rate frame at the Annex L minimum
+        // (b̂₀=119, ω₀=0.051051, L=56) comes back from full-rate as
+        // b̂₀=207 → ω₀=0.050979, just below the half-rate grid minimum.
+        // Without the boundary clamp FullToHalfConverter rejects it
+        // with HalfPitchOutOfRange; the clamp snaps ω₀ to the
+        // half-rate grid edge before quantizing.
         let mut src_state = HalfDecoderState::new();
         let l = 56u8;
         let voiced: Vec<bool> = (1..=l).map(|h| h <= l / 2).collect();
@@ -634,7 +632,7 @@ mod tests {
     fn half_to_full_encodes_tone_as_voice() {
         // Tone ID 1 → full-rate voice frame. The far-side receiver
         // will synthesize it as a 1-2-harmonic voiced sinusoid (not
-        // exact to DVSI's tone generator, but audible and continuous
+        // exact to the reference's tone generator, but audible and continuous
         // rather than a dropout).
         let mut conv = HalfToFullConverter::new();
         let input = ambe_plus2_tone_input();

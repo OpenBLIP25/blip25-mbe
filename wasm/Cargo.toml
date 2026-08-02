@@ -1,0 +1,40 @@
+[package]
+name = "blip25-wasm-decoder"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "In-browser decode-only proof-of-concept for the blip25-mbe P25 MBE vocoder (wasm32 + wasm-bindgen)."
+
+# Deliberately NOT a member of the root workspace: this crate targets
+# wasm32-unknown-unknown, links a cdylib, and pulls in wasm-bindgen — none of
+# which should burden a stable `cargo build --workspace` on the host. It only
+# CONSUMES the public decode API; it never touches the core codec crates.
+# Same pattern as `fuzz/`.
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+# The wasm-opt that ships with this wasm-pack is old enough to reject the
+# feature set current rustc emits by default (bulk-memory, sign-ext, …), so the
+# extra size pass is disabled. rustc still does the heavy lifting: the release
+# profile below runs opt-level = "s" + fat LTO + a single codegen unit +
+# panic = abort + strip.
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = false
+
+[dependencies]
+wasm-bindgen = "0.2"
+# Decode-only: this is the whole point — prove the lean, encoder-free decoder
+# builds and runs in the browser. `default-features = false` drops the encode
+# half of the public API (and its analysis pipeline) from the wasm binary.
+blip25-mbe = { path = "../crates/blip25-mbe", default-features = false, features = ["decode"] }
+
+[profile.release]
+# Size-first: the decoder ships to a browser. `opt-level = "s"` + fat LTO +
+# a single codegen unit + panic=abort strip the wasm down.
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

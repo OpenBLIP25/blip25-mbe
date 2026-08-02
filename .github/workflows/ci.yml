@@ -9,6 +9,16 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # The reference corpus and codebook extracts are non-redistributable and are never
+  # present in CI. The tests that need them now FAIL rather than silently
+  # skipping (a stderr "SKIP" + return is reported by cargo as a pass, which is
+  # indistinguishable from a real verification in a green log). These two flags
+  # are the explicit acknowledgement that CI runs without them; the hermetic
+  # gates, which are the ones that actually pin codec output, still run.
+  BLIP25_ALLOW_MISSING_CORPUS: 1
+  # The workspace is warning-clean by policy; every intentional exception is a
+  # targeted #[allow] with a justification comment. New warnings fail CI.
+  RUSTFLAGS: -D warnings
 
 jobs:
   test:
@@ -18,10 +28,82 @@ jobs:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: cargo build
-        run: cargo build --workspace --release
-      - name: cargo test
+      - name: cargo build (all targets, warnings are errors)
+        run: cargo build --workspace --all-targets --release
+      - name: cargo test (release)
         run: cargo test --workspace --release
+      - name: cargo test (dev profile, exercises debug_asserts)
+        run: cargo test --workspace
+      - name: cargo test (--all-features, exercises the serde derives)
+        run: cargo test -p blip25-mbe --all-features --release
+
+  # This crate's core claim is bit-exact reproduction of a reference vocoder,
+  # and the engine is a port of x86 code. A float divergence on another target
+  # would invalidate that claim silently.
+  #
+  # The `golden_output` test is what actually detects that: it compares codec
+  # output against hashes pinned as literals. The other tests cannot — they
+  # compare the `Vocoder` façade against the engine called directly, so on a
+  # diverging platform both sides move together and the suite stays green.
+  # Run the whole suite here, but `golden_output` is the one carrying the claim.
+  cross-platform:
+    name: bit-exactness (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-aarch64, os: ubuntu-24.04-arm }
+          - { name: macos-aarch64, os: macos-latest }
+          - { name: windows-x86_64, os: windows-latest }
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: pinned codec output must match x86-64
+        run: cargo test -p blip25-mbe --release --test golden_output
+      - name: cargo test (release)
+        run: cargo test --workspace --release
+
+  msrv:
+    name: MSRV (rust 1.85)
+    runs-on: ubuntu-latest
+    env:
+      # The MSRV job proves the declared rust-version can build the crate.
+      # Newer-toolchain lints are not part of that contract, so warnings are
+      # not errors here.
+      RUSTFLAGS: ""
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.85
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo build (MSRV must build the published crates)
+        run: cargo build -p blip25-mbe --all-features
+
+  package:
+    name: cargo package (publishability)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Catches the class of break where a path dependency loses its version,
+      # a build.rs input falls outside `include`, or lockstep versions drift
+      # apart — all of which otherwise only surface at release time, which is
+      # exactly how the 0.3.0 publish break went unnoticed.
+      #
+      # Note this cannot be `cargo package` for the two dependent crates:
+      # --no-verify still resolves dependencies, and their path deps point at
+      # workspace siblings at the *upcoming* version, which is not on crates.io
+      # yet. The script uses `cargo metadata` + `cargo package --list`, neither
+      # of which needs the registry.
+      - name: publishability pre-flight
+        run: python3 .github/scripts/check_publishable.py
+
+      # blip25-codebooks has no dependencies, so it alone can be fully
+      # verify-built from its packaged contents.
+      - name: verify blip25-codebooks packages and builds
+        run: cargo package -p blip25-codebooks --allow-dirty
 
   docs:
     name: rustdoc (warnings-as-errors)
@@ -33,5 +115,49 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: cargo doc
-        run: cargo doc --no-deps -p blip25-mbe
+        run: cargo doc --no-deps -p blip25-mbe --all-features
 
+  audit:
+    name: cargo deny (advisories + licenses)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories bans licenses sources
+
+  semver:
+    name: semver compatibility vs published
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Compares the public API against the last release on crates.io and
+      # fails if the version bump does not cover the changes. Under 0.x rules a
+      # 0.x -> 0.(x+1) bump may break; a 0.x.y -> 0.x.(y+1) bump may not.
+      - uses: obi1kenobi/cargo-semver-checks-action@v2
+        with:
+          package: blip25-mbe
+
+  fuzz:
+    name: fuzz (${{ matrix.target }}, 60s)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [decode_bits, decode_soft, encode_pcm, transcode]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+      - name: install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      # A short smoke run per PR — enough to catch a newly introduced panic on
+      # malformed input, not a substitute for a long soak. This crate decodes
+      # untrusted over-the-air data, so every public entry point is fuzzed.
+      - name: fuzz ${{ matrix.target }}
+        working-directory: fuzz
+        run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=60

@@ -1,15 +1,14 @@
 # Rust
 /target
+# ref-impl is its own (isolated) workspace; ignore its build target.
+/conformance/ref-impl/target
 **/*.rs.bk
 # Cargo.lock is committed — this workspace has binary members (conformance,
 # tools) that want reproducible builds. Downstream library consumers of the
 # published crate ignore it anyway.
 
-# DVSI material — free to download but not redistributable
-/DVSI/
-
-# Listening-test drop zone (A/B PCM files, user-side only)
-/audition/
+# Reference material — free to download but not redistributable
+/reference-material/
 
 # Python (mock-serial driver tests)
 __pycache__/
@@ -23,3 +22,32 @@ __pycache__/
 
 # Claude Code per-project state (lock files, transcripts, etc.)
 .claude/
+
+# Scratch working dir from decode probes (regenerable)
+/.pfwork/
+
+# ref-impl build artifacts (path-depends outside the repo)
+/conformance/ref-impl/target/
+/conformance/ref-impl/Cargo.lock
+/conformance/ref-impl/src/bin/zz*.rs
+
+# Generated listening/roundtrip output
+/roundtrip_check/
+
+# Local-only reference regression test — depends on external, non-vendored
+# reference fixtures and hard-codes local paths; must not ship to GitHub.
+# cargo auto-discovers tests/*.rs, so an absent file on a fresh clone is a no-op.
+/crates/blip25-codec/tests/reference_local.rs
+
+# cargo-fuzz build artifacts (regenerable)
+/fuzz/target/
+/fuzz/artifacts/
+/fuzz/coverage/
+
+# The hand-built seed corpus IS committed — see fuzz/corpus/README.md. Without
+# it every CI fuzz run starts cold and spends its 60-second budget
+# rediscovering basic frame structure. Only libFuzzer's own discovered inputs
+# are ignored: it names those by the SHA-1 of their contents (no extension),
+# while every committed seed ends in `.bin`.
+/fuzz/corpus/*/*
+!/fuzz/corpus/*/*.bin

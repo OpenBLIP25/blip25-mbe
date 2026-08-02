@@ -1,0 +1,18 @@
+[package]
+name = "blip25-conformance-roundtrip"
+description = "Codec vector/roundtrip conformance for blip25-mbe: decode/encode/full-roundtrip vs the reference vocoder's ground truth through the shipped Vocoder API."
+publish = false
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "conformance-roundtrip"
+path = "src/main.rs"
+
+[dependencies]
+blip25-mbe.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+hound.workspace = true

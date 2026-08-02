@@ -6,16 +6,17 @@
 //! bit allocations, scanned into `û₀..û₇` such that the most significant
 //! bits receive the strongest FEC.
 //!
-//! The table is generated at build time from `spec_tables/imbe_bit_prioritization.csv`,
-//! with coverage invariants checked during generation.
+//! The table is frozen into `src/generated/imbe_bit_priority.rs` — normative
+//! TIA-102 Annex data. Do not hand-edit it; the tests below enforce its
+//! coverage invariants.
 
 use crate::bits::BitMap;
 
-include!(concat!(env!("OUT_DIR"), "/imbe_bit_priority.rs"));
+include!("../generated/imbe_bit_priority.rs");
 
 /// Maximum full-rate parameter index: `b̂_{L+2}` for `L = 56` gives
 /// `b̂_{58}`, so the parameter array needs `59` slots (indices 0..=58).
-pub const IMBE_B_MAX: usize = 59;
+pub(crate) const IMBE_B_MAX: usize = 59;
 
 /// Minimum full-rate harmonic count. Matches [`crate::mbe_params::L_MIN`].
 pub const L_MIN: u8 = 9;
@@ -77,7 +78,7 @@ mod tests {
     }
 
     /// Width (in bits) of parameter b̂_{src_param} for a given L,
-    /// derived from the CSV table (max src_bit + 1 for that param).
+    /// derived from the bit map (max src_bit + 1 for that param).
     fn param_width(l: u8, src_param: u8) -> u8 {
         let l_idx = (l - L_MIN) as usize;
         let max_bit = IMBE_BIT_MAP[l_idx]

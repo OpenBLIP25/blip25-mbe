@@ -1,37 +1,61 @@
 [package]
 name = "blip25-mbe"
-description = "Research MBE / IMBE / AMBE+2 vocoder family: P25 wire formats, multi-generation codecs, and parametric rate conversion. Educational use; see PATENT_NOTICE.md."
+description = "MBE vocoder for P25: IMBE (Phase 1) and AMBE+2 (Phase 2) encode/decode, wire formats, and parametric rate conversion. Patent-encumbered — both codecs' audio comes from an analysis/synthesis core reverse-engineered from the reference's software vocoder. Read PATENT_NOTICE.md and ATTRIBUTION.md in the repository before use."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 readme = "../../README.md"
-repository = "https://github.com/openBLIP25/blip25-mbe"
-homepage = "https://github.com/openBLIP25/blip25-mbe"
+repository.workspace = true
+homepage.workspace = true
 documentation = "https://docs.rs/blip25-mbe"
 keywords = ["p25", "mbe", "imbe", "ambe", "vocoder"]
 categories = ["multimedia::audio", "encoding"]
 
+# Only the two examples the README documents ship to crates.io. The rest of
+# `examples/` is A/B research instrumentation: several hard-code local paths to
+# the (non-redistributable) reference vector corpus and cannot run for anyone else.
+include = [
+    "src/**/*.rs",
+    "tests/**/*.rs",
+    "examples/vocoder_demo.rs",
+    "examples/vocoder_bench.rs",
+    "Cargo.toml",
+    "LICENSE",
+]
+
 [features]
-default = []
+default = ["encode", "decode"]
+## Encode public API (`Vocoder::encode*`, `LiveEncoder`, `AmbeStream`,
+## `Transcoder`, the encode streaming iterators). Forwards to
+## `blip25-codec/encode`. Off in a decode-only build.
+encode = ["blip25-codec/encode"]
+## Decode public API (`Vocoder::decode*`, `Rate`, the shared frame/param
+## types, the wire + rate-conversion layers). Forwards to
+## `blip25-codec/decode`. Stands alone without `encode`.
+decode = ["blip25-codec/decode"]
 ## Derive `Serialize` / `Deserialize` on the diagnostic types in
 ## [`vocoder`] (`Rate`, `FrameStats`, `AnalysisStats`,
-## `AnalysisOutputKind`, `DecodeStats`) plus [`MbeParams`] and
-## [`codecs::mbe_baseline::FrameDisposition`]. Lets a future RPC layer
-## (gRPC / protobuf / WS) ship these over the wire without a
-## hand-rolled converter. Off by default to keep the core dep-free.
-serde = ["dep:serde"]
-## Per-stage timing instrumentation in the analysis encoder. Wraps
-## each step of `encode_with_trace` with thread-local Instant
-## accumulators; disabled by default (zero overhead). When enabled,
-## consumers read snapshots via [`codecs::mbe_baseline::analysis::profile`].
-## See the `profile_encode` example for a usage walkthrough.
-profile = []
+## `AnalysisOutputKind`, `DecodeStats`) plus [`MbeParams`]. Lets an RPC
+## layer (gRPC / protobuf / WS) ship these over the wire without a
+## hand-rolled converter. Off by default: with it off the crate has no
+## runtime dependencies outside this workspace. Also covers
+## `FrameDisposition`, which is re-exported from the engine crate and so
+## needs its derives enabled there too.
+serde = ["dep:serde", "blip25-codec/serde"]
 
 [dependencies]
-rustfft = { workspace = true }
-num-complex = { workspace = true }
 serde = { workspace = true, optional = true }
+# The codec engine (IMBE + AMBE+2) behind the public `Vocoder` API, and the
+# bit-exact vector-quantizer codebooks it reads. Both are published in lockstep
+# with this crate at the same version. See docs/WHY_THE_REFERENCE_CODEC.md.
+blip25-codec = { workspace = true, default-features = false }
 
 [dev-dependencies]
 serde_json = { workspace = true }
+blip25-codebooks = { path = "../blip25-codebooks" }
+
+[package.metadata.docs.rs]
+# Build docs with the optional serde derives visible.
+all-features = true

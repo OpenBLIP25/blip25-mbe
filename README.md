@@ -1,34 +1,38 @@
 # blip25-mbe
 
-A research Rust implementation of the DVSI MBE codec family (IMBE, AMBE,
-AMBE+, AMBE+2) for P25, DMR, NXDN, and D-STAR pipelines. Functionally
+A Rust implementation of the reference MBE codec family for P25, functionally
 parallel to the AMBE-3000R chip's codec layer.
 
-Covers IMBE (P25 Phase 1), AMBE / AMBE+ / AMBE+2 (DVSI AMBE-1000/2000/3000
-generations), and parametric rate conversion between them.
-
-Built from TIA-102 specifications and expired DVSI patents. Validated by
-black-box comparison against DVSI hardware and published test vectors.
-No code or algorithms borrowed from existing open-source vocoder projects.
+The `Vocoder` API exposes four wire rates across two codecs — **IMBE**
+(P25 Phase 1, full-rate 7200×4400 and info-only 4400×4400) and **AMBE+2**
+(P25 Phase 2, half-rate 3600×2450 and info-only 2450×2450) — plus parametric
+rate conversion between them. The AMBE+2 vocoder layer is also the voice
+codec for DMR Tier II/III, modulo carrier-specific burst framing; NXDN and
+D-STAR use different MBE variants that this crate does not encode.
 
 > **Patent notice.** This source code is provided for research and
-> educational purposes only. The half-rate (AMBE+2) implementation
+> interoperability study only. The half-rate (AMBE+2) implementation
 > unavoidably reads on the claims of **US8359197**, active until
-> **2028-05-20**. See [`PATENT_NOTICE.md`](./PATENT_NOTICE.md) for the
-> full list, comparable-project survey, and project policy.
+> **2028-05-20**. See [`PATENT_NOTICE.md`](./PATENT_NOTICE.md) for the full
+> list, comparable-project survey, and project policy.
 
-See [`DESIGN.md`](./DESIGN.md) for the architectural model and
-[`SCOPE_PLAN.md`](./SCOPE_PLAN.md) for the current roadmap status.
+## Install
 
-New to the DVSI codec family or curious why open-source P25 sounds worse than
-commercial radios? Read [`docs/codec_family_explainer.md`](./docs/codec_family_explainer.md)
-for the wire-format-vs-implementation story and what this project does about it.
+```toml
+[dependencies]
+blip25-mbe = "0.3"
+```
+
+Requires Rust 1.85 or later. With default features the crate pulls in no
+runtime dependencies outside its own workspace; enable `serde` to derive
+`Serialize` / `Deserialize` on the diagnostic and parameter types.
+
+> **Upgrading from 0.2.x?** 0.3.0 replaces the codec engine wholesale and
+> removes every runtime environment-variable lever. Read the
+> [0.3.0 changelog entry](./CHANGELOG.md) before bumping — the migration is
+> short but it is not a drop-in.
 
 ## Quick start
-
-The recommended entry point for in-process Rust callers is the
-[`Vocoder`](./crates/blip25-mbe/src/vocoder.rs) handle, modeled on
-the DVSI AMBE-3000R chip's per-channel API:
 
 ```rust
 use blip25_mbe::vocoder::{Rate, Vocoder};
@@ -42,109 +46,206 @@ let mut rx = Vocoder::new(Rate::Imbe7200x4400);
 let pcm = rx.decode_bits(&bits).unwrap();   // 160 samples
 ```
 
-Beyond the per-frame primitive, the same handle exposes:
-
-- `encode_stream` / `decode_stream` — slice → `Iterator<Item = Result<…>>`.
-- `LiveEncoder` / `LiveDecoder` — chunk-driven with internal residue
-  buffer for audio-callback / socket use.
-- `extract_params` / `synthesize_params` — parameter-layer entries
-  that skip the wire FEC, useful for transcoding / analysis pipelines.
-- `Transcoder` — P25 Phase 1 ↔ Phase 2 wire-bit bridge.
-- `VocoderBuilder` — fluent configuration (tone detection, beyond-spec
-  repeat reset, silence dispatch, pitch-silence override).
-- Optional `serde` feature for shipping diagnostic types over RPC.
-
-Two runnable examples demonstrate everything:
+Two runnable examples:
 
 ```bash
 cargo run --release --example vocoder_demo  -p blip25-mbe   # full API walkthrough
 cargo run --release --example vocoder_bench -p blip25-mbe   # throughput micro-benchmark
 ```
 
+## Architecture
+
+### What you depend on
+
+```
+blip25-mbe  = "0.3"        ← the only one you name
+   └── blip25-codec        ← engine, implementation detail
+         └── blip25-codebooks   ← VQ tables, leaf
+```
+
+Three crates, published to crates.io in lockstep at one version. The bottom
+two exist there only because cargo cannot resolve path dependencies; neither
+carries an API stability promise. A fourth workspace member,
+`conformance/roundtrip`, is a `publish = false` harness whose examples read
+the non-redistributable reference corpus, and `fuzz/` sits outside the workspace
+entirely because it requires nightly.
+
+Relative size is a fair map of where the difficulty lives:
+
+| Crate | Lines | Role |
+|---|---:|---|
+| `blip25-codec` | 30,405 | the DSP |
+| `blip25-mbe` | 12,776 | wire formats, public API, FEC |
+| `blip25-codebooks` | 87 + blobs | data |
+
+### The front door
+
+`Vocoder` is a chip-shaped façade — one handle per channel direction,
+modeled on the AMBE-3000R's per-channel API, enum-dispatched with no `dyn`.
+Around the per-frame primitive:
+
+- `encode_stream` / `decode_stream` — slice → `Iterator<Item = Result<…>>`
+- `LiveEncoder` / `LiveDecoder` — chunk-driven with an internal residue
+  buffer, for audio-callback and socket use
+- `decode_soft` / `decode_stream_soft` — soft-decision decode from per-bit
+  LLRs (`&[i8]`), for receivers that can surface demodulator confidence;
+  `soft_frame_bits` gives the expected count
+- `Transcoder` — P25 Phase 1 ↔ Phase 2 wire-bit bridge
+- `set_tone_detection` / `set_enhancement`, and `VocoderBuilder` to
+  configure the post-decode chain up front
+
 See [`INTEGRATION.md`](./INTEGRATION.md) for the AMBE-3000R protocol →
-`Vocoder` operation correspondence and the chip-vs-codec boundary
-principle.
+`Vocoder` operation correspondence.
 
-## Layout
+### Inside `blip25-mbe`
+
+Three orthogonal axes meeting at one interchange type:
 
 ```
-crates/blip25-mbe/        The published crate. Self-contained; no proprietary material.
-conformance/
-  vectors/                DVSI test-vector conformance harness.       (publish = false)
-  chip/                   Live DVSI USB-3000 chip conformance.        (publish = false)
-  speech-quality/         BABG-style PESQ/POLQA scoring.              (publish = false)
-tools/
-  dvsi-diff/              Iteration tool for diagnosing vector failures.
+                    ┌──────────────┐
+   wire  ──────────▶│  MbeParams   │◀────────── codec
+   imbe7200 (3120)  │              │            synth (181)
+   rate33   (3213)  │  ω₀          │            enhancement (397)
+                    │  L           │
+                    │  voiced[]    │
+                    │  amplitudes[]│
+                    └──────┬───────┘
+                           │
+                    rate_conversion (1370)
+                    bits → params → bits, no PCM
 ```
 
-## Testing tiers
+- **`vocoder`** (2657) — the façade; owns all per-rate state
+- **`imbe7200` / `rate33`** — one module per protocol-rate combination:
+  deframe, FEC, deinterleave, dequantize
+- **`mbe_params`** — the interchange type: fundamental frequency, harmonic
+  count, per-harmonic voicing and spectral amplitudes
+- **`rate_conversion`** — a *peer* of the wire and codec layers, not a
+  decoder afterthought; converts in the parameter domain, never touching PCM
+- **`fec`** (749) — Golay / Hamming, hard and soft decision
+- **`synth`** (181) — thin adapter, params → PCM over the engine
+- **`enhancement`** (397) — optional post-decode filter chain, **off by
+  default**, because enabling it is a deviation from the reference
 
-| Tier                 | Requirements                    | Who runs it                           |
-|----------------------|---------------------------------|---------------------------------------|
-| Unit tests           | None                            | Anyone, crates.io CI                  |
-| Vector conformance   | DVSI test vectors on disk       | Project CI / developers with access   |
-| Chip conformance     | DVSI USB-3000 hardware          | Project CI with chip attached         |
-| Speech quality       | Reference speech + PESQ scorer  | Later                                 |
+Two entry altitudes are supported on purpose: `Vocoder` for most callers,
+and the layered free functions (`rate33::dequantize` → `synth::synthesize_frame`)
+for anyone whose carrier lays out post-FEC bits differently. That pair is
+the carrier-agnostic seam.
 
-The published crate's `cargo test` is meaningful on its own. Conformance
-against DVSI material is additional, optional, and never required for a
+### Inside `blip25-codec`
+
+```
+enc/   44 files  18,962 lines   ← 62% of the engine
+dec/   16 files   4,820
+imbe/   8 files   1,809
+root   10 files   4,814         (synth, tone, phase_regen, fec, frame, fixops)
+```
+
+The asymmetry is the shape of the problem: encode carries the difficulty —
+`b1_audio.rs` (2346), `loudness_fixed.rs` (1951), `pitch.rs` (1231),
+`b0_audio.rs` (975), `voicing_fixed.rs` (669) — while the decode side is
+largely overlap-add machinery (six `ola_*.rs` files).
+
+`imbe/` is deliberately self-contained, with its own
+`frame`/`dequantize`/`quantize`/`tables`/`dsp`/`math`/`fixp`. The AMBE+2
+front-end is instead *fused* with the shared core rather than living in its
+own folder — a consequence of the engine being built AMBE+2-first. That is
+why `dequantize` hosts `MbeParams` itself, the type IMBE also produces.
+
+### The path through
+
+```
+encode:  &[i16; 160]
+           → Vocoder::encode_pcm
+           → match rate → enc.encode_frame_r33 / _r34 / encode_imbe_frame
+           → [analysis: pitch → voicing → amplitude → VQ]
+           → Vec<u8>
+
+decode:  &[u8]
+           → Vocoder::decode_bits  (length-checked first)
+           → Decoder / ImbeDecoder
+           → [FEC → deprioritize → tone classify → dequantize → OLA synth]
+           → enhancement (no-op by default)
+           → Vec<i16>
+```
+
+[`DESIGN.md`](./DESIGN.md) has the architectural rationale;
+[`docs/WHY_THE_REFERENCE_CODEC.md`](./docs/WHY_THE_REFERENCE_CODEC.md)
+explains why the codec matches the reference vocoder rather than chasing a
+quality metric. New to the MBE family, or wondering why open-source P25
+sounds worse than commercial radios?
+[`docs/codec_family_explainer.md`](./docs/codec_family_explainer.md) is the
+wire-format-vs-implementation story.
+
+Before changing anything in the codec, read
+[`docs/PROJECT_KNOWLEDGE.md`](./docs/PROJECT_KNOWLEDGE.md) — the constants that
+must not be re-tuned, the metrics that mislead, and the approaches that are
+ruled out.
+
+## Testing
+
+| Tier                | Requirements              | Who runs it                       |
+|---------------------|---------------------------|-----------------------------------|
+| Unit + integration  | None                      | Anyone, project CI                |
+| Pinned output       | None                      | Project CI (`golden_output`)      |
+| Routing parity      | None                      | Project CI (`codec_acceptance`)   |
+| Vector conformance  | reference test vectors on disk | Developers with access       |
+
+`cargo test` is meaningful on its own and is what CI gates on. The two
+hermetic tiers do different jobs, and the distinction matters:
+
+- **`golden_output`** compares codec output against hashes pinned as
+  literals. This is the only test that can detect a codec regression, and
+  it is what makes the cross-platform matrix meaningful — it runs on
+  aarch64, macOS, and Windows, so a float divergence fails loudly instead
+  of shipping.
+- **`codec_acceptance`** compares the `Vocoder` façade against the engine
+  called directly. That verifies *routing*, not output: if the engine
+  changes, both sides change together and it stays green. Useful, but not
+  a regression gate — do not mistake it for one.
+
+Vector conformance against the reference corpus is additional, skips
+automatically when the corpus is absent, and is never required for a
 contributor to validate their work.
 
-## On this being AI-designed
+Every public entry point is fuzzed (`fuzz/`, requires nightly). See
+[`RELEASING.md`](./RELEASING.md) for the release process.
 
-This project was designed and scaffolded by Claude Opus 4.6, via Claude
-Code, in collaboration with a human domain expert. The fact is called out
-here because "AI-written" is sometimes used as a reason to dismiss a
-project without looking at it, and the process behind this one is worth
-being honest about.
+## Provenance
 
-A single prompt of "build me an MBE vocoder in Rust" would have produced
-a port of OP25, SDRTrunk, dsdcc, or JMBE. Those codebases are what
-modern language models have been trained on, so they reproduce them. The
-result would have inherited the twenty-year-old conflation of wire format
-with codec that every one of those open implementations shares.
+Provenance splits by **layer**, not by codec — the two codecs are close to
+symmetric:
 
-That is not what happened. What happened was iterative correction:
+| Layer | Provenance |
+|---|---|
+| Wire framing, FEC, bit interpretation (both codecs) | **Spec** — TIA-102.BABA / BABA-A, clean-room derived |
+| Quantizer data | **AMBE+2: firmware** (all VQ codebooks). **IMBE: spec**, except the gain ladder |
+| Analysis / encode chain (shared) | **Reverse-engineered** |
+| Synthesis / decode audio (shared) | **Reverse-engineered** |
 
-- Before any code, the model was directed to read specific TIA-102
-  implementation specs and given a clean-room directive: no reading of
-  existing open-source vocoders. Ambiguous specs were to be reported as
-  gaps, not guessed around.
-- When the model proposed a module called `transcode/`, the author
-  corrected it to "rate conversion" — the term used in the DVSI AMBE-3000
-  protocol spec — and pointed it at the relevant document.
-- When the model treated the codec as a single thing, the author pointed
-  out that AMBE-1000, AMBE-2000, and AMBE-3000 are three generations
-  sharing one parameter model, and that DVSI's own P25 / P25A / P25X
-  modes run different codec algorithms behind identical wire bits.
-- When the model drifted toward IMBE-centric naming, the author
-  redirected it to `imbe7200` and `rate33` as peers (with
-  `dvsi_3000` alongside for the chip-protocol wire), reflecting that
-  each is a wire over the same shared parameter model.
-- The three-tier test architecture — self-contained unit tests, vector
-  blackbox, live-chip blackbox — came from the author requiring that
-  contributors never be blocked by lack of proprietary material.
+**Both codecs' wire layers are spec-derived.** Deframing, FEC, and bit
+interpretation come from TIA-102.BABA / BABA-A; the AMBE+2 half was carried
+over from this project's original clean-room implementation, and the IMBE half
+was built from the published fixed-point reference plus ITU-T G.191 basic
+operators.
 
-The design document's central claim — three orthogonal axes (wire,
-parameter, codec) joined at a common interchange type, with rate
-conversion as a first-class peer rather than a decoder afterthought —
-is what the specs say. The model would not have arrived there alone.
-It arrived there because a domain expert re-read specs with it, rejected
-plausible-sounding first answers, and insisted on the clean decomposition
-that the specs actually describe.
+**Both codecs' audio comes from a reverse-engineered core.** The shared
+analysis and synthesis engine was recovered from a compiled reference vocoder image
+— x86 disassembly transliterated to fixed-point Rust, constants recovered from
+the binary's data section, correctness pinned bit-exact against the vocoder's
+own output. It is not a copy of the reference vendor's source, which this project never
+obtained or read; it *is* a derivation of the reference vocoder's behavior, and it reads
+on the active patents above. IMBE is not exempt: `ImbeDecoder` defaults to that
+same overlap-add back-end, and IMBE encode runs the same analysis chain.
 
-That is the case for AI as a force multiplier rather than a shortcut.
-Most practitioners never find time to rebuild a familiar problem from
-first principles. Directed collaboration with an AI assistant makes it
-possible in a weekend that would otherwise have taken a sabbatical. The
-quality of the output is a direct function of the expert's willingness
-to correct and direct; the AI amplifies what the expert already knows,
-it does not substitute for it.
+**The one real asymmetry is quantizer data.** AMBE+2's vector-quantizer
+codebooks (PRBA, HOC, gain) are entirely firmware-recovered. IMBE's quantizer
+tables are published spec data, with a single exception — the gain ladder,
+where the reference vendor's real table diverges from Annex-E at its bottom eight levels.
 
-If you are an expert in something you care about but have never had the
-bandwidth to rebuild from the ground up, you have a collaborator now who
-reads as fast as you can think. Used that way, what comes out is not an
-AI project. It is the project you finally had the time to build.
+[`ATTRIBUTION.md`](./ATTRIBUTION.md) is the authoritative statement of what
+is original work and what is derived, and states it in both directions —
+neither overstating originality nor understating the derivation.
 
 ## License
 

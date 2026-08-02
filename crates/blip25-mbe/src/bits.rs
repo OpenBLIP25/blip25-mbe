@@ -10,9 +10,9 @@
 /// within the info-vector bundle.
 ///
 /// Used by both [`crate::imbe7200::priority`] (BABA-A §10) and
-/// [`crate::rate33::priority`] (BABA-A §16.7); the build script
-/// emits `BitMap { ... }` literals inside each rate's bit-priority
-/// table, so this type must be in scope at the include site.
+/// [`crate::rate33::priority`] (BABA-A §16.7). The bit-priority tables in
+/// `src/generated/` are `BitMap { ... }` literals, so this type must be in
+/// scope at each `include!` site.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct BitMap {
     pub src_param: u8,

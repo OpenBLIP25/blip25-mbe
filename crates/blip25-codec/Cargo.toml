@@ -1,0 +1,40 @@
+[package]
+name = "blip25-codec"
+description = "MBE codec engine: IMBE (P25 Phase 1) + AMBE+2 (P25 Phase 2), encode and decode. Wire layers are spec-derived from TIA-102.BABA; the shared analysis/synthesis core both codecs' audio comes from was recovered by reverse engineering the reference's software vocoder and reproduced bit-for-bit. See ATTRIBUTION.md and PATENT_NOTICE.md in the repository. Implementation detail of `blip25-mbe` — use that crate's `Vocoder` instead of depending on this directly."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords = ["p25", "mbe", "imbe", "ambe", "vocoder"]
+categories = ["multimedia::audio", "encoding"]
+include = [
+    "src/**/*.rs",
+    "src/**/*.rs.inc",
+    "Cargo.toml",
+    "LICENSE",
+]
+
+[lib]
+name = "blip25_codec"
+path = "src/lib.rs"
+
+[features]
+default = ["encode", "decode"]
+## Encoder analysis pipeline (PCM -> frame bits): gates in `enc/` and the
+## `Encoder` re-export. Off in a decode-only build.
+encode = []
+## Decoder + shared synthesis/dequantize/FEC-decode path (frame bits -> PCM).
+## The DSP/BFP primitives the decoder needs live in `shared/` (never `enc/`),
+## so this stands alone without `encode`.
+decode = []
+## Derive `Serialize` / `Deserialize` on the types this crate re-exports
+## through `blip25-mbe`'s public API (currently `FrameDisposition`).
+## Enabled by `blip25-mbe/serde`; not intended to be selected directly.
+serde = ["dep:serde"]
+
+[dependencies]
+blip25-codebooks = { workspace = true }
+serde = { workspace = true, optional = true }

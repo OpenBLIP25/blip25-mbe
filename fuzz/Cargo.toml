@@ -1,0 +1,48 @@
+[package]
+name = "blip25-mbe-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+# Deliberately NOT a member of the root workspace: cargo-fuzz requires nightly
+# and pulls in libfuzzer-sys, neither of which should burden a stable
+# `cargo build --workspace`. Run from this directory:
+#
+#   cargo +nightly fuzz run decode_bits -- -max_total_time=60
+#
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+blip25-mbe = { path = "../crates/blip25-mbe" }
+
+[[bin]]
+name = "decode_bits"
+path = "fuzz_targets/decode_bits.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_soft"
+path = "fuzz_targets/decode_soft.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "encode_pcm"
+path = "fuzz_targets/encode_pcm.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "transcode"
+path = "fuzz_targets/transcode.rs"
+test = false
+doc = false
+bench = false

@@ -20,7 +20,7 @@
 //! ## Codec independence
 //!
 //! This module is the **wire**, not the codec. Any codec generation
-//! (legacy IMBE, AMBE+, AMBE+2 — see [`crate::codecs`]) can produce or
+//! (legacy IMBE, AMBE+, AMBE+2) can produce or
 //! consume the [`crate::mbe_params::MbeParams`] that flows through this
 //! pipeline. P25 Phase 1 fire-channel deployments that pair this wire
 //! with the AMBE+2 codec for SCBA-mask noise immunity are the

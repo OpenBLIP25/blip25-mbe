@@ -13,11 +13,73 @@ The above patent notice is adapted from the verbatim form used by the
 [mbelib](https://github.com/szechyjs/mbelib) and
 [JMBE](https://github.com/DSheirer/jmbe) projects.
 
+## Patent-relevant codec components (added 2026-07-20)
+
+As of 2026-07-20 the project's default codec path is **no longer derived from
+the TIA-102 specifications**. The shared analysis and synthesis core of the
+`blip25-codec` engine was **recovered by reverse engineering a compiled
+reference vocoder image** — x86 disassembly transliterated to fixed-point Rust,
+constants recovered from the binary's data section, correctness pinned bit-exact
+against the vocoder's own output. It is not a copy of the reference vendor's
+source code, which the project never obtained or read; it **is** a derivation of
+the reference vocoder's behavior, and it reads on the same active patents listed
+above.
+
+**This applies to both codecs' audio output, including full-rate IMBE.** The
+division is by layer, not by codec, and the two codecs are close to symmetric:
+
+| Layer | Provenance |
+|---|---|
+| Wire framing, FEC, bit interpretation (both codecs) | **Spec** — TIA-102.BABA / BABA-A, clean-room derived |
+| Quantizer data | **AMBE+2: firmware** (all VQ codebooks). **IMBE: spec**, except the gain ladder |
+| Analysis / encode chain (shared) | **Reverse-engineered** |
+| Synthesis / decode audio (shared) | **Reverse-engineered** |
+
+Both wire layers are spec-derived. The one asymmetry in quantizer data is that
+AMBE+2's vector-quantizer codebooks are entirely firmware-recovered, whereas
+IMBE's quantizer tables are published spec data apart from the gain ladder,
+where the reference vendor's real table diverges from Annex-E at its bottom eight levels.
+
+Do not read "the IMBE bitstream is a published standard" as "the IMBE
+implementation here is unencumbered." The bitstream is published; the analysis
+and synthesis engineering that turns it into audio is the reference vendor's, and
+that is what this crate reproduces — for IMBE exactly as much as for AMBE+2.
+
+State this accurately in both directions: substantial original engineering
+surrounds the engine, and the engine itself is derived. See
+[`ATTRIBUTION.md`](./ATTRIBUTION.md) — **the authoritative statement of what is
+original versus derived** — and
+[`docs/WHY_THE_REFERENCE_CODEC.md`](./docs/WHY_THE_REFERENCE_CODEC.md) for why
+the project adopted this path and retired its clean-room posture.
+
+| Crate | What it is | Provenance |
+|---|---|---|
+| `crates/blip25-codec` | The default IMBE (P25 Phase 1) + AMBE+2 (Phase 2) encode/decode path | Reverse-engineered to emulate the reference vocoder, synthesized from many reference resources rather than any single one |
+| `crates/blip25-codebooks` | The IMBE / AMBE+2 VQ tables (PRBA24 / PRBA58 / HOC b5–b8 / Annex-O + MONO65 gain) | Derived and verified against the **reference** IMBE/AMBE+2 software vocoder (bit-exact): the standard tables against TIA-102.BABA-A, the reference-specific deviations against the codec's own output. The copy examined ran on a reference LMR console `R39.15.00` TMS320C55x image, but the vocoder is the reference vendor's — the same code ships in any radio that licenses it. |
+
+Both crates are **patent-encumbered**. As AMBE+2 / MBE implementations they
+unavoidably read on the same active patents catalogued below — notably
+**US8359197**, active until **2028-05-20** — and they additionally embody the
+reference vendor's proprietary analysis and synthesis engineering, which the expired-patent
+documentation does **not** place in the public domain.
+
+Both crates are new in 0.3.0 and, as of this writing, neither they nor 0.3.0
+itself have been released; releases through 0.2.2 shipped `blip25-mbe` alone,
+on the clean-room codec this one replaces. When 0.3.0 goes out **all three go
+to crates.io together** — `blip25-mbe` cannot be published without them, since
+crates.io does not resolve path dependencies.
+
+They are provided strictly for **research and interoperability study**; no
+commercial product is shipped from them (see **Project policy** below).
+Publishing them distributes a patent-encumbered implementation, which is a
+deliberate, documented decision and not an accident of packaging. Anyone
+depending on this crate takes on that consideration themselves.
+
 ## Specific patents the maintainers are aware of
 
 This list is not exhaustive and is not legal advice. It reflects the
 clean-room patent audit at
-`~/blip25-specs/DVSI/AMBE-3000/AMBE-3000_Patent_Reference.md`.
+`~/blip25-specs/reference/AMBE-3000/AMBE-3000_Patent_Reference.md`.
 
 ### Active patents that the half-rate (AMBE+2) implementation reads on
 
@@ -76,8 +138,8 @@ The maintainers researched comparable open-source projects (JMBE,
 mbelib, OP25, SDRTrunk, DSDcc, dsd-fme) and found a consistent pattern:
 all carry a patent disclaimer of this form, all distribute under
 permissive or copyleft open-source licenses without payment, and none
-have been the subject of patent enforcement action by DVSI in
-10+ years. DVSI's documented enforcement (Codec2 / David Rowe, 2017–2019)
+have been the subject of patent enforcement action by the reference vendor in
+10+ years. The reference vendor's documented enforcement (Codec2 / David Rowe, 2017–2019)
 targeted commercial use, not the existence of open-source
 implementations.
 

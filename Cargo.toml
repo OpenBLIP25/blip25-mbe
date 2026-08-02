@@ -2,27 +2,33 @@
 resolver = "2"
 members = [
     "crates/blip25-mbe",
-    "conformance/vectors",
-    "conformance/chip",
-    "conformance/speech-quality",
-    "tools/dvsi-diff",
+    "crates/blip25-codec",
+    "crates/blip25-codebooks",
+    "conformance/roundtrip",
 ]
 
 [workspace.package]
-version = "0.2.2"
+version = "0.3.0"
 edition = "2021"
+rust-version = "1.85"
 authors = ["Chance Lindsey"]
 license = "MIT"
+repository = "https://github.com/openBLIP25/blip25-mbe"
+homepage = "https://github.com/openBLIP25/blip25-mbe"
 
 [workspace.dependencies]
-blip25-mbe = { path = "crates/blip25-mbe", version = "0.2.0" }
+# The three published crates move in lockstep at the workspace version: the
+# engine and codebooks are implementation detail of `blip25-mbe`, and a version
+# skew between them is never meaningful. `cargo publish` needs each path dep to
+# also carry a version, so these are declared here once.
+blip25-mbe = { path = "crates/blip25-mbe", version = "0.3.0" }
+blip25-codec = { path = "crates/blip25-codec", version = "0.3.0", default-features = false }
+blip25-codebooks = { path = "crates/blip25-codebooks", version = "0.3.0" }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 hound = "3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-rustfft = "6"
-num-complex = "0.4"
 
 [profile.release]
 lto = "thin"

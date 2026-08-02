@@ -4,8 +4,8 @@
 //!
 //! Per TIA-102.BABA-A. This module composes the generic Golay/Hamming
 //! primitives in [`crate::fec`] into the full-rate wire layout and
-//! carries the Annex H interleaving table (generated at build time
-//! from `spec_tables/annex_h_interleave.csv` by `build.rs`).
+//! carries the Annex H interleaving table (frozen in
+//! `src/generated/annex_h.rs`).
 //!
 //! ## Bit-ordering convention (frame-wide)
 //!
@@ -36,7 +36,7 @@ pub const PN_SEQ_LEN: usize = 115;
 /// Lengths of the 8 modulation vectors in bits.
 /// Matches the full-rate FEC layout: c0..c3 = 23-bit Golay,
 /// c4..c6 = 15-bit Hamming, c7 = 7-bit uncoded.
-pub const VECTOR_LENGTHS: [u8; 8] = [23, 23, 23, 23, 15, 15, 15, 7];
+pub(crate) const VECTOR_LENGTHS: [u8; 8] = [23, 23, 23, 23, 15, 15, 15, 7];
 
 /// Generate the full-rate PN sequence `p_r(0..=114)`.
 ///
@@ -50,9 +50,11 @@ pub const VECTOR_LENGTHS: [u8; 8] = [23, 23, 23, 23, 15, 15, 15, 7];
 /// Each element is a 16-bit unsigned integer. The mask bit for position
 /// `n` is the MSB of `p_r(n)` (bit 15); see [`pn_mask_bit`].
 ///
-/// Panics in debug builds if `u0 >= 4096`.
+/// Over-width `u0` is masked to the 12-bit domain (never panics).
 pub fn pn_sequence(u0: u16) -> [u16; PN_SEQ_LEN] {
-    debug_assert!(u0 < 4096, "û₀ is a 12-bit Golay info word");
+    // Hostile input class: over-width û₀ (corrupted wire / raw u16) — mask to
+    // the 12-bit Golay info domain; 16·û₀ mod 2¹⁶ ignores those bits anyway.
+    let u0 = u0 & 0x0FFF;
     let mut pr = [0u16; PN_SEQ_LEN];
     pr[0] = u0.wrapping_mul(16);
     for n in 1..PN_SEQ_LEN {
@@ -65,7 +67,7 @@ pub fn pn_sequence(u0: u16) -> [u16; PN_SEQ_LEN] {
 ///
 /// Per BABA-A §1.6 Eqs. 86–93: `m = ⌊p_r(n) / 32768⌋`.
 #[inline]
-pub fn pn_mask_bit(pr_n: u16) -> u32 {
+pub(crate) fn pn_mask_bit(pr_n: u16) -> u32 {
     (pr_n >> 15) as u32
 }
 
@@ -76,14 +78,14 @@ pub fn pn_mask_bit(pr_n: u16) -> u32 {
 /// the highest used bit (`len-1`); the last PN value `p_r(start+len-1)`
 /// lands at bit 0.
 ///
-/// **PN-to-codeword alignment.** In our codeword storage convention,
-/// `u32` bit `(len-1)` is the first-transmitted (MSB) bit of the
-/// codeword (per the Annex H deinterleaver: row 0 routes
+/// **PN-to-codeword alignment.** In this crate's codeword storage
+/// convention, `u32` bit `(len-1)` is the first-transmitted (MSB) bit of
+/// the codeword (per the Annex H deinterleaver: row 0 routes
 /// `c0[22]` — the first dibit's high bit — to `u32` bit 22). Aligning
 /// the first PN value with the first-transmitted bit means the PN
-/// advances *with* transmission order, which is what DVSI's encoder
-/// produces. Validated empirically against the DVSI `tv-std/tv/p25/`
-/// reference vectors: every recovered DVSI mask matches this packing.
+/// advances *with* transmission order, which is what the reference's encoder
+/// produces: every mask recovered from the reference `tv-std/tv/p25/`
+/// reference vectors matches this packing.
 ///
 /// Note: the spec's §1.6 C code documents `MASK_RANGE` with element-k-
 /// at-bit-k packing, which is self-consistent but differs from the
@@ -155,7 +157,7 @@ pub(crate) struct AnnexHEntry {
     pub bit0_idx: u8,
 }
 
-include!(concat!(env!("OUT_DIR"), "/annex_h.rs"));
+include!("../generated/annex_h.rs");
 
 /// Deinterleave a 144-bit IMBE frame (72 dibit symbols) into the 8
 /// code vectors `c₀..c₇` per BABA-A Annex H.
@@ -252,6 +254,7 @@ fn place_soft(out: &mut SoftCodeVectors, vec_idx: usize, idx: usize, s: i8) {
 /// vectors (`c̃₄..c̃₆`), and one 7-bit uncoded vector (`c̃₇`). All
 /// vectors are MSB-first.
 #[derive(Clone, Copy, Debug)]
+#[derive(Default)]
 pub struct SoftCodeVectors {
     /// `c̃₀..c̃₃` — soft Golay-23 codewords, MSB at index 0.
     pub golay: [[i8; 23]; 4],
@@ -261,15 +264,6 @@ pub struct SoftCodeVectors {
     pub uncoded: [i8; 7],
 }
 
-impl Default for SoftCodeVectors {
-    fn default() -> Self {
-        Self {
-            golay: [[0i8; 23]; 4],
-            hamming: [[0i8; 15]; 3],
-            uncoded: [0i8; 7],
-        }
-    }
-}
 
 /// XOR a 32-bit hard PN mask into a soft codeword vector, preserving
 /// magnitudes. Each mask bit that is 1 flips the sign of the
