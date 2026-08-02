@@ -693,8 +693,8 @@ fn synthesize_voiced(
     // advance voiced state
     state.psi[1..(L_MAX + 1)].copy_from_slice(&psi_curr[1..(L_MAX + 1)]);
     state.phi[1..(L_MAX + 1)].copy_from_slice(&phi_curr[1..(L_MAX + 1)]);
-    state.prev_m_bar[1..(l_curr as usize + 1)].copy_from_slice(&m_bar[..((l_curr as usize - 1) + 1)]);
-    state.prev_v_bar[1..(l_curr as usize + 1)].copy_from_slice(&v_bar[..((l_curr as usize - 1) + 1)]);
+    state.prev_m_bar[1..(l_curr as usize + 1)].copy_from_slice(&m_bar[..(l_curr as usize)]);
+    state.prev_v_bar[1..(l_curr as usize + 1)].copy_from_slice(&v_bar[..(l_curr as usize)]);
     for l in (l_curr as usize + 1)..=L_MAX {
         state.prev_m_bar[l] = 0.0;
         state.prev_v_bar[l] = false;
