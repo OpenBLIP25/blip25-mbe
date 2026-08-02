@@ -54,7 +54,7 @@ blip25-codec = { workspace = true, default-features = false }
 
 [dev-dependencies]
 serde_json = { workspace = true }
-blip25-codebooks = { path = "../blip25-codebooks" }
+blip25-codebooks = { workspace = true }
 
 [package.metadata.docs.rs]
 # Build docs with the optional serde derives visible.
