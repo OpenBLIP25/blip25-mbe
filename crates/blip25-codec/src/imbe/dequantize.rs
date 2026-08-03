@@ -78,6 +78,11 @@ pub struct ImbeState {
     epsilon_r: f64,
     /// Count of consecutive invalid (repeated) frames.
     consecutive_invalid: u32,
+    /// Raw Golay error counts (e_0, e_1) from the two highest-priority words of
+    /// the most recent frame, exactly as the gate consumed them (an
+    /// uncorrectable word carries the [`u8::MAX`] sentinel). Reported to the
+    /// consumer alongside the concealment disposition.
+    last_errors: (u8, u8),
     /// The current (or, on repeat, most recent) frame's OLA-domain params — the
     /// pre-enhancement log-amps + fundamental + voicing the shared OLA synthesis
     /// consumes. Set by [`decode_params`]; retained across a repeat frame.
@@ -97,6 +102,7 @@ impl ImbeState {
             last_params: None,
             epsilon_r: 0.0,
             consecutive_invalid: 0,
+            last_errors: (0, 0),
             cur: None,
         }
     }
@@ -120,6 +126,23 @@ impl ImbeState {
     /// Consecutive invalid (repeated) frame count (§7.7 mute gate input).
     pub fn consecutive_invalid(&self) -> u32 {
         self.consecutive_invalid
+    }
+
+    /// (e_0, e_t) for the most recent frame: errors corrected in the highest-
+    /// priority Golay word, and their sum across the top two words. An
+    /// uncorrectable c0 reports as 4, matching the half-rate `epsilon_0`
+    /// convention so a consumer can treat both codecs' counts alike.
+    pub fn last_errors(&self) -> (u8, u8) {
+        let (e0_raw, e1) = self.last_errors;
+        let e0 = if e0_raw == u8::MAX { 4 } else { e0_raw };
+        (e0, e0.saturating_add(e1))
+    }
+
+    /// True when the most recent frame was concealed rather than decoded from
+    /// its own bits — the error-rate gate fired, or the pitch index was outside
+    /// the valid range. Reset by the next frame that decodes cleanly.
+    pub fn last_was_repeat(&self) -> bool {
+        self.consecutive_invalid > 0
     }
 }
 
@@ -602,6 +625,7 @@ pub fn decode_params(fr: &ImbeFrame, st: &mut ImbeState) -> Option<MbeParams> {
     let e0 = fr.errors[0];
     let e1 = fr.errors[1];
     let e_t = e0.saturating_add(e1);
+    st.last_errors = (e0, e1);
     st.epsilon_r = 0.95 * st.epsilon_r + 0.000365 * f64::from(e_t);
     let do_repeat = e0 > 2 && f64::from(e1) >= 10.0 + 40.0 * st.epsilon_r;
 

@@ -718,8 +718,12 @@ fn decoded_tone_audio_is_pinned() {
 // agree within the 6-bit tolerance) and demote to erasure, which repeats the
 // previous frame instead. IMBE literals are untouched: it has no tone path.
 const GOLDEN_ENHANCEMENT: [(&str, u64, u64); 4] = [
-    ("imbe_7200x4400", 0x73c6b3592a56f99c, 0x502d41796b0e1756),
-    ("imbe_4400x4400", 0x98a1edfdbb79afb3, 0x3f90b0f55d80f9aa),
+    // The IMBE rows carry the post-concealment fade. `wire_frames` builds its
+    // stream from random info vectors, so ~19% of IMBE frames land outside the
+    // valid pitch range and decode as erasures; the fade in `enhancement::apply`
+    // arms on the first `Use` frame after each of those runs.
+    ("imbe_7200x4400", 0x57333699d89bb564, 0x09217a389cd416f1),
+    ("imbe_4400x4400", 0x9c9de7f9212f9f0b, 0x08633cfc8ff4d6d5),
     ("ambe2_3600x2450", 0x7c1a72d8369b6a58, 0x7d8ec558ec9a8424),
     ("ambe2_2450x2450", 0x574e01aa1880b831, 0x874c387803ea20ba),
 ];

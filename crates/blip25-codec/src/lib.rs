@@ -971,22 +971,54 @@ impl ImbeDecoder {
     /// Decode one 18-byte IMBE frame to 160 PCM samples via the shared
     /// synthesis. Muted frames (per §7.7) synthesize uniform noise instead.
     pub fn decode_pcm(&mut self, bytes: &[u8; imbe::FRAME_BYTES]) -> [i16; synth::FRAME_SAMPLES] {
+        self.decode_pcm_concealed(bytes).0
+    }
+
+    /// [`Self::decode_pcm`] plus the concealment telemetry the framing layer
+    /// needs: the [`FrameDisposition`] this frame took and its (ε₀, εₜ) Golay
+    /// error counts.
+    ///
+    /// The PCM is byte-identical to [`Self::decode_pcm`] — the §7.6/§7.7 ladder
+    /// runs either way, and this call only reports what it decided. A frame
+    /// whose pitch index is outside the valid range (`b0 > 207`) is an erasure
+    /// marker: it repeats the previous good frame, and 4+ consecutive ones (or
+    /// a smoothed error rate above 0.0875) escalate to comfort-noise mute.
+    ///
+    /// IMBE has no counterpart to the half-rate silence escape, so this never
+    /// returns [`FrameDisposition::Silence`].
+    pub fn decode_pcm_concealed(
+        &mut self,
+        bytes: &[u8; imbe::FRAME_BYTES],
+    ) -> ([i16; synth::FRAME_SAMPLES], FrameDisposition, u8, u8) {
         let params = self.decode_params(bytes);
+        let (epsilon_0, epsilon_t) = self.deq.last_errors();
         if self.muted() {
-            return self.mute_noise_frame();
+            return (
+                self.mute_noise_frame(),
+                FrameDisposition::Mute,
+                epsilon_0,
+                epsilon_t,
+            );
         }
+        let disposition = if self.deq.last_was_repeat() {
+            FrameDisposition::Repeat
+        } else {
+            FrameDisposition::Use
+        };
         // Route the frame through the shared minimum-phase voiced OLA
         // synthesis when `ola_synth` is set; otherwise the f32 path.
         if self.ola_synth {
-            return match self.deq.ola_params().cloned() {
+            let pcm = match self.deq.ola_params().cloned() {
                 Some(ola) => self.decode_imbe_ola(&ola),
                 None => [0i16; synth::FRAME_SAMPLES],
             };
+            return (pcm, disposition, epsilon_0, epsilon_t);
         }
-        match params {
+        let pcm = match params {
             Some(params) => synth::synthesize_frame(&params, &mut self.syn),
             None => [0i16; synth::FRAME_SAMPLES],
-        }
+        };
+        (pcm, disposition, epsilon_0, epsilon_t)
     }
 }
 

@@ -151,6 +151,54 @@ impl Rate {
     pub const fn frame_samples(self) -> usize {
         FRAME_SAMPLES
     }
+
+    /// One wire frame, [`Self::fec_frame_bytes`] long, marked as an **erasure**.
+    ///
+    /// Feed this to [`Vocoder::decode_bits`] in place of a frame the transport
+    /// lost. The decoder repeats the previous good frame
+    /// ([`FrameDisposition::Repeat`]) and, after four consecutive erasures,
+    /// falls back to comfort noise ([`FrameDisposition::Mute`]) — the same
+    /// concealment a radio applies when the channel drops frames.
+    ///
+    /// Both codecs mark an erasure in-band, by placing the pitch index outside
+    /// its valid range: `b0 ∈ [120, 127]` for the half-rate AMBE+2 wire (the
+    /// `û₀(11..6) ∈ {0x3C, 0x3D}` erasure escape), `b0 > 207` for IMBE. This
+    /// returns the maximal marker in each range, so no single bit error can
+    /// turn it back into a decodable pitch. Every other field is zero: nothing
+    /// downstream of the erasure test reads them.
+    pub fn erasure_frame(self) -> Vec<u8> {
+        match self {
+            Rate::AmbePlus2_3600x2450 => {
+                let mut b = [0u16; 9];
+                b[0] = AMBE_ERASURE_B0;
+                blip25_codec::shared::encode_frame::encode_r33(&b).to_vec()
+            }
+            Rate::AmbePlus2_2450x2450 => {
+                let mut b = [0u16; 9];
+                b[0] = AMBE_ERASURE_B0;
+                blip25_codec::shared::encode_frame::encode_r34(&b).to_vec()
+            }
+            Rate::Imbe7200x4400 => imbe_erasure_fec_frame().to_vec(),
+            Rate::Imbe4400x4400 => {
+                imbe_pipeline::fec_to_info_bytes(&imbe_erasure_fec_frame()).to_vec()
+            }
+        }
+    }
+}
+
+/// Half-rate pitch index marking an erasure: the top of the `[120, 127]`
+/// erasure escape range (`û₀(11..6) == 0x3C`).
+const AMBE_ERASURE_B0: u16 = 127;
+
+/// Prioritized `u₀` whose IMBE pitch index decodes to 252 — outside the valid
+/// `[0, 207]` range, so the frame is an erasure marker.
+const IMBE_ERASURE_U0: u16 = 0xFFF;
+
+/// The 18-byte IMBE FEC frame carrying [`IMBE_ERASURE_U0`].
+fn imbe_erasure_fec_frame() -> [u8; 18] {
+    let mut u = [0u16; 8];
+    u[0] = IMBE_ERASURE_U0;
+    blip25_codec::imbe::enframe(&u)
 }
 
 /// Per-frame statistics recorded by the most recent [`Vocoder::encode_pcm`]
@@ -999,7 +1047,6 @@ impl Vocoder {
     /// Decode one wire frame to raw PCM through the vendored [`blip25_codec`] codec
     /// (no enhancement — [`Self::decode_bits`] applies it). Length pre-validated.
     fn decode_via_codec(&mut self, bits: &[u8]) -> (Vec<i16>, DecodeStats) {
-        use blip25_codec::FrameDisposition;
         match self.rate {
             Rate::AmbePlus2_3600x2450 => {
                 let dec = self.w_ambe_dec.as_mut().expect("AMBE decoder present");
@@ -1036,28 +1083,29 @@ impl Vocoder {
                 let mut fr = [0u8; 18];
                 fr.copy_from_slice(&bits[..18]);
                 let dec = self.w_imbe_dec.as_mut().expect("IMBE decoder present");
-                // IMBE conceals internally (imbe::decode_params ε-gate repeat).
-                // TODO: surface IMBE's own ε₀/εₜ + disposition (consecutive_invalid).
-                let pcm = dec.decode_pcm(&fr).to_vec();
+                let (pcm, disposition, epsilon_0, epsilon_t) = dec.decode_pcm_concealed(&fr);
                 (
-                    pcm,
+                    pcm.to_vec(),
                     DecodeStats {
-                        epsilon_0: 0,
-                        epsilon_t: 0,
-                        disposition: FrameDisposition::Use,
+                        epsilon_0,
+                        epsilon_t,
+                        disposition,
                     },
                 )
             }
             Rate::Imbe4400x4400 => {
                 let fr = imbe_pipeline::info_to_fec_bytes(bits);
                 let dec = self.w_imbe_dec.as_mut().expect("IMBE decoder present");
-                let pcm = dec.decode_pcm(&fr).to_vec();
+                // The re-encoded FEC frame carries no channel errors, so the
+                // ε-gate is inert here; an out-of-range pitch index still marks
+                // the frame as an erasure and drives repeat/mute.
+                let (pcm, disposition, epsilon_0, epsilon_t) = dec.decode_pcm_concealed(&fr);
                 (
-                    pcm,
+                    pcm.to_vec(),
                     DecodeStats {
-                        epsilon_0: 0,
-                        epsilon_t: 0,
-                        disposition: FrameDisposition::Use,
+                        epsilon_0,
+                        epsilon_t,
+                        disposition,
                     },
                 )
             }
@@ -2875,5 +2923,132 @@ mod tests {
         // No-FEC rate: empty stream (decode_soft would return SoftUnsupported).
         let mut nofec = Vocoder::new(Rate::Imbe4400x4400);
         assert_eq!(nofec.decode_stream_soft(&[0i8; 144]).count(), 0);
+    }
+
+    const ALL_RATES: [Rate; 4] = [
+        Rate::Imbe7200x4400,
+        Rate::Imbe4400x4400,
+        Rate::AmbePlus2_3600x2450,
+        Rate::AmbePlus2_2450x2450,
+    ];
+
+    /// The erasure marker is a well-formed wire frame at every rate.
+    #[test]
+    fn erasure_frame_is_frame_sized() {
+        for rate in ALL_RATES {
+            assert_eq!(
+                rate.erasure_frame().len(),
+                rate.fec_frame_bytes(),
+                "{rate:?} erasure frame is not one wire frame"
+            );
+        }
+    }
+
+    /// Every rate — including the two no-FEC ones, whose erasure signal cannot
+    /// come from channel-error counts — conceals an erasure frame by repeating,
+    /// then mutes once four have arrived in a row.
+    #[test]
+    fn erasure_frames_drive_repeat_then_mute() {
+        for rate in ALL_RATES {
+            let mut v = Vocoder::new(rate);
+            let pcm: Vec<i16> = (0..FRAME_SAMPLES)
+                .map(|i| ((i as f32 * 0.3).sin() * 6000.0) as i16)
+                .collect();
+            let good = Vocoder::new(rate).encode_pcm(&pcm).expect("encode primes");
+            v.decode_bits(&good).expect("prime decodes");
+
+            let eras = rate.erasure_frame();
+            let dispositions: Vec<FrameDisposition> = (0..5)
+                .map(|_| {
+                    v.decode_bits(&eras).expect("erasure frame decodes");
+                    v.last_stats().decode.as_ref().unwrap().disposition
+                })
+                .collect();
+
+            assert_eq!(
+                &dispositions[..3],
+                &[FrameDisposition::Repeat; 3],
+                "{rate:?} did not repeat on erasure"
+            );
+            assert_eq!(
+                &dispositions[3..],
+                &[FrameDisposition::Mute; 2],
+                "{rate:?} did not mute after 4 consecutive erasures"
+            );
+        }
+    }
+
+    /// A muted frame really is comfort noise, not repeated audio: §7.7 / §5.7
+    /// specify uniform noise on [-5, 5].
+    #[test]
+    fn mute_output_is_comfort_noise() {
+        for rate in ALL_RATES {
+            let mut v = Vocoder::new(rate);
+            let eras = rate.erasure_frame();
+            let mut pcm = Vec::new();
+            for _ in 0..6 {
+                pcm = v.decode_bits(&eras).expect("erasure frame decodes");
+            }
+            assert_eq!(
+                v.last_stats().decode.as_ref().unwrap().disposition,
+                FrameDisposition::Mute
+            );
+            let peak = pcm.iter().map(|s| s.unsigned_abs()).max().unwrap_or(0);
+            assert!(
+                peak <= 5,
+                "{rate:?} mute output peaked at {peak}, expected <= 5"
+            );
+        }
+    }
+
+    /// A clean voice frame reports `Use` at every rate — the concealment
+    /// telemetry stays inert when nothing is wrong.
+    #[test]
+    fn clean_frames_report_use() {
+        for rate in ALL_RATES {
+            let mut v = Vocoder::new(rate);
+            let pcm: Vec<i16> = (0..FRAME_SAMPLES * 4)
+                .map(|i| ((i as f32 * 0.3).sin() * 6000.0) as i16)
+                .collect();
+            let mut enc = Vocoder::new(rate);
+            // The encoder carries one frame of algorithmic delay, so its first
+            // output is a priming frame rather than coded speech. Only the
+            // frames after it represent a clean channel.
+            for (i, frame) in pcm.chunks(FRAME_SAMPLES).enumerate() {
+                let bits = enc.encode_pcm(frame).expect("encode");
+                v.decode_bits(&bits).expect("decode");
+                let d = v.last_stats().decode.as_ref().unwrap();
+                assert_eq!(d.disposition, FrameDisposition::Use, "{rate:?} frame {i}");
+                if i > 0 {
+                    assert_eq!((d.epsilon_0, d.epsilon_t), (0, 0), "{rate:?} frame {i}");
+                }
+            }
+        }
+    }
+
+    /// Concealment reporting on the IMBE rates is not hardcoded: an erasure is
+    /// distinguishable from a clean frame through the public API alone. This is
+    /// the property that was missing while both IMBE arms reported `Use`.
+    #[test]
+    fn imbe_disposition_is_not_hardcoded() {
+        for rate in [Rate::Imbe7200x4400, Rate::Imbe4400x4400] {
+            let mut v = Vocoder::new(rate);
+            let pcm: Vec<i16> = (0..FRAME_SAMPLES)
+                .map(|i| ((i as f32 * 0.3).sin() * 6000.0) as i16)
+                .collect();
+            let good = Vocoder::new(rate).encode_pcm(&pcm).expect("encode");
+            v.decode_bits(&good).expect("decode");
+            assert_eq!(
+                v.last_stats().decode.as_ref().unwrap().disposition,
+                FrameDisposition::Use
+            );
+
+            v.decode_bits(&rate.erasure_frame()).expect("decode");
+            assert_eq!(
+                v.last_stats().decode.as_ref().unwrap().disposition,
+                FrameDisposition::Repeat,
+                "{rate:?} still reports a fixed disposition"
+            );
+        }
     }
 }

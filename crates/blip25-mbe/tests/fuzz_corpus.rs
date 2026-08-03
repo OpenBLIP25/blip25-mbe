@@ -1237,23 +1237,16 @@ fn decode_bits_conceal_seeds_walk_repeat_then_mute() {
         assert_eq!(dispositions.len(), frames.len());
         assert_eq!(peaks.len(), frames.len());
 
-        match rate {
-            Rate::AmbePlus2_3600x2450 | Rate::AmbePlus2_2450x2450 => {
-                use FrameDisposition::{Mute, Repeat, Use};
-                assert_eq!(
-                    dispositions,
-                    vec![Use, Use, Repeat, Repeat, Repeat, Mute, Mute, Mute, Use, Use],
-                    "conceal run for {tag}: the run must walk Use -> Repeat -> Mute -> Use"
-                );
-            }
-            Rate::Imbe7200x4400 | Rate::Imbe4400x4400 => {
-                assert!(
-                    dispositions.iter().all(|&d| d == FrameDisposition::Use),
-                    "the IMBE decode path does not surface a disposition yet; update this \
-                     check if it starts to"
-                );
-            }
-            other => panic!("no disposition expectation wired up for {other:?}"),
+        // All four rates walk the same ladder: both codecs mark an erasure with
+        // an out-of-range pitch index, and both conceal it by repeating before
+        // escalating to comfort noise.
+        {
+            use FrameDisposition::{Mute, Repeat, Use};
+            assert_eq!(
+                dispositions,
+                vec![Use, Use, Repeat, Repeat, Repeat, Mute, Mute, Mute, Use, Use],
+                "conceal run for {tag}: the run must walk Use -> Repeat -> Mute -> Use"
+            );
         }
 
         // Audible signature, identical on all four rates: the mute gate replaces

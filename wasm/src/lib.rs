@@ -11,7 +11,7 @@
 //! wire frame at a time (or a whole concatenated bitstream) and gets back 8 kHz
 //! signed-16-bit PCM, one 20 ms / 160-sample block per frame.
 
-use blip25_mbe::vocoder::{Rate, Vocoder};
+use blip25_mbe::vocoder::{FrameDisposition, Rate, Vocoder};
 use wasm_bindgen::prelude::*;
 
 /// Map a small integer rate code (stable across the JS boundary) to a [`Rate`].
@@ -71,6 +71,39 @@ impl WasmDecoder {
     #[wasm_bindgen(getter, js_name = frameSamples)]
     pub fn frame_samples(&self) -> usize {
         self.rate.frame_samples()
+    }
+
+    /// One wire frame marked as an erasure, for a frame the transport lost.
+    ///
+    /// Feed it to [`Self::decode_frame`] / [`Self::decode_frame_f32`] in place
+    /// of the missing frame and the decoder conceals: it repeats the previous
+    /// good frame, then falls back to comfort noise after four in a row. Decode
+    /// state stays aligned with the sender's, which simply skipping would break.
+    #[wasm_bindgen(getter, js_name = erasureFrame)]
+    pub fn erasure_frame(&self) -> Vec<u8> {
+        self.rate.erasure_frame()
+    }
+
+    /// How the decoder treated the most recent frame: `"use"` for audio decoded
+    /// from its own bits, `"repeat"` for a concealed frame reusing the previous
+    /// one, `"mute"` for comfort noise, `"silence"` for a sender-requested
+    /// silence frame. Drives a "concealing" indicator in the UI.
+    #[wasm_bindgen(getter, js_name = lastDisposition)]
+    pub fn last_disposition(&self) -> String {
+        let d = self
+            .inner
+            .last_stats()
+            .decode
+            .as_ref()
+            .map(|s| s.disposition)
+            .unwrap_or(FrameDisposition::Use);
+        match d {
+            FrameDisposition::Use => "use",
+            FrameDisposition::Repeat => "repeat",
+            FrameDisposition::Mute => "mute",
+            FrameDisposition::Silence => "silence",
+        }
+        .to_string()
     }
 
     /// Decode exactly one wire frame ([`Self::frame_bytes`] bytes) to signed
