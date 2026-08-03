@@ -7,6 +7,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-08-03
+
+> **This release changes what some existing users hear.** Codec output is
+> byte-identical to 0.3.0 — every rate encodes and decodes to the same bits and
+> the same PCM. The change is confined to the **opt-in** enhancement
+> post-filter: if you decode IMBE with `EnhancementMode::Classical`, the
+> post-concealment fade now runs where it previously could not. If you use
+> `EnhancementMode::None` (the default), nothing about your audio changes.
+
+### Fixed
+
+- **The IMBE decode path reported a fixed concealment disposition.** Both IMBE
+  arms of the decoder returned `FrameDisposition::Use` with zero error counts
+  regardless of what happened, discarding the TIA-102.BABA §7.6/§7.7 ladder the
+  decoder had already run. The audio was correct — erasure frames were repeated
+  and runs of them muted to comfort noise — but a consumer reading
+  `Vocoder::last_stats()` could not distinguish decoded speech from concealed
+  audio or from comfort noise on Phase 1. The half-rate AMBE+2 path always
+  reported this correctly; the two are now consistent.
+
+  A consequence of the fix: the fade in `enhancement::apply` arms on the first
+  `Use` frame following a `Repeat` or `Mute`. Because IMBE's disposition was
+  pinned to `Use`, that fade could never arm on Phase 1. It now does, which is
+  the enhancement-output change described above.
+
+### Added
+
+- `Rate::erasure_frame()` — one wire frame, `fec_frame_bytes()` long, marked as
+  an erasure. Feed it to `Vocoder::decode_bits` in place of a frame the
+  transport lost and the decoder conceals as a radio would: repeat the previous
+  good frame, then fall back to comfort noise after four in a row. Both codecs
+  mark an erasure in-band by placing the pitch index outside its valid range
+  (`b0 ∈ [120, 127]` for AMBE+2, `b0 > 207` for IMBE), so this works on the
+  no-FEC rates as well, where there is no channel-error count to drive
+  concealment. Available in a decode-only build.
+
+  This is the piece a packet transport needs. Skipping a lost frame silently
+  desynchronizes decoder state from the sender's; an erasure frame keeps them
+  aligned and conceals audibly correctly.
+
+- `ImbeDecoder::decode_pcm_concealed()` — the PCM plus the `FrameDisposition`
+  and `(ε₀, εₜ)` Golay error counts, mirroring the half-rate
+  `Decoder::decode_pcm_fixed_concealed`. `decode_pcm` delegates to it, so its
+  output is unchanged. IMBE has no counterpart to the half-rate silence escape,
+  so it never reports `FrameDisposition::Silence`.
+
+- `ImbeState::last_errors()` and `ImbeState::last_was_repeat()`, exposing the
+  gate inputs the decoder already tracked.
+
+- The `wasm/` decode-only browser shim exposes `erasureFrame` and
+  `lastDisposition`, so a page can inject an erasure on jitter-buffer underrun
+  and show whether the audio it is playing is real or concealed.
+
 ## [0.3.0] - 2026-07-25
 
 > **Read this before upgrading from 0.2.x.** This release replaces the codec
@@ -409,7 +462,8 @@ patent caveat (US8359197 active until 2028-05-20).
   reference AMBE-3000R hardware. No code or algorithms imported from
   existing open-source MBE projects.
 
-[Unreleased]: https://github.com/openBLIP25/blip25-mbe/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/openBLIP25/blip25-mbe/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/openBLIP25/blip25-mbe/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/openBLIP25/blip25-mbe/compare/v0.2.2...v0.3.0
 [0.2.2]: https://github.com/openBLIP25/blip25-mbe/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/openBLIP25/blip25-mbe/compare/v0.2.0...v0.2.1

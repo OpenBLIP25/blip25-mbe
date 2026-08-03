@@ -8,7 +8,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 rust-version = "1.85"
 authors = ["Chance Lindsey"]
@@ -21,9 +21,9 @@ homepage = "https://github.com/openBLIP25/blip25-mbe"
 # engine and codebooks are implementation detail of `blip25-mbe`, and a version
 # skew between them is never meaningful. `cargo publish` needs each path dep to
 # also carry a version, so these are declared here once.
-blip25-mbe = { path = "crates/blip25-mbe", version = "0.3.0" }
-blip25-codec = { path = "crates/blip25-codec", version = "0.3.0", default-features = false }
-blip25-codebooks = { path = "crates/blip25-codebooks", version = "0.3.0" }
+blip25-mbe = { path = "crates/blip25-mbe", version = "0.3.1" }
+blip25-codec = { path = "crates/blip25-codec", version = "0.3.1", default-features = false }
+blip25-codebooks = { path = "crates/blip25-codebooks", version = "0.3.1" }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 hound = "3"

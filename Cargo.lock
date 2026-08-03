@@ -60,11 +60,11 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
 name = "blip25-codebooks"
-version = "0.3.0"
+version = "0.3.1"
 
 [[package]]
 name = "blip25-codec"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "blip25-codebooks",
  "serde",
@@ -72,7 +72,7 @@ dependencies = [
 
 [[package]]
 name = "blip25-conformance-roundtrip"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "blip25-mbe",
@@ -82,7 +82,7 @@ dependencies = [
 
 [[package]]
 name = "blip25-mbe"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "blip25-codebooks",
  "blip25-codec",
