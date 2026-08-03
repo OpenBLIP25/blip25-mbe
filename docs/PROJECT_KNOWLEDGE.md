@@ -61,6 +61,25 @@ encoder latency is therefore ~40 ms (AMBE+2) and ~120 ms (IMBE).
 There is **no end-of-stream call**. The pipeline is drained by pushing a frame of
 silence and discarding the priming output — a pipeline flush, not an EOF signal.
 
+### Measured: the encoder looks ahead exactly one frame
+
+Driving the DLL directly, one frame per `PROCESS` call (harness on the BLIP25
+share, `oracle_dependency_window/`):
+
+- **Delay.** A marker fed at input frame `k` first changes the output of call
+  `k+1`, at both codecs. IMBE batches three frames per call, but the delay is one
+  *frame*, not one batch.
+- **Causality.** Truncating the input never changes an already-returned output —
+  verified at every truncation point, both codecs. Output `j` depends only on
+  input frames `0..j`.
+
+So the total analysis window is **one frame of look-ahead**. Anything wider is
+not the codec.
+
+This is not an inference from the vectors; it is a property of the API. `PROCESS`
+returns a frame's bits before the next frame is offered, so future audio is not
+available to it even in principle.
+
 Two consequences worth stating because they are easy to get wrong:
 
 1. Any formulation of the analysis that needs more than about one frame of
