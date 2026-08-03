@@ -621,17 +621,18 @@ impl Vocoder {
     /// bits out, no options.** Applies the best available quality for the
     /// configured [`Rate`] automatically:
     ///
-    /// * **AMBE+2 (r33):** reverse-engineered reference voicing (`b1_track`,
-    ///   byte-identical to the reference encoder) + a silence gate, so fricatives
-    ///   don't buzz and inter-word silence stays quiet.
-    /// * **Other rates:** the per-frame encode, look-ahead aligned.
+    /// Every rate runs the reverse-engineered reference analysis: reference
+    /// pitch (`b0`), the tracked `b1` voicing word, the silence gate, and — on
+    /// AMBE+2 — the Annex-T tone overlay. Fricatives do not buzz and inter-word
+    /// silence stays quiet.
     ///
-    /// `pcm` may be any length; returns one FEC frame per 20 ms. This is the
-    /// method a caller should use; [`Self::encode_pcm`] is the low-level
-    /// per-frame primitive it is built on. The two emit different bits at every
-    /// rate: reference pitch (`b0`) is injected only here, and on both AMBE+2 rates
-    /// so are the tracked `b1` voicing swap, the silent-frame gain clamp, and
-    /// the Annex-T tone overlay.
+    /// `pcm` may be any length; returns one FEC frame per 20 ms of input,
+    /// rounded up. Output is byte-identical to feeding the same audio through
+    /// [`LiveEncoder`], so this is a convenience for callers that already hold
+    /// the whole buffer — not a higher-quality path. Real-time callers should
+    /// use [`LiveEncoder`]. [`Self::encode_pcm`] is the low-level per-frame
+    /// primitive both are built on and emits different bits: it applies none of
+    /// the reference analysis above.
     #[cfg(feature = "encode")]
     pub fn encode(&self, pcm: &[i16]) -> Vec<Vec<u8>> {
         match self.rate {
