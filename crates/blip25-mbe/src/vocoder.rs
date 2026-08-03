@@ -638,9 +638,46 @@ impl Vocoder {
             // Both AMBE+2 rates carry the SAME 49 info bits and go through the
             // SAME reference-voicing analysis; r33 packs with FEC, r34 without.
             // (r34 is the primary path: encode → encrypt → FEC externally.)
-            Rate::AmbePlus2_3600x2450 => self.encode_ambe2_reference_voicing(pcm, true),
-            Rate::AmbePlus2_2450x2450 => self.encode_ambe2_reference_voicing(pcm, false),
+            Rate::AmbePlus2_3600x2450 | Rate::AmbePlus2_2450x2450 => {
+                let with_fec = matches!(self.rate, Rate::AmbePlus2_3600x2450);
+                // One output frame per 20 ms of input. The reference analysis
+                // spends one frame of look-ahead, so a partial trailing frame is
+                // completed with silence and one further silent frame is appended
+                // to buy that look-ahead back; the emitted count is then exactly
+                // `ceil(len / 160)`. `AmbeStream::flush` pads identically, so
+                // both paths analyse the same buffer.
+                let want = pcm.len().div_ceil(FRAME_SAMPLES);
+                if want == 0 {
+                    return Vec::new();
+                }
+                let mut padded = Vec::with_capacity((want + 1) * FRAME_SAMPLES);
+                padded.extend_from_slice(pcm);
+                padded.resize((want + 1) * FRAME_SAMPLES, 0);
+                // The alignment estimate scores only the output frames the
+                // caller's own audio backs, so appending the pad cannot move it.
+                let mut out = self.encode_ambe2_reference_voicing(
+                    &padded,
+                    with_fec,
+                    want.saturating_sub(1),
+                );
+                out.truncate(want);
+                out
+            }
             _ => {
+                // One output frame per 20 ms of input, so a partial trailing
+                // frame is completed with silence rather than discarded.
+                let residue = pcm.len() % FRAME_SAMPLES;
+                let padded: Vec<i16>;
+                let pcm = if residue == 0 {
+                    pcm
+                } else {
+                    padded = pcm
+                        .iter()
+                        .copied()
+                        .chain(std::iter::repeat_n(0i16, FRAME_SAMPLES - residue))
+                        .collect();
+                    &padded
+                };
                 // Per-frame path for the other rates (look-ahead: drop the
                 // placeholder frames, flush the tail).
                 let mut enc = Vocoder::new(self.rate);
@@ -764,8 +801,16 @@ impl Vocoder {
     /// (byte-identical to the reference encoder), plus a gain clamp on silent
     /// frames. A/B-validated against the reference vectors (fricative buzz removed,
     /// inter-word floor pulled down). Whole-clip (b1_track needs the stream).
+    ///
+    /// `lag_span` bounds the alignment estimate to the leading output frames —
+    /// see the `min_by_key` below.
     #[cfg(feature = "encode")]
-    fn encode_ambe2_reference_voicing(&self, pcm: &[i16], with_fec: bool) -> Vec<Vec<u8>> {
+    fn encode_ambe2_reference_voicing(
+        &self,
+        pcm: &[i16],
+        with_fec: bool,
+        lag_span: usize,
+    ) -> Vec<Vec<u8>> {
         use blip25_codec::enc::b1_audio::{b1_track_from_logs, RingRefineMode};
         debug_assert!(
             matches!(
@@ -878,17 +923,7 @@ impl Vocoder {
         // 3. Align blip25's stream to the b1_track index (the two use different
         //    look-ahead conventions), then swap `b1` and repack the r33 frame.
         let ours_b1: Vec<u16> = frames.iter().map(|f| b1_of(f)).collect();
-        let mismatch = |lag: i64| -> usize {
-            let mut m = 0;
-            for (i, &x) in ours_b1.iter().enumerate() {
-                let j = i as i64 + lag;
-                if j >= 0 && (j as usize) < orac_b1.len() && x != orac_b1[j as usize] {
-                    m += 1;
-                }
-            }
-            m
-        };
-        let lag = (-3..=3).min_by_key(|&l| mismatch(l)).unwrap_or(0);
+        let lag = ambe2_b1_lag(&ours_b1, &orac_b1, lag_span);
 
         // 4. Annex-T tone overlay. A streaming detector reproduces the reference's tone
         //    vs voice decision (and 1-frame onset lag) per source frame; where
@@ -1490,10 +1525,50 @@ const B1_RESERVE: usize = 16;
 #[cfg(feature = "encode")]
 const B1_MIN_BATCH: usize = 16;
 
-/// Whole-buffer `encode` sources output frame `s`'s voicing from `b1_track[s+2]`
-/// (its lag search lands here); the stream reproduces that offset directly.
+/// Voicing offset on the SOURCE-frame axis: `AmbeStream` packs source frame
+/// `s` with `b1_track[s + BLAG]`.
 #[cfg(feature = "encode")]
 const BLAG: usize = 2;
+
+/// The same offset on the OUTPUT-frame axis, where whole-buffer `encode`'s lag
+/// search works. Output frame `i` is source frame `i + 1` (the dropped
+/// look-ahead placeholder), so the two constants differ by exactly that one
+/// frame and both paths agree only when the search lands here.
+#[cfg(feature = "encode")]
+const AMBE_B1_OUTPUT_LAG: i64 = BLAG as i64 + 1;
+
+/// Choose the offset that aligns the encoder's own voicing sequence `ours_b1`
+/// to the reference `b1_track` sequence `orac_b1`, both on the output-frame
+/// axis.
+///
+/// Only the leading `lag_span` entries are scored. `Vocoder::encode` appends
+/// trailing silence to buy the analysis look-ahead back, and that padding must
+/// not be able to change which alignment wins for the real audio ahead of it —
+/// the choice is global, so a shifted decision would perturb frames anywhere in
+/// the clip. `lag_span` is therefore the output-frame count the caller's own
+/// audio would have produced unpadded.
+///
+/// Ties resolve to [`AMBE_B1_OUTPUT_LAG`], the offset the streaming path
+/// applies, so inputs the data cannot distinguish (silence, sub-frame audio)
+/// still agree between the two paths.
+#[cfg(feature = "encode")]
+fn ambe2_b1_lag(ours_b1: &[u16], orac_b1: &[u16], lag_span: usize) -> i64 {
+    let span_o = lag_span.min(ours_b1.len());
+    let span_r = lag_span.min(orac_b1.len());
+    let mismatch = |lag: i64| -> usize {
+        let mut m = 0;
+        for (i, &x) in ours_b1[..span_o].iter().enumerate() {
+            let j = i as i64 + lag;
+            if j >= 0 && (j as usize) < span_r && x != orac_b1[j as usize] {
+                m += 1;
+            }
+        }
+        m
+    };
+    (-3..=3)
+        .min_by_key(|&l| (mismatch(l), (l - AMBE_B1_OUTPUT_LAG).abs()))
+        .unwrap_or(AMBE_B1_OUTPUT_LAG)
+}
 
 /// Single-pass stateful AMBE+2 streamer — byte-exact to whole-buffer
 /// [`Vocoder::encode`] at ~`B1_RESERVE`-frame latency, the console's own
@@ -1533,6 +1608,7 @@ struct AmbeStream {
     emitted_src: usize,
     /// Total output frames emitted so far (for `pending_samples`).
     out_count: usize,
+    flushed: bool,
     pend: std::collections::VecDeque<(usize, [u8; 9])>,
     // Persistent hdr30 VAD (the one slow-converging b1_track state — an adaptive
     // noise floor — carried so a bounded analysis window stays byte-exact).
@@ -1585,6 +1661,7 @@ impl AmbeStream {
             fed: 0,
             emitted_src: 0,
             out_count: 0,
+            flushed: false,
             pend: std::collections::VecDeque::new(),
             hdr: blip25_codec::enc::b1_audio::Hdr30Vad::new(),
             hdr30: Vec::new(),
@@ -1599,19 +1676,39 @@ impl AmbeStream {
     /// Prefilter + buffer new PCM, then finalise/emit whatever frames now have
     /// their look-ahead.
     fn push(&mut self, pcm: &[i16]) -> Vec<Vec<u8>> {
+        if !pcm.is_empty() {
+            self.flushed = false;
+        }
+        self.absorb(pcm);
+        self.pump(false)
+    }
+
+    /// End of stream: complete a partial frame with silence and append one
+    /// further silent frame to buy back the analysis look-ahead, so `n` frames
+    /// of caller audio yield `n` output frames. Whole-buffer `encode` pads
+    /// identically, which is what keeps the two analysing the same buffer.
+    /// Repeating it without new input is a no-op.
+    fn flush(&mut self) -> Vec<Vec<u8>> {
+        if self.flushed {
+            return Vec::new();
+        }
+        self.flushed = true;
+        if self.raw.is_empty() {
+            return Vec::new();
+        }
+        let want = self.raw.len().div_ceil(FRAME_SAMPLES);
+        let pad = (want + 1) * FRAME_SAMPLES - self.raw.len();
+        let zeros = vec![0i16; pad];
+        self.absorb(&zeros);
+        self.pump(true)
+    }
+
+    fn absorb(&mut self, pcm: &[i16]) {
         let (pref_new, state) =
             blip25_codec::enc::audio_prefilter::prefilter(&self.pref_state, pcm);
         self.pref_state = state;
         self.pref.extend_from_slice(&pref_new);
         self.raw.extend_from_slice(pcm);
-        self.pump(false)
-    }
-
-    /// End of stream: finalise the tail (full look-ahead now available) and
-    /// drain the Encoder. A sub-frame residue is dropped (chunks_exact, matching
-    /// whole-buffer `encode`).
-    fn flush(&mut self) -> Vec<Vec<u8>> {
-        self.pump(true)
     }
 
     /// Advance every chain as far as the current buffer allows and return the
@@ -1768,6 +1865,257 @@ impl AmbeStream {
     }
 }
 
+/// Frames of warm-up context a bounded `b1_track` window carries before its
+/// first finalised frame. `b1_track` is causal with bounded look-ahead, so a
+/// window that starts this far back reproduces the whole-buffer answer for
+/// every frame it finalises. Measured: 4 diverges on one frame of the 1273-frame
+/// DVSI speech vector, 8 and above are clean.
+#[cfg(feature = "encode")]
+const B1_CTX: usize = 8;
+
+/// Single-pass stateful IMBE streamer — byte-exact to whole-buffer
+/// [`Vocoder::encode`] at ~`B1_RESERVE`-frame latency.
+///
+/// IMBE consumes the whole-buffer analysis on the *input* side: `forced_b0`
+/// (reference spectral-DP pitch behind a silence gate) and `forced_b1` (the
+/// reference voicing word) are read inside `analyze_imbe_frame`, where they
+/// drive the per-harmonic V/UV expansion and the amplitude quantizer. There is
+/// therefore no post-hoc repack as on the AMBE+2 side — a frame cannot be
+/// emitted until both forced entries covering it are final.
+///
+/// Each cross-frame chain is carried as live state rather than re-derived per
+/// window, so nothing drifts:
+/// * `reference` — the persistent [`B0Audio`] tracker, advanced one frame at a
+///   time with the same masks `encode_pcm_b0` uses → byte-exact `b0`.
+/// * `e` — one persistent [`Encoder`], fed in order → byte-exact amplitudes.
+/// * `hdr` — the persistent hdr30 VAD, the one slow-converging `b1_track` state.
+///
+/// Unlike [`AmbeStream`], no source frame is dropped: `nf` input frames yield
+/// `nf` output frames, matching whole-buffer `encode`.
+#[cfg(feature = "encode")]
+struct ImbeStream {
+    /// `Imbe4400x4400` ships the 88 info bits without the FEC parity.
+    info_only: bool,
+    e: blip25_codec::enc::Encoder,
+    reference: blip25_codec::enc::b0_audio::B0Audio,
+    pref_state: blip25_codec::enc::audio_prefilter::PrefilterState,
+    pref: Vec<i16>,
+    raw: Vec<i16>,
+    hdr: blip25_codec::enc::b1_audio::Hdr30Vad,
+    hdr30: Vec<i32>,
+    reference_b0: Vec<u8>,
+    reference_frame: usize,
+    b1: Vec<u16>,
+    /// Both indexed by ANALYSIS frame, which for IMBE is also the output index.
+    forced_b0: Vec<u8>,
+    forced_b1: Vec<u16>,
+    horizon: usize,
+    fed: usize,
+    out_count: usize,
+    flushed: bool,
+}
+
+#[cfg(feature = "encode")]
+impl ImbeStream {
+    fn new(info_only: bool) -> Self {
+        // The whole-buffer IMBE arm runs the two-frame look-ahead so the live
+        // `gap2_mid` window feeding the mechanism amplitudes is pitch-aligned;
+        // match it here or the amplitude fields diverge.
+        let mut e = blip25_codec::enc::Encoder::new();
+        e.set_live_gap2_amps(true);
+        // The forced vectors grow as the analysis finalises, so a feed that runs
+        // ahead of them must fail loudly rather than quietly encode a frame with
+        // the estimator — that is exactly the fricative buzz coming back.
+        e.set_forced_strict(true);
+        Self {
+            info_only,
+            e,
+            reference: blip25_codec::enc::b0_audio::B0Audio::new(),
+            pref_state: blip25_codec::enc::audio_prefilter::PrefilterState::default(),
+            pref: Vec::new(),
+            raw: Vec::new(),
+            hdr: blip25_codec::enc::b1_audio::Hdr30Vad::new(),
+            hdr30: Vec::new(),
+            reference_b0: Vec::new(),
+            reference_frame: 0,
+            b1: Vec::new(),
+            forced_b0: Vec::new(),
+            forced_b1: Vec::new(),
+            horizon: 0,
+            fed: 0,
+            out_count: 0,
+            flushed: false,
+        }
+    }
+
+    /// Prefilter + buffer new PCM, then emit whatever frames are now final.
+    fn push(&mut self, pcm: &[i16]) -> Vec<Vec<u8>> {
+        if !pcm.is_empty() {
+            self.flushed = false;
+        }
+        self.absorb(pcm);
+        self.pump(false)
+    }
+
+    /// End of stream: complete a partial frame with silence so the trailing
+    /// audio is carried, then finalise everything and drain the Encoder.
+    /// Repeating it without new input is a no-op — the silence completion must
+    /// happen once, or the second flush would append a whole extra frame.
+    fn flush(&mut self) -> Vec<Vec<u8>> {
+        if self.flushed {
+            return Vec::new();
+        }
+        self.flushed = true;
+        let residue = self.raw.len() % FRAME_SAMPLES;
+        if residue != 0 {
+            let pad = vec![0i16; FRAME_SAMPLES - residue];
+            self.absorb(&pad);
+        }
+        self.pump(true)
+    }
+
+    fn absorb(&mut self, pcm: &[i16]) {
+        let (pref_new, state) =
+            blip25_codec::enc::audio_prefilter::prefilter(&self.pref_state, pcm);
+        self.pref_state = state;
+        self.pref.extend_from_slice(&pref_new);
+        self.raw.extend_from_slice(pcm);
+    }
+
+    /// Feed source frames `[self.fed, feed_to)` to the Encoder, then drain its
+    /// look-ahead when `flush`. Every emission is the next analysis frame.
+    fn feed(&mut self, feed_to: usize, flush: bool, out: &mut Vec<Vec<u8>>) {
+        let n = FRAME_SAMPLES;
+        let before = out.len();
+        while self.fed < feed_to {
+            let fr: [i16; FRAME_SAMPLES] =
+                self.raw[self.fed * n..self.fed * n + n].try_into().unwrap();
+            if let Some(b) = self.e.encode_imbe_frame(&fr) {
+                out.push(self.pack(&b));
+            }
+            self.fed += 1;
+        }
+        if flush {
+            for b in self.e.flush_imbe() {
+                out.push(self.pack(&b));
+            }
+        }
+        self.out_count += out.len() - before;
+    }
+
+    fn pack(&self, b: &[u8; blip25_codec::imbe::FRAME_BYTES]) -> Vec<u8> {
+        if self.info_only {
+            imbe_fec_to_info_bytes(b).to_vec()
+        } else {
+            b.to_vec()
+        }
+    }
+
+    /// Advance every chain as far as the buffer allows and return the newly
+    /// final output frames in order. See the struct docs.
+    fn pump(&mut self, flush: bool) -> Vec<Vec<u8>> {
+        use blip25_codec::enc::b1_audio::{b1_track_hdr30, RingRefineMode};
+        let n = FRAME_SAMPLES;
+        let avail = self.raw.len() / n;
+        let mut out: Vec<Vec<u8>> = Vec::new();
+        if avail < 2 {
+            // Below the reference analysis' minimum context. Whole-buffer
+            // `encode` leaves both forced vectors unset here too, so the
+            // Encoder's own estimators drive the single frame.
+            if flush && avail == 1 {
+                self.feed(1, true, &mut out);
+            }
+            return out;
+        }
+        // N input frames → N-1 analysable frames (the reference analysis'
+        // one-frame look-ahead), the same convention as `encode_pcm_b0`.
+        let nframes = avail - 1;
+        let new_horizon = if flush {
+            nframes
+        } else {
+            nframes.saturating_sub(B1_RESERVE)
+        };
+        if !flush && new_horizon.saturating_sub(self.horizon) < B1_MIN_BATCH {
+            return out;
+        }
+        // (1) b1_track on a BOUNDED window carrying `B1_CTX` frames of warm-up.
+        //     `bt[k]` is global frame `win_start + k`.
+        let win_start = self.horizon.saturating_sub(B1_CTX);
+        let win_nframes = (avail - win_start).saturating_sub(1);
+        self.advance_hdr30(avail);
+        let bt = b1_track_hdr30(
+            &self.pref[win_start * n..],
+            &self.raw[win_start * n..],
+            win_nframes,
+            RingRefineMode::Off,
+            &self.hdr30[win_start..win_start + win_nframes],
+        );
+        // (2) finalise the voicing word for the newly-final analysis frames.
+        for f in self.horizon..new_horizon {
+            self.b1.push(bt[f - win_start].b1);
+        }
+        // (3) advance the persistent reference-pitch tracker (final masks only).
+        let reference_target = if flush { nframes } else { new_horizon };
+        while self.reference_frame < reference_target {
+            let cf = self.reference_frame;
+            let a11 = if cf == 0 {
+                0
+            } else {
+                i32::from(bt[cf - 1 - win_start].mask)
+            };
+            let b0 = self
+                .reference
+                .push_pcm_frame_with_prev_mask(&self.pref, a11);
+            self.reference_b0.push(b0);
+            self.reference_frame += 1;
+        }
+        // (4) grow the forced vectors over the analysis frames whose inputs are
+        //     final. Whole-buffer reads frame f's OWN audio for the silence gate
+        //     but frame f+2 for the pitch and voicing; reproduce that asymmetry
+        //     exactly. The `.min(len - 1)` clamps are whole-buffer's tail
+        //     behaviour and must bite only at flush.
+        let covered = if flush {
+            avail
+        } else {
+            new_horizon.saturating_sub(2)
+        };
+        while self.forced_b0.len() < covered {
+            let f = self.forced_b0.len();
+            debug_assert!(
+                flush || (f + 2 < self.b1.len() && f + 2 < self.reference_b0.len()),
+                "ImbeStream finalised analysis frame {f} before its (f+2) inputs"
+            );
+            let chunk = &self.raw[f * n..f * n + n];
+            let ss: f64 = chunk.iter().map(|&x| f64::from(x) * f64::from(x)).sum();
+            let rms = (ss / FRAME_SAMPLES as f64).sqrt();
+            let b0 = if rms < IMBE_SILENCE_RMS {
+                IMBE_SILENCE_B0
+            } else {
+                self.reference_b0[(f + 2).min(self.reference_b0.len() - 1)]
+            };
+            self.forced_b0.push(b0);
+            self.forced_b1.push(self.b1[(f + 2).min(self.b1.len() - 1)]);
+        }
+        self.e.set_forced_b0(self.forced_b0.clone());
+        self.e.set_forced_b1(self.forced_b1.clone());
+        // (5) feed. The two-frame look-ahead means feeding source `k` emits
+        //     analysis frame `k - 2`, so covering analysis frames `< covered`
+        //     needs sources through `covered + 2`.
+        let feed_to = if flush {
+            avail
+        } else {
+            (covered + 2).min(avail)
+        };
+        self.feed(feed_to, flush, &mut out);
+        self.horizon = new_horizon;
+        out
+    }
+
+    fn advance_hdr30(&mut self, upto: usize) {
+        advance_hdr30(&mut self.hdr, &mut self.hdr30, &self.raw, upto);
+    }
+}
+
 /// Push-driven encoder for live PCM streams that arrive in chunks
 /// of arbitrary length (audio device callbacks, file readers, sockets).
 /// Holds residual samples internally across calls so the caller can
@@ -1777,31 +2125,88 @@ impl AmbeStream {
 /// that already have whole-buffer PCM. `LiveEncoder` is for callers
 /// that don't.
 ///
+/// The streamer reproduces the whole-buffer reference analysis causally, so it
+/// holds a bounded look-ahead before a frame's bits are final and emits in
+/// bursts rather than one frame per 160 samples. [`Self::pending_samples`]
+/// reports what is still held. A caller that needs a frame per 20 ms with no
+/// look-ahead wants the [`Vocoder::encode_pcm`] primitive instead, and gets
+/// lower quality for it.
+///
 /// ```rust
 /// # use blip25_mbe::vocoder::{LiveEncoder, Rate};
 /// let mut enc = LiveEncoder::new(Rate::Imbe7200x4400);
 /// // 256 samples (audio-device callback); not a multiple of 160.
 /// let chunk: [i16; 256] = [0; 256];
 /// let frames = enc.push(&chunk);
-/// assert_eq!(frames.len(), 1);                   // one full frame produced
-/// assert!(frames[0].is_ok());
-/// // 96 samples residue; next push contributes them to the next frame.
-/// assert_eq!(enc.pending_samples(), 96);
-/// // End of stream: flush pads the residue and drains the reference
-/// // codec's one-frame look-ahead, returning every remaining frame so
-/// // the trailing audio is never lost.
+/// assert!(frames.is_empty());                    // still inside the look-ahead
+/// assert_eq!(enc.pending_samples(), 256);
+/// // End of stream: flush completes the partial frame with silence and
+/// // finalises everything held, so the trailing audio is never lost.
 /// let tail = enc.flush().unwrap();
-/// assert!(!tail.is_empty());
+/// assert_eq!(tail.len(), 2);                     // ceil(256 / 160)
 /// assert_eq!(enc.pending_samples(), 0);
 /// ```
 #[cfg(feature = "encode")]
 pub struct LiveEncoder {
     vocoder: Vocoder,
-    pcm_buf: Vec<i16>,
-    /// AMBE+2: the single-pass stateful streamer (byte-exact to whole-buffer
-    /// `encode` at ~`B1_RESERVE`-frame latency). `None` for the other rates,
-    /// which use the per-frame `encode_pcm` path via `pcm_buf`.
-    stream: Option<AmbeStream>,
+    /// The single-pass stateful streamer for the configured rate — byte-exact
+    /// to whole-buffer `encode` at ~`B1_RESERVE`-frame latency.
+    stream: Stream,
+}
+
+/// The rate-appropriate single-pass streamer. The two differ in where the
+/// reference analysis binds (AMBE+2 repacks the emitted frame, IMBE forces the
+/// analysis inputs), how many source frames are dropped (one vs none) and how
+/// the tail is clamped, so they are separate implementations rather than one
+/// generic driven by a config.
+#[cfg(feature = "encode")]
+enum Stream {
+    Ambe(AmbeStream),
+    Imbe(ImbeStream),
+}
+
+#[cfg(feature = "encode")]
+impl Stream {
+    fn push(&mut self, pcm: &[i16]) -> Vec<Vec<u8>> {
+        match self {
+            Stream::Ambe(s) => s.push(pcm),
+            Stream::Imbe(s) => s.push(pcm),
+        }
+    }
+
+    fn flush(&mut self) -> Vec<Vec<u8>> {
+        match self {
+            Stream::Ambe(s) => s.flush(),
+            Stream::Imbe(s) => s.flush(),
+        }
+    }
+
+    fn received(&self) -> usize {
+        match self {
+            Stream::Ambe(s) => s.raw.len(),
+            Stream::Imbe(s) => s.raw.len(),
+        }
+    }
+
+    /// Samples already accounted for by an emitted frame. AMBE+2 additionally
+    /// consumes the dropped source-0 look-ahead placeholder once anything has
+    /// emitted; IMBE drops no source frame.
+    fn accounted(&self) -> usize {
+        match self {
+            Stream::Ambe(s) => {
+                let placeholder = if s.out_count > 0 { FRAME_SAMPLES } else { 0 };
+                s.out_count * FRAME_SAMPLES + placeholder
+            }
+            Stream::Imbe(s) => s.out_count * FRAME_SAMPLES,
+        }
+    }
+
+    fn cold(&self) -> Self {
+        match self {
+            Stream::Ambe(s) => Stream::Ambe(AmbeStream::new(s.with_fec, s.tone_on)),
+            Stream::Imbe(s) => Stream::Imbe(ImbeStream::new(s.info_only)),
+        }
+    }
 }
 
 #[cfg(feature = "encode")]
@@ -1809,13 +2214,13 @@ impl LiveEncoder {
     /// Open a new live encoder at the given rate, all state cold.
     pub fn new(rate: Rate) -> Self {
         let stream = match rate {
-            Rate::AmbePlus2_3600x2450 => Some(AmbeStream::new(true, false)),
-            Rate::AmbePlus2_2450x2450 => Some(AmbeStream::new(false, false)),
-            _ => None,
+            Rate::AmbePlus2_3600x2450 => Stream::Ambe(AmbeStream::new(true, false)),
+            Rate::AmbePlus2_2450x2450 => Stream::Ambe(AmbeStream::new(false, false)),
+            Rate::Imbe7200x4400 => Stream::Imbe(ImbeStream::new(false)),
+            _ => Stream::Imbe(ImbeStream::new(true)),
         };
         Self {
             vocoder: Vocoder::new(rate),
-            pcm_buf: Vec::new(),
             stream,
         }
     }
@@ -1832,53 +2237,25 @@ impl LiveEncoder {
     /// buffer drains regardless so a single bad frame doesn't stall
     /// the stream.
     pub fn push(&mut self, pcm: &[i16]) -> Vec<Result<Vec<u8>, VocoderError>> {
-        if let Some(s) = self.stream.as_mut() {
-            return s.push(pcm).into_iter().map(Ok).collect();
-        }
-        self.pcm_buf.extend_from_slice(pcm);
-        let n = self.vocoder.frame_samples();
-        let mut out = Vec::with_capacity(self.pcm_buf.len() / n);
-        while self.pcm_buf.len() >= n {
-            // Encode from the front of the buffer; drain after the call.
-            // Disjoint-field borrow keeps this clean (vocoder and
-            // pcm_buf are independent struct fields).
-            let result = self.vocoder.encode_pcm(&self.pcm_buf[..n]);
-            self.pcm_buf.drain(..n);
-            out.push(result);
-        }
-        out
+        self.stream.push(pcm).into_iter().map(Ok).collect()
     }
 
-    /// Samples received but not yet represented by an emitted frame. For the
-    /// per-frame rates this is the sub-frame residue (`0..frame_samples()-1`);
-    /// for the AMBE+2 single-pass streamer it also includes the bounded
-    /// look-ahead the streamer holds before a frame's voicing is final.
+    /// Samples received but not yet represented by an emitted frame: the
+    /// sub-frame residue plus the bounded look-ahead the streamer holds before
+    /// a frame's reference analysis is final. Drains to 0 after [`Self::flush`].
     #[inline]
     pub fn pending_samples(&self) -> usize {
-        if let Some(s) = self.stream.as_ref() {
-            // Samples received minus those an emitted frame accounts for. Once any
-            // frame has emitted, the reference codec's dropped source-0 look-ahead
-            // placeholder (one frame) is also consumed, so subtract it — this
-            // makes pending == 0 once the whole stream has been flushed out.
-            let placeholder = if s.out_count > 0 { FRAME_SAMPLES } else { 0 };
-            s.raw
-                .len()
-                .saturating_sub(s.out_count * FRAME_SAMPLES + placeholder)
-        } else {
-            self.pcm_buf.len()
-        }
+        self.stream
+            .received()
+            .saturating_sub(self.stream.accounted())
     }
 
     /// Drop any pending samples without encoding them. Useful at
     /// stream shutdown when the caller doesn't want a partial-frame
-    /// flush. Resets the AMBE+2 streamer to a cold state.
+    /// flush. Resets the streamer to a cold state.
     #[inline]
     pub fn discard_pending(&mut self) {
-        self.pcm_buf.clear();
-        if let Some(s) = self.stream.as_mut() {
-            let (with_fec, tone_on) = (s.with_fec, s.tone_on);
-            *s = AmbeStream::new(with_fec, tone_on);
-        }
+        self.stream = self.stream.cold();
     }
 
     /// Finish the stream: encode any pending residue (zero-padded to a
@@ -1902,32 +2279,14 @@ impl LiveEncoder {
     /// byte-identical to encoding the same PCM straight through
     /// `blip25_codec::enc::Encoder` (`encode_frame_r33` per frame + `flush_r33`).
     pub fn flush(&mut self) -> Result<Vec<Vec<u8>>, VocoderError> {
-        if let Some(s) = self.stream.as_mut() {
-            return Ok(s.flush());
-        }
-        let mut out: Vec<Vec<u8>> = Vec::new();
-        if !self.pcm_buf.is_empty() {
-            let n = self.vocoder.frame_samples();
-            self.pcm_buf.resize(n, 0);
-            let bits = self.vocoder.encode_pcm(&self.pcm_buf)?;
-            self.pcm_buf.clear();
-            out.push(bits);
-        }
-        // Drain the reference codec's one-frame look-ahead FIFO (no-op on
-        // the research path / when nothing is buffered).
-        out.extend(self.vocoder.flush_encode());
-        Ok(out)
+        Ok(self.stream.flush())
     }
 
     /// Reset all state — both the inner [`Vocoder`] (predictor /
-    /// look-ahead / synth substates) and the residual sample buffer.
+    /// look-ahead / synth substates) and the streamer.
     pub fn reset(&mut self) {
         self.vocoder.reset();
-        self.pcm_buf.clear();
-        if let Some(s) = self.stream.as_mut() {
-            let (with_fec, tone_on) = (s.with_fec, s.tone_on);
-            *s = AmbeStream::new(with_fec, tone_on);
-        }
+        self.stream = self.stream.cold();
     }
 
     /// Configured rate.
@@ -2588,60 +2947,131 @@ mod tests {
         }
     }
 
+    /// The AMBE+2 voicing alignment is chosen from the caller's own audio only.
+    ///
+    /// `Vocoder::encode` appends trailing silence to buy back the analysis
+    /// look-ahead. The alignment it picks is global — it is applied to every
+    /// output frame — so if the padding could move the choice, adding it would
+    /// perturb frames at the START of a clip. Scoring the pad's frames is
+    /// exactly what makes that possible, so extending either sequence past
+    /// `lag_span` must be inert.
+    #[test]
+    fn ambe2_lag_ignores_frames_past_the_span() {
+        // A sequence that aligns at +3 over its first 12 entries.
+        let orac: Vec<u16> = (0..24).map(|i| (i * 7 % 31) as u16).collect();
+        let ours: Vec<u16> = (0..12)
+            .map(|i| orac[(i as i64 + AMBE_B1_OUTPUT_LAG) as usize])
+            .collect();
+        let span = ours.len();
+        assert_eq!(ambe2_b1_lag(&ours, &orac, span), AMBE_B1_OUTPUT_LAG);
+
+        // Append entries beyond the span that would win at a different offset if
+        // they were scored. The estimate must not move.
+        for pad in 1..=4usize {
+            let mut ours_pad = ours.clone();
+            let mut orac_pad = orac.clone();
+            for (k, &o) in orac.iter().enumerate().take(pad) {
+                ours_pad.push(o);
+                orac_pad.push(u16::MAX - k as u16);
+            }
+            assert_eq!(
+                ambe2_b1_lag(&ours_pad, &orac_pad, span),
+                AMBE_B1_OUTPUT_LAG,
+                "{pad} padded frames moved the alignment estimate"
+            );
+        }
+
+        // With nothing to score every offset ties, and the tie-break must pick
+        // the offset the streaming path applies.
+        assert_eq!(ambe2_b1_lag(&[], &[], 0), AMBE_B1_OUTPUT_LAG);
+        assert_eq!(ambe2_b1_lag(&ours, &orac, 0), AMBE_B1_OUTPUT_LAG);
+    }
+
     /// `LiveEncoder` accepts arbitrary chunk sizes, holds residue
-    /// across `push` calls, and emits the same bits as a one-shot
-    /// `Vocoder::encode_pcm` per-frame loop.
+    /// across `push` calls, and emits the same bits as whole-buffer
+    /// `Vocoder::encode` on the same PCM — the single-encoder invariant.
     #[test]
     fn live_encoder_handles_arbitrary_chunk_sizes() {
         let mut total_pcm: Vec<i16> = Vec::with_capacity(7 * FRAME_SAMPLES);
         for _ in 0..7 {
             total_pcm.extend_from_slice(&periodic_pcm(40, 6000));
         }
-        // Reference: per-frame Vocoder loop on the same input.
-        let mut ref_v = Vocoder::new(Rate::Imbe7200x4400);
-        let mut ref_bits: Vec<u8> = Vec::new();
-        for chunk in total_pcm.chunks_exact(FRAME_SAMPLES) {
-            ref_bits.extend(ref_v.encode_pcm(chunk).unwrap());
-        }
-        // Live: feed in mismatched chunk sizes (250, 50, 333, rest).
-        let mut live = LiveEncoder::new(Rate::Imbe7200x4400);
-        let mut live_bits: Vec<u8> = Vec::new();
-        let splits = [250usize, 50, 333];
-        let mut pos = 0;
-        for &n in &splits {
-            let end = (pos + n).min(total_pcm.len());
-            for r in live.push(&total_pcm[pos..end]) {
+        for rate in [
+            Rate::Imbe7200x4400,
+            Rate::Imbe4400x4400,
+            Rate::AmbePlus2_3600x2450,
+            Rate::AmbePlus2_2450x2450,
+        ] {
+            let ref_bits: Vec<u8> = Vocoder::new(rate).encode(&total_pcm).concat();
+            // Live: feed in mismatched chunk sizes (250, 50, 333, rest).
+            let mut live = LiveEncoder::new(rate);
+            let mut live_bits: Vec<u8> = Vec::new();
+            let splits = [250usize, 50, 333];
+            let mut pos = 0;
+            for &n in &splits {
+                let end = (pos + n).min(total_pcm.len());
+                for r in live.push(&total_pcm[pos..end]) {
+                    live_bits.extend(r.unwrap());
+                }
+                pos = end;
+            }
+            for r in live.push(&total_pcm[pos..]) {
                 live_bits.extend(r.unwrap());
             }
-            pos = end;
+            for f in live.flush().unwrap() {
+                live_bits.extend(f);
+            }
+            assert_eq!(
+                live_bits, ref_bits,
+                "{rate:?}: LiveEncoder diverges from Vocoder::encode"
+            );
+            // Total samples 1120 = 7 frames exactly, so nothing is held back.
+            assert_eq!(live.pending_samples(), 0);
         }
-        for r in live.push(&total_pcm[pos..]) {
-            live_bits.extend(r.unwrap());
-        }
-        assert_eq!(live_bits, ref_bits);
-        // Total samples 1120 = 7 frames exactly, so no residue.
-        assert_eq!(live.pending_samples(), 0);
     }
 
-    /// `LiveEncoder` correctly retains residue when input ends
-    /// mid-frame.
+    /// `LiveEncoder` accounts for every sample it is handed. The emission
+    /// *schedule* is the streamer's business — it holds a bounded look-ahead
+    /// and emits in bursts — but `pending_samples` must always equal received
+    /// minus emitted, and `flush` must drain it to zero.
     #[test]
     fn live_encoder_residue_held_across_calls() {
-        let mut live = LiveEncoder::new(Rate::Imbe7200x4400);
-        // 1.5 frames of input split into two pushes.
-        let pcm: Vec<i16> = periodic_pcm(40, 6000)
-            .iter()
-            .copied()
-            .chain(periodic_pcm(40, 6000)[..80].iter().copied())
-            .collect();
-        assert_eq!(pcm.len(), 240);
-        let frames = live.push(&pcm[..120]);
-        assert!(frames.is_empty());
-        assert_eq!(live.pending_samples(), 120);
-        let frames = live.push(&pcm[120..]);
-        assert_eq!(frames.len(), 1);
-        assert!(frames[0].is_ok());
-        assert_eq!(live.pending_samples(), 80);
+        for rate in [
+            Rate::Imbe7200x4400,
+            Rate::Imbe4400x4400,
+            Rate::AmbePlus2_3600x2450,
+            Rate::AmbePlus2_2450x2450,
+        ] {
+            let mut live = LiveEncoder::new(rate);
+            // 1.5 frames of input split into two pushes.
+            let pcm: Vec<i16> = periodic_pcm(40, 6000)
+                .iter()
+                .copied()
+                .chain(periodic_pcm(40, 6000)[..80].iter().copied())
+                .collect();
+            assert_eq!(pcm.len(), 240);
+
+            let mut received = 0usize;
+            let mut emitted = 0usize;
+            for part in [&pcm[..120], &pcm[120..]] {
+                let frames = live.push(part);
+                received += part.len();
+                emitted += frames.len();
+                assert!(frames.iter().all(|r| r.is_ok()));
+                assert!(
+                    live.pending_samples() + emitted * FRAME_SAMPLES <= received,
+                    "{rate:?}: pending_samples double-counts emitted audio"
+                );
+            }
+            let tail = live.flush().unwrap();
+            emitted += tail.len();
+            assert_eq!(
+                emitted,
+                pcm.len().div_ceil(FRAME_SAMPLES),
+                "{rate:?}: flush must complete the partial frame, not drop it"
+            );
+            assert_eq!(live.pending_samples(), 0);
+        }
     }
 
     /// `LiveDecoder` handles arbitrary chunk sizes for the byte stream

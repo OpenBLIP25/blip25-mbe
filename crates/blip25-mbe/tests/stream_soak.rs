@@ -89,17 +89,21 @@ fn mib(bytes: usize) -> f64 {
     bytes as f64 / (1024.0 * 1024.0)
 }
 
-/// LiveEncoder soak (AMBE+2 3600x2450). Scaled to the dev-profile encode cost
+/// LiveEncoder soak, one rate. Scaled to the dev-profile encode cost
 /// (~95 ms/frame); reports the per-frame growth rate so a fixed-rate leak is
 /// diagnosable even at this scale.
-fn soak_live_encoder() {
+///
+/// Every rate is driven by a single-pass streamer holding a bounded look-ahead
+/// (`AmbeStream` / `ImbeStream`), and each keeps its own copy of the growing
+/// `pref`/`raw` analysis buffers, so each needs its own soak.
+fn soak_live_encoder(rate: Rate, frame_bytes: usize) {
     const WARMUP: usize = 24;
     const SOAK: usize = 80;
     // Pending look-ahead bound: B1_RESERVE(16) + B1_MIN_BATCH(16) + lag slack,
     // asserted with headroom at 64 frames.
     const PENDING_LIMIT: usize = 64 * FRAME;
 
-    let mut enc = LiveEncoder::new(Rate::AmbePlus2_3600x2450);
+    let mut enc = LiveEncoder::new(rate);
     let mut lcg = Lcg(0xB1_1925);
     let mut t = 0.0f64;
     let mut frames_out = 0usize;
@@ -115,7 +119,7 @@ fn soak_live_encoder() {
             let f = synth_frame(lcg, t);
             for r in enc.push(&f) {
                 let bits = r.expect("valid PCM must encode without error");
-                assert_eq!(bits.len(), R33_BYTES);
+                assert_eq!(bits.len(), frame_bytes);
                 *frames_out += 1;
                 *bytes_out += bits.len();
             }
@@ -146,7 +150,7 @@ fn soak_live_encoder() {
     );
     let tail = enc.flush().expect("flush must succeed");
     for bits in &tail {
-        assert_eq!(bits.len(), R33_BYTES);
+        assert_eq!(bits.len(), frame_bytes);
         bytes_out += bits.len();
     }
     assert_eq!(
@@ -168,14 +172,14 @@ fn soak_live_encoder() {
 
     let delta = rss1.saturating_sub(rss0);
     eprintln!(
-        "[soak] LiveEncoder(AMBE+2): {SOAK} frames after warm-up, RSS delta {:.2} MiB \
+        "[soak] LiveEncoder({rate:?}): {SOAK} frames after warm-up, RSS delta {:.2} MiB \
          ({:.0} B/frame), {bytes_out} bytes out",
         mib(delta),
         delta as f64 / SOAK as f64
     );
     assert!(
         delta < RSS_DELTA_LIMIT,
-        "LiveEncoder RSS grew {:.2} MiB over {SOAK} frames ({:.0} B/frame) — unbounded growth",
+        "LiveEncoder({rate:?}) RSS grew {:.2} MiB over {SOAK} frames ({:.0} B/frame) — unbounded growth",
         mib(delta),
         delta as f64 / SOAK as f64
     );
@@ -384,7 +388,9 @@ fn stream_soak_bounded_memory() {
     };
     let pool = build_frame_pool();
     lap("pool", &mut t0);
-    soak_live_encoder();
+    soak_live_encoder(Rate::AmbePlus2_3600x2450, R33_BYTES);
+    soak_live_encoder(Rate::Imbe7200x4400, 18);
+    soak_live_encoder(Rate::Imbe4400x4400, 11);
     lap("live_encoder", &mut t0);
     soak_tone_detection_encode();
     lap("tone_encode", &mut t0);

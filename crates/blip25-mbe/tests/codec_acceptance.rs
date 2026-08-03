@@ -329,19 +329,14 @@ fn assert_encode_parity_opt(rate: Rate, pcm: &[i16], ctx: &str, ambe_strict: boo
         "{ctx} {}: LiveEncoder empty",
         rate_name(rate)
     );
-    // AMBE+2 LiveEncoder is the single-pass reference streamer (reference pitch +
-    // b1_track voicing). With Route A (the two-frame look-ahead), its amplitude
-    // Encoder sees the pitch-aligned live `gap2` window, so it now MATCHES the
-    // whole-buffer `Vocoder::encode` byte-for-byte on the amplitude / gain
-    // fields (b2..b8) as well as pitch (b0). It already drops source-0 internally
-    // (no placeholder to strip). The other rates stay straight-through per-frame.
+    // `LiveEncoder` is the single-pass streaming replica of whole-buffer
+    // `Vocoder::encode` at EVERY rate — `AmbeStream` for AMBE+2, `ImbeStream`
+    // for IMBE. Both carry the reference pitch and voicing analysis causally,
+    // both handle their own look-ahead internally (nothing to strip here), and
+    // both emit one frame per 20 ms of input. So the reference is `encode`, not
+    // the per-frame codec-direct stream that steps 1-3 above pin.
     let is_ambe = matches!(rate, Rate::AmbePlus2_3600x2450 | Rate::AmbePlus2_2450x2450);
-    let expected = if is_ambe {
-        Vocoder::new(rate).encode(pcm)
-    } else {
-        emitted.remove(0); // drop the frame-0 look-ahead placeholder
-        refr.clone()
-    };
+    let expected = Vocoder::new(rate).encode(pcm);
     assert_eq!(
         emitted.len(),
         expected.len(),
@@ -393,10 +388,12 @@ fn assert_encode_parity_opt(rate: Rate, pcm: &[i16], ctx: &str, ambe_strict: boo
             );
         }
     } else {
+        // IMBE has no r33 field decomposition to compare through, so the
+        // streaming replica is asserted on the packed wire bytes directly.
         assert_eq!(
             emitted,
             expected,
-            "{ctx} {}: LiveEncoder+flush diverges from its reference",
+            "{ctx} {}: LiveEncoder (ImbeStream) diverges from Vocoder::encode",
             rate_name(rate)
         );
     }

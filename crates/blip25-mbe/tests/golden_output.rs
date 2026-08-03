@@ -436,15 +436,14 @@ const GOLDEN_ENVELOPE: [(&str, (u64, u32, u32), (u64, u32, u32)); 4] = [
 //
 // `GOLDEN` above hashes `Vocoder::encode_pcm`, the low-level per-frame
 // primitive. That is NOT the path the documentation tells callers to use, and
-// for AMBE+2 it is not even the same analysis chain: `Vocoder::encode` runs the
-// reverse-engineered reference pitch chain, the RE'd `b1_track` voicing with its ±3
-// lag search, the silence gate and the optional tone overlay — none of which
-// `encode_pcm` touches. `LiveEncoder` is a third path again: byte-exact to
-// `Vocoder::encode` for AMBE+2 (via `AmbeStream`), but falling back to
-// `encode_pcm` for the two IMBE rates.
+// it is not the same analysis chain: `Vocoder::encode` runs the
+// reverse-engineered reference pitch chain, the RE'd `b1_track` voicing, the
+// silence gate and (AMBE+2) the ±3 lag search and optional tone overlay — none
+// of which `encode_pcm` touches. `LiveEncoder` is the causal single-pass
+// replica of `Vocoder::encode`: `AmbeStream` for AMBE+2, `ImbeStream` for IMBE.
 //
 // These hashes are the only guard on the reference pitch injection, the voicing
-// tracker, the lag search, `BLAG`, and the `AmbeStream` duplicates — none of
+// tracker, the lag search, `BLAG`, and the streaming duplicates — none of
 // those move a `GOLDEN` hash.
 //
 // A silence gain-cap once clamped near-silent frames' b2, but it was removed:
@@ -454,93 +453,22 @@ const GOLDEN_ENVELOPE: [(&str, (u64, u32, u32), (u64, u32, u32)); 4] = [
 // rather than track it. Removing it restored the reference match and moved b2 (only
 // b2) on both AMBE+2 rates, which is why both AMBE+2 hashes below moved.
 //
-// Two facts are visible in the values themselves, and both are load-bearing:
-//
-//   * For BOTH AMBE+2 rates, `whole_buffer != live` — but with Route A the two
-//     now agree on pitch (b0) AND amplitude/gain (b2..b8): the streaming
-//     amplitude Encoder gained the same two-frame look-ahead, so both feed
-//     `band_decompress` the identical pitch-aligned live `gap2` window. The
-//     residual hash difference is voicing (b1) alone — whole-buffer's global ±3
-//     lag search vs the streamer's bounded `b1_track` — on a few frames of this
-//     silence-containing fixture. The structural invariant below enforces that
-//     b0 and b2..b8 match byte-for-byte rather than asserting it only in prose.
-//   * For BOTH IMBE rates, `whole_buffer != live`. That is NOT a property to
-//     preserve — it is a known defect:
-//     `Vocoder::encode` injects the RE'd reference pitch for IMBE while
-//     `LiveEncoder` falls back to the clean-room estimator, so the same PCM
-//     gives audibly different output depending on which API a caller reaches
-//     for. Closing that WILL move the IMBE `live` hashes, and that re-bless is
-//     the fix landing, not a regression.
+// One fact is visible in the values themselves and it is load-bearing: at every
+// rate `whole_buffer == live`. There is ONE encoder per rate, reachable through
+// two APIs, and a caller gets the same bits whichever they pick. The structural
+// invariant below enforces that frame-by-frame rather than only in prose; if a
+// `live` hash ever moves without its `whole_buffer` twin, the streaming replica
+// has drifted from the analysis it replicates.
 //
 // `whole_buffer` also differs from the `GOLDEN` encode hash for every rate,
 // since that one covers the per-frame primitive.
 //
 // (rate key, whole_buffer, live)
 const GOLDEN_ENCODE_PATHS: [(&str, u64, u64); 4] = [
-    // both paths moved with the fricative-protect + per-band voicing veto (b1
-    // V/UV bits change); IMBE only, AMBE+2 rows below unmoved (default config).
-    // whole_buffer ONLY moved again with the bit-exact FFT spectrum -> mechanism
-    // amps + re-fit gain DC biases (b2..b8 bits change): the whole-buffer path
-    // opts into the two-frame look-ahead + mechanism amplitudes, while the live
-    // (LiveEncoder) streaming path keeps the one-frame look-ahead + synthesized-
-    // DFT proxy and is byte-unchanged. IMBE only, AMBE+2 unmoved.
-    // whole_buffer ONLY moved again with the exact per-frame band_decompress
-    // step: the IMBE mechanism amplitude path now derives band_decompress's STEP
-    // from the quantized IMBE pitch index (STEP = fund_freq(b0) >> 13, pure
-    // truncation on the Q1.31 fundamental) instead of round(omega_0*2^18/pi) fed
-    // the continuous pitch estimate. This reproduces the reference DLL's captured
-    // step 45/45 on the mark capture (vs ~0% for the round-of-continuous form) and
-    // lifts the shared amplitude fields vs the reference across the board (amps|L
-    // clean 60.0->60.7 / dam 65.2->66.1 / mark 77.5->77.7 / noisy 68.5->76.2; ALL
-    // clean 0.05->0.24 / mark 0.11->0.54 / noisy 0.64->6.53). Amplitude wire bits
-    // change (b3..b8) so whole_buffer moves; the live (LiveEncoder) path keeps the
-    // synthesized-DFT proxy and is byte-unchanged. IMBE only: the step is derived
-    // inside analyze_imbe_frame from b0_imbe; the shared omega-keyed step_for_omega
-    // used by the frozen AMBE+2 Route A path is untouched, so both AMBE+2 rows hold.
-    // whole_buffer ONLY moved again wiring IMBE voicing through the shared reference
-    // metric: analyze_imbe_frame now expands `b1_track`'s 5-bit voicing word
-    // (build_maskword + gen_vmask on the IMBE ω0/L grid, AND-binned per band)
-    // instead of the float decide_voicing_cfg path, which over-voiced fricative
-    // high bands. b1 V/UV bits change (broad b1 vs reference clean 64.8->76.5 /
-    // dam 66.5->78.0 / mark 56.5->72.5 / noisy 65.9->76.2; clean SH fricative
-    // frames now unvoice to match reference). The live (LiveEncoder) path keeps the
-    // float voicing and is byte-unchanged; AMBE+2 rows unmoved (IMBE-only consumer).
-    // both paths moved again with the inter-word gap ring-out fix: (1) the low-L
-    // gain floor in sa_encode is now energy-gated (src_rms < IMBE_SILENCE_RMS &&
-    // b_vec[1]==0, dropping the nh<15 proxy) so low-energy unvoiced word-edge
-    // frames get the -2100 gain floor without touching high-energy fricatives, and
-    // (2) analyze_imbe_frame forces all bands unvoiced when src_rms < the same
-    // silence threshold. Both fire on the silence-containing fixture, changing the
-    // gain (b2) and voicing (b1) wire bits on the low-energy gap frames; both the
-    // whole_buffer and live paths run the shared quantizer/analysis so both move.
-    // IMBE only (src_rms plumbed only through the IMBE analyze/quantize path);
-    // AMBE+2 rows below unmoved.
-    // whole_buffer ONLY moved again with the release-edge alignment: at a word's
-    // trailing edge our boundary frame stays hot (b0/L/b2) one frame after its
-    // voicing has released to fully unvoiced, seeding the decoder's differential-
-    // amplitude predictor and ringing into the inter-word gap. analyze_imbe_frame
-    // now detects that edge (previous frame voiced, this frame fully unvoiced,
-    // still loud, NEXT frame already in the silence regime) and forces the same
-    // silence release the next frame gets — pin b0 to the silence default (25/L14)
-    // and route through the low-energy gain floor. b0/L/b1/b2 wire bits change on
-    // the release-edge frames (e.g. clean f601 32/16/0/47 -> 25/14/0/41, matching
-    // reference 25/14/0). The clip guard (frame must be already fully unvoiced) keeps
-    // voiced word tails and loud unvoiced fricatives untouched; broad b1 holds
-    // (clean 76.7 / dam 78.6 / mark 73.3 / noisy 76.2). The live (LiveEncoder)
-    // path uses float voicing and the edge does not fire on the fixture, so it is
-    // byte-unchanged; AMBE+2 rows below unmoved (IMBE-only analyze/quantize path).
-    ("imbe_7200x4400", 0x65d9100dd278a904, 0x3a36cb44d0c9bbfb),
-    ("imbe_4400x4400", 0x57ec6d93ce04289d, 0xd22380d77b32cbcb),
-    // Route A: the streaming amplitude Encoder now runs the same two-frame
-    // look-ahead as whole-buffer, so both feed `band_decompress` the identical
-    // pitch-aligned live `gap2` window and agree on the amplitude/gain fields
-    // (b2..b8). `whole_buffer != live` here survives only because voicing (b1)
-    // still comes from two different trackers — whole-buffer's global ±3 lag
-    // search vs the streamer's bounded `b1_track` — which differ on a few frames
-    // of this silence-containing fixture. The `live` hashes moved (b2..b8 now
-    // aligned) while `whole_buffer` held.
-    ("ambe2_3600x2450", 0x42b6c4be42ebaa3d, 0x2b2e6aa6e5fd5547),
-    ("ambe2_2450x2450", 0x6c0c03fee044490b, 0xc8b4d346ca730bd6),
+    ("imbe_7200x4400", 0x65d9100dd278a904, 0x65d9100dd278a904),
+    ("imbe_4400x4400", 0x57ec6d93ce04289d, 0x57ec6d93ce04289d),
+    ("ambe2_3600x2450", 0x1360adc1639682be, 0x1360adc1639682be),
+    ("ambe2_2450x2450", 0xddf1a61713ef7dfb, 0xddf1a61713ef7dfb),
 ];
 
 fn golden_for(key: &str) -> (u64, u64, u64) {
@@ -631,20 +559,6 @@ fn encode_live(rate: Rate, pcm: &[i16]) -> Vec<u8> {
         all.extend(frame);
     }
     all
-}
-
-/// Per-frame b-fields (`[b0..b8]`) of a concatenated AMBE+2 bitstream — FEC r33
-/// (9B) or no-FEC r34 (7B). Lets the streaming/whole-buffer structural invariant
-/// compare pitch/voicing (b0/b1) apart from amplitude/gain (b2..b8).
-fn ambe_fields_of(rate: Rate, bits: &[u8]) -> Vec<[u16; 9]> {
-    let n = rate.fec_frame_bytes();
-    bits.chunks_exact(n)
-        .map(|f| match rate {
-            Rate::AmbePlus2_3600x2450 => blip25_mbe::rate33::frame::fields_from_fec(f),
-            Rate::AmbePlus2_2450x2450 => blip25_mbe::rate33::frame::fields_from_no_fec(f),
-            _ => unreachable!("ambe_fields_of called on a non-AMBE+2 rate"),
-        })
-        .collect()
 }
 
 fn decode_all(rate: Rate, bits: &[u8]) -> Vec<i16> {
@@ -864,35 +778,64 @@ fn shipped_encode_paths_are_pinned() {
     // Structural invariant, stated independently of the literals above so a
     // regression fails with a diagnosis instead of an opaque hash mismatch.
     //
-    // `AmbeStream` is the single-pass streaming replica of the whole-buffer
-    // AMBE+2 encoder. With Route A (the two-frame look-ahead) the two share the
-    // identical pitch-aligned live `gap2` window, so on continuous speech they
-    // are byte-for-byte IDENTICAL across all nine fields — pitch (b0), voicing
-    // (b1) and amplitude/gain (b2..b8). This asserts that full equality. (b2..b8
-    // parity is the Route A win; b0/b1 must hold as they did before it.) On a
-    // silence-containing signal b1 can still differ — the whole-buffer `(-3..=3)`
-    // lag search vs the streamer's bounded `b1_track`, `BLAG = 2` — so this runs
-    // on the continuous signal only.
+    // `LiveEncoder` is the single-pass streaming replica of whole-buffer
+    // `Vocoder::encode` at EVERY rate — `AmbeStream` carries the AMBE+2 chains,
+    // `ImbeStream` the IMBE ones — so on continuous speech the two APIs are
+    // byte-for-byte identical. The absence of this assertion for IMBE is what
+    // let the two IMBE encoders drift apart into audibly different output, so it
+    // runs on all four rates now.
+    //
+    // Continuous speech only: on a silence-containing signal the AMBE+2 voicing
+    // can still differ, since the whole-buffer `(-3..=3)` lag search and the
+    // streamer's `BLAG` offset are not derived the same way.
     let continuous = test_pcm(FRAMES);
-    for rate in [Rate::AmbePlus2_3600x2450, Rate::AmbePlus2_2450x2450] {
-        let wf = ambe_fields_of(rate, &encode_whole_buffer(rate, &continuous));
-        let lf = ambe_fields_of(rate, &encode_live(rate, &continuous));
+    for rate in ALL_RATES {
+        let whole = encode_whole_buffer(rate, &continuous);
+        let live = encode_live(rate, &continuous);
+        let n = rate.fec_frame_bytes();
         assert_eq!(
-            wf.len(),
-            lf.len(),
-            "{}: LiveEncoder (AmbeStream) and Vocoder::encode emit different \
-             frame counts on continuous speech.",
-            rate_key(rate)
+            whole.len() / n,
+            live.len() / n,
+            "{}: LiveEncoder and Vocoder::encode emit different frame counts on \
+             continuous speech ({} vs {}).",
+            rate_key(rate),
+            whole.len() / n,
+            live.len() / n
         );
-        for (i, (w, l)) in wf.iter().zip(&lf).enumerate() {
+        for (i, (w, l)) in whole.chunks_exact(n).zip(live.chunks_exact(n)).enumerate() {
             assert_eq!(
-                w, l,
-                "{}: LiveEncoder (AmbeStream) diverges from Vocoder::encode at \
-                 frame {i} on continuous speech — Route A makes the two identical \
-                 across b0..b8. b2..b8 divergence = the pitch-aligned live gap2 \
-                 window drifted (look-ahead depth / feed timing); b0/b1 divergence \
-                 = the hdr30 VAD replica (vocoder.rs advance_hdr30) or the reference-b0 \
-                 injection drifting.",
+                w,
+                l,
+                "{}: LiveEncoder diverges from Vocoder::encode at frame {i} on \
+                 continuous speech. The two must be one encoder reached through \
+                 two APIs. Amplitude/gain divergence = the pitch-aligned live gap2 \
+                 window drifted (look-ahead depth / feed timing); pitch or voicing \
+                 divergence = the hdr30 VAD, the reference-b0 injection, or the \
+                 streamer's forced-vector schedule drifting.",
+                rate_key(rate),
+            );
+        }
+    }
+
+    // Every path emits one frame per 20 ms of input, so a partial trailing frame
+    // is completed with silence rather than dropped. Exercised at exact multiples
+    // and at residues, since the two take different padding branches.
+    for rate in ALL_RATES {
+        let n = rate.fec_frame_bytes();
+        for samples in [160usize, 240, 3840, 3841, 4000] {
+            let mut pcm = test_pcm(samples.div_ceil(160));
+            pcm.truncate(samples);
+            let want = samples.div_ceil(160);
+            assert_eq!(
+                encode_whole_buffer(rate, &pcm).len() / n,
+                want,
+                "{}: Vocoder::encode dropped or gained frames on {samples} samples",
+                rate_key(rate)
+            );
+            assert_eq!(
+                encode_live(rate, &pcm).len() / n,
+                want,
+                "{}: LiveEncoder dropped or gained frames on {samples} samples",
                 rate_key(rate)
             );
         }

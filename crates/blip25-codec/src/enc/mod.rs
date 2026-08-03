@@ -112,6 +112,10 @@ pub struct Encoder {
     /// ω0/L grid. Left `None` on a bare `Encoder` and on `encode_pcm`, which
     /// keep the float voicing path.
     forced_b1: Option<Vec<u16>>,
+    /// When set, a forced vector that does not cover the frame being analysed is
+    /// a debug-build panic rather than a silent fall back to the estimator.
+    /// See [`Self::set_forced_strict`].
+    forced_strict: bool,
     /// Pitch-aligned mechanism-amplitude mode (Route A). When set,
     /// [`Self::analyze_frame`] sources the spectral amplitudes (and the
     /// reference-exact `b2` gain) for frame `f` from the LIVE `gap2` window
@@ -661,6 +665,7 @@ impl Encoder {
             state: DecoderState::new(),
             forced_b0: None,
             forced_b1: None,
+            forced_strict: false,
             live_gap2_amps: false,
             bias_raw_state: 0,
             diagnostics: false,
@@ -846,6 +851,18 @@ impl Encoder {
     /// grid. Out-of-range frames fall back to the float voicing path.
     pub fn set_forced_b1(&mut self, seq: Vec<u16>) {
         self.forced_b1 = Some(seq);
+    }
+
+    /// Require the forced vectors to cover every frame that is analysed.
+    ///
+    /// The fallbacks in `set_forced_b0` / `set_forced_b1` are silent by design —
+    /// a caller supplying a short prefix gets the estimator for the rest. A
+    /// streaming caller that grows those vectors as its analysis finalises has
+    /// the opposite requirement: reaching the estimator means its schedule is
+    /// off by a frame, which degrades the audio while every test stays green.
+    /// With this set, that becomes a debug-build panic instead.
+    pub fn set_forced_strict(&mut self, on: bool) {
+        self.forced_strict = on;
     }
 
     /// Enable Route A: pitch-aligned mechanism amplitudes + reference-exact `b2`
@@ -2155,6 +2172,16 @@ impl Encoder {
         // quantizer bins per band by reading `voiced[band*3]` (FIRST); with
         // `IMBE_VOICE_BINNING_AND` each band's triplet is AND-reduced onto that
         // slot instead.
+        debug_assert!(
+            !self.forced_strict
+                || (self.forced_b0.as_ref().is_none_or(|s| f < s.len())
+                    && self.forced_b1.as_ref().is_none_or(|s| f < s.len())),
+            "forced vectors do not cover analysis frame {f} \
+             (b0 len {:?}, b1 len {:?}) — the caller's finalise schedule is off \
+             and this frame would silently fall back to the estimator",
+            self.forced_b0.as_ref().map(|s| s.len()),
+            self.forced_b1.as_ref().map(|s| s.len()),
+        );
         let voiced: Vec<bool> = match self.forced_b1.as_ref().and_then(|s| s.get(f).copied()) {
             Some(b1w) => {
                 let fund = crate::imbe::pitch_cell(b0_imbe as i16).0;
