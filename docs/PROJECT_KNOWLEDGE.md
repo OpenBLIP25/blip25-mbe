@@ -15,27 +15,61 @@ have to rediscover.
 
 ## 1. What the codec is actually targeting
 
-The correctness target is the **reference codec that ships in a professional
-dispatch console**, reverse-engineered into `blip25-codec`. It is *not* the
-AMBE-3000R chip and *not* any single reference test-vector set.
+The correctness target is the **Wave7k x86 softclient** (`W7K_UA_SDK.dll`),
+reverse-engineered into `blip25-codec`.
 
-That distinction is load-bearing, because the reference vendor ships several
-products whose output genuinely disagrees:
+The reason is architectural, not preferential. The DVSI `.bit` test vectors are
+**chip-produced** — an AMBE-3000R running C55x fixed-point firmware. Our code is
+x86. Two different arithmetic targets do not produce identical bits from the same
+algorithm, so the chip vectors are **not bit-exact reachable** by anything we
+write. The Wave7k DLL is x86, the same class of target as our implementation, so
+it is the only reference for which bit-exactness is a coherent goal at all.
 
-| Reference | What it is | Standing |
+This is the same target [`MISSION.md`](MISSION.md) names: `W7K_UA_SDK.dll` is the
+vocoder that ships with the Motorola AXS console. "The console is the ruler" and
+"Wave7k is the oracle" are one statement, not two.
+
+That makes the reference set a hierarchy of *purposes*, not of quality:
+
+| Reference | What it is | Use it for |
 |---|---|---|
-| Console codec | The dispatch console's vocoder | **The target** |
-| `tv-std/tv/r33` | the reference SDK P25 vectors, AMBE+2 | Good proxy; decode matches, ear-good |
-| `tv-std/tv/p25` | Full-rate IMBE vectors (18 B/frame) | Phase 1 reference |
-| `tv-rc` | **Rate-conversion** vectors | **Not** the AMBE+2 reference — easy to grab by mistake |
-| AMBE-3000R chip | Third distinct product | Not a reference for either (see §5) |
+| Wave7k DLL (`W7K_UA_SDK.dll`) | x86 softclient, same target class as us | **Bit-exactness. The oracle.** |
+| `tv-std/tv/r33`, `tv-std/tv/p25` | Chip-produced SDK vectors | Decode validation, wire-format structure, realistic input audio |
+| `tv-rc` | **Rate-conversion** vectors | Transcode paths only — not an encode reference |
+| AMBE-3000R chip | C55x fixed-point | Interop reasoning; never an x86 bit target |
 
-**They disagree with each other.** An encoder reverse-engineered against the
-desktop reference product scores 0% whole-frame against `tv-std/r33` while matching `tv-rc` at
-b0 85%. Two faithful reverse engineerings of "the reference encoder" can target
-different reference products. When a conformance number looks impossible, check
-which reference you are scoring against before you debug the code — scoring
-against `tv-rc` by mistake invalidates the whole run.
+Two failure modes this hierarchy exists to prevent:
+
+- **Scoring encode bit-exactness against the chip vectors.** The ceiling is not
+  100% and never was; a plateau there proves nothing about the code.
+- **Scoring anything against `tv-rc` by mistake.** It is a rate-conversion set.
+  Doing so invalidates the whole run.
+
+### The encoder is block-synchronous — this is load-bearing
+
+Recorded SDK capabilities (`wave7k_gold_standard/MANIFEST.md`):
+
+```
+encoder tdma-ambe2  in=320 out=7   frames=1     (20 ms in -> one frame out)
+encoder fdma-imbe   in=960 out=36  frames=3     (60 ms in -> three frames out)
+```
+
+AMBE+2 consumes one 20 ms frame and emits one frame, with a **one-frame pipeline
+delay**. IMBE works in three-frame batches with one batch of delay. Effective
+encoder latency is therefore ~40 ms (AMBE+2) and ~120 ms (IMBE).
+
+There is **no end-of-stream call**. The pipeline is drained by pushing a frame of
+silence and discarding the priming output — a pipeline flush, not an EOF signal.
+
+Two consequences worth stating because they are easy to get wrong:
+
+1. Any formulation of the analysis that needs more than about one frame of
+   forward context is **not what the codec does**. A wide look-ahead window that
+   reproduces the right answers is a curve fit, not the algorithm — and it costs
+   latency the real codec never pays.
+2. Bit-exactness and low latency are the **same** problem here, not a trade-off.
+   The causal, one-frame-delay formulation is the correct one; finding it removes
+   the look-ahead as a side effect.
 
 ## 2. The only quality gate is a listening test
 
