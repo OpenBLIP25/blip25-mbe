@@ -1536,11 +1536,27 @@ struct AmbeStream {
     pend: std::collections::VecDeque<(usize, [u8; 9])>,
     // Persistent hdr30 VAD (the one slow-converging b1_track state — an adaptive
     // noise floor — carried so a bounded analysis window stays byte-exact).
+    hdr: blip25_codec::enc::b1_audio::Hdr30Vad,
     hdr30: Vec<i32>,
-    hdr_nf: Option<f64>,
-    hdr_cd: usize,
-    hdr_h: i32,
-    hdr_prev: bool,
+}
+
+/// Extend `hdr30` with the shift-register value of every source frame in
+/// `raw` up to `upto`, advancing the persistent tracker. Frames are 160
+/// samples; a short trailing frame reads as zero-padded, matching
+/// `derive_hdr30_vad`.
+#[cfg(feature = "encode")]
+fn advance_hdr30(
+    hdr: &mut blip25_codec::enc::b1_audio::Hdr30Vad,
+    hdr30: &mut Vec<i32>,
+    raw: &[i16],
+    upto: usize,
+) {
+    while hdr30.len() < upto {
+        let s = hdr30.len() * FRAME_SAMPLES;
+        let end = (s + FRAME_SAMPLES).min(raw.len());
+        let frame = if s < end { &raw[s..end] } else { &[][..] };
+        hdr30.push(hdr.push_frame(frame));
+    }
 }
 
 #[cfg(feature = "encode")]
@@ -1570,55 +1586,14 @@ impl AmbeStream {
             emitted_src: 0,
             out_count: 0,
             pend: std::collections::VecDeque::new(),
+            hdr: blip25_codec::enc::b1_audio::Hdr30Vad::new(),
             hdr30: Vec::new(),
-            hdr_nf: None,
-            hdr_cd: 0,
-            hdr_h: 0,
-            hdr_prev: false,
         }
     }
 
     /// Advance the persistent hdr30 VAD to cover source frames `[0, upto)`.
-    /// Byte-exact incremental replica of `b1_audio::derive_hdr30_vad`
-    /// (fully causal): per-frame log-energy, adaptive noise floor (leak 0.05),
-    /// 1-frame hangover, 2-bit-per-frame shift register. The noise floor is the
-    /// state a bounded window can't reproduce, so it lives here.
     fn advance_hdr30(&mut self, upto: usize) {
-        const FRAME: usize = FRAME_SAMPLES;
-        const LEAK: f64 = 0.05;
-        const MARGIN: f64 = 3.25;
-        while self.hdr30.len() < upto {
-            let f = self.hdr30.len();
-            let s = f * FRAME;
-            let mut acc = 0.0f64;
-            for i in 0..FRAME {
-                if s + i < self.raw.len() {
-                    let v = f64::from(self.raw[s + i]);
-                    acc += v * v;
-                }
-            }
-            let e = (acc / FRAME as f64 + 1.0).log2();
-            if self.hdr_nf.is_none() {
-                self.hdr_nf = Some(e);
-            }
-            let nf = self.hdr_nf.unwrap();
-            let nf = if e < nf { e } else { nf + LEAK };
-            self.hdr_nf = Some(nf);
-            let base = e > nf + MARGIN;
-            let v = if base {
-                self.hdr_cd = 1;
-                true
-            } else if self.hdr_cd > 0 {
-                self.hdr_cd -= 1;
-                true
-            } else {
-                false
-            };
-            let fill = (v as i32) | ((self.hdr_prev as i32) << 1);
-            self.hdr_h = ((self.hdr_h << 2) | fill) & 0xffff;
-            self.hdr30.push(self.hdr_h);
-            self.hdr_prev = v;
-        }
+        advance_hdr30(&mut self.hdr, &mut self.hdr30, &self.raw, upto);
     }
 
     /// Prefilter + buffer new PCM, then finalise/emit whatever frames now have

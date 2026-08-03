@@ -3044,11 +3044,68 @@ pub(crate) fn pitch_predictor_gate(mut a4: [i16; 16], hdr30: i32) -> [i16; 16] {
 /// `MARGIN`/`LEAK`/`HANG` are a single shared config (same for both corpus files); they were
 /// tuned against the captured hdr30 on those two files, so this is a 1-parameter fit on a
 /// 2-file corpus -- audio-only (reads only PCM) but NOT yet validated to generalise.
+/// hdr30 VAD decision margin, in log2 power units above the tracked noise floor.
+pub const HDR30_MARGIN: f64 = 2.75;
+/// Upward leak applied to the hdr30 noise floor on every non-minimum frame.
+pub const HDR30_LEAK: f64 = 0.05;
+/// Frames of hangover after the hdr30 VAD releases.
+pub const HDR30_HANG: usize = 1;
+
+/// Incremental, frame-serial form of [`derive_hdr30_vad`] for streaming callers.
+///
+/// The adaptive noise floor is the one slow-converging state a bounded analysis
+/// window cannot reproduce, so a streamer carries this across pumps and hands the
+/// accumulated register to [`b1_track_hdr30`]. Pushing frames `0..n` in order
+/// yields exactly `derive_hdr30_vad(pcm, n)`.
+#[derive(Clone, Debug, Default)]
+pub struct Hdr30Vad {
+    nf: Option<f64>,
+    cd: usize,
+    h: i32,
+    prev: bool,
+}
+
+impl Hdr30Vad {
+    /// A cold tracker, positioned before frame 0.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Consume the next 160-sample frame and return its shift-register value.
+    /// `frame` shorter than 160 samples is treated as zero-padded, matching
+    /// `derive_hdr30_vad`'s out-of-range read.
+    pub fn push_frame(&mut self, frame: &[i16]) -> i32 {
+        const FRAME: usize = 160;
+        let mut acc = 0.0f64;
+        for i in 0..FRAME {
+            let v = f64::from(frame.get(i).copied().unwrap_or(0));
+            acc += v * v;
+        }
+        let e = (acc / FRAME as f64 + 1.0).log2();
+        let nf = self.nf.unwrap_or(e);
+        let nf = if e < nf { e } else { nf + HDR30_LEAK };
+        self.nf = Some(nf);
+        let v = if e > nf + HDR30_MARGIN {
+            self.cd = HDR30_HANG;
+            true
+        } else if self.cd > 0 {
+            self.cd -= 1;
+            true
+        } else {
+            false
+        };
+        let fill = (v as i32) | ((self.prev as i32) << 1);
+        self.h = ((self.h << 2) | fill) & 0xffff;
+        self.prev = v;
+        self.h
+    }
+}
+
 pub(crate) fn derive_hdr30_vad(raw_pcm: &[i16], nframes: usize) -> Vec<i32> {
     const FRAME: usize = 160;
-    let margin: f64 = 2.75;
-    const LEAK: f64 = 0.05;
-    const HANG: usize = 1;
+    let margin: f64 = HDR30_MARGIN;
+    const LEAK: f64 = HDR30_LEAK;
+    const HANG: usize = HDR30_HANG;
     let energy: Vec<f64> = (0..nframes)
         .map(|f| {
             let s = f * FRAME;
