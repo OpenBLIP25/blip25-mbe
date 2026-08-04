@@ -887,11 +887,36 @@ impl Vocoder {
         // reference-exact b2 with no per-frame override array. (Pass 1 above still
         // runs at the one-frame look-ahead purely to populate the b1-track logs,
         // which were fit to that timing.)
+        // The b1 track is derived from pass 1's logs, so it is available before
+        // pass 2 runs — which is what lets the low-band floor's gate read the
+        // b1 that will actually be transmitted. Only `e2` may carry the floor:
+        // giving it to `e` would move the very logs this track is built from.
+        let nframes = (pcm.len() / FRAME_SAMPLES).saturating_sub(1);
+        let bt = b1_track_from_logs(
+            e.gap2_mid_log(),
+            e.gap2_slot1_log(),
+            e.gap2_slot2_log(),
+            e.prefiltered_log(),
+            pcm,
+            nframes,
+            RingRefineMode::Off,
+        );
+        let orac_b1: Vec<u16> = bt.iter().map(|f| f.b1).collect();
+
         let mut e2 = blip25_codec::enc::Encoder::new();
         if let Some(fb) = forced_b0.as_ref() {
             e2.set_forced_b0(fb.clone());
         }
         e2.set_live_gap2_amps(true);
+        if lowband_floor_enabled() && !orac_b1.is_empty() {
+            // Analyse frame `f` is packed with `orac_b1[f + BLAG]` whenever the
+            // lag search below lands on `AMBE_B1_OUTPUT_LAG`, which is the same
+            // assumption `forced_b0` already makes.
+            let last = orac_b1.len() - 1;
+            let nf = pcm.len() / FRAME_SAMPLES;
+            e2.set_lowband_floor(true);
+            e2.set_lowband_gate_b1((0..=nf).map(|f| orac_b1[(f + BLAG).min(last)]).collect());
+        }
         let mut frames: Vec<[u8; R33]> = Vec::new();
         for f in pcm.chunks_exact(FRAME_SAMPLES) {
             let a: &[i16; FRAME_SAMPLES] = f.try_into().expect("chunk is 160");
@@ -909,17 +934,7 @@ impl Vocoder {
         //    (`e` ran the full r34-equivalent analysis; r33/r34 share the
         //    prefilter + gap-log writers and diverge only in bit-packing), so
         //    the b1 chain does not re-run the encoder two more times.
-        let nframes = (pcm.len() / FRAME_SAMPLES).saturating_sub(1);
-        let bt = b1_track_from_logs(
-            e.gap2_mid_log(),
-            e.gap2_slot1_log(),
-            e.gap2_slot2_log(),
-            e.prefiltered_log(),
-            pcm,
-            nframes,
-            RingRefineMode::Off,
-        );
-        let orac_b1: Vec<u16> = bt.iter().map(|f| f.b1).collect();
+        //    (`orac_b1` is computed above, between the two passes.)
 
         // 3. Align blip25's stream to the b1_track index (the two use different
         //    look-ahead conventions), then swap `b1` and repack the r33 frame.
@@ -1531,6 +1546,18 @@ const B1_MIN_BATCH: usize = 16;
 #[cfg(feature = "encode")]
 const BLAG: usize = 2;
 
+/// Opt-in for the encoder's gated low-band spectral floor
+/// (`BLIP25_LOWBAND_FLOOR=1`), read once.
+///
+/// The env read lives here rather than in `blip25-codec`: that crate reads no
+/// environment at all, and the floor's Encoder-side controls are plain setters.
+/// Off, the AMBE+2 amplitude path is byte-identical to a build without it.
+#[cfg(feature = "encode")]
+fn lowband_floor_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("BLIP25_LOWBAND_FLOOR").as_deref() == Ok("1"))
+}
+
 /// The same offset on the OUTPUT-frame axis, where whole-buffer `encode`'s lag
 /// search works. Output frame `i` is source frame `i + 1` (the dropped
 /// look-ahead placeholder), so the two constants differ by exactly that one
@@ -1593,6 +1620,10 @@ fn ambe2_b1_lag(ours_b1: &[u16], orac_b1: &[u16], lag_span: usize) -> i64 {
 struct AmbeStream {
     with_fec: bool,
     tone_on: bool,
+    /// The low-band floor is on for this stream, so the Encoder needs the
+    /// transmitted `b1` for every frame it analyses — which costs `BLAG` frames
+    /// of emit latency it does not otherwise pay.
+    floor: bool,
     e: blip25_codec::enc::Encoder,
     reference: blip25_codec::enc::b0_audio::B0Audio,
     pref_state: blip25_codec::enc::audio_prefilter::PrefilterState,
@@ -1644,9 +1675,12 @@ impl AmbeStream {
         // `Vocoder::encode` on b2..b8 (not just b0/b1).
         let mut e = blip25_codec::enc::Encoder::new();
         e.set_live_gap2_amps(true);
+        let floor = lowband_floor_enabled();
+        e.set_lowband_floor(floor);
         Self {
             with_fec,
             tone_on,
+            floor,
             e,
             reference: blip25_codec::enc::b0_audio::B0Audio::new(),
             pref_state: blip25_codec::enc::audio_prefilter::PrefilterState::default(),
@@ -1779,6 +1813,12 @@ impl AmbeStream {
         //     emit source `src` to reference frame `src + 2`, clamped).
         let emit_src_max = if flush {
             nframes
+        } else if self.floor {
+            // The floor's gate input for source `src` is the TRANSMITTED
+            // `b1[src + BLAG]`, final only through `new_horizon - 1`. Emitting
+            // through `new_horizon - 1 - BLAG` costs nothing: step (6) already
+            // holds every frame with `s + BLAG >= b1.len()`.
+            new_horizon.saturating_sub(1 + BLAG)
         } else {
             new_horizon.saturating_sub(1)
         };
@@ -1788,6 +1828,15 @@ impl AmbeStream {
             self.forced_b0.push(self.reference_b0[idx]);
         }
         self.e.set_forced_b0(self.forced_b0.clone());
+        if self.floor && !self.b1.is_empty() {
+            // Same lag `pack` applies, so the gate sees the `b1` that is
+            // actually transmitted rather than the Encoder's internal estimate.
+            let last = self.b1.len() - 1;
+            let gate_b1: Vec<u16> = (0..=emit_src_max)
+                .map(|src| self.b1[(src + BLAG).min(last)])
+                .collect();
+            self.e.set_lowband_gate_b1(gate_b1);
+        }
         // (5) feed raw frames to the Encoder; each emission is the next source.
         //     Route A's two-frame look-ahead means emission `s` (analyze frame
         //     `s`) lands only after frame `s + 2` is fed, so to have sources up

@@ -138,6 +138,19 @@ pub struct Encoder {
     /// observed frame-0 bias) and only advances on frames where
     /// [`Self::live_gap2_amps`] is set.
     bias_raw_state: i16,
+    /// Apply the reference's gated low-band spectral floor to the mechanism
+    /// `M_l` before both the shape quantizer and the `b2` gain override. Off by
+    /// default; only reachable on the Route A path ([`Self::live_gap2_amps`]).
+    lowband_floor: bool,
+    /// Caller-held recursive `L0` state of that floor, seeded with
+    /// [`band_decompress::LOWBAND_L0_INIT`]. Advances ONLY on frames where the
+    /// gate fires — advancing it on a gated-off frame desyncs every later frame.
+    lowband_l0: i16,
+    /// Per-emit-frame gate input for the low-band floor: the `b1` that will
+    /// actually be transmitted for frame `f` (the caller's lagged voicing
+    /// track), NOT the Encoder's own internal `b1`. Parallel to
+    /// [`Self::forced_b0`].
+    lowband_gate_b1: Option<Vec<u16>>,
     /// Gate for the DIAGNOSTIC/EXPERIMENTAL per-frame analysis paths (every
     /// `*_x86_*` research log and its isolated cross-frame state below). Off
     /// by default: `analyze_frame` then does ZERO experimental-path work and
@@ -668,6 +681,9 @@ impl Encoder {
             forced_strict: false,
             live_gap2_amps: false,
             bias_raw_state: 0,
+            lowband_floor: false,
+            lowband_l0: band_decompress::LOWBAND_L0_INIT,
+            lowband_gate_b1: None,
             diagnostics: false,
             frame_energy_log: Vec::new(),
             next_emit: 0,
@@ -873,6 +889,22 @@ impl Encoder {
     /// produce byte-identical `b2..b8` in a single forward pass.
     pub fn set_live_gap2_amps(&mut self, on: bool) {
         self.live_gap2_amps = on;
+    }
+
+    /// Enable the reference's gated low-band spectral floor on the Route A
+    /// amplitude path (see [`Self::lowband_floor`]). Requires
+    /// [`Self::set_lowband_gate_b1`] to cover every analysed frame; set both
+    /// before feeding any frames so the recursive `l0` starts from frame 0.
+    pub fn set_lowband_floor(&mut self, on: bool) {
+        self.lowband_floor = on;
+    }
+
+    /// Supply the per-emit-frame gate input for the low-band floor. `seq[f]` is
+    /// the `b1` transmitted for emit frame `f` — the caller's lagged voicing
+    /// track, not the Encoder's internal estimate. The two differ, and the
+    /// transmitted one is the reference's own gate input.
+    pub fn set_lowband_gate_b1(&mut self, seq: Vec<u16>) {
+        self.lowband_gate_b1 = Some(seq);
     }
 
     /// Analysis look-ahead depth in frames. One frame normally; two when
@@ -1336,8 +1368,35 @@ impl Encoder {
         } else {
             None
         };
+        // Gated low-band spectral floor (opt-in). Mutates the mechanism `M_l`
+        // in the log2 domain before BOTH the shape quantizer below and the `b2`
+        // gain override further down, which is the reference's own order — so
+        // the floored `biased` is carried to that override rather than
+        // recomputed there.
+        let mut floored_biased: Option<Vec<i16>> = None;
         let mut amplitudes = if let Some(g2) = aligned_gap2 {
-            loudness_fixed::amps_from_mechanism_bins(&g2, l_us, f64::from(omega_0)).0
+            if self.lowband_floor {
+                let gate_b1 = self
+                    .lowband_gate_b1
+                    .as_ref()
+                    .and_then(|s| s.get(f).copied());
+                debug_assert!(
+                    gate_b1.is_some(),
+                    "lowband floor enabled without a gate b1 for frame {f}"
+                );
+                let gate = gate_b1.is_some_and(band_decompress::lowband_gate_from_b1);
+                let (amps, biased) = loudness_fixed::mechanism_ml_lowband_floored(
+                    &g2,
+                    l_us,
+                    f64::from(omega_0),
+                    gate,
+                    &mut self.lowband_l0,
+                );
+                floored_biased = Some(biased);
+                amps
+            } else {
+                loudness_fixed::amps_from_mechanism_bins(&g2, l_us, f64::from(omega_0)).0
+            }
         } else {
             loudness_fixed::amps_from_bins_omega(spec, l_us, f64::from(omega_0))
         };
@@ -1434,7 +1493,10 @@ impl Encoder {
         // threaded across frames via next_bias_raw_exact (starts at 0). This is
         // the port of the reference gain path (DLL sub_0x10313ec0).
         if let Some(g2) = aligned_gap2 {
-            let biased = loudness_fixed::biased_from_mechanism_bins(&g2, l_us, f64::from(omega_0));
+            let biased = match floored_biased.take() {
+                Some(b) => b,
+                None => loudness_fixed::biased_from_mechanism_bins(&g2, l_us, f64::from(omega_0)),
+            };
             let gamma_raw = loudness_fixed::gamma_ref_exact(&biased, l_us, self.bias_raw_state);
             let idx = loudness_fixed::nearest_gain_o_index(gamma_raw);
             b[2] = u16::from(idx);

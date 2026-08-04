@@ -369,3 +369,75 @@ pub(crate) fn band_decompress(step: i16, count: usize, bins: &[i32], outer: i16)
 //     `l0` trajectory 199/199 on BOTH files.
 // With the gate correct, self-driven M_l is exact on every scoreable frame of
 // both files (voiced 196/196, mark 197/197).
+
+/// Initial value of the low-band floor's recursive `L0` state (live-confirmed).
+pub(crate) const LOWBAND_L0_INIT: i16 = 13107; // 0x3333
+
+/// The low-band floor's `a4 & 1` gate, recovered from the QUANTIZED voicing index.
+///
+/// `a4` itself is the *pre-VQ* raw per-band voicing vector and is not a codebook
+/// entry (171/398 captured frames match no codebook dword), so the gate cannot be
+/// read off `a4` post-quantization. It is however recoverable from `b1`: the VQ
+/// reads bands REVERSED (`build_arrays` uses word `15-k`), so band 0 lives at bit
+/// 30, and `VOICING_CB[b1*4] >> 30 & 1` is exactly `[1;16] ++ [0;16]`. The gate
+/// therefore reduces to `b1 < 16` -- a structural codebook-ordering property, not
+/// an in-sample fit. Matches the live-captured gate 398/398 across both files.
+pub(crate) fn lowband_gate_from_b1(b1: u16) -> bool {
+    (crate::enc::voicing_vq::VOICING_CB[(b1 as usize) * 4] >> 30) & 1 == 1
+}
+
+/// Verbatim port of the gated low-band spectral-amplitude floor.
+///
+/// `ml` is the post-bias_clamp M_l vector (Q11 log2 words, modified in place);
+/// `step` is the frame's pitch step; `l0` is the caller-held recursive state
+/// (seed with [`LOWBAND_L0_INIT`]).
+///
+/// CALL ONLY WHEN [`lowband_gate_from_b1`] IS TRUE. The `l0` tail is unconditional
+/// *within* the call, but the call itself is gated -- calling on a gated-off frame
+/// advances `l0` spuriously and desyncs every later frame.
+pub(crate) fn lowband_floor(ml: &mut [i16], step: i16, l0: &mut i16) {
+    let l0v = *l0;
+    if step <= 0x3333 {
+        let mut band: i32 = if step > 0x199a {
+            0
+        } else if step <= 0x1111 {
+            2
+        } else {
+            1
+        };
+        let step_i = step as i32;
+        let n = band + 1;
+        let mut rem: i16 = (((n.wrapping_mul(step_i) << 16)
+            .wrapping_sub((l0v as i32).wrapping_mul(0xcccc)))
+            >> 16) as i16;
+        while band >= 0 {
+            if rem <= 0 {
+                break;
+            }
+            if (band as usize) + 1 >= ml.len() {
+                break;
+            }
+            let ml_sh: i32 = (ml[(band + 1) as usize] as i32) << 16;
+            let c: i32 = step_i.wrapping_mul(-15360i32);
+            let sum = c.wrapping_add(ml_sh);
+            let ov = (sum ^ c) & (sum ^ ml_sh);
+            let sat = if ov >= 0 {
+                sum
+            } else if ml_sh < 0 {
+                0x8000_0000u32 as i32
+            } else {
+                0x7fff_ffff
+            };
+            let v = (sat >> 16) as i16;
+            if ml[band as usize] < v {
+                ml[band as usize] = v;
+            }
+            band -= 1;
+            rem = ((rem as i32).wrapping_sub(step_i)) as i16;
+        }
+    }
+    // TAIL -- always runs once the call is ENTERED (but the call is gated).
+    let step_term = (step as i32).wrapping_mul(0xcccc) >> 3;
+    let l0_term = (l0v as i32).wrapping_mul(0xe666);
+    *l0 = (step_term.wrapping_add(l0_term) >> 16) as i16;
+}

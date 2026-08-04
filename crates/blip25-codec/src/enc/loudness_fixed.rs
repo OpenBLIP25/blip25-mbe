@@ -326,6 +326,56 @@ pub(crate) fn biased_from_mechanism_bins(
         .collect()
 }
 
+/// [`amps_from_mechanism_bins`] + [`biased_from_mechanism_bins`] in one pass,
+/// with the reference's gated low-band spectral floor applied between the
+/// bias-clamp and BOTH consumers.
+///
+/// Returns `(amplitudes, biased)`: the relinearized `M_l` the shape quantizer
+/// consumes and the bias-clamped words [`gamma_ref_exact`] consumes. The single
+/// call keeps them derived from the same floored vector; recomputing `biased`
+/// separately would feed `b2` an unfloored `M_l` while `b3..b8` saw the floored
+/// one.
+///
+/// `gate` selects whether [`band_decompress::lowband_floor`] runs at all —
+/// including its `l0` tail, which is a recursive leaky integrator and must not
+/// advance on a gated-off frame. `l0` is caller-held and seeded with
+/// [`band_decompress::LOWBAND_L0_INIT`].
+///
+/// The floor's increment is carried back onto the *un-biased* words rather than
+/// relinearizing `biased` directly: `bias_clamp_one`'s uniform `+0xAA` cancels in
+/// the PRBA/HOC shape but not in the quantizer's own pre-override `b2`, which
+/// advances the cross-frame gain predictor. With `gate == false` this makes the
+/// returned amplitudes bit-identical to [`amps_from_mechanism_bins`].
+pub(crate) fn mechanism_ml_lowband_floored(
+    gap2: &[i16; super::history_ring::GAP2_LEN],
+    l: usize,
+    omega_0: f64,
+    gate: bool,
+    l0: &mut i16,
+) -> (Vec<f32>, Vec<i16>) {
+    let (bins, scale) = frame_power_and_scale(gap2, true);
+    let outer = scale - 30;
+    let l_c = l.clamp(1, 56);
+    let step = step_table::step_for_omega(l_c as u32, omega_0);
+    let raw = band_decompress::band_decompress(step, l.max(1), &bins, outer);
+
+    let pre: Vec<i16> = raw
+        .iter()
+        .map(|&v| band_decompress::bias_clamp_one(v))
+        .collect();
+    let mut biased = pre.clone();
+    if gate {
+        band_decompress::lowband_floor(&mut biased, step, l0);
+    }
+    let ml: Vec<i16> = raw
+        .iter()
+        .zip(pre.iter())
+        .zip(biased.iter())
+        .map(|((&r, &p), &b)| r.saturating_add(b.saturating_sub(p)))
+        .collect();
+    (band_to_amps(&ml), biased)
+}
+
 /// Shared tail of the `amps_from_bins*` family: relinearize each
 /// `band_decompress` log2-domain word (`2^(word/2048)`) into a linear `M_l`.
 fn band_to_amps(raw: &[i16]) -> Vec<f32> {
