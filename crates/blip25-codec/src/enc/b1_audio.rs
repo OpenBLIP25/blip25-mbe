@@ -224,6 +224,26 @@ fn a5_gate_tail(out0: i16, out1: i16, r: i16, sc: i32, cbuf: &[i16]) -> (i16, i1
     (ph0 as i16, ph1 as i16, expx)
 }
 
+/// Opt-in switch (`BLIP25_TS_NEXT=1`, OFF by default) for the a5 analysis
+/// window's spectral transform: the FULL multistage `fft_bfp_transform` on
+/// every call rather than the stage-1-only `loudness_array_transform` that the
+/// `FLUSH_LOOKAHEAD` rule in [`a5_pcm_arms`] otherwise selects.
+///
+/// Read out of the live Wave7k DLL by hooking the T/S producer
+/// (`0x10314070`, the sole caller of the (T,S) delay line): at the unchanged
+/// window start `s = (2*f + c) * 80 - 275`, the multistage
+/// `(power[129], scale)` is bit-exact against the oracle's own arguments on
+/// 236/236 `mark` calls and 294/294 `clean` calls; the stage-1-only transform
+/// matches 0/236 and 0/294 (`scale` alone 70/236).
+pub(crate) fn ts_next_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("BLIP25_TS_NEXT")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    })
+}
+
 /// Per-(frame,call) PCM arms + exp_y + x-arm self-corr exponent `sc`.
 /// `pre` = the encoder's prefiltered stream (`prefiltered_log`), the same
 /// signal the a5 window was validated against. `seq = 2*f + c`, window start
@@ -264,8 +284,11 @@ fn a5_pcm_arms(pre: &[i16], f: usize, c: usize) -> Option<(Vec<i16>, Vec<i16>, i
     // FLUSH_LOOKAHEAD ~= the analysis forward context (~12 frames), calibrated to
     // reproduce the measured boundary on the 200-frame clips (first flush call =
     // frame 189) while generalizing to any input length.
+    //
+    // Direct DLL readout contradicts the whole flush rule: the oracle takes the
+    // multistage transform on EVERY call. `ts_next_enabled` is that reading.
     const FLUSH_LOOKAHEAD: usize = 1876;
-    let multi = (s as usize + GAP2_LEN + FLUSH_LOOKAHEAD) > pre.len();
+    let multi = ts_next_enabled() || (s as usize + GAP2_LEN + FLUSH_LOOKAHEAD) > pre.len();
     // The y-arm POWER + SCALE share the SAME per-frame fft_bfp_transform stage
     // count k as the x-arm: both are one d890 fft_bfp_transform+a1b0 pass over the
     // same loudness window. Pinning power/scale to a fixed k=6 while latching the
