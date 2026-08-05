@@ -21,6 +21,7 @@
 //! through the decoder reproduces the quantized parameters bit-for-bit.
 
 pub mod a5_assemble;
+pub mod amp_next;
 pub mod analysis;
 pub mod analysis_stage_window;
 pub use crate::shared::array_a_stage2;
@@ -161,6 +162,16 @@ pub struct Encoder {
     /// track), NOT the Encoder's own internal `b1`. Parallel to
     /// [`Self::forced_b0`].
     lowband_gate_b1: Option<Vec<u16>>,
+    /// Take `b3..b8` from the reference's own fixed-point amplitude shape
+    /// quantizer ([`amp_next`]) instead of the real-valued forward transform.
+    /// Off by default; only reachable on the Route A path
+    /// ([`Self::live_gap2_amps`]), since it needs that path's aligned
+    /// amplitude vector and its reference-exact gain.
+    amp_next: bool,
+    /// That quantizer's cross-frame predictor memory. Advances only on frames
+    /// where [`Self::amp_next`] actually runs, so a disabled build threads no
+    /// state at all.
+    amp_state: amp_next::AmpShapeState,
     /// Gate for the DIAGNOSTIC/EXPERIMENTAL per-frame analysis paths (every
     /// `*_x86_*` research log and its isolated cross-frame state below). Off
     /// by default: `analyze_frame` then does ZERO experimental-path work and
@@ -695,6 +706,8 @@ impl Encoder {
             lowband_floor: false,
             lowband_l0: band_decompress::LOWBAND_L0_INIT,
             lowband_gate_b1: None,
+            amp_next: false,
+            amp_state: amp_next::AmpShapeState::new(),
             diagnostics: false,
             frame_energy_log: Vec::new(),
             next_emit: 0,
@@ -923,6 +936,14 @@ impl Encoder {
     /// transmitted one is the reference's own gate input.
     pub fn set_lowband_gate_b1(&mut self, seq: Vec<u16>) {
         self.lowband_gate_b1 = Some(seq);
+    }
+
+    /// Take `b3..b8` from the reference's fixed-point amplitude shape quantizer
+    /// (see [`Self::amp_next`]). Requires [`Self::set_live_gap2_amps`]; a no-op
+    /// without it. Set before feeding any frames so the predictor memory starts
+    /// from frame 0.
+    pub fn set_amp_next(&mut self, on: bool) {
+        self.amp_next = on;
     }
 
     /// Analysis look-ahead depth in frames. One frame normally; two when
@@ -1529,6 +1550,25 @@ impl Encoder {
             let idx = loudness_fixed::nearest_gain_o_index(gamma_raw);
             b[2] = u16::from(idx);
             self.bias_raw_state = loudness_fixed::next_bias_raw_exact(self.bias_raw_state, idx);
+
+            // Reference-exact shape quantizer (opt-in). Runs on the same aligned
+            // `biased` the gain override just consumed, and on the gain state
+            // this frame just committed -- `bias_raw_state` after the update IS
+            // the reconstructed frame gain the reference's shape reconstruction
+            // anchors its DC term to. Last writer of `b3..b8`, so it also
+            // supersedes the near-silence pins above, which model the
+            // real-valued transform's block-0 inflation and have nothing to
+            // correct here.
+            if self.amp_next {
+                if let Some(shape) = amp_next::quantize_shape(
+                    &mut self.amp_state,
+                    &biased,
+                    l_us,
+                    self.bias_raw_state,
+                ) {
+                    b[3..9].copy_from_slice(&shape);
+                }
+            }
         }
 
         // --- EXPERIMENTAL comparison path (loudness_fixed) -----------------

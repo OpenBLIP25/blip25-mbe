@@ -894,6 +894,7 @@ impl Vocoder {
             e2.set_forced_b0(fb.clone());
         }
         e2.set_live_gap2_amps(true);
+        e2.set_amp_next(amp_next_enabled());
         if !orac_b1.is_empty() {
             // The packer tone branch's `(L, step)` override for the same frame
             // whose `b̂₀` `forced_b0` injected: analyse frame `f` carries
@@ -1562,6 +1563,17 @@ fn lowband_floor_enabled() -> bool {
     *ON.get_or_init(|| std::env::var("BLIP25_LOWBAND_FLOOR").as_deref() == Ok("1"))
 }
 
+/// Opt-in for the encoder's fixed-point amplitude shape quantizer
+/// (`BLIP25_AMP_NEXT=1`), read once. Same rationale for the env read living
+/// here as [`lowband_floor_enabled`]. Off, `b3..b8` come from the real-valued
+/// forward transform and the emitted bits are byte-identical to a build
+/// without it.
+#[cfg(feature = "encode")]
+fn amp_next_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("BLIP25_AMP_NEXT").as_deref() == Ok("1"))
+}
+
 /// The same offset on the OUTPUT-frame axis. Output frame `i` is source frame
 /// `i + 1` (the dropped look-ahead placeholder), so the two constants differ by
 /// exactly that one frame.
@@ -1660,6 +1672,7 @@ impl AmbeStream {
         e.set_live_gap2_amps(true);
         let floor = lowband_floor_enabled();
         e.set_lowband_floor(floor);
+        e.set_amp_next(amp_next_enabled());
         Self {
             with_fec,
             tone_on,

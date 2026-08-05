@@ -538,10 +538,7 @@ pub(crate) fn gamma_ref_exact_intermediates(
     };
     let mean16 = mean_i32 as i16;
 
-    let l_ret = band_decompress::log2_fn(l as i16, 15);
-    let shifted = band_decompress::shift_scale(l_ret, 0xf - 5);
-    let rounded = sat_add32(shifted, 0x8000);
-    let log2l16 = (rounded >> 16) as u16 as i16;
+    let log2l16 = log2_count_q10(l);
 
     let combined = sat_add32(
         ((mean16 as i32) << 16) as u32,
@@ -561,6 +558,14 @@ pub(crate) fn gamma_ref_exact_intermediates(
         after as i32,
         gamma_raw,
     )
+}
+
+/// `log2(count)` in the reference's Q10 word format — the harmonic-count term
+/// the gain target adds and the shape reconstruction's DC anchor subtracts.
+pub(crate) fn log2_count_q10(count: usize) -> i16 {
+    let raw = band_decompress::log2_fn(count as i16, 15);
+    let shifted = band_decompress::shift_scale(raw, 0xf - 5);
+    (sat_add32(shifted, 0x8000) >> 16) as u16 as i16
 }
 
 #[inline]
