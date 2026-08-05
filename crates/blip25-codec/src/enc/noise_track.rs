@@ -24,6 +24,9 @@ use crate::enc::loudness_fixed::gamma_poly_magsq16;
 use crate::enc::real_fft32::real_fft32;
 use crate::enc::windowed_taper::windowed_taper;
 use crate::fixops::acc64::sat16;
+// `FUN_1030a600`, the fractional divide, lives in `crate::shared` so the
+// always-compiled IMBE pitch quantiser can reach it too.
+use crate::shared::fractional_divide::a600;
 
 /// The two analysis passes' window bases, in samples relative to the frame start,
 /// and the offset/length of the run each pass takes its block exponent over.
@@ -612,38 +615,6 @@ fn a660(p1: i32, p2: i32, p3: i32, p4: i32) -> (i32, i32) {
         return (0, 0);
     }
     (m, s16(s16(e - n) - s16(p4)))
-}
-
-/// `FUN_1030a600`: fractional divide.
-fn a600(p1: i32, p2: i32) -> i32 {
-    let den0 = s16(p2);
-    let sgn = den0 ^ p1;
-    let num = if p1 < 0 {
-        if p1 == i32::MIN {
-            i32::MAX
-        } else {
-            -p1
-        }
-    } else {
-        p1
-    };
-    let den = if den0 < 0 {
-        if den0 == -0x8000 {
-            0x7fff
-        } else {
-            -den0
-        }
-    } else {
-        den0
-    };
-    if den == 0 {
-        return 0;
-    }
-    let mut r = if num < den { 0 } else { (num / den) >> 1 };
-    if sgn < 0 {
-        r = -r;
-    }
-    r
 }
 
 /// `FUN_1030a890`: `2^x` with a block-float rescale.

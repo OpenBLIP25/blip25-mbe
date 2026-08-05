@@ -13,8 +13,9 @@
 //!   [`array_a_stage2`], [`loudness_transform`], [`cepstral_normalize`].
 //! * **Extracted primitives** pulled out of otherwise encode-heavy modules:
 //!   [`gamma_poly`] (from `loudness_fixed`), [`q_energy`] (from `pq_builder` /
-//!   `band_decompress`), [`step_count`] (from `step_recursive_fixed`), and
-//!   [`voicing_map`] (from `voicing_vq`).
+//!   `band_decompress`), [`step_count`] (from `step_recursive_fixed`),
+//!   [`voicing_map`] (from `voicing_vq`), and [`fractional_divide`] (from
+//!   `noise_track`).
 
 pub mod array_a_stage2;
 pub mod atan2_bfp_divide;
@@ -22,6 +23,7 @@ pub mod atan2_chain;
 pub mod bfp_add;
 pub mod cepstral_normalize;
 pub mod encode_frame;
+pub mod fractional_divide;
 pub mod gamma_poly;
 pub mod loudness_transform;
 pub mod q_energy;

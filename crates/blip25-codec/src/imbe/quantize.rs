@@ -482,12 +482,15 @@ pub fn quantize_to_u(
         num_harms_prev,
         false,
         f32::MAX,
+        0,
     )
 }
 
 /// As [`quantize_to_u`], with `mech` selecting the gain-DC bias regime in
 /// [`sa_encode`]: `true` for the mechanism-sourced (pitch-aligned fixed-point
 /// spectrum) amplitude level, `false` for the synthesized-DFT proxy level.
+///
+/// `sync` is `b̂_{L+2}`, the frame's synchronisation bit.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn quantize_to_u_mech(
     b0: u8,
@@ -498,6 +501,7 @@ pub(crate) fn quantize_to_u_mech(
     num_harms_prev: i16,
     mech: bool,
     src_rms: f32,
+    sync: u8,
 ) -> [u16; 8] {
     let nh = num_harms;
     let num_bands = if nh <= 36 {
@@ -529,7 +533,7 @@ pub(crate) fn quantize_to_u_mech(
         mech,
         src_rms,
     );
-    // sync bit = 0 (b_vec[L+2]); already zero.
+    b_vec[nh as usize + 2] = i16::from(sync & 1);
     encode_frame_vector(&b_vec, nh, num_bands, &bit_alloc)
 }
 
@@ -587,6 +591,25 @@ pub fn pitch_omega0(b0: i16) -> f64 {
     std::f64::consts::PI * (fund_freq as f64) / 2_147_483_648.0
 }
 
+/// The reference's IMBE pitch quantiser: prequantiser pitch word → `b̂₀`
+/// (`FUN_10311170`).
+///
+/// `word` is the encoder's `block[+0xc]`, the same value the AMBE+2 quantiser
+/// [`crate::enc::pitch::reject_recurrence::reject_b0`] consumes. The two grids
+/// differ: AMBE+2 takes `log2` of the word onto a 120-cell ladder, IMBE divides
+/// into it, which is linear in the pitch period and gives 208 cells. Going
+/// through the AMBE+2 index and back out through a float ω₀ therefore cannot
+/// address the IMBE grid — it can only reach the 113 cells that are images of
+/// AMBE+2 cells.
+///
+/// The divide is [`crate::shared::fractional_divide::a600`] with a `2^27`
+/// numerator; the affine tail is the reference's, exactly.
+pub fn imbe_b0_from_pitch_word(word: u16) -> u8 {
+    let q = crate::shared::fractional_divide::a600(0x0800_0000, i32::from(word)) as i16;
+    let v = (((i32::from(q) << 16) >> 5) - 0x004E_0000) >> 17;
+    (v as i16).clamp(0, 0xCF) as u8
+}
+
 /// Quantize an analysis fundamental frequency `omega_0` (rad/sample) to the
 /// nearest IMBE pitch index `b0`, returning `(b0, num_harms)` where `num_harms`
 /// is exactly the decoder's harmonic count for that `b0`. Only voice cells whose
@@ -624,13 +647,14 @@ pub fn quantize_frame(
     sa_q142: &[i16],
 ) -> [u8; super::frame::FRAME_BYTES] {
     // Generic non-mech entry point: no source RMS, energy-gated floor off.
-    quantize_frame_mech(enc, b0, num_harms, voiced, sa_q142, false, f32::MAX)
+    quantize_frame_mech(enc, b0, num_harms, voiced, sa_q142, false, f32::MAX, 0)
 }
 
 /// As [`quantize_frame`], with `mech` selecting the gain-DC bias regime (see
 /// [`quantize_to_u_mech`] / `sa_encode`): `true` for the whole-buffer reference
 /// fixed-point spectrum amplitude source, `false` for the streaming
-/// synthesized-DFT proxy.
+/// synthesized-DFT proxy. `sync` is the frame's synchronisation bit `b̂_{L+2}`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn quantize_frame_mech(
     enc: &mut ImbeEncState,
     b0: u8,
@@ -639,11 +663,12 @@ pub(crate) fn quantize_frame_mech(
     sa_q142: &[i16],
     mech: bool,
     src_rms: f32,
+    sync: u8,
 ) -> [u8; super::frame::FRAME_BYTES] {
     let snap = enc.st.snapshot();
     let la = amps_to_la(sa_q142);
     let u = quantize_to_u_mech(
-        b0, num_harms, voiced, &la, &snap.0, snap.1, mech, src_rms,
+        b0, num_harms, voiced, &la, &snap.0, snap.1, mech, src_rms, sync,
     );
     // Advance the encoder state to mirror the decoder on the produced bits.
     let fr = ImbeFrame { u, errors: [0; 8] };
@@ -653,4 +678,47 @@ pub(crate) fn quantize_frame_mech(
         .zip(U_WIDTHS.iter())
         .all(|(&v, &w)| (v as u32) < (1 << w)));
     enframe(&u)
+}
+
+#[cfg(test)]
+mod pitch_word_tests {
+    use super::imbe_b0_from_pitch_word;
+
+    /// `(prequantiser pitch word, b0)` pairs read off the reference encoder's
+    /// own `FUN_10311170` under a live hook, spanning the observed word range
+    /// (3276..25438 across mark/dam/clean/noisy).
+    const REFERENCE: [(u16, u8); 6] = [
+        (3276, 207),
+        (4908, 174),
+        (6022, 135),
+        (8494, 84),
+        (12426, 45),
+        (25438, 2),
+    ];
+
+    #[test]
+    fn matches_the_reference_pitch_quantizer() {
+        for (w, b0) in REFERENCE {
+            assert_eq!(imbe_b0_from_pitch_word(w), b0, "word {w}");
+        }
+    }
+
+    #[test]
+    fn stays_inside_the_valid_pitch_range() {
+        for w in 1..=u16::MAX {
+            assert!(imbe_b0_from_pitch_word(w) <= 207);
+        }
+        assert_eq!(imbe_b0_from_pitch_word(0), 0);
+    }
+
+    /// Every cell the grid can address is reachable -- the property the AMBE+2
+    /// index round trip does not have (it reaches 113 of 208).
+    #[test]
+    fn addresses_the_whole_grid() {
+        let mut seen = [false; 208];
+        for w in 1..=u16::MAX {
+            seen[imbe_b0_from_pitch_word(w) as usize] = true;
+        }
+        assert!(seen.iter().all(|&s| s));
+    }
 }

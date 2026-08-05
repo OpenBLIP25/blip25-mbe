@@ -62,6 +62,11 @@ pub const FRAME_SAMPLES: usize = 160;
 /// spectral-DP pitch saturates to a spurious high `b0` there.
 const IMBE_SILENCE_B0: u8 = 31;
 
+/// The same silence default read straight off the IMBE grid — the constant the
+/// reference's own silence arm writes. Injected in place of [`IMBE_SILENCE_B0`]
+/// on the paths that force `b̂₀` on the IMBE grid.
+const IMBE_SILENCE_IMBE_B0: u8 = 25;
+
 /// Source-RMS threshold below which an IMBE frame is treated as silence and its
 /// pitch pinned to [`IMBE_SILENCE_B0`]. Voiced frames sit far above this (agreeing
 /// frames average RMS ~1400–1800; silence frames ~80–350), so the split is clean.
@@ -693,6 +698,7 @@ impl Vocoder {
                 if imbe {
                     if let Some(e) = enc.w_enc.as_mut() {
                         e.set_live_gap2_amps(true);
+                        e.set_imbe_sync_toggle(imbe_next_enabled());
                     }
                 }
                 // Reference pitch for IMBE — THE single pitch path (same RE'd
@@ -700,11 +706,11 @@ impl Vocoder {
                 // The packer tone branch is half-rate only, so this uses the
                 // variant without it and matches `ImbeStream`.
                 {
-                    let reference_b0 =
-                        blip25_codec::enc::pcm_encode::encode_pcm_b0_no_tone_branch(
-                            pcm,
-                            blip25_codec::enc::pcm_encode::EncodeOpts::default(),
-                        );
+                    let track = blip25_codec::enc::pcm_encode::encode_pcm_pitch_no_tone_branch(
+                        pcm,
+                        blip25_codec::enc::pcm_encode::EncodeOpts::default(),
+                    );
+                    let reference_b0 = track.b0;
                     if !reference_b0.is_empty() {
                         let nf = pcm.len() / FRAME_SAMPLES;
                         // Silence gate: on low-energy frames the reference spectral-DP
@@ -728,6 +734,29 @@ impl Vocoder {
                             .collect();
                         if let Some(e) = enc.w_enc.as_mut() {
                             e.set_forced_b0(forced);
+                        }
+                        // The same silence gate on the IMBE grid, quantizing the
+                        // tracker's own pitch word rather than re-deriving a
+                        // fundamental from the AMBE+2 index.
+                        if imbe && imbe_next_enabled() {
+                            let forced_imbe: Vec<u8> = (0..nf)
+                                .map(|f| {
+                                    let chunk = &pcm[f * FRAME_SAMPLES..(f + 1) * FRAME_SAMPLES];
+                                    let ss: f64 =
+                                        chunk.iter().map(|&x| (x as f64) * (x as f64)).sum();
+                                    let rms = (ss / FRAME_SAMPLES as f64).sqrt();
+                                    if rms < IMBE_SILENCE_RMS {
+                                        IMBE_SILENCE_IMBE_B0
+                                    } else {
+                                        blip25_codec::imbe::quantize::imbe_b0_from_pitch_word(
+                                            track.word[(f + 2).min(track.word.len() - 1)],
+                                        )
+                                    }
+                                })
+                                .collect();
+                            if let Some(e) = enc.w_enc.as_mut() {
+                                e.set_forced_imbe_b0(forced_imbe);
+                            }
                         }
                     }
                 }
@@ -1574,6 +1603,25 @@ fn amp_next_enabled() -> bool {
     *ON.get_or_init(|| std::env::var("BLIP25_AMP_NEXT").as_deref() == Ok("1"))
 }
 
+/// Opt-in for the IMBE back end's own `b̂₀` and synchronisation bit
+/// (`BLIP25_IMBE_NEXT=1`), read once. Same rationale for the env read living
+/// here as [`lowband_floor_enabled`]. Off, IMBE keeps the AMBE+2 index round
+/// trip and the pinned-zero sync bit, and every rate's emitted bits are
+/// byte-identical to a build without it.
+///
+/// On, two reference mechanisms replace fitted stand-ins:
+///
+/// * `b̂₀` is quantized from the prequantiser pitch word onto the 208-cell IMBE
+///   grid ([`blip25_codec::imbe::quantize::imbe_b0_from_pitch_word`]) instead of
+///   being re-derived from the 120-cell AMBE+2 index, which can only address 113
+///   of those cells.
+/// * `b̂_{L+2}` toggles per emitted frame instead of being pinned to zero.
+#[cfg(feature = "encode")]
+fn imbe_next_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("BLIP25_IMBE_NEXT").as_deref() == Ok("1"))
+}
+
 /// The same offset on the OUTPUT-frame axis. Output frame `i` is source frame
 /// `i + 1` (the dropped look-ahead placeholder), so the two constants differ by
 /// exactly that one frame.
@@ -2084,11 +2132,15 @@ struct ImbeStream {
     hdr: Hdr30State,
     hdr30: Vec<i32>,
     reference_b0: Vec<u8>,
+    /// The prequantiser pitch word behind each `reference_b0` entry, carried so
+    /// the IMBE grid can be addressed directly rather than through that index.
+    reference_word: Vec<u16>,
     reference_frame: usize,
     b1: Vec<u16>,
     /// Both indexed by ANALYSIS frame, which for IMBE is also the output index.
     forced_b0: Vec<u8>,
     forced_b1: Vec<u16>,
+    forced_imbe_b0: Vec<u8>,
     horizon: usize,
     fed: usize,
     out_count: usize,
@@ -2103,6 +2155,7 @@ impl ImbeStream {
         // match it here or the amplitude fields diverge.
         let mut e = blip25_codec::enc::Encoder::new();
         e.set_live_gap2_amps(true);
+        e.set_imbe_sync_toggle(imbe_next_enabled());
         // The forced vectors grow as the analysis finalises, so a feed that runs
         // ahead of them must fail loudly rather than quietly encode a frame with
         // the estimator — that is exactly the fricative buzz coming back.
@@ -2117,10 +2170,12 @@ impl ImbeStream {
             hdr: Hdr30State::new(),
             hdr30: Vec::new(),
             reference_b0: Vec::new(),
+            reference_word: Vec::new(),
             reference_frame: 0,
             b1: Vec::new(),
             forced_b0: Vec::new(),
             forced_b1: Vec::new(),
+            forced_imbe_b0: Vec::new(),
             horizon: 0,
             fed: 0,
             out_count: 0,
@@ -2247,6 +2302,7 @@ impl ImbeStream {
                 .reference
                 .push_pcm_frame_with_prev_mask(&self.pref, a11);
             self.reference_b0.push(b0);
+            self.reference_word.push(self.reference.last_pitch_word());
             self.reference_frame += 1;
         }
         // (4) grow the forced vectors over the analysis frames whose inputs are
@@ -2275,9 +2331,19 @@ impl ImbeStream {
             };
             self.forced_b0.push(b0);
             self.forced_b1.push(self.b1[(f + 2).min(self.b1.len() - 1)]);
+            self.forced_imbe_b0.push(if rms < IMBE_SILENCE_RMS {
+                IMBE_SILENCE_IMBE_B0
+            } else {
+                blip25_codec::imbe::quantize::imbe_b0_from_pitch_word(
+                    self.reference_word[(f + 2).min(self.reference_word.len() - 1)],
+                )
+            });
         }
         self.e.set_forced_b0(self.forced_b0.clone());
         self.e.set_forced_b1(self.forced_b1.clone());
+        if imbe_next_enabled() {
+            self.e.set_forced_imbe_b0(self.forced_imbe_b0.clone());
+        }
         // (5) feed. The two-frame look-ahead means feeding source `k` emits
         //     analysis frame `k - 2`, so covering analysis frames `< covered`
         //     needs sources through `covered + 2`.

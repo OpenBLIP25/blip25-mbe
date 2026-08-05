@@ -124,6 +124,20 @@ pub struct Encoder {
     /// ω0/L grid. Left `None` on a bare `Encoder` and on `encode_pcm`, which
     /// keep the float voicing path.
     forced_b1: Option<Vec<u16>>,
+    /// IMBE pitch override on the IMBE grid, indexed by emit-frame `f`. When set,
+    /// [`Self::analyze_imbe_frame`] takes `b̂₀` from here instead of re-quantizing
+    /// a fundamental decoded from [`Self::forced_b0`].
+    ///
+    /// The two are not interchangeable. [`Self::forced_b0`] is an AMBE+2 index on
+    /// a 120-cell logarithmic ladder; the IMBE grid is 208 cells linear in the
+    /// pitch period, so the round trip through a fundamental can only address the
+    /// 113 IMBE cells that are images of AMBE+2 cells. The reference quantizes the
+    /// prequantiser pitch word onto each grid independently
+    /// ([`crate::imbe::quantize::imbe_b0_from_pitch_word`]).
+    forced_imbe_b0: Option<Vec<u8>>,
+    /// Emit `b̂_{L+2}` as the reference's per-frame toggle rather than a constant
+    /// zero. See [`Self::set_imbe_sync_toggle`].
+    imbe_sync_toggle: bool,
     /// When set, a forced vector that does not cover the frame being analysed is
     /// a debug-build panic rather than a silent fall back to the estimator.
     /// See [`Self::set_forced_strict`].
@@ -693,6 +707,11 @@ const IMBE_VOICE_BINNING_AND: bool = true; // AND: best net (broad b1 up most, l
 /// release-edge alignment in [`Encoder::analyze_imbe_frame`].
 const IMBE_SILENCE_AMBE_B0: u8 = 31;
 
+/// The IMBE pitch index the silence release pins to directly, on the paths that
+/// force `b̂₀` on the IMBE grid. Same cell [`IMBE_SILENCE_AMBE_B0`] re-quantizes
+/// to, and the constant the reference's own `g == 56` arm writes.
+const IMBE_SILENCE_IMBE_B0: u8 = 25;
+
 impl Encoder {
     pub fn new() -> Self {
         Self {
@@ -701,6 +720,8 @@ impl Encoder {
             forced_b0: None,
             forced_l56: None,
             forced_b1: None,
+            forced_imbe_b0: None,
+            imbe_sync_toggle: false,
             forced_strict: false,
             live_gap2_amps: false,
             bias_raw_state: 0,
@@ -899,6 +920,20 @@ impl Encoder {
     /// grid. Out-of-range frames fall back to the float voicing path.
     pub fn set_forced_b1(&mut self, seq: Vec<u16>) {
         self.forced_b1 = Some(seq);
+    }
+
+    /// Force the per-emit-frame IMBE pitch index (see `forced_imbe_b0`).
+    /// `seq[f]` is emit-frame `f`'s `b̂₀` on the 208-cell IMBE grid, indexed
+    /// exactly as [`Self::set_forced_b0`]'s sequence. Out-of-range frames fall
+    /// back to re-quantizing the [`Self::set_forced_b0`] fundamental.
+    pub fn set_forced_imbe_b0(&mut self, seq: Vec<u8>) {
+        self.forced_imbe_b0 = Some(seq);
+    }
+
+    /// Emit the IMBE synchronisation bit `b̂_{L+2}` as the reference does — a
+    /// strict toggle on the emit index — instead of pinning it to zero.
+    pub fn set_imbe_sync_toggle(&mut self, on: bool) {
+        self.imbe_sync_toggle = on;
     }
 
     /// Require the forced vectors to cover every frame that is analysed.
@@ -2269,10 +2304,16 @@ impl Encoder {
             .and_then(crate::dequantize::decode_pitch)
             .map(|p| p.omega_0)
             .unwrap_or(omega_0);
-        // Re-quantize the fundamental onto the IMBE pitch grid: this fixes both
-        // the transmitted b0 index and the harmonic count L the IMBE quantizer
-        // and decoder agree on.
-        let (mut b0_imbe, mut num_harms) = crate::imbe::quantize_pitch(omega_0);
+        // Fix the transmitted b0 index and the harmonic count L the IMBE
+        // quantizer and decoder agree on. `forced_imbe_b0` is already on the IMBE
+        // grid — the reference quantizes its prequantiser pitch word straight
+        // onto it — so it only needs the matching L. Without it, re-quantize the
+        // fundamental decoded from the AMBE+2 index.
+        let (mut b0_imbe, mut num_harms) =
+            match self.forced_imbe_b0.as_ref().and_then(|s| s.get(f).copied()) {
+                Some(b) => (b, crate::imbe::pitch_cell(i16::from(b)).1),
+                None => crate::imbe::quantize_pitch(omega_0),
+            };
         let mut l_us = num_harms as usize;
 
         // --- voicing over the magnitude spectrum at the IMBE harmonic count -
@@ -2394,8 +2435,16 @@ impl Encoder {
         // decision (it carried voiced energy iff any harmonic was voiced).
         self.imbe_prev_voiced = voiced.iter().any(|&v| v);
         if force_release {
-            if let Some(p) = crate::dequantize::decode_pitch(IMBE_SILENCE_AMBE_B0) {
-                let (rb0, rnh) = crate::imbe::quantize_pitch(p.omega_0);
+            let pinned = if self.forced_imbe_b0.is_some() {
+                Some((
+                    IMBE_SILENCE_IMBE_B0,
+                    crate::imbe::pitch_cell(i16::from(IMBE_SILENCE_IMBE_B0)).1,
+                ))
+            } else {
+                crate::dequantize::decode_pitch(IMBE_SILENCE_AMBE_B0)
+                    .map(|p| crate::imbe::quantize_pitch(p.omega_0))
+            };
+            if let Some((rb0, rnh)) = pinned {
                 b0_imbe = rb0;
                 num_harms = rnh;
                 l_us = num_harms as usize;
@@ -2404,11 +2453,7 @@ impl Encoder {
         }
         // Effective source RMS for the low-energy gain floor: a forced release
         // takes the silence floor even though the raw frame is still loud.
-        let eff_rms = if force_release {
-            0.0f32
-        } else {
-            src_rms
-        };
+        let eff_rms = if force_release { 0.0f32 } else { src_rms };
 
         // --- spectral amplitudes (linear M_l) at the IMBE harmonic count ----
         // The IMBE quantizer wants the RAW envelope M_l (no AMBE unvoiced-band
@@ -2448,6 +2493,13 @@ impl Encoder {
             })
             .collect();
 
+        // b̂_{L+2}, the synchronisation bit: the reference toggles it once per
+        // emitted frame, so it is the emit index's parity and nothing else.
+        let sync = if self.imbe_sync_toggle {
+            (f & 1) as u8
+        } else {
+            0
+        };
         let bytes = crate::imbe::quantize::quantize_frame_mech(
             &mut self.imbe_enc,
             b0_imbe,
@@ -2456,6 +2508,7 @@ impl Encoder {
             &sa_q142,
             mech,
             eff_rms,
+            sync,
         );
 
         self.next_emit += 1;

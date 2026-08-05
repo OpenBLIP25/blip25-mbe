@@ -1448,6 +1448,7 @@ pub struct B0Audio {
     prev_raw_r622: i32,
     trk: PitchTrackerState,
     frame: i64,
+    last_pq: u16,
 }
 
 impl Default for B0Audio {
@@ -1472,6 +1473,7 @@ impl B0Audio {
             prev_raw_r622: 0,
             trk: PitchTrackerState::default(),
             frame: 0,
+            last_pq: 8192,
         }
     }
 
@@ -1508,6 +1510,19 @@ impl B0Audio {
     /// `32767` seed.
     pub fn c62c_at(&self, f: usize) -> i32 {
         self.c62ch.get(f).copied().unwrap_or(32767)
+    }
+
+    /// The frame just pushed's prequantiser pitch word — the `block[+0xc]` the
+    /// reference hands its pitch quantisers. The AMBE+2 quantiser
+    /// ([`crate::enc::pitch::reject_recurrence::reject_b0`]) consumes it on a
+    /// 120-cell logarithmic ladder; the IMBE quantiser
+    /// ([`crate::imbe::quantize::imbe_b0_from_pitch_word`]) consumes the same
+    /// word on a 208-cell linear-in-period grid, so a caller on the IMBE path
+    /// needs the word rather than the AMBE index derived from it.
+    ///
+    /// Reads `8192` before any frame is pushed, matching the frame-0 seed.
+    pub fn last_pitch_word(&self) -> u16 {
+        self.last_pq
     }
 
     /// `Q[2]`: the c62c of the frame before the one just pushed.
@@ -1666,6 +1681,7 @@ impl B0Audio {
         self.c62eh.push(c62e);
         self.c62ch.push(c62c);
         self.prev_raw_r622 = raw_r622;
+        self.last_pq = pq as u16;
 
         crate::enc::pitch::reject_recurrence::reject_b0(pq as u16, 7)
     }

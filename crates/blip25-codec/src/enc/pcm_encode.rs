@@ -129,16 +129,47 @@ pub fn encode_pcm_b0(raw_pcm: &[i16], opts: EncodeOpts) -> Vec<u8> {
 /// the full-rate packer has no equivalent. Callers on the IMBE path use this so
 /// the whole-buffer and streaming IMBE encoders agree.
 pub fn encode_pcm_b0_no_tone_branch(raw_pcm: &[i16], opts: EncodeOpts) -> Vec<u8> {
+    encode_pcm_pitch_no_tone_branch(raw_pcm, opts).b0
+}
+
+/// One frame of the shared pitch tracker's output.
+///
+/// `b0` is the AMBE+2 pitch index; `word` is the prequantiser word `b0` was
+/// quantised from ([`crate::enc::b0_audio::B0Audio::last_pitch_word`]). The
+/// IMBE grid is finer than the AMBE+2 ladder, so an IMBE caller quantises the
+/// word itself rather than re-deriving a fundamental from `b0`.
+pub struct PitchTrack {
+    pub b0: Vec<u8>,
+    pub word: Vec<u16>,
+}
+
+/// [`encode_pcm_b0_no_tone_branch`], also returning the prequantiser pitch word
+/// behind each index. Same single tracker pass; nothing is recomputed.
+pub fn encode_pcm_pitch_no_tone_branch(raw_pcm: &[i16], opts: EncodeOpts) -> PitchTrack {
     let nframes = (raw_pcm.len() / FRAME_SAMPLES).saturating_sub(1);
     if nframes == 0 {
-        return Vec::new();
+        return PitchTrack {
+            b0: Vec::new(),
+            word: Vec::new(),
+        };
     }
     let (pref_full, _) = crate::enc::audio_prefilter::prefilter(
         &crate::enc::audio_prefilter::PrefilterState::default(),
         raw_pcm,
     );
     let bt = b1_track(&pref_full, raw_pcm, nframes, opts.refine_ring_p0);
-    b0_sequence(&pref_full, &bt, nframes, false)
+    let mut tracker = B0Audio::new();
+    let mut out = PitchTrack {
+        b0: Vec::with_capacity(nframes),
+        word: Vec::with_capacity(nframes),
+    };
+    for f in 0..nframes {
+        let a11 = if f == 0 { 0 } else { bt[f - 1].mask as i32 };
+        out.b0
+            .push(tracker.push_pcm_frame_with_prev_mask(&pref_full, a11));
+        out.word.push(tracker.last_pitch_word());
+    }
+    out
 }
 
 /// Opt-in switch (`BLIP25_TONE_BRANCH=1`, OFF by default) for the packer's
