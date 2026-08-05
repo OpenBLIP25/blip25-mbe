@@ -54,6 +54,7 @@ pub mod stage2_refine_dispatch;
 pub mod step_recursive_fixed;
 pub mod step_table;
 pub mod t_ring;
+pub(crate) mod tone_branch;
 pub mod voicing;
 pub mod voicing_fixed;
 pub mod voicing_vq;
@@ -104,6 +105,13 @@ pub struct Encoder {
     /// `Encoder` and on the public per-frame `Vocoder::encode_pcm`, both of
     /// which therefore keep the estimated pitch.
     forced_b0: Option<Vec<u8>>,
+    /// The packer tone branch's `(L, step)` override, indexed by emit-frame `f`
+    /// alongside [`Self::forced_b0`]. On a frame the branch fires, the packed
+    /// `b̂₀` is a tone index rather than a pitch index, and the reference writes
+    /// `L = 56` / `step = 0x1079` into both parameter blocks instead of decoding
+    /// the pitch table — so the amplitude chain must sample the spectrum on that
+    /// grid, not on `decode_pitch(b̂₀)`'s.
+    forced_l56: Option<Vec<bool>>,
     /// IMBE voicing override, indexed by emit-frame `f`. When set,
     /// [`Self::analyze_imbe_frame`] replaces the float `decide_voicing_cfg`
     /// decision with the shared reverse-engineered reference voicing metric: each
@@ -677,6 +685,7 @@ impl Encoder {
             analyzer: Analyzer::new(),
             state: DecoderState::new(),
             forced_b0: None,
+            forced_l56: None,
             forced_b1: None,
             forced_strict: false,
             live_gap2_amps: false,
@@ -859,6 +868,13 @@ impl Encoder {
     /// spectral-DP pitch.
     pub fn set_forced_b0(&mut self, seq: Vec<u8>) {
         self.forced_b0 = Some(seq);
+    }
+
+    /// Force the packer tone branch's `(L, step)` override (see
+    /// `forced_l56`). `seq[f]` is emit-frame `f`'s gate, indexed exactly as
+    /// [`Self::set_forced_b0`]'s sequence.
+    pub fn set_forced_l56(&mut self, seq: Vec<bool>) {
+        self.forced_l56 = Some(seq);
     }
 
     /// Force the per-emit-frame IMBE voicing word `b1` (see `forced_b1`).
@@ -1331,8 +1347,14 @@ impl Encoder {
         // and `AmbeStream` set it, feeding the `b0_audio` spectral-DP pitch; a
         // bare `Encoder` and the per-frame `Vocoder::encode_pcm` leave it `None`
         // and get `estimate_pitch` above.
+        let mut l56 = false;
         if let Some(g) = self.forced_b0.as_ref().and_then(|s| s.get(f).copied()) {
-            if let Some(pi) = crate::dequantize::decode_pitch(g) {
+            if self.forced_l56.as_ref().and_then(|s| s.get(f).copied()) == Some(true) {
+                l56 = true;
+                omega_0 = crate::shared::voicing_map::L56_OMEGA_0;
+                l = crate::shared::voicing_map::L56_L as u8;
+                b0 = g;
+            } else if let Some(pi) = crate::dequantize::decode_pitch(g) {
                 omega_0 = pi.omega_0;
                 l = pi.l;
                 b0 = g;
@@ -1434,9 +1456,13 @@ impl Encoder {
         // encoder, whose gain quantizer (DLL sub_0x10313ec0) works from the
         // spectral log-amplitude vector, not frame energy.
         let mut b = {
-            let bb = quantize::quantize_indices(&params, &self.state);
+            let bb = quantize::quantize_indices(&params, &self.state, l56);
             let u = quantize::pack_u(&bb);
-            let _ = crate::dequantize::dequantize(&u, &mut self.state);
+            let grid = l56.then_some((
+                crate::shared::voicing_map::L56_L as u8,
+                crate::shared::voicing_map::L56_OMEGA_0,
+            ));
+            let _ = crate::dequantize::dequantize_on_grid(&u, &mut self.state, grid);
             bb
         };
 

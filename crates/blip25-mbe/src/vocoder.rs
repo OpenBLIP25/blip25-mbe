@@ -908,6 +908,22 @@ impl Vocoder {
             e2.set_forced_b0(fb.clone());
         }
         e2.set_live_gap2_amps(true);
+        if !orac_b1.is_empty() {
+            // The packer tone branch's `(L, step)` override for the same frame
+            // whose `b̂₀` `forced_b0` injected: analyse frame `f` carries
+            // reference frame `f + BLAG`'s packing. A no-op with the branch off.
+            let last = orac_b1.len() - 1;
+            let nf = pcm.len() / FRAME_SAMPLES;
+            e2.set_forced_l56(
+                (0..=nf)
+                    .map(|f| {
+                        blip25_codec::enc::pcm_encode::tone_branch_l56(
+                            orac_b1[(f + BLAG).min(last)],
+                        )
+                    })
+                    .collect(),
+            );
+        }
         if lowband_floor_enabled() && !orac_b1.is_empty() {
             // Analyse frame `f` is packed with `orac_b1[f + BLAG]` whenever the
             // lag search below lands on `AMBE_B1_OUTPUT_LAG`, which is the same
@@ -1630,7 +1646,12 @@ struct AmbeStream {
     pref: Vec<i16>,
     raw: Vec<i16>,
     reference_b0: Vec<u8>,
+    /// The packer tone branch's gate per reference frame, carried alongside
+    /// `reference_b0` so the amplitude Encoder can be told which frames' `b̂₀`
+    /// is a tone index (see `Encoder::set_forced_l56`).
+    reference_l56: Vec<bool>,
     forced_b0: Vec<u8>,
+    forced_l56: Vec<bool>,
     b1: Vec<u16>,
     tone_of: Vec<Option<blip25_codec::tone::ToneFrameFields>>,
     det: blip25_codec::tone::ToneDetector,
@@ -1687,7 +1708,9 @@ impl AmbeStream {
             pref: Vec::new(),
             raw: Vec::new(),
             reference_b0: Vec::new(),
+            reference_l56: Vec::new(),
             forced_b0: Vec::new(),
+            forced_l56: Vec::new(),
             b1: Vec::new(),
             tone_of: Vec::new(),
             det: blip25_codec::tone::ToneDetector::new(),
@@ -1806,7 +1829,11 @@ impl AmbeStream {
                 i32::from(bt[cf - 1 - win_start].mask)
             };
             let b0 = self.reference.push_pcm_frame_with_prev_mask(&self.pref, a11);
-            self.reference_b0.push(b0);
+            let fr = &bt[cf - win_start];
+            self.reference_b0
+                .push(blip25_codec::enc::pcm_encode::b0_with_tone_branch(b0, fr));
+            self.reference_l56
+                .push(blip25_codec::enc::pcm_encode::tone_branch_l56(fr.b1));
             self.reference_frame += 1;
         }
         // (4) forced-b0 for the persistent amplitude Encoder (whole-buffer maps
@@ -1826,8 +1853,10 @@ impl AmbeStream {
             let src = self.forced_b0.len();
             let idx = (src + 2).min(self.reference_b0.len().saturating_sub(1));
             self.forced_b0.push(self.reference_b0[idx]);
+            self.forced_l56.push(self.reference_l56[idx]);
         }
         self.e.set_forced_b0(self.forced_b0.clone());
+        self.e.set_forced_l56(self.forced_l56.clone());
         if self.floor && !self.b1.is_empty() {
             // Same lag `pack` applies, so the gate sees the `b1` that is
             // actually transmitted rather than the Encoder's internal estimate.

@@ -372,10 +372,30 @@ pub(crate) fn compute_m_tilde(
 
 /// Run the half-rate dequantization end-to-end: (u0..u3, state) -> MbeParams.
 pub fn dequantize(u: &[u16; 4], state: &mut DecoderState) -> Result<MbeParams, DecodeError> {
+    dequantize_on_grid(u, state, None)
+}
+
+/// [`dequantize`] with the harmonic grid supplied instead of decoded from `b̂₀`.
+///
+/// `grid = Some((L, omega_0))` is the packer tone branch's `(56, 0x1079)`
+/// override: on those frames `b̂₀` is a tone index, so the pitch table is not
+/// what the frame was analysed — or is synthesised — on. `None` is the ordinary
+/// path and decodes the grid from `b̂₀`.
+pub fn dequantize_on_grid(
+    u: &[u16; 4],
+    state: &mut DecoderState,
+    grid: Option<(u8, f32)>,
+) -> Result<MbeParams, DecodeError> {
     let b = deprioritize(u);
     let b0 = b[0] as u8;
-    let pitch = decode_pitch(b0).ok_or(DecodeError::BadPitch)?;
-    let l = pitch.l;
+    let (l, omega_0) = match grid {
+        Some((l, w)) => (l, w),
+        None => {
+            let pitch = decode_pitch(b0).ok_or(DecodeError::BadPitch)?;
+            (pitch.l, pitch.omega_0)
+        }
+    };
+    let pitch = PitchInfo { omega_0, l };
 
     let voiced = expand_vuv(b[1] as u8, pitch.omega_0, l);
     let gamma = decode_gain(b[2] as u8, state.prev_gamma);

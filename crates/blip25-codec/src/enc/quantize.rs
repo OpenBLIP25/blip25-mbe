@@ -370,12 +370,21 @@ fn forward_amplitudes(
 /// `gamma(-1)` and `prev_lambda` for the predictive gain and log-prediction.
 ///
 /// Returns `b` packed as `[b0,b1,b2,b3,b4,b5,b6,b7,b8]` (all LSB-aligned).
-pub(crate) fn quantize_indices(params: &MbeParams, state: &DecoderState) -> [u16; 9] {
+///
+/// `pin_b0` marks a packer tone-branch frame: `b̂₀` is then the classifier's
+/// tone index rather than a pitch index, so it is transmitted as supplied and
+/// the harmonic grid stays the branch's own `(L, step)` instead of being
+/// re-derived through the pitch table.
+pub(crate) fn quantize_indices(params: &MbeParams, state: &DecoderState, pin_b0: bool) -> [u16; 9] {
     // b0: pitch. Use the *quantized* pitch's (omega_0, L) downstream so the
     // unvoiced rescale and V/UV band map agree with the decoder exactly.
-    let b0 = quantize_pitch(params.omega_0, params.l);
-    let pitch = decode_pitch(b0).expect("quantized b0 is always a voice index");
-    let omega_q = pitch.omega_0;
+    let (b0, omega_q) = if pin_b0 {
+        (params.b0, params.omega_0)
+    } else {
+        let b0 = quantize_pitch(params.omega_0, params.l);
+        let pitch = decode_pitch(b0).expect("quantized b0 is always a voice index");
+        (b0, pitch.omega_0)
+    };
     let l = params.l; // harmonic count carried by the params (== pitch.l)
 
     // b1: V/UV.

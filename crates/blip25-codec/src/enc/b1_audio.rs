@@ -175,6 +175,11 @@ pub struct B1Frame {
     pub p0_flat: [i16; 40],
     /// The p1 plane, flat -- the DLL's `in1` array. Same purpose, for a6.
     pub p1_flat: [i16; 40],
+    /// The f0 ring's two previous entries as the packer reads them (`ring[1]`,
+    /// `ring[2]`): this frame's first analysis call's
+    /// [`repair_gate_f0`](super::t_ring::repair_gate_f0) and the previous
+    /// frame's second call's. The packer's tone branch quantises these two.
+    pub f0_ring: (i16, i16),
 }
 
 // ============================================================================
@@ -320,7 +325,7 @@ fn a5_pcm_arms(pre: &[i16], f: usize, c: usize) -> Option<(Vec<i16>, Vec<i16>, i
 /// frames (the zeros-trap: the off-lever T/S ring is only lever-validated).
 /// `a5` is emitted verbatim here; the caller applies whatever voicing gate it
 /// wants. Returns one `[i16;16]` per frame (index 0..nframes).
-pub(crate) fn a5_track(raw_pcm: &[i16], nframes: usize) -> Vec<[i16; 16]> {
+pub(crate) fn a5_track(raw_pcm: &[i16], nframes: usize) -> (Vec<[i16; 16]>, Vec<i16>) {
     use crate::synth::FRAME_SAMPLES;
     use crate::Encoder;
 
@@ -346,7 +351,7 @@ pub(crate) fn a5_track(raw_pcm: &[i16], nframes: usize) -> Vec<[i16; 16]> {
 /// encoder to produce it. Lets a caller that already ran the encoder (for the
 /// emitted bits) share that one pass. `a5_track` runs the encoder and forwards
 /// its log here.
-fn a5_track_from_pre(pre: &[i16], raw_pcm: &[i16], nframes: usize) -> Vec<[i16; 16]> {
+fn a5_track_from_pre(pre: &[i16], raw_pcm: &[i16], nframes: usize) -> (Vec<[i16; 16]>, Vec<i16>) {
     use crate::enc::a5_assemble::{pq_driver, RingState};
     use crate::enc::windowed_complex_correlation::windowed_complex_correlation;
     use crate::enc::t_ring::repair_gate_f0;
@@ -442,7 +447,7 @@ fn a5_track_from_pre(pre: &[i16], raw_pcm: &[i16], nframes: usize) -> Vec<[i16; 
             }
         }
     }
-    a5_out
+    (a5_out, f0v)
 }
 
 /// Source of the r34 encoder-analysis logs the b1 chain needs (the gap2
@@ -574,7 +579,7 @@ fn b1_track_core(
     // 0/1/2 on both independent clips = a real encoder startup transient, not a
     // fit). Zeroing that warmup (A5_WARMUP) reproduces the +22-voiced ceiling
     // (voiced 171->193, mark 195->197).
-    let a5_all: Vec<[i16; 16]> = match logs {
+    let (a5_all, f0v): (Vec<[i16; 16]>, Vec<i16>) = match logs {
         EncLogs::FromPcm => a5_track(raw_pcm, nframes),
         EncLogs::Supplied { pre, .. } => a5_track_from_pre(pre, raw_pcm, nframes),
     };
@@ -652,6 +657,14 @@ fn b1_track_core(
             mask,
             p0_flat,
             p1_flat,
+            f0_ring: (
+                f0v.get(2 * f).copied().unwrap_or(0),
+                if f == 0 {
+                    0
+                } else {
+                    f0v.get(2 * f - 1).copied().unwrap_or(0)
+                },
+            ),
         });
     }
     out

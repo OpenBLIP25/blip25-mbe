@@ -61,6 +61,11 @@ pub(crate) fn l56_gate_from_b1(b1: u16) -> bool {
 pub(crate) const L56_STEP: i16 = 0x1079;
 /// The override's harmonic count, `0x38` (56).
 pub(crate) const L56_L: usize = 56;
+/// [`L56_STEP`] as a fundamental in radians/sample — the step scale is
+/// `524288 / 2π`. The encoder's analysis chain works in radians, so it takes
+/// the override here rather than through the pitch table.
+pub(crate) const L56_OMEGA_0: f32 =
+    (L56_STEP as f64 * (2.0 * core::f64::consts::PI) / 524288.0) as f32;
 
 /// The encoder's `(L, step)` derivation for a frame — the Rust of the gated branch
 /// in the `L`/`step` derivation. Returns `None` exactly when `b0` is not a decodable

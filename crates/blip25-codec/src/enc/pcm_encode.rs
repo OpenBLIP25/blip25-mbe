@@ -122,6 +122,48 @@ pub fn encode_pcm_b0(raw_pcm: &[i16], opts: EncodeOpts) -> Vec<u8> {
     b0_sequence(&pref_full, &bt, nframes)
 }
 
+/// Opt-in switch (`BLIP25_TONE_BRANCH=1`, OFF by default) for the packer's
+/// tone/silence branch: on frames whose voicing word trips the shared `L = 56`
+/// gate, the pitch quantiser is skipped and `b̂₀` is the classifier's own index
+/// over the f0 ring. See [`crate::enc::tone_branch`].
+pub fn tone_branch_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("BLIP25_TONE_BRANCH")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    })
+}
+
+/// The pitch field width the packer hands the classifier (`cfg[5]`).
+const PITCH_BITS: u32 = 7;
+
+/// The packer's `b̂₀` for one frame: the classifier's index when the tone branch
+/// fires, the pitch quantiser's index otherwise. A no-op unless
+/// [`tone_branch_enabled`].
+///
+/// The pitch tracker must be advanced for the frame either way — the branch
+/// skips the pitch QUANTISER, not the analysis behind it — so this takes the
+/// tracker's answer and replaces it, rather than gating the call.
+pub fn b0_with_tone_branch(pitch_b0: u8, fr: &crate::enc::b1_audio::B1Frame) -> u8 {
+    if !tone_branch_enabled() {
+        return pitch_b0;
+    }
+    match crate::enc::tone_branch::tone_index(fr.b1, fr.f0_ring.0, fr.f0_ring.1, PITCH_BITS) {
+        Some(idx) => idx as u8,
+        None => pitch_b0,
+    }
+}
+
+/// Whether the frame's `b̂₀` is a tone index rather than a pitch index, i.e.
+/// whether the branch's `(L, step) = (56, 0x1079)` override applies to the
+/// amplitude chain. Purely the frame's voicing word, so a caller that already
+/// holds the transmitted `b̂₁` needs nothing else. A no-op unless
+/// [`tone_branch_enabled`].
+pub fn tone_branch_l56(b1: u16) -> bool {
+    tone_branch_enabled() && crate::enc::tone_branch::l56_gate(b1)
+}
+
 /// The `b̂₀` loop behind [`encode_pcm_b0`]: advance one [`B0Audio`] tracker
 /// across every frame, feeding the previous frame's `b1_track` mask as `a11`
 /// (0 for the first frame).
@@ -130,7 +172,8 @@ fn b0_sequence(pref_full: &[i16], bt: &[crate::enc::b1_audio::B1Frame], nframes:
     (0..nframes)
         .map(|f| {
             let a11 = if f == 0 { 0 } else { bt[f - 1].mask as i32 };
-            tracker.push_pcm_frame_with_prev_mask(pref_full, a11)
+            let b0 = tracker.push_pcm_frame_with_prev_mask(pref_full, a11);
+            b0_with_tone_branch(b0, &bt[f])
         })
         .collect()
 }
