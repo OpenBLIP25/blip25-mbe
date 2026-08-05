@@ -21,9 +21,7 @@
 //! 40/199 -- the decisive test that the chain is genuinely audio-driven, since a
 //! placeholder is immune to it.
 //!
-//! # `C820` is OFF by default, and that is a measured choice
-//!
-//! Read this before re-attacking refine_ring_p0.
+//! # `C820`: `Off` models a branch that does not exist
 //!
 //! `refine_ring_p0`'s `arg3` (a 129-i32 buffer from the d890) IS derived from audio
 //! bit-exactly -- 151/151 rows, 19328/19328 words, with `MUT=zeroaudio` at 0/151
@@ -31,21 +29,19 @@
 //! that omits the in-place normalize and the `arr[1]=0` store scores 3928/16256
 //! and looks like a wrong source; it is not. See `cepstral_transform_wide`.
 //!
-//! With the correct arg3 wired in, `Gate` makes every bfp_scale ring intermediate
-//! near-exact -- voiced p0 slot0 105 -> 197, p0 slot2 104 -> 196, p0 slot1 out
-//! 94 -> 194, i.e. the ring state matches the reference capture. **And b1 gets
-//! WORSE: voiced 190 -> 166** (mark unchanged at 195).
+//! The live gate at `0x1030eb2e` is `(0x1000 < xh) || (*param_9 != 0)`.
+//! `param_9` is `FUN_1030a190`'s `local_208`, and the only write it can take
+//! before the gate is `FUN_1031bd30`'s unconditional `*param_8 = 0` -- so the
+//! second disjunct is always false, the `P[7] = 0x1999` pin under it is dead,
+//! and the gate is `xh > 0x1000` alone. [`RingRefineMode::Gate`] is the
+//! reference; `Off` models nothing.
 //!
-//! The conclusion is not "arg3 is wrong". The shipped `Off` 190 is substantially
-//! **error cancellation**: a wrong ring lands on the right VQ cell more often
-//! than a right ring does. The real defect is DOWNSTREAM of bfp_scale, in
-//! `pitch_predictor_from_ring` / `stable_counter_from_ring`: against the reference's captured a4/a6,
-//! **a6 = 17/199 voiced and 11/199 mark**, versus a zeroed-audio floor of 3/199
-//! and 1/199 -- essentially chance; a4 = 105/199 voiced against a floor of 50.
-//! That is the b1 lever; refine_ring_p0 is not.
-//!
-//! `c820_gate_regresses_b1_until_a4_a6_are_fixed` pins this. When a4/a6 are
-//! fixed and `Gate` overtakes `Off`, flip the default.
+//! Against the reference's own post-`c820` row, `Off` scores 80.77 / 11.79 /
+//! 92.94 % (dam / noisy / mark) and `Gate` 99.61 / 25.87 / 96.53 %. Whether
+//! `Gate` also improves b1 depends on which a4 gate it runs under: with the
+//! energy VAD it costs dam and mark, with the tracker gate ([`Hdr30Track`]) b1
+//! against the reference's own goes 95.29 -> 99.69 dam, 92.67 -> 97.57 noisy
+//! and 99.13 -> 99.02 mark. The two are one lever, not two.
 //!
 //! # a4 -- and a4 alone with a5 -- is the whole b1 gap. a6 is worth ZERO.
 //!
@@ -87,17 +83,19 @@
 //! 195 -> 197 mark (fixes [0,76]), with zero frames broken -- no refine_ring_p0-style
 //! error cancellation.
 //!
-//! ## The remaining blocker: hdr30 is a STATEFUL voicing-onset envelope
+//! ## hdr30 is the noise tracker's own register
 //!
-//! hdr30 is a shift register: onset ramps `0,1,7,31,127,...`, 2 per-band voicing
-//! bits shifted in per frame. a4 is emitted only in the voiced regions
-//! ([16-117],[149-198] voiced) and zeroed during onset (0-15) and the inter-word
-//! gap (118-148).
+//! hdr30 is a shift register: 2 voicing bits shifted in per frame, one per
+//! analysis pass. It is `[desc+0x30]`, which `FUN_1030fe40` copies from block
+//! offset `0x44` of the `ctx+0x938` noise tracker -- the register
+//! [`super::noise_track::NoiseTracker`] already maintains. [`Hdr30Track`] reads
+//! it out and reproduces the live DLL's own word on 1274/1274 dam, 3587/3587
+//! noisy and 921/921 mark frames, at lag 0.
 //!
-//! A per-frame content threshold on `den` replicates the gate only 77%/95%
-//! (`maxden>=4`), so it REGRESSES: the gate needs the multi-frame voicing state,
-//! not a scalar test. Deriving hdr30 audio-only is the next lever; until then
-//! [`pitch_predictor_gate`] is unwired, since there is no capture-fed hdr30 in the live path.
+//! [`derive_hdr30_vad`], the energy VAD that stands in for it, gets the full
+//! word on 57.85 / 45.80 / 75.57 % of those frames and the two gate bits on
+//! 87-89 / 80-81 / 95-96 %. The `noisy` column is the asymmetry: the vector
+//! whose b1 is worst is the one whose gate the VAD misses most.
 //!
 //! # Two late writers exist -- do not assume otherwise
 //! The VQ leaf runs late in the call graph, after the main p0/p1 writer. A second
@@ -120,15 +118,15 @@ use crate::enc::win_taper_wide::win_from_gap2_slot2;
 
 /// Whether to run `refine_ring_p0`'s conditional min-refine of p0 slot 0.
 ///
-/// `Off` is the shipping default and the configuration the 190/195 numbers were
-/// measured in -- see the module header for why feeding refine_ring_p0 currently HURTS.
+/// `Off` is the shipping default; `Gate` is the reference's own behaviour and
+/// is what [`noisy_next_enabled`] selects. See the module header.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum RingRefineMode {
-    /// Never call refine_ring_p0. **The measured-best default.**
+    /// Never call refine_ring_p0.
     #[default]
     Off,
-    /// Call iff `x_halved > 0x1000` (the `[esi] != 0`
-    /// arm of the real gate is the caller's own arg and is not modelled).
+    /// Call iff `x_halved > 0x1000` — the live gate, whose second disjunct is
+    /// provably always false (module header).
     Gate,
     /// Always call. Panics the port's own `count1 <= 55` assert on real audio --
     /// which is independent confirmation that the `> 0x1000` gate is real.
@@ -535,18 +533,22 @@ fn b1_track_core(
     let mut exp_hist = [0i16; 4];
     let mut out: Vec<B1Frame> = Vec::with_capacity(nframes);
 
-    // r51: the a4 GATE reads the `hdr30` onset envelope. hdr30 is a 16-bit
-    // shift register `hdr30 = (hdr30<<2) | fill`, fill = (Vcur | Vprev<<1) a 2-bit voicing
-    // edge code. r51 PROVED the driving flag V is NOT the voicing byte (GT b1 fed in fails
-    // 175/199) -- it is an ENERGY VAD (b1==16 unvoiced-byte frames stay envelope-VOICED mid
-    // word). A file-independent adaptive noise-floor VAD reproduces the gate bits 396/395 of
-    // 398 and lifts b1 +3 voiced / +2 mark. Default ON (r51 measured +3 voiced / +2 mark
-    // ALL-9, zero regressions, robust across MARGIN [2,5]).
-    // A caller streaming frame-by-frame supplies a persistently-tracked hdr30
-    // VAD (its adaptive noise floor is the one slow-converging state that a
-    // bounded analysis window cannot reproduce); otherwise derive it here.
+    // `Off` models the gate's second disjunct as unknown. It is not: the local
+    // it reads is initialised to zero in `FUN_1030a190` and never written before
+    // `FUN_1030eaa0` runs, so the live gate is `xh > 0x1000` alone.
+    let c820mode = match (noisy_next_enabled(), c820mode) {
+        (true, RingRefineMode::Off) => RingRefineMode::Gate,
+        (_, m) => m,
+    };
+
+    // The a4 gate reads the `hdr30` shift register: two voicing bits per frame,
+    // one per analysis pass. A caller streaming frame-by-frame supplies it from
+    // its own persistent producer — the slow-converging state a bounded analysis
+    // window cannot reproduce; otherwise derive it here.
     let hdr30_deriv: Vec<i32> = if let Some(h) = hdr30_override {
         h.to_vec()
+    } else if noisy_next_enabled() {
+        derive_hdr30_track(pref, nframes)
     } else {
         derive_hdr30_vad(raw_pcm, nframes)
     };
@@ -3126,6 +3128,61 @@ impl Hdr30Vad {
     }
 }
 
+/// Opt-in switch (`BLIP25_NOISY_NEXT=1`, OFF by default) for the a4 gate's
+/// `hdr30` word taken from the noise tracker's own register instead of the
+/// energy VAD, and for `refine_ring_p0`'s live gate.
+///
+/// The gate word is `[desc+0x30]`, which `FUN_1030fe40` copies from the
+/// `ctx+0x938` noise-tracker block at block offset `0x44` — the register
+/// [`super::noise_track::NoiseTracker::voicing_register`] already maintains,
+/// one bit per analysis pass. Against the live DLL's own `hdr30` it is exact on
+/// every frame of every captured vector, where [`derive_hdr30_vad`] reproduces
+/// the two gate bits on 80% of `noisy` frames.
+pub fn noisy_next_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("BLIP25_NOISY_NEXT")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    })
+}
+
+/// The `hdr30` gate word from the noise tracker, frame-serial, for streaming
+/// callers.
+///
+/// The tracker is causal — frame `f` reads the prefiltered stream over
+/// `[160f - 28, 160f + 160)` — but slow-converging (a warm-up counter and
+/// sixteen per-band floors), so a bounded analysis window cannot reproduce it.
+/// A streamer carries one of these across pumps and hands the accumulated
+/// values to [`b1_track_hdr30`], the same contract [`Hdr30Vad`] has.
+#[derive(Clone, Default)]
+pub struct Hdr30Track {
+    nt: crate::enc::noise_track::NoiseTracker,
+    next: i64,
+}
+
+impl Hdr30Track {
+    /// A cold tracker, positioned before frame 0.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Consume the next frame of `pref` — the prefiltered stream from sample 0,
+    /// covering at least `160 * (frame + 1)` samples — and return its register
+    /// value. Samples past the end read as zero.
+    pub fn push_frame(&mut self, pref: &[i16]) -> i32 {
+        crate::enc::noise_track::push_frame(&mut self.nt, pref, self.next);
+        self.next += 1;
+        self.nt.voicing_register()
+    }
+}
+
+/// Whole-buffer form of [`Hdr30Track`]: the gate word for frames `0..nframes`.
+pub(crate) fn derive_hdr30_track(pref: &[i16], nframes: usize) -> Vec<i32> {
+    let mut t = Hdr30Track::new();
+    (0..nframes).map(|_| t.push_frame(pref)).collect()
+}
+
 pub(crate) fn derive_hdr30_vad(raw_pcm: &[i16], nframes: usize) -> Vec<i32> {
     const FRAME: usize = 160;
     let margin: f64 = HDR30_MARGIN;
@@ -3300,4 +3357,67 @@ fn front_end(pref: &[i16], nframes: usize) -> Vec<FrameIn> {
         });
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A tone burst inside near-silence, so the tracker's warm-up counter, its
+    /// per-band floors and the activity decision all get exercised.
+    fn burst_pcm(n: usize) -> Vec<i16> {
+        (0..n)
+            .map(|i| {
+                let t = i as f64 / 8000.0;
+                let env = if i > n / 4 && i < 3 * n / 4 {
+                    6000.0
+                } else {
+                    40.0
+                };
+                (env * (2.0 * std::f64::consts::PI * 217.0 * t).sin()) as i16
+            })
+            .collect()
+    }
+
+    fn burst_pref(nframes: usize) -> Vec<i16> {
+        let pcm = burst_pcm(160 * nframes);
+        crate::enc::audio_prefilter::prefilter(
+            &crate::enc::audio_prefilter::PrefilterState::default(),
+            &pcm,
+        )
+        .0
+    }
+
+    /// [`Hdr30Track`] fed one frame at a time, seeing only the samples a
+    /// streamer would have absorbed, must reproduce the whole-buffer derivation
+    /// exactly — the property a streaming encoder's bit-parity with
+    /// `Vocoder::encode` rests on.
+    #[test]
+    fn hdr30_track_streams_identically_to_whole_buffer() {
+        const N: usize = 60;
+        let pref = burst_pref(N);
+        let whole = derive_hdr30_track(&pref, N);
+        let mut t = Hdr30Track::new();
+        let streamed: Vec<i32> = (0..N)
+            .map(|f| t.push_frame(&pref[..160 * (f + 1)]))
+            .collect();
+        assert_eq!(whole, streamed);
+    }
+
+    /// The register the a4 gate reads shifts left by two every frame — one bit
+    /// per analysis pass — and the gate it exposes is not a constant.
+    #[test]
+    fn hdr30_track_is_a_two_bit_per_frame_shift_register() {
+        const N: usize = 60;
+        let h = derive_hdr30_track(&burst_pref(N), N);
+        for f in 1..N {
+            assert_eq!(
+                (h[f] >> 2) & 0x3fff,
+                h[f - 1] & 0x3fff,
+                "frame {f} is not the previous register shifted left by two"
+            );
+        }
+        let gate: Vec<i32> = h.iter().map(|v| (v >> 3) & 1).collect();
+        assert!(gate.contains(&1) && gate.contains(&0));
+    }
 }

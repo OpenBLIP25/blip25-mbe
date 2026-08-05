@@ -1637,28 +1637,56 @@ struct AmbeStream {
     out_count: usize,
     flushed: bool,
     pend: std::collections::VecDeque<(usize, [u8; 9])>,
-    // Persistent hdr30 VAD (the one slow-converging b1_track state — an adaptive
-    // noise floor — carried so a bounded analysis window stays byte-exact).
-    hdr: blip25_codec::enc::b1_audio::Hdr30Vad,
+    // The persistent hdr30 gate word (the one slow-converging b1_track state,
+    // carried so a bounded analysis window stays byte-exact).
+    hdr: Hdr30State,
     hdr30: Vec<i32>,
 }
 
-/// Extend `hdr30` with the shift-register value of every source frame in
-/// `raw` up to `upto`, advancing the persistent tracker. Frames are 160
-/// samples; a short trailing frame reads as zero-padded, matching
-/// `derive_hdr30_vad`.
+/// The persistent producer of the a4 gate word a streamer carries across pumps,
+/// in whichever form `b1_track` derives it whole-buffer.
+#[cfg(feature = "encode")]
+enum Hdr30State {
+    /// The energy VAD over the raw samples.
+    Vad(blip25_codec::enc::b1_audio::Hdr30Vad),
+    /// The noise tracker's own register, over the prefiltered stream. Boxed:
+    /// the tracker's per-band state dwarfs the VAD's four scalars.
+    Track(Box<blip25_codec::enc::b1_audio::Hdr30Track>),
+}
+
+#[cfg(feature = "encode")]
+impl Hdr30State {
+    fn new() -> Self {
+        if blip25_codec::enc::b1_audio::noisy_next_enabled() {
+            Self::Track(Box::new(blip25_codec::enc::b1_audio::Hdr30Track::new()))
+        } else {
+            Self::Vad(blip25_codec::enc::b1_audio::Hdr30Vad::new())
+        }
+    }
+}
+
+/// Extend `hdr30` with the gate word of every source frame up to `upto`,
+/// advancing the persistent producer. Frames are 160 samples; a short trailing
+/// frame reads as zero-padded, matching the whole-buffer derivations.
 #[cfg(feature = "encode")]
 fn advance_hdr30(
-    hdr: &mut blip25_codec::enc::b1_audio::Hdr30Vad,
+    hdr: &mut Hdr30State,
     hdr30: &mut Vec<i32>,
     raw: &[i16],
+    pref: &[i16],
     upto: usize,
 ) {
     while hdr30.len() < upto {
-        let s = hdr30.len() * FRAME_SAMPLES;
-        let end = (s + FRAME_SAMPLES).min(raw.len());
-        let frame = if s < end { &raw[s..end] } else { &[][..] };
-        hdr30.push(hdr.push_frame(frame));
+        let v = match hdr {
+            Hdr30State::Vad(v) => {
+                let s = hdr30.len() * FRAME_SAMPLES;
+                let end = (s + FRAME_SAMPLES).min(raw.len());
+                let frame = if s < end { &raw[s..end] } else { &[][..] };
+                v.push_frame(frame)
+            }
+            Hdr30State::Track(t) => t.push_frame(pref),
+        };
+        hdr30.push(v);
     }
 }
 
@@ -1696,14 +1724,14 @@ impl AmbeStream {
             out_count: 0,
             flushed: false,
             pend: std::collections::VecDeque::new(),
-            hdr: blip25_codec::enc::b1_audio::Hdr30Vad::new(),
+            hdr: Hdr30State::new(),
             hdr30: Vec::new(),
         }
     }
 
-    /// Advance the persistent hdr30 VAD to cover source frames `[0, upto)`.
+    /// Advance the persistent hdr30 producer to cover source frames `[0, upto)`.
     fn advance_hdr30(&mut self, upto: usize) {
-        advance_hdr30(&mut self.hdr, &mut self.hdr30, &self.raw, upto);
+        advance_hdr30(&mut self.hdr, &mut self.hdr30, &self.raw, &self.pref, upto);
     }
 
     /// Prefilter + buffer new PCM, then finalise/emit whatever frames now have
@@ -1942,7 +1970,8 @@ const B1_CTX: usize = 8;
 /// * `reference` — the persistent [`B0Audio`] tracker, advanced one frame at a
 ///   time with the same masks `encode_pcm_b0` uses → byte-exact `b0`.
 /// * `e` — one persistent [`Encoder`], fed in order → byte-exact amplitudes.
-/// * `hdr` — the persistent hdr30 VAD, the one slow-converging `b1_track` state.
+/// * `hdr` — the persistent hdr30 producer, the one slow-converging
+///   `b1_track` state.
 ///
 /// Unlike [`AmbeStream`], no source frame is dropped: `nf` input frames yield
 /// `nf` output frames, matching whole-buffer `encode`.
@@ -1955,7 +1984,7 @@ struct ImbeStream {
     pref_state: blip25_codec::enc::audio_prefilter::PrefilterState,
     pref: Vec<i16>,
     raw: Vec<i16>,
-    hdr: blip25_codec::enc::b1_audio::Hdr30Vad,
+    hdr: Hdr30State,
     hdr30: Vec<i32>,
     reference_b0: Vec<u8>,
     reference_frame: usize,
@@ -1988,7 +2017,7 @@ impl ImbeStream {
             pref_state: blip25_codec::enc::audio_prefilter::PrefilterState::default(),
             pref: Vec::new(),
             raw: Vec::new(),
-            hdr: blip25_codec::enc::b1_audio::Hdr30Vad::new(),
+            hdr: Hdr30State::new(),
             hdr30: Vec::new(),
             reference_b0: Vec::new(),
             reference_frame: 0,
@@ -2166,7 +2195,7 @@ impl ImbeStream {
     }
 
     fn advance_hdr30(&mut self, upto: usize) {
-        advance_hdr30(&mut self.hdr, &mut self.hdr30, &self.raw, upto);
+        advance_hdr30(&mut self.hdr, &mut self.hdr30, &self.raw, &self.pref, upto);
     }
 }
 

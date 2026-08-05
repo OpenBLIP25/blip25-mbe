@@ -46,17 +46,25 @@ pub(crate) fn pass_be(pref: &[i16], f: i64, pass: usize) -> i16 {
     crate::enc::block_exponent::block_exponent(&w)
 }
 
+/// Advance the tracker over both of frame `f`'s analysis passes.
+///
+/// Frame `f` reads `pref` over `[160f - 28, 160f + 160)`, so the tracker is
+/// frame-serial and causal with no look-ahead; out-of-range samples read as zero.
+pub(crate) fn push_frame(nt: &mut NoiseTracker, pref: &[i16], f: i64) {
+    for pass in 0..2 {
+        let be = pass_be(pref, f, pass);
+        let bv = pass_band_vector(pref, f, pass, be);
+        nt.push_pass(&bv, 2 * be as i32 + 7, 20);
+    }
+}
+
 /// Advance the tracker over both of frame `f`'s analysis passes and return the
 /// window the DP score reads, or `None` when the weighted score is switched off.
 pub(crate) fn advance(nt: &mut NoiseTracker, pref: &[i16], f: i64) -> Option<[i16; ST_WORDS]> {
     if !crate::enc::dp_score::enabled() {
         return None;
     }
-    for pass in 0..2 {
-        let be = pass_be(pref, f, pass);
-        let bv = pass_band_vector(pref, f, pass, be);
-        nt.push_pass(&bv, 2 * be as i32 + 7, 20);
-    }
+    push_frame(nt, pref, f);
     Some(nt.window())
 }
 /// Blocks a pass contributes to the band vector, and their four-sample stride.
@@ -151,6 +159,15 @@ impl NoiseTracker {
     fn set_dw(&mut self, i: usize, v: i32) {
         self.w[2 * i] = v as i16;
         self.w[2 * i + 1] = (v >> 16) as i16;
+    }
+
+    /// Block offset `0x44`: the voicing shift register, two bits per frame.
+    ///
+    /// `FUN_1030fe40` copies it into the quantiser descriptor at `+0x30`, where
+    /// `FUN_1030c3f0` reads it as the `hdr30` word and `FUN_10310c50` tests bit
+    /// `s + 2` to gate the a4 band it produces.
+    pub(crate) fn voicing_register(&self) -> i32 {
+        self.g(0x44) & 0xffff
     }
 
     /// The window [`super::dp_score`] reads: block offsets 0x40..0x190.
