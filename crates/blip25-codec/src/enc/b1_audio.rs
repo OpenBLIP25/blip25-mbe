@@ -107,6 +107,7 @@
 #![allow(dead_code, clippy::too_many_arguments, clippy::needless_range_loop)]
 
 use crate::enc::block_exponent::block_exponent;
+use crate::enc::dp_score::ST_WORDS;
 use crate::enc::history_ring::{GAP2_LEN, GAP2_LEN_WIDE};
 use crate::enc::loudness_fixed::{assemble_bins_from_win, win_from_gap2};
 use crate::enc::voicing_fixed::{
@@ -457,6 +458,7 @@ pub(crate) fn b1_track(
         EncLogs::FromPcm,
         None,
         None,
+        None,
     )
 }
 
@@ -473,6 +475,7 @@ pub(crate) fn b1_track_lb(
     nframes: usize,
     c820mode: RingRefineMode,
 ) -> Vec<B1Frame> {
+    let st = noise_windows(pref, nframes);
     let first = b1_track_core(
         pref,
         raw_pcm,
@@ -480,6 +483,7 @@ pub(crate) fn b1_track_lb(
         c820mode,
         EncLogs::FromPcm,
         None,
+        st.as_deref(),
         None,
     );
     let Some(lb) = lb_inputs(pref, nframes, &first) else {
@@ -492,7 +496,26 @@ pub(crate) fn b1_track_lb(
         c820mode,
         EncLogs::FromPcm,
         None,
+        st.as_deref(),
         Some(&lb),
+    )
+}
+
+/// Every frame's noise-tracker window, from a cold tracker at frame 0 — the
+/// whole-buffer form of what a streaming caller keeps persistently. `None`
+/// unless a stage that reads it is on.
+fn noise_windows(pref: &[i16], nframes: usize) -> Option<Vec<[i16; ST_WORDS]>> {
+    if !bv_next_enabled() {
+        return None;
+    }
+    let mut t = Hdr30Track::new();
+    Some(
+        (0..nframes)
+            .map(|_| {
+                let _ = t.push_frame(pref);
+                t.window()
+            })
+            .collect(),
     )
 }
 
@@ -515,20 +538,23 @@ pub fn b1_track_hdr30(
         EncLogs::FromPcm,
         Some(hdr30),
         None,
+        None,
     )
 }
 
 /// [`b1_track_hdr30`] with the low-band noise rewrite's per-frame inputs
 /// supplied by the caller -- the streaming form, where the pitch tracker and the
 /// noise tracker are persistent and a bounded window cannot rebuild them.
-/// `lb[k]` belongs to the same frame as `hdr30[k]`. A no-op with the flag off.
+/// `st[k]` and `lb[k]` belong to the same frame as `hdr30[k]`. Each is a no-op
+/// with its own flag off.
 pub fn b1_track_hdr30_lb(
     pref: &[i16],
     raw_pcm: &[i16],
     nframes: usize,
     c820mode: RingRefineMode,
     hdr30: &[i32],
-    lb: &[LbNoiseIn],
+    st: Option<&[[i16; ST_WORDS]]>,
+    lb: Option<&[LbNoiseIn]>,
 ) -> Vec<B1Frame> {
     b1_track_core(
         pref,
@@ -537,7 +563,8 @@ pub fn b1_track_hdr30_lb(
         c820mode,
         EncLogs::FromPcm,
         Some(hdr30),
-        Some(lb),
+        st,
+        lb,
     )
 }
 
@@ -582,6 +609,7 @@ pub fn b1_track_from_logs(
         EncLogs::Supplied { gap0, gap1, gap2w },
         None,
         None,
+        None,
     )
 }
 
@@ -597,10 +625,27 @@ pub fn b1_track_from_logs_lb(
     nframes: usize,
     c820mode: RingRefineMode,
 ) -> Vec<B1Frame> {
-    let first = b1_track_from_logs(gap0, gap1, gap2w, pre, raw_pcm, nframes, c820mode);
     let (pref, _) = crate::enc::audio_prefilter::prefilter(
         &crate::enc::audio_prefilter::PrefilterState::default(),
         raw_pcm,
+    );
+    debug_assert!(
+        {
+            let n = pre.len().min(pref.len());
+            pre[..n] == pref[..n]
+        },
+        "prefiltered_log disagrees with the prefilter over raw_pcm"
+    );
+    let st = noise_windows(&pref, nframes);
+    let first = b1_track_core(
+        &pref,
+        raw_pcm,
+        nframes,
+        c820mode,
+        EncLogs::Supplied { gap0, gap1, gap2w },
+        None,
+        st.as_deref(),
+        None,
     );
     let Some(lb) = lb_inputs(&pref, nframes, &first) else {
         return first;
@@ -612,6 +657,7 @@ pub fn b1_track_from_logs_lb(
         c820mode,
         EncLogs::Supplied { gap0, gap1, gap2w },
         None,
+        st.as_deref(),
         Some(&lb),
     )
 }
@@ -661,9 +707,10 @@ fn b1_track_core(
     c820mode: RingRefineMode,
     logs: EncLogs<'_>,
     hdr30_override: Option<&[i32]>,
+    st: Option<&[[i16; ST_WORDS]]>,
     lb: Option<&[LbNoiseIn]>,
 ) -> Vec<B1Frame> {
-    let fr = front_end(pref, nframes);
+    let fr = front_end(pref, nframes, st.filter(|_| bv_next_enabled()));
     let (a9v, wide) = match logs {
         EncLogs::FromPcm => precompute_from_ring(raw_pcm, nframes),
         EncLogs::Supplied { gap0, gap1, gap2w } => precompute_from_logs(gap0, gap1, gap2w, nframes),
@@ -3299,6 +3346,17 @@ pub fn noisy_next_enabled() -> bool {
     })
 }
 
+/// Opt-in switch (`BLIP25_BV_NEXT=1`, OFF by default) for the band-voicing row's
+/// band-0 spectrum carrying `FUN_1030e100`'s in-place row weighting.
+pub fn bv_next_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("BLIP25_BV_NEXT")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    })
+}
+
 /// The `hdr30` gate word from the noise tracker, frame-serial, for streaming
 /// callers.
 ///
@@ -3411,7 +3469,12 @@ struct FrameIn {
 
 /// The AUDIO-ONLY front end, additionally emitting a3/bandexp. No capture
 /// branches: this is the arithmetic that scores x at 199/199 and 194/199.
-fn front_end(pref: &[i16], nframes: usize) -> Vec<FrameIn> {
+///
+/// `st` is the per-frame noise-tracker window `FUN_1030e100` gates its row
+/// weighting on. Supplied, band 0 of `a3` — and only band 0, the pair of rows
+/// that call writes back — carries the weighting, and the DP score it emits is
+/// the weighted accumulation. Absent, both are the unweighted form.
+fn front_end(pref: &[i16], nframes: usize, st: Option<&[[i16; ST_WORDS]]>) -> Vec<FrameIn> {
     let mut ab80 = fe::PassAccumulatorState::default();
     let mut prev_pass1 = [[0i64; 10]; 16];
     let mut e530_hist = [[0i64; 50]; 16];
@@ -3472,11 +3535,21 @@ fn front_end(pref: &[i16], nframes: usize) -> Vec<FrameIn> {
             svs[b] = sv;
             expo[b] = r;
         }
-        let (a3, bandexp) = amp_scores_and_bandexp(&svs, &expo);
-        // No noise window here: this chain's `x` / a3 / bandexp consumers were
-        // derived against the unweighted score, and feeding them the weighted one
-        // costs b1 on every vector. The b0 chain takes the weighted score.
-        let score32 = e100::run(&svs, &expo, None);
+        let mut wsvs = svs;
+        let mut wexpo = expo;
+        crate::enc::dp_score::weight_rows01_in_place(
+            &mut wsvs,
+            &mut wexpo,
+            st.and_then(|w| w.get(f as usize)),
+        );
+        let (a3, bandexp) = amp_scores_and_bandexp(&wsvs, &wexpo);
+        // The DP score `FUN_1030e100` emits from the same rows. Its weighted form
+        // is what the coarse-pitch argmax and the octave decision downstream read;
+        // without the noise window they take the unweighted accumulation.
+        let score32 = match st.and_then(|w| w.get(f as usize)) {
+            Some(s) => crate::enc::dp_score::run(&svs, &expo, Some(s)),
+            None => e100::run(&svs, &expo, None),
+        };
         let mut score = [0i32; 40];
         for i in 0..32 {
             score[i] = score32[i] as i32;

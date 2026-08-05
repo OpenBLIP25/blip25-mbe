@@ -1738,7 +1738,9 @@ impl AmbeStream {
     /// Advance the persistent hdr30 producer to cover source frames `[0, upto)`.
     fn advance_hdr30(&mut self, upto: usize) {
         advance_hdr30(&mut self.hdr, &mut self.hdr30, &self.raw, &self.pref, upto);
-        if blip25_codec::enc::b1_audio::lb_noise_enabled() {
+        if blip25_codec::enc::b1_audio::lb_noise_enabled()
+            || blip25_codec::enc::b1_audio::bv_next_enabled()
+        {
             while self.lb_win.len() < upto {
                 let _ = self.lb_hdr.push_frame(&self.pref);
                 self.lb_win.push(self.lb_hdr.window());
@@ -1834,9 +1836,29 @@ impl AmbeStream {
             (new_horizon + 2).min(nframes)
         };
         let lb_on = blip25_codec::enc::b1_audio::lb_noise_enabled();
+        let bv_on = blip25_codec::enc::b1_audio::bv_next_enabled();
+        // The band-voicing row's band-0 spectrum reads the same persistent
+        // noise-tracker window, on both passes.
+        let st_win: Option<Vec<[i16; 168]>> = if bv_on {
+            Some(
+                (0..win_nframes)
+                    .map(|k| self.lb_win[win_start + k])
+                    .collect(),
+            )
+        } else {
+            None
+        };
         let mut raw_b0: Vec<(usize, u8)> = Vec::new();
-        let bt = if lb_on {
-            let btm = b1_track_hdr30(win_pref, win_raw, win_nframes, RingRefineMode::Off, hdr_win);
+        let bt = if lb_on || bv_on {
+            let btm = blip25_codec::enc::b1_audio::b1_track_hdr30_lb(
+                win_pref,
+                win_raw,
+                win_nframes,
+                RingRefineMode::Off,
+                hdr_win,
+                st_win.as_deref(),
+                None,
+            );
             while self.reference_frame < reference_target {
                 let cf = self.reference_frame;
                 let a11 = if cf == 0 {
@@ -1850,28 +1872,34 @@ impl AmbeStream {
                 raw_b0.push((cf, b0));
                 self.reference_frame += 1;
             }
-            let lb_win: Vec<blip25_codec::enc::b1_audio::LbNoiseIn> = (0..win_nframes)
-                .map(|k| {
-                    let f = win_start + k;
-                    blip25_codec::enc::b1_audio::LbNoiseIn {
-                        st: self.lb_win[f],
-                        q0: self.reference.c62c_at(f),
-                        q2: if f == 0 {
-                            32767
-                        } else {
-                            self.reference.c62c_at(f - 1)
-                        },
-                    }
-                })
-                .collect();
-            blip25_codec::enc::b1_audio::b1_track_hdr30_lb(
-                win_pref,
-                win_raw,
-                win_nframes,
-                RingRefineMode::Off,
-                hdr_win,
-                &lb_win,
-            )
+            let lb_win: Option<Vec<blip25_codec::enc::b1_audio::LbNoiseIn>> = lb_on.then(|| {
+                (0..win_nframes)
+                    .map(|k| {
+                        let f = win_start + k;
+                        blip25_codec::enc::b1_audio::LbNoiseIn {
+                            st: self.lb_win[f],
+                            q0: self.reference.c62c_at(f),
+                            q2: if f == 0 {
+                                32767
+                            } else {
+                                self.reference.c62c_at(f - 1)
+                            },
+                        }
+                    })
+                    .collect()
+            });
+            match lb_win.as_deref() {
+                Some(l) => blip25_codec::enc::b1_audio::b1_track_hdr30_lb(
+                    win_pref,
+                    win_raw,
+                    win_nframes,
+                    RingRefineMode::Off,
+                    hdr_win,
+                    st_win.as_deref(),
+                    Some(l),
+                ),
+                None => btm,
+            }
         } else {
             b1_track_hdr30(win_pref, win_raw, win_nframes, RingRefineMode::Off, hdr_win)
         };

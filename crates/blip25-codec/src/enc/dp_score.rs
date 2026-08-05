@@ -457,6 +457,32 @@ pub(crate) fn run(
     pack(&acc)
 }
 
+/// The half of `FUN_1030e100` that survives the call: rows 0 and 1 — the pair the
+/// per-band combine folds into band 0 of the spectrum `FUN_1031c960` reads — are
+/// scaled by `FUN_1030eed0`'s gain **in the caller's own buffer**, and their
+/// exponents take its bump. Rows 2..15 are scaled only into the accumulator's
+/// scratch copy, so the caller's buffer keeps them verbatim. `None`, or a zero
+/// gate, leaves every row alone.
+pub(crate) fn weight_rows01_in_place(
+    scorevecs: &mut [[i32; 32]; 16],
+    expo: &mut [i32; 16],
+    st: Option<&[i16; ST_WORDS]>,
+) {
+    let Some(s) = st else { return };
+    if dd30(s).0 == 0 {
+        return;
+    }
+    for k in 0..2 {
+        let (g, adj) = eed0(s, k as i32);
+        scorevecs[k][0] = 0;
+        scorevecs[k][1] = 0;
+        for i in 0..32 {
+            scorevecs[k][i] = q15mul(scorevecs[k][i], g);
+        }
+        expo[k] = s16(expo[k] + adj);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -567,5 +593,47 @@ mod tests {
         off[4] = 0;
         assert_eq!(dd30(&off).0, 0);
         assert_eq!(run(&pre, &expo, Some(&off)), run(&pre, &expo, None));
+    }
+
+    /// The write-back reaches rows 0 and 1 and stops there. Widening it to the
+    /// rows `FUN_1030ed30` scales would corrupt bands 1..7 of the spectrum the
+    /// band-voicing row is built from, which the reference leaves verbatim.
+    #[test]
+    fn only_rows_0_and_1_are_written_back() {
+        let (st, pre, expo, _) = case();
+        assert_ne!(dd30(&st).0, 0, "fixture gate must fire");
+        let (mut svs, mut ex) = (pre, expo);
+        weight_rows01_in_place(&mut svs, &mut ex, Some(&st));
+        for k in 0..2 {
+            let (g, adj) = eed0(&st, k as i32);
+            assert_eq!(ex[k], s16(expo[k] + adj), "row {k} exponent");
+            for i in 2..32 {
+                assert_eq!(svs[k][i], q15mul(pre[k][i], g), "row {k} word {i}");
+            }
+            assert_eq!((svs[k][0], svs[k][1]), (0, 0), "row {k} head");
+        }
+        for k in 2..16 {
+            assert_eq!(svs[k], pre[k], "row {k} must be untouched");
+            assert_eq!(ex[k], expo[k], "row {k} exponent must be untouched");
+        }
+    }
+
+    /// A zero gate, or no window at all, leaves every row alone.
+    #[test]
+    fn gate_zero_writes_nothing_back() {
+        let (st, pre, expo, _) = case();
+        let mut off = st;
+        for i in 9..25 {
+            off[i] = -0x7000;
+        }
+        off[8] = -0x2000;
+        off[4] = 0;
+        assert_eq!(dd30(&off).0, 0);
+        for w in [Some(&off), None] {
+            let (mut svs, mut ex) = (pre, expo);
+            weight_rows01_in_place(&mut svs, &mut ex, w);
+            assert_eq!(svs, pre);
+            assert_eq!(ex, expo);
+        }
     }
 }
