@@ -1496,6 +1496,30 @@ impl B0Audio {
         self.push_frame_inner(pref, 0)
     }
 
+    /// The frame just pushed's `ctx+0x62c` harmonic-fit error — the `Q[0]` the
+    /// `FUN_1030eaa0` tail compares against `0x2001`. `Q[2]` is the previous
+    /// frame's value; `32767` before any frame is pushed, per the ring's init.
+    pub fn last_c62c(&self) -> i32 {
+        *self.c62ch.last().unwrap_or(&32767)
+    }
+
+    /// `Q[0]` for frame `f`, for a caller that has advanced this tracker past
+    /// `f` and needs the value again. Frames not yet pushed read as the ring's
+    /// `32767` seed.
+    pub fn c62c_at(&self, f: usize) -> i32 {
+        self.c62ch.get(f).copied().unwrap_or(32767)
+    }
+
+    /// `Q[2]`: the c62c of the frame before the one just pushed.
+    pub fn prev_c62c(&self) -> i32 {
+        let n = self.c62ch.len();
+        if n >= 2 {
+            self.c62ch[n - 2]
+        } else {
+            32767
+        }
+    }
+
     fn push_frame_inner(&mut self, pref: &[i16], a11_in: i32) -> u8 {
         let f = self.frame;
         self.frame += 1;

@@ -54,7 +54,7 @@
 //!   arbitrary audio".
 
 use crate::enc::b0_audio::B0Audio;
-use crate::enc::b1_audio::{b1_track, RingRefineMode};
+use crate::enc::b1_audio::{b1_track, b1_track_lb, RingRefineMode};
 use crate::synth::FRAME_SAMPLES;
 
 /// Tunables for the PCM encode chain.
@@ -118,7 +118,7 @@ pub fn encode_pcm_b0(raw_pcm: &[i16], opts: EncodeOpts) -> Vec<u8> {
         &crate::enc::audio_prefilter::PrefilterState::default(),
         raw_pcm,
     );
-    let bt = b1_track(&pref_full, raw_pcm, nframes, opts.refine_ring_p0);
+    let bt = b1_track_lb(&pref_full, raw_pcm, nframes, opts.refine_ring_p0);
     b0_sequence(&pref_full, &bt, nframes, true)
 }
 

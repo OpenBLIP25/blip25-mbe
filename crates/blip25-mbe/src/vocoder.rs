@@ -801,7 +801,7 @@ impl Vocoder {
     /// inter-word floor pulled down). Whole-clip (b1_track needs the stream).
     #[cfg(feature = "encode")]
     fn encode_ambe2_reference_voicing(&self, pcm: &[i16], with_fec: bool) -> Vec<Vec<u8>> {
-        use blip25_codec::enc::b1_audio::{b1_track_from_logs, RingRefineMode};
+        use blip25_codec::enc::b1_audio::{b1_track_from_logs_lb, RingRefineMode};
         debug_assert!(
             matches!(
                 self.rate,
@@ -878,7 +878,7 @@ impl Vocoder {
         // b1 that will actually be transmitted. Only `e2` may carry the floor:
         // giving it to `e` would move the very logs this track is built from.
         let nframes = (pcm.len() / FRAME_SAMPLES).saturating_sub(1);
-        let bt = b1_track_from_logs(
+        let bt = b1_track_from_logs_lb(
             e.gap2_mid_log(),
             e.gap2_slot1_log(),
             e.gap2_slot2_log(),
@@ -1641,6 +1641,10 @@ struct AmbeStream {
     // carried so a bounded analysis window stays byte-exact).
     hdr: Hdr30State,
     hdr30: Vec<i32>,
+    /// The low-band noise rewrite's other persistent producer: the noise-tracker
+    /// block window per source frame. Populated only when the stage is on.
+    lb_hdr: Box<blip25_codec::enc::b1_audio::Hdr30Track>,
+    lb_win: Vec<[i16; 168]>,
 }
 
 /// The persistent producer of the a4 gate word a streamer carries across pumps,
@@ -1726,12 +1730,20 @@ impl AmbeStream {
             pend: std::collections::VecDeque::new(),
             hdr: Hdr30State::new(),
             hdr30: Vec::new(),
+            lb_hdr: Box::new(blip25_codec::enc::b1_audio::Hdr30Track::new()),
+            lb_win: Vec::new(),
         }
     }
 
     /// Advance the persistent hdr30 producer to cover source frames `[0, upto)`.
     fn advance_hdr30(&mut self, upto: usize) {
         advance_hdr30(&mut self.hdr, &mut self.hdr30, &self.raw, &self.pref, upto);
+        if blip25_codec::enc::b1_audio::lb_noise_enabled() {
+            while self.lb_win.len() < upto {
+                let _ = self.lb_hdr.push_frame(&self.pref);
+                self.lb_win.push(self.lb_hdr.window());
+            }
+        }
     }
 
     /// Prefilter + buffer new PCM, then finalise/emit whatever frames now have
@@ -1807,7 +1819,62 @@ impl AmbeStream {
         let win_raw = &self.raw[win_start * n..];
         let win_pref = &self.pref[win_start * n..];
         let hdr_win = &self.hdr30[win_start..win_start + win_nframes];
-        let bt = b1_track_hdr30(win_pref, win_raw, win_nframes, RingRefineMode::Off, hdr_win);
+        // (1a) The low-band noise rewrite needs the pitch tracker's fit-error
+        //      ring for the same frames, which is produced from the masks of a
+        //      pass that has not run yet. The stage cannot move the masks
+        //      (`ctx+0x91a` is written before it), so run the chain once for
+        //      them, advance the persistent pitch tracker over the frames that
+        //      are about to be finalised, then run it again with the stage's
+        //      inputs. Frames past the tracker read the ring's `32767` seed;
+        //      they are never finalised in this pump and are recomputed in the
+        //      next one, when the tracker has reached them.
+        let reference_target = if flush {
+            nframes
+        } else {
+            (new_horizon + 2).min(nframes)
+        };
+        let lb_on = blip25_codec::enc::b1_audio::lb_noise_enabled();
+        let mut raw_b0: Vec<(usize, u8)> = Vec::new();
+        let bt = if lb_on {
+            let btm = b1_track_hdr30(win_pref, win_raw, win_nframes, RingRefineMode::Off, hdr_win);
+            while self.reference_frame < reference_target {
+                let cf = self.reference_frame;
+                let a11 = if cf == 0 {
+                    0
+                } else {
+                    i32::from(btm[cf - 1 - win_start].mask)
+                };
+                let b0 = self
+                    .reference
+                    .push_pcm_frame_with_prev_mask(&self.pref, a11);
+                raw_b0.push((cf, b0));
+                self.reference_frame += 1;
+            }
+            let lb_win: Vec<blip25_codec::enc::b1_audio::LbNoiseIn> = (0..win_nframes)
+                .map(|k| {
+                    let f = win_start + k;
+                    blip25_codec::enc::b1_audio::LbNoiseIn {
+                        st: self.lb_win[f],
+                        q0: self.reference.c62c_at(f),
+                        q2: if f == 0 {
+                            32767
+                        } else {
+                            self.reference.c62c_at(f - 1)
+                        },
+                    }
+                })
+                .collect();
+            blip25_codec::enc::b1_audio::b1_track_hdr30_lb(
+                win_pref,
+                win_raw,
+                win_nframes,
+                RingRefineMode::Off,
+                hdr_win,
+                &lb_win,
+            )
+        } else {
+            b1_track_hdr30(win_pref, win_raw, win_nframes, RingRefineMode::Off, hdr_win)
+        };
         // (2) finalise b1 + tone (in order) for the newly-final source frames.
         for f in self.horizon..new_horizon {
             self.b1.push(bt[f - win_start].b1);
@@ -1819,11 +1886,13 @@ impl AmbeStream {
             self.tone_of.push(tf);
         }
         // (3) advance the persistent reference-pitch tracker (uses only final masks).
-        let reference_target = if flush {
-            nframes
-        } else {
-            (new_horizon + 2).min(nframes)
-        };
+        for &(cf, b0) in &raw_b0 {
+            let fr = &bt[cf - win_start];
+            self.reference_b0
+                .push(blip25_codec::enc::pcm_encode::b0_with_tone_branch(b0, fr));
+            self.reference_l56
+                .push(blip25_codec::enc::pcm_encode::tone_branch_l56(fr.b1));
+        }
         while self.reference_frame < reference_target {
             let cf = self.reference_frame;
             let a11 = if cf == 0 {

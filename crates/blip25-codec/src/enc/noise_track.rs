@@ -647,7 +647,7 @@ fn a600(p1: i32, p2: i32) -> i32 {
 }
 
 /// `FUN_1030a890`: `2^x` with a block-float rescale.
-fn a890(p1: i32, p2: i32, p3: i32) -> i32 {
+pub(crate) fn a890(p1: i32, p2: i32, p3: i32) -> i32 {
     let v = shr_dsp(s16(p1).wrapping_mul(0x10000), s16(p2 - 0xf));
     let (val, exp) = a7a0(v);
     shr_dsp(val, s16(exp - p3)).wrapping_add(0x8000) >> 16

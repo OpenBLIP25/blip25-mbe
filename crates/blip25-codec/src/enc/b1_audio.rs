@@ -449,7 +449,51 @@ pub(crate) fn b1_track(
     nframes: usize,
     c820mode: RingRefineMode,
 ) -> Vec<B1Frame> {
-    b1_track_core(pref, raw_pcm, nframes, c820mode, EncLogs::FromPcm, None)
+    b1_track_core(
+        pref,
+        raw_pcm,
+        nframes,
+        c820mode,
+        EncLogs::FromPcm,
+        None,
+        None,
+    )
+}
+
+/// [`b1_track`] with the low-band noise rewrite (`BLIP25_LB_NOISE=1`) applied.
+///
+/// Whole-buffer only, and a no-op with the flag off. The stage needs the pitch
+/// tracker's fit-error ring, which is produced from the band-voicing masks of
+/// the same frames, so the chain runs TWICE: once for the masks (which the
+/// stage provably cannot move -- `ctx+0x91a` is written before the rewrite) and
+/// once with the stage's per-frame inputs derived from them.
+pub(crate) fn b1_track_lb(
+    pref: &[i16],
+    raw_pcm: &[i16],
+    nframes: usize,
+    c820mode: RingRefineMode,
+) -> Vec<B1Frame> {
+    let first = b1_track_core(
+        pref,
+        raw_pcm,
+        nframes,
+        c820mode,
+        EncLogs::FromPcm,
+        None,
+        None,
+    );
+    let Some(lb) = lb_inputs(pref, nframes, &first) else {
+        return first;
+    };
+    b1_track_core(
+        pref,
+        raw_pcm,
+        nframes,
+        c820mode,
+        EncLogs::FromPcm,
+        None,
+        Some(&lb),
+    )
 }
 
 /// As [`b1_track`], but with a caller-supplied hdr30 VAD (one `i32` per frame).
@@ -470,6 +514,30 @@ pub fn b1_track_hdr30(
         c820mode,
         EncLogs::FromPcm,
         Some(hdr30),
+        None,
+    )
+}
+
+/// [`b1_track_hdr30`] with the low-band noise rewrite's per-frame inputs
+/// supplied by the caller -- the streaming form, where the pitch tracker and the
+/// noise tracker are persistent and a bounded window cannot rebuild them.
+/// `lb[k]` belongs to the same frame as `hdr30[k]`. A no-op with the flag off.
+pub fn b1_track_hdr30_lb(
+    pref: &[i16],
+    raw_pcm: &[i16],
+    nframes: usize,
+    c820mode: RingRefineMode,
+    hdr30: &[i32],
+    lb: &[LbNoiseIn],
+) -> Vec<B1Frame> {
+    b1_track_core(
+        pref,
+        raw_pcm,
+        nframes,
+        c820mode,
+        EncLogs::FromPcm,
+        Some(hdr30),
+        Some(lb),
     )
 }
 
@@ -513,6 +581,76 @@ pub fn b1_track_from_logs(
         c820mode,
         EncLogs::Supplied { gap0, gap1, gap2w },
         None,
+        None,
+    )
+}
+
+/// [`b1_track_from_logs`] with the low-band noise rewrite applied. Same
+/// two-pass structure and same no-op-when-off contract as [`b1_track_lb`].
+#[allow(clippy::too_many_arguments)]
+pub fn b1_track_from_logs_lb(
+    gap0: &[[i16; GAP2_LEN]],
+    gap1: &[[i16; GAP2_LEN]],
+    gap2w: &[[i16; GAP2_LEN_WIDE]],
+    pre: &[i16],
+    raw_pcm: &[i16],
+    nframes: usize,
+    c820mode: RingRefineMode,
+) -> Vec<B1Frame> {
+    let first = b1_track_from_logs(gap0, gap1, gap2w, pre, raw_pcm, nframes, c820mode);
+    let (pref, _) = crate::enc::audio_prefilter::prefilter(
+        &crate::enc::audio_prefilter::PrefilterState::default(),
+        raw_pcm,
+    );
+    let Some(lb) = lb_inputs(&pref, nframes, &first) else {
+        return first;
+    };
+    b1_track_core(
+        &pref,
+        raw_pcm,
+        nframes,
+        c820mode,
+        EncLogs::Supplied { gap0, gap1, gap2w },
+        None,
+        Some(&lb),
+    )
+}
+
+/// The per-frame inputs the low-band noise rewrite reads outside the ring: the
+/// noise-tracker window and the pitch tracker's fit-error ring words `Q[0]` and
+/// `Q[2]`.
+#[derive(Clone, Copy)]
+pub struct LbNoiseIn {
+    /// The `ctx+0x938` block's `0x40..0x190` window.
+    pub st: [i16; 168],
+    /// `S+0x62c`: this frame's harmonic-fit error.
+    pub q0: i32,
+    /// `S+0x630`: the previous frame's.
+    pub q2: i32,
+}
+
+/// Derive [`LbNoiseIn`] for every frame from the prefiltered stream and a first
+/// pass's masks, or `None` when the stage is off. Whole-buffer: both trackers
+/// start cold at frame 0, exactly as the reference's do.
+fn lb_inputs(pref: &[i16], nframes: usize, first: &[B1Frame]) -> Option<Vec<LbNoiseIn>> {
+    if !crate::enc::lb_noise::enabled() {
+        return None;
+    }
+    let mut hdr = Hdr30Track::new();
+    let mut trk = crate::enc::b0_audio::B0Audio::new();
+    Some(
+        (0..nframes)
+            .map(|f| {
+                let a11 = if f == 0 { 0 } else { first[f - 1].mask as i32 };
+                let _ = trk.push_pcm_frame_with_prev_mask(pref, a11);
+                let _ = hdr.push_frame(pref);
+                LbNoiseIn {
+                    st: hdr.window(),
+                    q0: trk.last_c62c(),
+                    q2: trk.prev_c62c(),
+                }
+            })
+            .collect(),
     )
 }
 
@@ -523,6 +661,7 @@ fn b1_track_core(
     c820mode: RingRefineMode,
     logs: EncLogs<'_>,
     hdr30_override: Option<&[i32]>,
+    lb: Option<&[LbNoiseIn]>,
 ) -> Vec<B1Frame> {
     let fr = front_end(pref, nframes);
     let (a9v, wide) = match logs {
@@ -596,6 +735,19 @@ fn b1_track_core(
         };
         if fire {
             c820m::refine_ring_p0(&mut ring.w, xh, &wide[f]);
+        }
+        // The low-band noise rewrite of p0 slot 0 words 0..2, between the ring
+        // refine and the a4 measurement -- the reference's own order. It reads
+        // the mask this frame and the one two frames back, both already stored.
+        if let Some(lbv) = lb.filter(|_| crate::enc::lb_noise::enabled()) {
+            if let Some(l) = lbv.get(f) {
+                let m2 = if f >= 2 { out[f - 2].mask } else { 0 };
+                let mut row: [i16; 8] = std::array::from_fn(|k| ring.p0(0, k));
+                crate::enc::lb_noise::apply(&mut row, &l.st, l.q0, l.q2, mask, m2);
+                for k in 0..3 {
+                    ring.set_p0(0, k, row[k]);
+                }
+            }
         }
         let a9 = a9v[f].unwrap_or(0);
         let (p0s0, p0s2) = (ring.slot(0, 0), ring.slot(0, 2));
@@ -3175,6 +3327,19 @@ impl Hdr30Track {
         self.next += 1;
         self.nt.voicing_register()
     }
+
+    /// The tracker block's `0x40..0x190` window, which the low-band noise
+    /// rewrite reads alongside the gate word.
+    pub fn window(&self) -> [i16; 168] {
+        const _: () = assert!(crate::enc::dp_score::ST_WORDS == 168);
+        self.nt.window()
+    }
+}
+
+/// Whether the low-band noise rewrite (`BLIP25_LB_NOISE=1`) is on, for callers
+/// outside this crate that must supply its per-frame inputs.
+pub fn lb_noise_enabled() -> bool {
+    crate::enc::lb_noise::enabled()
 }
 
 /// Whole-buffer form of [`Hdr30Track`]: the gate word for frames `0..nframes`.

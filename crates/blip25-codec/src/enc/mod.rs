@@ -42,6 +42,7 @@ pub mod cos_quadrature_interp;
 pub(crate) mod dp_score;
 pub(crate) mod noise_track;
 pub use crate::shared::encode_frame;
+pub(crate) mod lb_noise;
 pub mod history_ring;
 pub mod loudness_fixed;
 pub use crate::shared::loudness_transform;
