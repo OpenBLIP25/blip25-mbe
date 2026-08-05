@@ -654,13 +654,7 @@ impl Vocoder {
                 let mut padded = Vec::with_capacity((want + 1) * FRAME_SAMPLES);
                 padded.extend_from_slice(pcm);
                 padded.resize((want + 1) * FRAME_SAMPLES, 0);
-                // The alignment estimate scores only the output frames the
-                // caller's own audio backs, so appending the pad cannot move it.
-                let mut out = self.encode_ambe2_reference_voicing(
-                    &padded,
-                    with_fec,
-                    want.saturating_sub(1),
-                );
+                let mut out = self.encode_ambe2_reference_voicing(&padded, with_fec);
                 out.truncate(want);
                 out
             }
@@ -703,11 +697,14 @@ impl Vocoder {
                 }
                 // Reference pitch for IMBE — THE single pitch path (same RE'd
                 // spectral-DP pitch that fixed AMBE+2; owner-confirmed better).
+                // The packer tone branch is half-rate only, so this uses the
+                // variant without it and matches `ImbeStream`.
                 {
-                    let reference_b0 = blip25_codec::enc::pcm_encode::encode_pcm_b0(
-                        pcm,
-                        blip25_codec::enc::pcm_encode::EncodeOpts::default(),
-                    );
+                    let reference_b0 =
+                        blip25_codec::enc::pcm_encode::encode_pcm_b0_no_tone_branch(
+                            pcm,
+                            blip25_codec::enc::pcm_encode::EncodeOpts::default(),
+                        );
                     if !reference_b0.is_empty() {
                         let nf = pcm.len() / FRAME_SAMPLES;
                         // Silence gate: on low-energy frames the reference spectral-DP
@@ -802,16 +799,8 @@ impl Vocoder {
     /// (byte-identical to the reference encoder), plus a gain clamp on silent
     /// frames. A/B-validated against the reference vectors (fricative buzz removed,
     /// inter-word floor pulled down). Whole-clip (b1_track needs the stream).
-    ///
-    /// `lag_span` bounds the alignment estimate to the leading output frames —
-    /// see the `min_by_key` below.
     #[cfg(feature = "encode")]
-    fn encode_ambe2_reference_voicing(
-        &self,
-        pcm: &[i16],
-        with_fec: bool,
-        lag_span: usize,
-    ) -> Vec<Vec<u8>> {
+    fn encode_ambe2_reference_voicing(&self, pcm: &[i16], with_fec: bool) -> Vec<Vec<u8>> {
         use blip25_codec::enc::b1_audio::{b1_track_from_logs, RingRefineMode};
         debug_assert!(
             matches!(
@@ -827,9 +816,6 @@ impl Vocoder {
             return Vec::new();
         }
         const R33: usize = 9;
-        let b1_of = |fr: &[u8]| {
-            blip25_codec::tables::deprioritize(&blip25_codec::frame::decode_bytes(fr).info)[1]
-        };
 
         // 1. blip25's own per-frame amplitude/pitch frames (drop the look-ahead
         //    placeholder, flush the tail) — same convention as `encode_pcm`.
@@ -954,8 +940,10 @@ impl Vocoder {
 
         // 3. Align blip25's stream to the b1_track index (the two use different
         //    look-ahead conventions), then swap `b1` and repack the r33 frame.
-        let ours_b1: Vec<u16> = frames.iter().map(|f| b1_of(f)).collect();
-        let lag = ambe2_b1_lag(&ours_b1, &orac_b1, lag_span);
+        //    The offset is [`AMBE_B1_OUTPUT_LAG`], the same convention
+        //    `forced_b0` and the tone branch's `(L, step)` override above are
+        //    built on.
+        let lag = AMBE_B1_OUTPUT_LAG;
 
         // 4. Annex-T tone overlay. A streaming detector reproduces the reference's tone
         //    vs voice decision (and 1-frame onset lag) per source frame; where
@@ -1574,45 +1562,19 @@ fn lowband_floor_enabled() -> bool {
     *ON.get_or_init(|| std::env::var("BLIP25_LOWBAND_FLOOR").as_deref() == Ok("1"))
 }
 
-/// The same offset on the OUTPUT-frame axis, where whole-buffer `encode`'s lag
-/// search works. Output frame `i` is source frame `i + 1` (the dropped
-/// look-ahead placeholder), so the two constants differ by exactly that one
-/// frame and both paths agree only when the search lands here.
+/// The same offset on the OUTPUT-frame axis. Output frame `i` is source frame
+/// `i + 1` (the dropped look-ahead placeholder), so the two constants differ by
+/// exactly that one frame.
+///
+/// This is the whole encoder's voicing convention, not an estimate: whole-buffer
+/// `encode` already hard-wires it in `forced_b0` (`reference_b0[f + 2]`) and in
+/// the tone branch's `(L, step)` override (`orac_b1[f + BLAG]`), and
+/// [`AmbeStream`] applies the same offset per frame. Deriving the emitted `b1`'s
+/// offset any other way lets one field disagree with the injections the rest of
+/// the frame was built from, and cannot be reproduced by a streaming caller —
+/// any data fit over the clip needs frames the stream has not received yet.
 #[cfg(feature = "encode")]
 const AMBE_B1_OUTPUT_LAG: i64 = BLAG as i64 + 1;
-
-/// Choose the offset that aligns the encoder's own voicing sequence `ours_b1`
-/// to the reference `b1_track` sequence `orac_b1`, both on the output-frame
-/// axis.
-///
-/// Only the leading `lag_span` entries are scored. `Vocoder::encode` appends
-/// trailing silence to buy the analysis look-ahead back, and that padding must
-/// not be able to change which alignment wins for the real audio ahead of it —
-/// the choice is global, so a shifted decision would perturb frames anywhere in
-/// the clip. `lag_span` is therefore the output-frame count the caller's own
-/// audio would have produced unpadded.
-///
-/// Ties resolve to [`AMBE_B1_OUTPUT_LAG`], the offset the streaming path
-/// applies, so inputs the data cannot distinguish (silence, sub-frame audio)
-/// still agree between the two paths.
-#[cfg(feature = "encode")]
-fn ambe2_b1_lag(ours_b1: &[u16], orac_b1: &[u16], lag_span: usize) -> i64 {
-    let span_o = lag_span.min(ours_b1.len());
-    let span_r = lag_span.min(orac_b1.len());
-    let mismatch = |lag: i64| -> usize {
-        let mut m = 0;
-        for (i, &x) in ours_b1[..span_o].iter().enumerate() {
-            let j = i as i64 + lag;
-            if j >= 0 && (j as usize) < span_r && x != orac_b1[j as usize] {
-                m += 1;
-            }
-        }
-        m
-    };
-    (-3..=3)
-        .min_by_key(|&l| (mismatch(l), (l - AMBE_B1_OUTPUT_LAG).abs()))
-        .unwrap_or(AMBE_B1_OUTPUT_LAG)
-}
 
 /// Single-pass stateful AMBE+2 streamer — byte-exact to whole-buffer
 /// [`Vocoder::encode`] at ~`B1_RESERVE`-frame latency, the console's own
@@ -3026,44 +2988,42 @@ mod tests {
         }
     }
 
-    /// The AMBE+2 voicing alignment is chosen from the caller's own audio only.
+    /// Audio a caller has not sent yet cannot change the frames already emitted.
     ///
-    /// `Vocoder::encode` appends trailing silence to buy back the analysis
-    /// look-ahead. The alignment it picks is global — it is applied to every
-    /// output frame — so if the padding could move the choice, adding it would
-    /// perturb frames at the START of a clip. Scoring the pad's frames is
-    /// exactly what makes that possible, so extending either sequence past
-    /// `lag_span` must be inert.
+    /// The AMBE+2 voicing offset is [`AMBE_B1_OUTPUT_LAG`] applied per frame,
+    /// not a quantity fitted over the clip, so appending audio must leave the
+    /// leading output frames byte-identical. A global fit would break exactly
+    /// here — and it is also what makes `Vocoder::encode` reproducible by
+    /// `LiveEncoder`, which never sees the whole clip.
+    #[cfg(feature = "encode")]
     #[test]
-    fn ambe2_lag_ignores_frames_past_the_span() {
-        // A sequence that aligns at +3 over its first 12 entries.
-        let orac: Vec<u16> = (0..24).map(|i| (i * 7 % 31) as u16).collect();
-        let ours: Vec<u16> = (0..12)
-            .map(|i| orac[(i as i64 + AMBE_B1_OUTPUT_LAG) as usize])
+    fn ambe2_trailing_audio_cannot_move_earlier_frames() {
+        let n = FRAME_SAMPLES;
+        let tone: Vec<i16> = (0..80 * n)
+            .map(|i| {
+                let t = i as f64 / 8000.0;
+                (6000.0 * (2.0 * std::f64::consts::PI * 180.0 * t).sin()) as i16
+            })
             .collect();
-        let span = ours.len();
-        assert_eq!(ambe2_b1_lag(&ours, &orac, span), AMBE_B1_OUTPUT_LAG);
-
-        // Append entries beyond the span that would win at a different offset if
-        // they were scored. The estimate must not move.
-        for pad in 1..=4usize {
-            let mut ours_pad = ours.clone();
-            let mut orac_pad = orac.clone();
-            for (k, &o) in orac.iter().enumerate().take(pad) {
-                ours_pad.push(o);
-                orac_pad.push(u16::MAX - k as u16);
-            }
-            assert_eq!(
-                ambe2_b1_lag(&ours_pad, &orac_pad, span),
-                AMBE_B1_OUTPUT_LAG,
-                "{pad} padded frames moved the alignment estimate"
+        for rate in [Rate::AmbePlus2_3600x2450, Rate::AmbePlus2_2450x2450] {
+            let head = Vocoder::new(rate).encode(&tone[..48 * n]);
+            // The head's own trailing frames still move with later audio (the
+            // analysis look-ahead genuinely reaches into it); everything before
+            // that must not.
+            let stable = head.len().saturating_sub(B1_RESERVE);
+            assert!(
+                stable >= 32,
+                "test is vacuous: only {stable} frames compared"
             );
+            for extra in [1usize, 7, 20, 32] {
+                let longer = Vocoder::new(rate).encode(&tone[..(48 + extra) * n]);
+                assert_eq!(
+                    head[..stable],
+                    longer[..stable],
+                    "{extra} extra frames of audio changed already-emitted frames"
+                );
+            }
         }
-
-        // With nothing to score every offset ties, and the tie-break must pick
-        // the offset the streaming path applies.
-        assert_eq!(ambe2_b1_lag(&[], &[], 0), AMBE_B1_OUTPUT_LAG);
-        assert_eq!(ambe2_b1_lag(&ours, &orac, 0), AMBE_B1_OUTPUT_LAG);
     }
 
     /// `LiveEncoder` accepts arbitrary chunk sizes, holds residue

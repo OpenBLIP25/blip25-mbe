@@ -316,55 +316,33 @@ fn a5_pcm_arms(pre: &[i16], f: usize, c: usize) -> Option<(Vec<i16>, Vec<i16>, i
 }
 
 /// Assemble `a5` (the 16-word array A, two 8-word `a_writer_band` halves) for
-/// every frame, from PCM alone. This is the standalone realization of the
-/// r54..r64 chain: PCM -> arms -> windowed_complex_correlation (w from the lib's own PCM band_voicing_mask) ->
-/// gate -> `pq_driver` -> cross-frame T/S ring (with the PCM
-/// `repair_gate_f0` reference) -> `a_writer_band`.
+/// every frame. This is the standalone realization of the r54..r64 chain:
+/// prefiltered audio -> arms -> windowed_complex_correlation (w from the lib's
+/// own band_voicing_mask) -> gate -> `pq_driver` -> cross-frame T/S ring (with
+/// the `repair_gate_f0` reference) -> `a_writer_band`.
+///
+/// `pre` is the caller's prefiltered stream and `fr` its front end, both
+/// starting at the same sample as the frame index. The chain reads no raw PCM
+/// and starts no filter of its own: every stage here is a block-floating-point
+/// cascade over `pre`, and the prefilter is an integer IIR whose state error
+/// does not decay to zero, so re-deriving `pre` from a window of raw samples
+/// perturbs `a5` an unbounded distance into the window.
 ///
 /// The raw `a_writer` output is nonzero on ~85 voiced / ~48 mark NON-lever
 /// frames (the zeros-trap: the off-lever T/S ring is only lever-validated).
 /// `a5` is emitted verbatim here; the caller applies whatever voicing gate it
-/// wants. Returns one `[i16;16]` per frame (index 0..nframes).
-pub(crate) fn a5_track(raw_pcm: &[i16], nframes: usize) -> (Vec<[i16; 16]>, Vec<i16>) {
-    use crate::synth::FRAME_SAMPLES;
-    use crate::Encoder;
-
-    // Prefiltered stream for the arms.
-    let pre: Vec<i16> = {
-        let mut e = Encoder::new();
-        for ch in raw_pcm.chunks(FRAME_SAMPLES) {
-            if ch.len() < FRAME_SAMPLES {
-                break;
-            }
-            let mut fr = [0i16; FRAME_SAMPLES];
-            fr.copy_from_slice(ch);
-            let _ = e.encode_frame_r34(&fr);
-        }
-        let _ = e.flush_r34();
-        e.prefiltered_log().to_vec()
-    };
-    a5_track_from_pre(&pre, raw_pcm, nframes)
-}
-
-/// The body of [`a5_track`] that takes the encoder's already-captured
-/// prefiltered stream (`prefiltered_log`) as `pre`, instead of running the r34
-/// encoder to produce it. Lets a caller that already ran the encoder (for the
-/// emitted bits) share that one pass. `a5_track` runs the encoder and forwards
-/// its log here.
-fn a5_track_from_pre(pre: &[i16], raw_pcm: &[i16], nframes: usize) -> (Vec<[i16; 16]>, Vec<i16>) {
+/// wants. Returns one `[i16;16]` per frame (index 0..nframes) alongside the
+/// per-call `repair_gate_f0` log (index 0..2*nframes).
+fn a5_track_from_pre(pre: &[i16], fr: &[FrameIn], nframes: usize) -> (Vec<[i16; 16]>, Vec<i16>) {
     use crate::enc::a5_assemble::{pq_driver, RingState};
     use crate::enc::windowed_complex_correlation::windowed_complex_correlation;
     use crate::enc::t_ring::repair_gate_f0;
     use crate::enc::w_builder::w_builder;
 
-    // Per-frame w_builder inputs (thresh8, exp_arg, table8) from PCM, via the
-    // lib's own band_voicing_mask ring -- NO captured band_voicing_mask CSV. table8 = the FRESH heap_src
-    // this frame (`table8[N] == heap_src[N+1]`, r54 `w_builder` doc).
-    let (pref_af, _) = crate::enc::audio_prefilter::prefilter(
-        &crate::enc::audio_prefilter::PrefilterState::default(),
-        raw_pcm,
-    );
-    let fr = front_end(&pref_af, nframes);
+    // Per-frame w_builder inputs (thresh8, exp_arg, table8) via the lib's own
+    // band_voicing_mask ring -- NO captured band_voicing_mask CSV. table8 = the
+    // FRESH heap_src this frame (`table8[N] == heap_src[N+1]`, r54 `w_builder`
+    // doc).
     let mut win_in: Vec<([i16; 8], i16, [i16; 8])> = Vec::with_capacity(nframes);
     {
         let mut ring = Ring90 { w: [0i16; 90] };
@@ -450,10 +428,8 @@ fn a5_track_from_pre(pre: &[i16], raw_pcm: &[i16], nframes: usize) -> (Vec<[i16;
     (a5_out, f0v)
 }
 
-/// Source of the r34 encoder-analysis logs the b1 chain needs (the gap2
-/// windows for `precompute_from_logs` and the prefiltered stream for
-/// `a5_track_from_pre`). `FromPcm` runs the encoder internally (once for the
-/// gaps, once for the prefiltered stream); `Supplied` reuses logs a caller
+/// Source of the r34 encoder gap2 logs `precompute_from_logs` needs.
+/// `FromPcm` runs the encoder internally; `Supplied` reuses logs a caller
 /// already captured from its own encoder pass, so no encoder run is repeated.
 #[derive(Clone, Copy)]
 enum EncLogs<'a> {
@@ -462,7 +438,6 @@ enum EncLogs<'a> {
         gap0: &'a [[i16; GAP2_LEN]],
         gap1: &'a [[i16; GAP2_LEN]],
         gap2w: &'a [[i16; GAP2_LEN_WIDE]],
-        pre: &'a [i16],
     },
 }
 
@@ -500,13 +475,18 @@ pub fn b1_track_hdr30(
     )
 }
 
-/// As [`b1_track`], but reuses the r34 encoder-analysis logs a caller already
+/// As [`b1_track`], but reuses the r34 encoder gap2 logs a caller already
 /// captured from its own encoder pass (`gap2_mid_log` / `gap2_slot1_log` /
-/// `gap2_slot2_log` / `prefiltered_log`) instead of running the encoder twice
-/// internally (`precompute_from_ring` + `a5_track`). The emitted-bits encoder
-/// pass and the b1 chain then share ONE analysis pass. The r33 and r34 encoders
-/// share the same analysis / prefilter / gap-log writers and differ only in the
-/// final bit-packing, so r33-captured logs are byte-identical here.
+/// `gap2_slot2_log`) instead of running the encoder again internally
+/// (`precompute_from_ring`). The emitted-bits encoder pass and the b1 chain
+/// then share ONE analysis pass. The r33 and r34 encoders share the same
+/// analysis / prefilter / gap-log writers and differ only in the final
+/// bit-packing, so r33-captured logs are byte-identical here.
+///
+/// `pre` is the same pass's `prefiltered_log`. The encoder prefilters each
+/// frame in two 80-sample halves off one persistent state, so for a whole
+/// number of frames it is the same stream as prefiltering `raw_pcm` in one
+/// call; it is taken here as a checked redundancy rather than a second input.
 #[allow(clippy::too_many_arguments)]
 pub fn b1_track_from_logs(
     gap0: &[[i16; GAP2_LEN]],
@@ -521,17 +501,19 @@ pub fn b1_track_from_logs(
         &crate::enc::audio_prefilter::PrefilterState::default(),
         raw_pcm,
     );
+    debug_assert!(
+        {
+            let n = pre.len().min(pref.len());
+            pre[..n] == pref[..n]
+        },
+        "prefiltered_log disagrees with the prefilter over raw_pcm"
+    );
     b1_track_core(
         &pref,
         raw_pcm,
         nframes,
         c820mode,
-        EncLogs::Supplied {
-            gap0,
-            gap1,
-            gap2w,
-            pre,
-        },
+        EncLogs::Supplied { gap0, gap1, gap2w },
         None,
     )
 }
@@ -547,9 +529,7 @@ fn b1_track_core(
     let fr = front_end(pref, nframes);
     let (a9v, wide) = match logs {
         EncLogs::FromPcm => precompute_from_ring(raw_pcm, nframes),
-        EncLogs::Supplied {
-            gap0, gap1, gap2w, ..
-        } => precompute_from_logs(gap0, gap1, gap2w, nframes),
+        EncLogs::Supplied { gap0, gap1, gap2w } => precompute_from_logs(gap0, gap1, gap2w, nframes),
     };
     let mut ring = Ring90 { w: [0i16; 90] };
     let mut exp_hist = [0i16; 4];
@@ -571,21 +551,23 @@ fn b1_track_core(
         derive_hdr30_vad(raw_pcm, nframes)
     };
 
-    // a5 (array A) FROM PCM (r64 chain), gated by the hdr30 VAD (a5=[0;16] off
-    // voiced frames) to suppress the off-lever zeros-trap false-nonzeros. See
-    // `a5_track`.
-    // r93: a5 is ON BY DEFAULT. a5_track (from PCM, audio-only) is nonzero only on
-    // the ~9 voiced VQ levers + the first 3 startup-warmup frames (identical
-    // 0/1/2 on both independent clips = a real encoder startup transient, not a
-    // fit). Zeroing that warmup (A5_WARMUP) reproduces the +22-voiced ceiling
-    // (voiced 171->193, mark 195->197).
-    let (a5_all, f0v): (Vec<[i16; 16]>, Vec<i16>) = match logs {
-        EncLogs::FromPcm => a5_track(raw_pcm, nframes),
-        EncLogs::Supplied { pre, .. } => a5_track_from_pre(pre, raw_pcm, nframes),
-    };
+    // a5 (array A), the r64 chain, gated by the hdr30 VAD (a5=[0;16] off voiced
+    // frames) to suppress the off-lever zeros-trap false-nonzeros. See
+    // `a5_track_from_pre`. It reads the caller's own prefiltered stream — never
+    // a re-derived one — truncated to the whole frames the front end covers.
+    // r93: a5 is ON BY DEFAULT. It is nonzero only on the ~9 voiced VQ levers +
+    // the first 3 startup-warmup frames (identical 0/1/2 on both independent
+    // clips = a real encoder startup transient, not a fit). Zeroing that warmup
+    // (A5_WARMUP) reproduces the +22-voiced ceiling (voiced 171->193, mark
+    // 195->197).
+    let a5_pre_len = ((raw_pcm.len() / crate::synth::FRAME_SAMPLES) * crate::synth::FRAME_SAMPLES)
+        .min(pref.len());
+    let (a5_all, f0v): (Vec<[i16; 16]>, Vec<i16>) =
+        a5_track_from_pre(&pref[..a5_pre_len], &fr, nframes);
     /// Startup-transient frames where the analysis chain is not yet warmed up
-    /// and the real encoder emits a5=[0;16] (r40 f0/1/2 = 0; a5_track spuriously
-    /// nonzero there). Zeroed to match. Principled (input-independent startup).
+    /// and the real encoder emits a5=[0;16] (r40 f0/1/2 = 0; the chain is
+    /// spuriously nonzero there). Zeroed to match. Principled (input-independent
+    /// startup).
     const A5_WARMUP: usize = 3;
     let a5_vad: Vec<i32> = if a5_all.is_empty() {
         Vec::new()

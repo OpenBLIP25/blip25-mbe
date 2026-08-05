@@ -119,7 +119,26 @@ pub fn encode_pcm_b0(raw_pcm: &[i16], opts: EncodeOpts) -> Vec<u8> {
         raw_pcm,
     );
     let bt = b1_track(&pref_full, raw_pcm, nframes, opts.refine_ring_p0);
-    b0_sequence(&pref_full, &bt, nframes)
+    b0_sequence(&pref_full, &bt, nframes, true)
+}
+
+/// [`encode_pcm_b0`] without the packer tone branch.
+///
+/// The branch is a half-rate packer mechanism: it substitutes the classifier's
+/// index for the pitch quantiser's on frames that trip the `L = 56` gate, and
+/// the full-rate packer has no equivalent. Callers on the IMBE path use this so
+/// the whole-buffer and streaming IMBE encoders agree.
+pub fn encode_pcm_b0_no_tone_branch(raw_pcm: &[i16], opts: EncodeOpts) -> Vec<u8> {
+    let nframes = (raw_pcm.len() / FRAME_SAMPLES).saturating_sub(1);
+    if nframes == 0 {
+        return Vec::new();
+    }
+    let (pref_full, _) = crate::enc::audio_prefilter::prefilter(
+        &crate::enc::audio_prefilter::PrefilterState::default(),
+        raw_pcm,
+    );
+    let bt = b1_track(&pref_full, raw_pcm, nframes, opts.refine_ring_p0);
+    b0_sequence(&pref_full, &bt, nframes, false)
 }
 
 /// Opt-in switch (`BLIP25_TONE_BRANCH=1`, OFF by default) for the packer's
@@ -167,13 +186,22 @@ pub fn tone_branch_l56(b1: u16) -> bool {
 /// The `b̂₀` loop behind [`encode_pcm_b0`]: advance one [`B0Audio`] tracker
 /// across every frame, feeding the previous frame's `b1_track` mask as `a11`
 /// (0 for the first frame).
-fn b0_sequence(pref_full: &[i16], bt: &[crate::enc::b1_audio::B1Frame], nframes: usize) -> Vec<u8> {
+fn b0_sequence(
+    pref_full: &[i16],
+    bt: &[crate::enc::b1_audio::B1Frame],
+    nframes: usize,
+    tone_branch: bool,
+) -> Vec<u8> {
     let mut tracker = B0Audio::new();
     (0..nframes)
         .map(|f| {
             let a11 = if f == 0 { 0 } else { bt[f - 1].mask as i32 };
             let b0 = tracker.push_pcm_frame_with_prev_mask(pref_full, a11);
-            b0_with_tone_branch(b0, &bt[f])
+            if tone_branch {
+                b0_with_tone_branch(b0, &bt[f])
+            } else {
+                b0
+            }
         })
         .collect()
 }
