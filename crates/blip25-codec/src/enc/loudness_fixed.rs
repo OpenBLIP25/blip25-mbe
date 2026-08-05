@@ -1260,7 +1260,7 @@ fn outer_calib_b() -> f64 {
 /// [`super::voicing_fixed::magsq_assemble_bins`]: that one's `src` array is 64
 /// `i16` wide, a different call site's wider window. The `ptr63c` call site
 /// consumes a 32-`i16` `real_fft32` output directly.
-fn gamma_poly_magsq16(fft_out: &[i16; 32]) -> [i32; 16] {
+pub(crate) fn gamma_poly_magsq16(fft_out: &[i16; 32]) -> [i32; 16] {
     let mut out = [0i32; 16];
     for (i, slot) in out.iter_mut().enumerate() {
         let re = i64::from(fft_out[2 * i]);

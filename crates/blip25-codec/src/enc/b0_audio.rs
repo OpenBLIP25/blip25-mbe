@@ -94,7 +94,14 @@ mod e100 {
         out
     }
     /// run e100: seq scorevecs (16 x 32 already lag-0,1 masked) + per-seq exponent.
-    pub(crate) fn run(scorevecs: &[[i32; 32]; 16], expo: &[i32; 16]) -> [i16; 32] {
+    pub(crate) fn run(
+        scorevecs: &[[i32; 32]; 16],
+        expo: &[i32; 16],
+        st: Option<&[i16; crate::enc::dp_score::ST_WORDS]>,
+    ) -> [i16; 32] {
+        if crate::enc::dp_score::enabled() {
+            return crate::enc::dp_score::run(scorevecs, expo, st);
+        }
         let mut acc = vec![0i64; 32];
         let mut eacc: Option<i32> = None;
         for seq in 0..16 {
@@ -1431,6 +1438,7 @@ const K_SLIDE: usize = 20;
 /// [`push_pcm_frame`](Self::push_pcm_frame) once per 160-sample frame, in order.
 pub struct B0Audio {
     ab80: fe::PassAccumulatorState,
+    noise: crate::enc::noise_track::NoiseTracker,
     prev_pass1: [[i64; 10]; 16],
     e530_hist: [[i64; 50]; 16],
     r622h: Vec<i32>,
@@ -1452,6 +1460,7 @@ impl B0Audio {
     pub fn new() -> Self {
         B0Audio {
             ab80: fe::PassAccumulatorState::default(),
+            noise: crate::enc::noise_track::NoiseTracker::default(),
             prev_pass1: [[0i64; 10]; 16],
             // The e530 frame-0 seed is genuinely all-zero (probe: `seed_zero == true`
             // on both files), so no capture is needed to initialize it.
@@ -1493,6 +1502,7 @@ impl B0Audio {
 
         let pass0 = self.ab80.run_pass(pref, f, 0);
         let pass1 = self.ab80.run_pass(pref, f, 1);
+        let noise_win = crate::enc::noise_track::advance(&mut self.noise, pref, f);
         if f > 0 {
             for b in 0..16usize {
                 let mut app = [0i64; 20];
@@ -1542,7 +1552,7 @@ impl B0Audio {
             expo[b] = r; // = 2 * inverse-FFT exponent
         }
 
-        let score32 = e100::run(&svs, &expo);
+        let score32 = e100::run(&svs, &expo, noise_win.as_ref());
         let mut score = [0i32; 40];
         for i in 0..32 {
             score[i] = score32[i] as i32;

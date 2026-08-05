@@ -719,7 +719,14 @@ mod e100 {
         out
     }
     /// run e100: seq scorevecs (16 x 32 already lag-0,1 masked) + per-seq exponent.
-    pub(crate) fn run(scorevecs: &[[i32; 32]; 16], expo: &[i32; 16]) -> [i16; 32] {
+    pub(crate) fn run(
+        scorevecs: &[[i32; 32]; 16],
+        expo: &[i32; 16],
+        st: Option<&[i16; crate::enc::dp_score::ST_WORDS]>,
+    ) -> [i16; 32] {
+        if crate::enc::dp_score::enabled() {
+            return crate::enc::dp_score::run(scorevecs, expo, st);
+        }
         let mut acc = vec![0i64; 32];
         let mut eacc: Option<i32> = None;
         for seq in 0..16 {
@@ -3244,7 +3251,10 @@ fn front_end(pref: &[i16], nframes: usize) -> Vec<FrameIn> {
             expo[b] = r;
         }
         let (a3, bandexp) = amp_scores_and_bandexp(&svs, &expo);
-        let score32 = e100::run(&svs, &expo);
+        // No noise window here: this chain's `x` / a3 / bandexp consumers were
+        // derived against the unweighted score, and feeding them the weighted one
+        // costs b1 on every vector. The b0 chain takes the weighted score.
+        let score32 = e100::run(&svs, &expo, None);
         let mut score = [0i32; 40];
         for i in 0..32 {
             score[i] = score32[i] as i32;
