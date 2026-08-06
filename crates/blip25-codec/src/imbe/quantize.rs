@@ -114,7 +114,7 @@ fn sat_sub_q16(a: i16, b: i16) -> i16 {
 /// The scan is not the same map as [`tbl_quant`] over [`MONO65_ENCODE`]: that one
 /// breaks ties toward the higher index and can address the encoder-only 65th
 /// level, which `b̂₂`'s six bits cannot carry.
-fn ref_gain_dc_quant(val: i16) -> i16 {
+pub(super) fn ref_gain_dc_quant(val: i16) -> i16 {
     // Index 0's metric is computed WITHOUT the `-0x8000` guard the loop applies
     // to indices 1..63, so a saturating difference of -32768 wraps its square to
     // a large negative and wins. Reproduced rather than normalised.
@@ -155,7 +155,7 @@ pub fn unvoiced_log_offset(pitch_word: u16) -> i16 {
 /// Bands run three harmonics wide; the top band (`K-1`) covers everything from
 /// `3(K-1)` up. `voic` is the packed per-band V/UV word `b̂₁`, band 0 in its most
 /// significant bit.
-fn apply_unvoiced_offset(words: &mut [i16], num_harms: i16, voic: i16, delta: i16) {
+pub(super) fn apply_unvoiced_offset(words: &mut [i16], num_harms: i16, voic: i16, delta: i16) {
     let k = num_bands(num_harms);
     if k == 0 {
         return;
@@ -194,7 +194,7 @@ fn tbl_quant(val: i16, tbl: &[i16]) -> i16 {
 
 // ---- bit allocation (shared with decode) -----------------------------------
 
-fn get_bit_allocation(num_harms: i16, ptr: &mut [i16]) {
+pub(super) fn get_bit_allocation(num_harms: i16, ptr: &mut [i16]) {
     let mut bat = if num_harms == NUM_HARMS_MIN {
         0
     } else {
@@ -419,7 +419,7 @@ fn sa_encode(
 
 /// Pack the b-vector indices into the 8 info words (u0..u7), the inverse of
 /// `decode_frame_vector`'s priority rescan + word assembly.
-fn encode_frame_vector(
+pub(super) fn encode_frame_vector(
     b_vec: &[i16],
     num_harms: i16,
     num_bands: i16,
@@ -621,13 +621,7 @@ pub(crate) fn quantize_to_u_mech(
 
     let mut b_vec = [0i16; NUM_HARMS_MAX + 3];
     b_vec[0] = b0 as i16;
-    // b1: per-band V/UV bit = band's (first) harmonic voicing.
-    let mut b1 = 0i16;
-    for band in 0..num_bands as usize {
-        let h = (band * 3).min(nh as usize - 1);
-        let v = if voiced[h] { 1 } else { 0 };
-        b1 = (b1 << 1) | v;
-    }
+    let b1 = packed_voicing(nh, voiced);
     b_vec[1] = b1;
 
     // The reference band vector is already the log-domain quantity `sa_encode`
@@ -694,6 +688,17 @@ pub fn pitch_cell(b0: i16) -> (i32, i16) {
     tmp = (tmp + 0x2) >> 3; // (b0 + 40.5)/4
     let num_harms = ((CNST_0_9254_Q0_16 * tmp as u32) >> 16) as i16;
     (fund_freq, num_harms)
+}
+
+/// `b̂₁`: one V/UV bit per band, band 0 in the most significant bit, taken from
+/// the band's first harmonic.
+pub(crate) fn packed_voicing(num_harms: i16, voiced: &[bool]) -> i16 {
+    let mut b1 = 0i16;
+    for band in 0..num_bands(num_harms) {
+        let h = (band * 3).min(num_harms as usize - 1);
+        b1 = (b1 << 1) | i16::from(voiced[h]);
+    }
+    b1
 }
 
 /// Number of IMBE voicing bands `K` for a harmonic count `num_harms`, matching
@@ -889,7 +894,7 @@ pub(crate) fn quantize_frame_ref_amps(
 }
 
 /// Advance the encoder's prediction state on the produced words and frame them.
-fn finish(enc: &mut ImbeEncState, u: [u16; 8]) -> [u8; super::frame::FRAME_BYTES] {
+pub(crate) fn finish(enc: &mut ImbeEncState, u: [u16; 8]) -> [u8; super::frame::FRAME_BYTES] {
     // Mirror the decoder on the produced bits.
     let fr = ImbeFrame { u, errors: [0; 8] };
     let _ = super::dequantize::decode_params(&fr, &mut enc.st);

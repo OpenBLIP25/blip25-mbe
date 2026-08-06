@@ -35,6 +35,8 @@ pub mod fixp;
 pub mod frame;
 pub mod math;
 pub mod quantize;
+#[cfg(feature = "encode")]
+pub(crate) mod ref_amp;
 pub mod tables;
 
 pub use dequantize::{decode_params, ImbeOlaParams, ImbeState};

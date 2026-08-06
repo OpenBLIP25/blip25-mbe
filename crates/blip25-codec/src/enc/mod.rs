@@ -155,6 +155,13 @@ pub struct Encoder {
     /// the two are different encoder instances in the reference and each carries
     /// its own recursive state.
     imbe_lb_l0: i16,
+    /// Run the reference encoder's own IMBE amplitude back end.
+    /// See [`Self::set_imbe_ref_backend`].
+    imbe_ref_backend: bool,
+    /// The reference amplitude back end's predictor memory. Held here rather
+    /// than inside the quantizer because it replaces `imbe_enc`'s decoder mirror
+    /// only on the frames the back end actually runs on.
+    imbe_ref_state: crate::imbe::ref_amp::RefAmpState,
     /// Apply the IMBE packer's all-unvoiced `b̂₀` override.
     /// See [`Self::set_imbe_uv_pin`].
     imbe_uv_pin: bool,
@@ -750,6 +757,8 @@ impl Encoder {
             imbe_sync_toggle: false,
             imbe_lowband_floor: false,
             imbe_lb_l0: band_decompress::LOWBAND_L0_INIT,
+            imbe_ref_backend: false,
+            imbe_ref_state: crate::imbe::ref_amp::RefAmpState::new(),
             imbe_uv_pin: false,
             imbe_packer_voicing: None,
             forced_strict: false,
@@ -999,6 +1008,23 @@ impl Encoder {
     /// log-domain band vector for the floor to act on.
     pub fn set_imbe_lowband_floor(&mut self, on: bool) {
         self.imbe_lowband_floor = on;
+    }
+
+    /// Run the reference encoder's own IMBE amplitude back end
+    /// ([`crate::imbe::ref_amp`]) instead of the TIA-102.BABA fixed-point one.
+    ///
+    /// The two compute the same transform in different arithmetic and disagree
+    /// by a quantiser level here and there — a per-block DCT that keeps its
+    /// products at full width against one that truncates each to `i16`, a
+    /// prediction resampled through `i16` against one kept in Q10.22, an exact
+    /// restoring division against a reciprocal multiply. It also carries the
+    /// reference's own predictor memory, so the state the next frame predicts
+    /// from is the reconstruction the reference forms.
+    ///
+    /// Needs [`Self::set_imbe_ref_amps`]: the back end quantises the reference's
+    /// log-domain band vector, and a frame without one keeps the shipped path.
+    pub fn set_imbe_ref_backend(&mut self, on: bool) {
+        self.imbe_ref_backend = on;
     }
 
     /// Apply the IMBE packer's all-unvoiced `b̂₀` override (`FUN_1030bda0`).
@@ -2663,6 +2689,22 @@ impl Encoder {
             0
         };
         let bytes = match (band_words, pitch_word) {
+            // The reference's own amplitude back end, predictor memory included.
+            // The decoder mirror still advances on the words it produces, so a
+            // frame that falls back to the shipped path finds it in step.
+            (Some(ref words), Some(pw)) if self.imbe_ref_backend => {
+                let b1 = crate::imbe::quantize::packed_voicing(num_harms, &voiced);
+                let u = crate::imbe::ref_amp::encode_frame(
+                    &mut self.imbe_ref_state,
+                    b0_imbe,
+                    num_harms,
+                    b1,
+                    words,
+                    pw,
+                    sync,
+                );
+                crate::imbe::quantize::finish(&mut self.imbe_enc, u)
+            }
             (Some(words), Some(pw)) => crate::imbe::quantize::quantize_frame_ref_amps(
                 &mut self.imbe_enc,
                 b0_imbe,

@@ -783,6 +783,9 @@ impl Vocoder {
                                 e.set_imbe_lowband_floor(
                                     imbe_amp_enabled() && imbe_lowband_floor_enabled(),
                                 );
+                                e.set_imbe_ref_backend(
+                                    imbe_amp_enabled() && imbe_ref_backend_enabled(),
+                                );
                             }
                         }
                     }
@@ -1705,6 +1708,27 @@ fn imbe_lowband_floor_enabled() -> bool {
     *ON.get_or_init(|| std::env::var("BLIP25_IMBE_LBFLOOR").as_deref() == Ok("1"))
 }
 
+/// Opt-in for the reference encoder's own IMBE amplitude back end
+/// (`BLIP25_IMBE_BACKEND=1`), read once. Same rationale for the env read living
+/// here as [`lowband_floor_enabled`]. Off, every rate's emitted bits are
+/// byte-identical to a build without it.
+///
+/// On, `blip25_codec::enc::Encoder::set_imbe_ref_backend` replaces the
+/// TIA-102.BABA fixed-point amplitude encoder with the DVSI encoder's own
+/// arithmetic — a full-width block-floating-point DCT, an `i16` prediction
+/// resample, an exact restoring-division quantiser — and with the reference's
+/// own predictor memory. The two compute the same transform and disagree by a
+/// quantiser level often enough to cost most of a frame's amplitude
+/// coefficients.
+///
+/// Needs [`imbe_amp_enabled`]: the back end quantises the reference's log-domain
+/// band vector, which only that path carries.
+#[cfg(feature = "encode")]
+fn imbe_ref_backend_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("BLIP25_IMBE_BACKEND").as_deref() == Ok("1"))
+}
+
 /// Opt-in for the IMBE packer's all-unvoiced `b̂₀` override
 /// (`BLIP25_IMBE_UV=1`), read once. Same rationale for the env read living here
 /// as [`lowband_floor_enabled`]. Off, every rate's emitted bits are
@@ -2615,6 +2639,8 @@ impl ImbeStream {
             self.e.set_imbe_ref_amps(imbe_amp_enabled());
             self.e
                 .set_imbe_lowband_floor(imbe_amp_enabled() && imbe_lowband_floor_enabled());
+            self.e
+                .set_imbe_ref_backend(imbe_amp_enabled() && imbe_ref_backend_enabled());
         }
         // (5) feed. The two-frame look-ahead means feeding source `k` emits
         //     analysis frame `k - 2`, so covering analysis frames `< covered`
