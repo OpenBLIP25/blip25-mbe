@@ -300,6 +300,34 @@ fn main() {
         "  amps agg  {:>7.2}%   ({aden} coefficients, L-matching frames)",
         pc(anum, aden)
     );
+    // The same block WITHOUT the L condition. Conditioning on `L` scores a
+    // different population every time `L` moves, so the conditioned figure can
+    // fall while the block gets better (or the reverse); the gap between these
+    // three numbers IS the b̂₀/L cap on the amplitude field.
+    //   * common   — the prefix both sides have, so neither side's extra
+    //                coefficients count against it.
+    //   * refblock — every coefficient the reference transmits, so a short `L`
+    //                pays for the tail it never sent.
+    let (mut un, mut ud, mut un2, mut ud2) = (0usize, 0usize, 0usize, 0usize);
+    for (o, r) in pairs.iter().filter(|(o, r)| both(o, r)) {
+        let common = o.amp_range().end.min(r.amp_range().end);
+        for p in 3..common {
+            ud += 1;
+            un += usize::from(o.b[p] == r.b[p]);
+        }
+        for p in r.amp_range() {
+            ud2 += 1;
+            un2 += usize::from(o.b[p] == r.b[p]);
+        }
+    }
+    println!(
+        "  amps unc  {:>7.2}%   ({ud} coefficients, ALL both-valid frames, common prefix)",
+        pc(un, ud)
+    );
+    println!(
+        "  amps ref  {:>7.2}%   ({ud2} coefficients, ALL both-valid frames, reference's own block)",
+        pc(un2, ud2)
+    );
     println!(
         "  amps unc  {:>7.2}%   ({uden} coefficients, ALL both-valid frames)",
         pc(unum, uden)
@@ -443,6 +471,73 @@ fn internal_state(pcm: &[i16], pairs: &[(&Dec, &Dec)], live: bool) {
         "  oracle frames whose b̂₀ cell is UNREACHABLE by our chain: {:.2}%  ({unreach_cells} of {} distinct oracle cells)",
         pc(unreachable, pairs.len()),
         distinct_ref.len()
+    );
+    println!("  (the reachability ceiling above binds only the AMBE-index round trip, which is\n   what a build WITHOUT BLIP25_IMBE_NEXT uses; the section below reads the word)");
+
+    // 1b. The pitch word itself, which is what the IMBE grid is addressed from
+    //     when `BLIP25_IMBE_NEXT` is on. Two things are worth separating:
+    //     whether the right ANALYSIS frame feeds the right EMIT frame (a
+    //     plumbing question with a spike for an answer), and whether the misses
+    //     that remain are sub-cell rounding or gross.
+    if !live {
+        let pw = internal_pitch_word(pcm);
+        if !pw.is_empty() {
+            println!("\n  pitch-word injection lag (b̂₀ from the word alone — no packer override)");
+            print!("   ");
+            let mut at_two = 0.0f64;
+            for lag in 0..=4i64 {
+                let (mut hit, mut n) = (0usize, 0usize);
+                for (i, (_, r)) in pairs.iter().enumerate() {
+                    let Some(&w) = pw.get((i as i64 + lag).max(0) as usize) else {
+                        continue;
+                    };
+                    n += 1;
+                    if i16::from(blip25_codec::imbe::quantize::imbe_b0_from_pitch_word(w)) == r.b0 {
+                        hit += 1;
+                    }
+                }
+                let v = pc(hit, n);
+                if lag == 2 {
+                    at_two = v;
+                }
+                print!("  lag{lag:+} {v:.2}%");
+            }
+            println!("\n    (the shipped injection is lag +2; a plumbing offset is a spike, a fit is a plateau)");
+
+            let mut d: Vec<i64> = Vec::new();
+            for (i, (_, r)) in pairs.iter().enumerate() {
+                let Some(&w) = pw.get(i + 2) else { continue };
+                let b = i16::from(blip25_codec::imbe::quantize::imbe_b0_from_pitch_word(w));
+                if b != r.b0 {
+                    d.push(i64::from(b - r.b0).abs());
+                }
+            }
+            let one = d.iter().filter(|&&x| x == 1).count();
+            println!(
+                "    at lag +2: {at_two:.2}% exact; of the {} misses {:.1}% are ±1 cell, median |Δ| {}",
+                d.len(),
+                pc(one, d.len()),
+                median(&mut d)
+            );
+            println!("    (±1 is a resolution loss; a large median is the packer emitting something\n     that is not a pitch measurement at all)");
+        }
+    }
+
+    // 1c. The packer's all-unvoiced override, scored as the event it is.
+    let (mut tp, mut fp, mut fnn) = (0usize, 0usize, 0usize);
+    for (o, r) in pairs {
+        match (o.b0 == IMBE_UV_B0, r.b0 == IMBE_UV_B0) {
+            (true, true) => tp += 1,
+            (true, false) => fp += 1,
+            (false, true) => fnn += 1,
+            _ => {}
+        }
+    }
+    println!(
+        "\n  all-unvoiced override (b̂₀ == {IMBE_UV_B0}): reference fires on {:.2}% of frames;\n    ours precision {:.2}%  recall {:.2}%   (tp {tp} fp {fp} fn {fnn})",
+        pc(tp + fnn, pairs.len()),
+        pc(tp, tp + fp),
+        pc(tp, tp + fnn)
     );
 
     // 2. Sub-cell placement. Where does our continuous ω₀ sit relative to the

@@ -154,6 +154,9 @@ pub struct Encoder {
     /// the two are different encoder instances in the reference and each carries
     /// its own recursive state.
     imbe_lb_l0: i16,
+    /// Apply the IMBE packer's all-unvoiced `b̂₀` override.
+    /// See [`Self::set_imbe_uv_pin`].
+    imbe_uv_pin: bool,
     /// When set, a forced vector that does not cover the frame being analysed is
     /// a debug-build panic rather than a silent fall back to the estimator.
     /// See [`Self::set_forced_strict`].
@@ -742,6 +745,7 @@ impl Encoder {
             imbe_sync_toggle: false,
             imbe_lowband_floor: false,
             imbe_lb_l0: band_decompress::LOWBAND_L0_INIT,
+            imbe_uv_pin: false,
             forced_strict: false,
             live_gap2_amps: false,
             bias_raw_state: 0,
@@ -989,6 +993,21 @@ impl Encoder {
     /// log-domain band vector for the floor to act on.
     pub fn set_imbe_lowband_floor(&mut self, on: bool) {
         self.imbe_lowband_floor = on;
+    }
+
+    /// Apply the IMBE packer's all-unvoiced `b̂₀` override (`FUN_1030bda0`).
+    ///
+    /// The packer quantizes the prequantiser pitch word, then runs the voicing
+    /// search; when that search returns the all-unvoiced code it DISCARDS the
+    /// quantized index, writes `b̂₀ = 25`, and re-derives the params block's
+    /// harmonic count and pitch word from that index before the amplitude arm
+    /// runs. So on an all-unvoiced frame the transmitted pitch carries no pitch
+    /// measurement at all, and `L` is 14 whatever the audio was.
+    ///
+    /// Off, the frame keeps its measured `b̂₀`/`L` unless the caller's own
+    /// silence gate pinned them.
+    pub fn set_imbe_uv_pin(&mut self, on: bool) {
+        self.imbe_uv_pin = on;
     }
 
     /// Require the forced vectors to cover every frame that is analysed.
@@ -2510,6 +2529,20 @@ impl Encoder {
         // takes the silence floor even though the raw frame is still loud.
         let eff_rms = if force_release { 0.0f32 } else { src_rms };
 
+        // The packer's all-unvoiced override (see `set_imbe_uv_pin`). The
+        // reference re-derives the params block from the pinned index, so the
+        // harmonic count, the pitch word the amplitude back end's unvoiced-band
+        // offset is keyed on, and the voicing vector's own length all move with
+        // it — this is the pitch chain being discarded for the frame, not a
+        // relabelling of its answer.
+        let uv_pin = self.imbe_uv_pin && l_us > 0 && voiced.iter().all(|&v| !v);
+        if uv_pin {
+            b0_imbe = IMBE_SILENCE_IMBE_B0;
+            num_harms = crate::imbe::quantize::packer_num_harms(b0_imbe);
+            l_us = num_harms as usize;
+            voiced = vec![false; l_us];
+        }
+
         // --- spectral amplitudes (linear M_l) at the IMBE harmonic count ----
         // The IMBE quantizer wants the RAW envelope M_l (no AMBE unvoiced-band
         // rescale); `sa_q142 = round(M_l * 4)` (Q14.2).
@@ -2536,6 +2569,13 @@ impl Encoder {
             .forced_imbe_word
             .as_ref()
             .and_then(|s| s.get(f).copied())
+            .map(|w| {
+                if uv_pin {
+                    crate::imbe::quantize::packer_pitch_word(b0_imbe)
+                } else {
+                    w
+                }
+            })
             .filter(|_| self.imbe_ref_amps && mech);
         let (amplitudes, band_words) = if mech {
             // Reference-exact per-frame band_decompress step from the quantized IMBE

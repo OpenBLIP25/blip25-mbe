@@ -732,6 +732,26 @@ pub fn imbe_b0_from_pitch_word(word: u16) -> u8 {
     (v as i16).clamp(0, 0xCF) as u8
 }
 
+/// The packer's own `params[+0xc]` producer (`FUN_10310f80`): the prequantiser
+/// pitch word the reference writes back when it OVERRIDES `b̂₀`.
+///
+/// The override arms of `FUN_1030bda0` replace the quantiser's index with a
+/// constant and then re-derive the params block from it, so the amplitude back
+/// end downstream sees this word — not the tracker's — as the frame's pitch.
+/// Exact: it round-trips through [`imbe_b0_from_pitch_word`] for every `b0` in
+/// `0..=207`.
+pub fn packer_pitch_word(b0: u8) -> u16 {
+    let den = i32::from(b0) * 4 + 1 + 0x9d;
+    crate::shared::fractional_divide::a600(0x0080_0000, den) as u16
+}
+
+/// The packer's harmonic count for `b0` (`FUN_10310f80`), clamped to the codec's
+/// `[9, 56]` voice range. Identical to [`pitch_cell`]'s count over `0..=207`.
+pub fn packer_num_harms(b0: u8) -> i16 {
+    let l = (((i32::from(b0) >> 2) + 10) * 0xece8) >> 16;
+    (l as i16).clamp(NUM_HARMS_MIN, NUM_HARMS_MAX as i16)
+}
+
 /// A prequantiser pitch word that [`imbe_b0_from_pitch_word`] maps back to `b0`.
 ///
 /// The inverse is a cell, not a point, so this returns the cell's midpoint. It
@@ -962,6 +982,30 @@ mod amplitude_backend_tests {
         for b0 in 0..=207u8 {
             let w = pitch_word_for_b0(b0);
             assert_eq!(imbe_b0_from_pitch_word(w), b0, "b0 {b0} -> word {w}");
+        }
+    }
+
+    /// The packer's own params writer is the exact inverse of the packer's
+    /// quantiser: `FUN_10310f80` and `FUN_10311170` are two halves of one map,
+    /// so an overridden `b̂₀` and the pitch word the amplitude arm then reads
+    /// cannot drift apart.
+    #[test]
+    fn packer_pitch_word_round_trips() {
+        for b0 in 0..=207u8 {
+            let w = packer_pitch_word(b0);
+            assert_eq!(imbe_b0_from_pitch_word(w), b0, "b0 {b0} -> word {w}");
+        }
+    }
+
+    /// `FUN_10310f80`'s harmonic count and [`pitch_cell`]'s agree over the whole
+    /// grid, so the override arm and the ordinary arm cannot disagree on `L`.
+    #[test]
+    fn packer_num_harms_matches_pitch_cell() {
+        for b0 in 0..=207u8 {
+            let want = pitch_cell(i16::from(b0))
+                .1
+                .clamp(NUM_HARMS_MIN, NUM_HARMS_MAX as i16);
+            assert_eq!(packer_num_harms(b0), want, "b0 {b0}");
         }
     }
 }

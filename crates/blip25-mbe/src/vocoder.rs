@@ -699,6 +699,7 @@ impl Vocoder {
                     if let Some(e) = enc.w_enc.as_mut() {
                         e.set_live_gap2_amps(true);
                         e.set_imbe_sync_toggle(imbe_next_enabled());
+                        e.set_imbe_uv_pin(imbe_next_enabled() && imbe_uv_pin_enabled());
                     }
                 }
                 // Reference pitch for IMBE — THE single pitch path (same RE'd
@@ -1675,6 +1676,22 @@ fn imbe_lowband_floor_enabled() -> bool {
     *ON.get_or_init(|| std::env::var("BLIP25_IMBE_LBFLOOR").as_deref() == Ok("1"))
 }
 
+/// Opt-in for the IMBE packer's all-unvoiced `b̂₀` override
+/// (`BLIP25_IMBE_UV=1`), read once. Same rationale for the env read living here
+/// as [`lowband_floor_enabled`]. Off, every rate's emitted bits are
+/// byte-identical to a build without it.
+///
+/// On, `blip25_codec::enc::Encoder::set_imbe_uv_pin` replaces the
+/// [`IMBE_SILENCE_RMS`] energy threshold as the thing that decides when `b̂₀`
+/// stops carrying pitch: the reference's condition is its voicing search
+/// returning the all-unvoiced code, which is a property of the frame's voicing
+/// and not of its level.
+#[cfg(feature = "encode")]
+fn imbe_uv_pin_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("BLIP25_IMBE_UV").as_deref() == Ok("1"))
+}
+
 /// The same offset on the OUTPUT-frame axis. Output frame `i` is source frame
 /// `i + 1` (the dropped look-ahead placeholder), so the two constants differ by
 /// exactly that one frame.
@@ -2211,6 +2228,7 @@ impl ImbeStream {
         let mut e = blip25_codec::enc::Encoder::new();
         e.set_live_gap2_amps(true);
         e.set_imbe_sync_toggle(imbe_next_enabled());
+        e.set_imbe_uv_pin(imbe_next_enabled() && imbe_uv_pin_enabled());
         // The forced vectors grow as the analysis finalises, so a feed that runs
         // ahead of them must fail loudly rather than quietly encode a frame with
         // the estimator — that is exactly the fricative buzz coming back.

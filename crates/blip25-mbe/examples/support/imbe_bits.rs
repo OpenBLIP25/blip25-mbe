@@ -225,6 +225,31 @@ pub fn internal_ambe_b0(pcm: &[i16]) -> Vec<u8> {
         .collect()
 }
 
+/// The `b̂₀` the reference packer writes when its voicing search returns the
+/// all-unvoiced code (`FUN_1030bda0`). On those frames `b̂₀` is not a pitch.
+pub const IMBE_UV_B0: i16 = 25;
+
+/// The prequantiser pitch word per ANALYSIS frame — the quantity
+/// `blip25_codec::imbe::quantize::imbe_b0_from_pitch_word` consumes when
+/// `BLIP25_IMBE_NEXT` is on. Indexed by analysis frame, so a caller comparing
+/// against emitted frames applies the injection lag itself.
+pub fn internal_pitch_word(pcm: &[i16]) -> Vec<u16> {
+    let residue = pcm.len() % FRAME;
+    let padded: Vec<i16> = if residue == 0 {
+        pcm.to_vec()
+    } else {
+        pcm.iter()
+            .copied()
+            .chain(std::iter::repeat_n(0i16, FRAME - residue))
+            .collect()
+    };
+    blip25_codec::enc::pcm_encode::encode_pcm_pitch_no_tone_branch(
+        &padded,
+        blip25_codec::enc::pcm_encode::EncodeOpts::default(),
+    )
+    .word
+}
+
 /// ω₀ (rad/sample) the AMBE pitch word `b0` decodes to — the continuous value
 /// the IMBE grid then requantizes.
 pub fn ambe_omega0(b0: u8) -> Option<f64> {
