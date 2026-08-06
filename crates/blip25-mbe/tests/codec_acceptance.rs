@@ -307,28 +307,41 @@ fn assert_encode_parity_opt(rate: Rate, pcm: &[i16], ctx: &str, ambe_strict: boo
         rate_name(rate)
     );
 
-    // 3. LiveEncoder push(odd chunks) + flush: byte-identical AND zero frames lost.
-    let mut live = LiveEncoder::new(rate);
-    let splits = [137usize, 400, 99, 160, 320, 211, 41];
-    let mut emitted: Vec<Vec<u8>> = Vec::new();
-    let (mut pos, mut i) = (0usize, 0usize);
-    while pos < pcm.len() {
-        let take = splits[i % splits.len()];
-        i += 1;
-        let end = (pos + take).min(pcm.len());
-        for r in live.push(&pcm[pos..end]) {
-            emitted.push(r.unwrap());
-        }
-        pos = end;
+    // 3. LiveEncoder push + flush, over EVERY buffering schedule: byte-identical
+    //    to each other, byte-identical to whole-buffer, and zero frames lost.
+    //    A live caller gets whatever length its audio device hands it, so bits
+    //    that depend on the schedule are unshippable however well any one
+    //    schedule scores.
+    let runs: Vec<(&[usize], Vec<Vec<u8>>)> = LIVE_SPLITS
+        .iter()
+        .map(|sp| (*sp, live_encode(rate, pcm, sp)))
+        .collect();
+    for (sp, frames) in &runs {
+        assert!(
+            !frames.is_empty(),
+            "{ctx} {}: LiveEncoder empty at splits {sp:?}",
+            rate_name(rate)
+        );
     }
-    for b in live.flush().unwrap() {
-        emitted.push(b);
+    let base_splits = runs[0].0;
+    let emitted = runs[0].1.clone();
+    for (sp, other) in &runs[1..] {
+        let mism: Vec<usize> = (0..emitted.len().min(other.len()))
+            .filter(|&i| emitted[i] != other[i])
+            .collect();
+        assert!(
+            mism.is_empty() && emitted.len() == other.len(),
+            "{ctx} {}: LiveEncoder output depends on the caller's chunk size - \
+             splits {base_splits:?} vs {sp:?} differ at frames {:?} ({} of {}), \
+             counts {} vs {}",
+            rate_name(rate),
+            &mism[..mism.len().min(8)],
+            mism.len(),
+            emitted.len(),
+            emitted.len(),
+            other.len(),
+        );
     }
-    assert!(
-        !emitted.is_empty(),
-        "{ctx} {}: LiveEncoder empty",
-        rate_name(rate)
-    );
     // `LiveEncoder` is the single-pass streaming replica of whole-buffer
     // `Vocoder::encode` at EVERY rate — `AmbeStream` for AMBE+2, `ImbeStream`
     // for IMBE. Both carry the reference pitch and voicing analysis causally,
@@ -390,19 +403,57 @@ fn assert_encode_parity_opt(rate: Rate, pcm: &[i16], ctx: &str, ambe_strict: boo
     } else {
         // IMBE has no r33 field decomposition to compare through, so the
         // streaming replica is asserted on the packed wire bytes directly.
-        assert_eq!(
-            emitted,
-            expected,
-            "{ctx} {}: LiveEncoder (ImbeStream) diverges from Vocoder::encode",
-            rate_name(rate)
+        // Reported as frame indices: the frames themselves are 18 bytes each
+        // and a whole-clip dump buries the one fact that identifies the bug.
+        let mism: Vec<usize> = (0..emitted.len().min(expected.len()))
+            .filter(|&i| emitted[i] != expected[i])
+            .collect();
+        assert!(
+            mism.is_empty(),
+            "{ctx} {}: LiveEncoder (ImbeStream) diverges from Vocoder::encode at frames {:?} ({} of {})",
+            rate_name(rate),
+            &mism[..mism.len().min(8)],
+            mism.len(),
+            expected.len(),
         );
     }
+}
+
+/// The buffering schedules the streaming gate replays every clip through. Each
+/// inner slice is a repeating chunk-length cycle: an irregular one (an audio
+/// device's ragged callbacks), then the exact frame length, two multiples of it
+/// and one length that is neither.
+const LIVE_SPLITS: [&[usize]; 5] = [
+    &[137, 400, 99, 160, 320, 211, 41],
+    &[160],
+    &[320],
+    &[377],
+    &[960],
+];
+
+/// Push `pcm` through a cold [`LiveEncoder`] in `splits`-sized chunks and
+/// return every frame it emits, flush included. Asserts the encoder holds
+/// nothing back afterwards.
+fn live_encode(rate: Rate, pcm: &[i16], splits: &[usize]) -> Vec<Vec<u8>> {
+    let mut live = LiveEncoder::new(rate);
+    let mut emitted: Vec<Vec<u8>> = Vec::new();
+    let (mut pos, mut i) = (0usize, 0usize);
+    while pos < pcm.len() {
+        let end = (pos + splits[i % splits.len()]).min(pcm.len());
+        i += 1;
+        for r in live.push(&pcm[pos..end]) {
+            emitted.push(r.expect("live encode"));
+        }
+        pos = end;
+    }
+    emitted.extend(live.flush().expect("live flush"));
     assert_eq!(
         live.pending_samples(),
         0,
-        "{ctx} {}: LiveEncoder left samples pending after flush",
+        "{}: LiveEncoder left samples pending after flush at splits {splits:?}",
         rate_name(rate)
     );
+    emitted
 }
 
 // ---------- deterministic synthetic corpus (hermetic) ----------
@@ -697,7 +748,9 @@ fn corpus_representative_parity_all_rates() {
     // Names present across the rate subdirs; speech + tone + channel-error.
     let names = ["mark", "alltone", "dam_e5_hd"];
     const DEC_FRAMES: usize = 120; // prefix, keeps the slow IMBE synth fast
-    const ENC_FRAMES: usize = 60; // encode is ~140 frames/s, so keep short
+    /// Long enough to reach a streaming divergence a short prefix hides: on the
+    /// reference `mark` vector the first frame a streamer can disagree on is 65.
+    const ENC_FRAMES: usize = 128;
 
     let mut decode_checked = 0usize;
     let mut encode_checked = 0usize;

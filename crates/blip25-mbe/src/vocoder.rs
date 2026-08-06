@@ -1812,8 +1812,10 @@ const AMBE_B1_OUTPUT_LAG: i64 = BLAG as i64 + 1;
 ///   time with the same voicing masks as whole-buffer → byte-exact `b0`.
 /// * `e` — one persistent [`Encoder`]; feeding it frames in order carries the
 ///   amplitude predictor → byte-exact `b2..b8` (given the same `b0`).
-/// * `b1_track` — recomputed on the *growing* prefix each pump; causal + bounded
-///   look-ahead makes any frame ≥ `B1_RESERVE` back byte-exact.
+/// * `b1_track` — advanced frame by frame through a persistent
+///   [`B1Carry`](blip25_codec::enc::b1_audio::B1Carry) over the analysis logs of
+///   a persistent second [`Encoder`], so it runs the same recurrence the
+///   whole-buffer call runs rather than a warmed-up window of it.
 ///
 /// `pref`/`raw` grow with the transmission (from index 0 — the reference tracker
 /// indexes `pref` by an internal frame counter). That is bounded for PTT; a
@@ -1827,6 +1829,28 @@ struct AmbeStream {
     /// of emit latency it does not otherwise pay.
     floor: bool,
     e: blip25_codec::enc::Encoder,
+    /// The analysis-log encoder: the streaming counterpart of the pass
+    /// whole-buffer `encode` runs to populate the gap2 logs `b1_track` reads.
+    /// Fed one source frame at a time, in order, so its logs are the same rows.
+    /// The logs are a function of the audio alone, so it carries none of the
+    /// emitting encoder's overrides.
+    la: blip25_codec::enc::Encoder,
+    la_fed: usize,
+    /// The b1 chain's cross-frame state, carried instead of re-derived.
+    carry: blip25_codec::enc::b1_audio::B1Carry,
+    /// Analysis frames already run through the b1 chain.
+    analysed: usize,
+    /// Analysed frames not yet consumed by every reader, and the global index
+    /// of `btq[0]`. The voicing horizon and the reference pitch tracker consume
+    /// at different depths, so a frame outlives the pump that produced it.
+    btq: std::collections::VecDeque<blip25_codec::enc::b1_audio::B1Frame>,
+    bt_base: usize,
+    /// Every analysed frame's band-voicing mask; the reference pitch tracker
+    /// reads the previous frame's, which is behind the current batch.
+    masks: Vec<u16>,
+    /// The low-band noise rewrite's per-frame inputs, grown as the pitch
+    /// tracker reaches each frame. Populated only when the stage is on.
+    lb_in: Vec<blip25_codec::enc::b1_audio::LbNoiseIn>,
     reference: blip25_codec::enc::b0_audio::B0Audio,
     pref_state: blip25_codec::enc::audio_prefilter::PrefilterState,
     pref: Vec<i16>,
@@ -1922,6 +1946,14 @@ impl AmbeStream {
             tone_on,
             floor,
             e,
+            la: blip25_codec::enc::Encoder::new(),
+            la_fed: 0,
+            carry: blip25_codec::enc::b1_audio::B1Carry::default(),
+            analysed: 0,
+            btq: std::collections::VecDeque::new(),
+            bt_base: 0,
+            masks: Vec::new(),
+            lb_in: Vec::new(),
             reference: blip25_codec::enc::b0_audio::B0Audio::new(),
             pref_state: blip25_codec::enc::audio_prefilter::PrefilterState::default(),
             pref: Vec::new(),
@@ -2001,7 +2033,7 @@ impl AmbeStream {
     /// Advance every chain as far as the current buffer allows and return the
     /// newly-final output frames in order. See the struct docs.
     fn pump(&mut self, flush: bool) -> Vec<Vec<u8>> {
-        use blip25_codec::enc::b1_audio::{b1_track_hdr30, RingRefineMode};
+        use blip25_codec::enc::b1_audio::RingRefineMode;
         let n = FRAME_SAMPLES;
         let avail = self.raw.len() / n;
         let mut out: Vec<Vec<u8>> = Vec::new();
@@ -2019,29 +2051,22 @@ impl AmbeStream {
         if !flush && new_horizon.saturating_sub(self.horizon) < B1_MIN_BATCH {
             return out;
         }
-        // (1) b1_track on a BOUNDED window (not the growing prefix — that recomputes
-        //     FFT gaps in O(n²)). `b1_track` is causal + bounded look-ahead, so a
-        //     window carrying `ctx` frames of warm-up before the finalise point is
-        //     byte-exact for the finalised frames. `bt[k]` is global frame
-        //     `win_start + k`.
-        let ctx = 8usize;
-        let win_start = self.horizon.saturating_sub(ctx);
-        let win_nframes = (avail - win_start).saturating_sub(1);
-        // Persistent hdr30 for every available frame (covers both the standalone
-        // and from_logs windows) — mutate before the immutable slices below.
+        // (1) advance the b1 chain over the analysis frames this pump needs,
+        //     resuming `carry` rather than re-deriving a warm-up window. The
+        //     chain reads the gap2 logs of the analysis-log encoder, fed the
+        //     same source frames in the same order as whole-buffer's own
+        //     analysis pass, so both index the same rows.
         self.advance_hdr30(avail);
-        let win_raw = &self.raw[win_start * n..];
-        let win_pref = &self.pref[win_start * n..];
-        let hdr_win = &self.hdr30[win_start..win_start + win_nframes];
-        // (1a) The low-band noise rewrite needs the pitch tracker's fit-error
-        //      ring for the same frames, which is produced from the masks of a
-        //      pass that has not run yet. The stage cannot move the masks
-        //      (`ctx+0x91a` is written before it), so run the chain once for
-        //      them, advance the persistent pitch tracker over the frames that
-        //      are about to be finalised, then run it again with the stage's
-        //      inputs. Frames past the tracker read the ring's `32767` seed;
-        //      they are never finalised in this pump and are recomputed in the
-        //      next one, when the tracker has reached them.
+        while self.la_fed < avail {
+            let fr: [i16; FRAME_SAMPLES] = self.raw[self.la_fed * n..self.la_fed * n + n]
+                .try_into()
+                .unwrap();
+            let _ = self.la.encode_frame_r33(&fr);
+            self.la_fed += 1;
+        }
+        // The reference pitch tracker runs two frames ahead of the voicing
+        // horizon, so it sets how far the chain advances; the frames past the
+        // horizon are held in `btq` for the next pump instead of re-analysed.
         let reference_target = if flush {
             nframes
         } else {
@@ -2049,75 +2074,92 @@ impl AmbeStream {
         };
         let lb_on = blip25_codec::enc::b1_audio::lb_noise_enabled();
         let bv_on = blip25_codec::enc::b1_audio::bv_next_enabled();
-        // The band-voicing row's band-0 spectrum reads the same persistent
+        // The band-voicing row's band-0 spectrum reads the persistent
         // noise-tracker window, on both passes.
-        let st_win: Option<Vec<[i16; 168]>> = if bv_on {
-            Some(
-                (0..win_nframes)
-                    .map(|k| self.lb_win[win_start + k])
-                    .collect(),
-            )
-        } else {
-            None
-        };
+        let st_all: Option<&[[i16; 168]]> = bv_on.then_some(&self.lb_win[..]);
+        let batch = reference_target.saturating_sub(self.analysed);
+        // (1a) The low-band noise rewrite needs the pitch tracker's fit-error
+        //      ring for the same frames, which is produced from the masks of a
+        //      pass that has not run yet. The stage cannot move the masks
+        //      (`ctx+0x91a` is written before it), so run the chain once for
+        //      them, advance the persistent pitch tracker over those frames,
+        //      then rewind the carry and run it again with the stage's inputs.
+        let saved = lb_on.then(|| self.carry.clone());
+        let btm = blip25_codec::enc::b1_audio::b1_track_next(
+            &mut self.carry,
+            self.la.gap2_mid_log(),
+            self.la.gap2_slot1_log(),
+            self.la.gap2_slot2_log(),
+            &self.pref,
+            &self.raw,
+            batch,
+            RingRefineMode::Off,
+            &self.hdr30,
+            st_all,
+            None,
+        );
+        for f in &btm {
+            self.masks.push(f.mask);
+        }
+        self.analysed += batch;
+        // (2) advance the persistent reference-pitch tracker (final masks only).
         let mut raw_b0: Vec<(usize, u8)> = Vec::new();
-        let bt = if lb_on || bv_on {
-            let btm = blip25_codec::enc::b1_audio::b1_track_hdr30_lb(
-                win_pref,
-                win_raw,
-                win_nframes,
-                RingRefineMode::Off,
-                hdr_win,
-                st_win.as_deref(),
-                None,
-            );
-            while self.reference_frame < reference_target {
-                let cf = self.reference_frame;
-                let a11 = if cf == 0 {
-                    0
-                } else {
-                    i32::from(btm[cf - 1 - win_start].mask)
-                };
-                let b0 = self
-                    .reference
-                    .push_pcm_frame_with_prev_mask(&self.pref, a11);
-                raw_b0.push((cf, b0));
-                self.reference_frame += 1;
-            }
-            let lb_win: Option<Vec<blip25_codec::enc::b1_audio::LbNoiseIn>> = lb_on.then(|| {
-                (0..win_nframes)
-                    .map(|k| {
-                        let f = win_start + k;
-                        blip25_codec::enc::b1_audio::LbNoiseIn {
-                            st: self.lb_win[f],
-                            q0: self.reference.c62c_at(f),
-                            q2: if f == 0 {
-                                32767
-                            } else {
-                                self.reference.c62c_at(f - 1)
-                            },
-                        }
-                    })
-                    .collect()
-            });
-            match lb_win.as_deref() {
-                Some(l) => blip25_codec::enc::b1_audio::b1_track_hdr30_lb(
-                    win_pref,
-                    win_raw,
-                    win_nframes,
+        while self.reference_frame < reference_target {
+            let cf = self.reference_frame;
+            let a11 = if cf == 0 {
+                0
+            } else {
+                i32::from(self.masks[cf - 1])
+            };
+            let b0 = self
+                .reference
+                .push_pcm_frame_with_prev_mask(&self.pref, a11);
+            raw_b0.push((cf, b0));
+            self.reference_frame += 1;
+        }
+        // (3) the second pass, on the stage's own inputs, which the tracker has
+        //     now reached. With the stage off there is only ever one pass.
+        let bt: Vec<blip25_codec::enc::b1_audio::B1Frame> = match saved {
+            Some(before) if !btm.is_empty() => {
+                while self.lb_in.len() < reference_target {
+                    let f = self.lb_in.len();
+                    self.lb_in.push(blip25_codec::enc::b1_audio::LbNoiseIn {
+                        st: self.lb_win[f],
+                        q0: self.reference.c62c_at(f),
+                        q2: if f == 0 {
+                            32767
+                        } else {
+                            self.reference.c62c_at(f - 1)
+                        },
+                    });
+                }
+                self.carry = before;
+                self.analysed -= batch;
+                let v = blip25_codec::enc::b1_audio::b1_track_next(
+                    &mut self.carry,
+                    self.la.gap2_mid_log(),
+                    self.la.gap2_slot1_log(),
+                    self.la.gap2_slot2_log(),
+                    &self.pref,
+                    &self.raw,
+                    batch,
                     RingRefineMode::Off,
-                    hdr_win,
-                    st_win.as_deref(),
-                    Some(l),
-                ),
-                None => btm,
+                    &self.hdr30,
+                    st_all,
+                    Some(&self.lb_in),
+                );
+                self.analysed += batch;
+                v
             }
-        } else {
-            b1_track_hdr30(win_pref, win_raw, win_nframes, RingRefineMode::Off, hdr_win)
+            _ => btm,
         };
-        // (2) finalise b1 + tone (in order) for the newly-final source frames.
+        if self.btq.is_empty() {
+            self.bt_base = self.analysed - bt.len();
+        }
+        self.btq.extend(bt);
+        // (4) finalise b1 + tone (in order) for the newly-final source frames.
         for f in self.horizon..new_horizon {
-            self.b1.push(bt[f - win_start].b1);
+            self.b1.push(self.btq[f - self.bt_base].b1);
             let tf = if self.tone_on {
                 self.det.process(&self.raw[f * n..f * n + n])
             } else {
@@ -2125,30 +2167,21 @@ impl AmbeStream {
             };
             self.tone_of.push(tf);
         }
-        // (3) advance the persistent reference-pitch tracker (uses only final masks).
+        // (5) the tracker's own frames, packed with the analysis of the same
+        //     frame — the tone branch's (b0, L) override rides on it.
         for &(cf, b0) in &raw_b0 {
-            let fr = &bt[cf - win_start];
+            let fr = &self.btq[cf - self.bt_base];
             self.reference_b0
                 .push(blip25_codec::enc::pcm_encode::b0_with_tone_branch(b0, fr));
             self.reference_l56
                 .push(blip25_codec::enc::pcm_encode::tone_branch_l56(fr.b1));
         }
-        while self.reference_frame < reference_target {
-            let cf = self.reference_frame;
-            let a11 = if cf == 0 {
-                0
-            } else {
-                i32::from(bt[cf - 1 - win_start].mask)
-            };
-            let b0 = self.reference.push_pcm_frame_with_prev_mask(&self.pref, a11);
-            let fr = &bt[cf - win_start];
-            self.reference_b0
-                .push(blip25_codec::enc::pcm_encode::b0_with_tone_branch(b0, fr));
-            self.reference_l56
-                .push(blip25_codec::enc::pcm_encode::tone_branch_l56(fr.b1));
-            self.reference_frame += 1;
+        // Everything before the voicing horizon has been read by both consumers.
+        while self.bt_base < new_horizon && !self.btq.is_empty() {
+            self.btq.pop_front();
+            self.bt_base += 1;
         }
-        // (4) forced-b0 for the persistent amplitude Encoder (whole-buffer maps
+        // (6) forced-b0 for the persistent amplitude Encoder (whole-buffer maps
         //     emit source `src` to reference frame `src + 2`, clamped).
         let emit_src_max = if flush {
             nframes
@@ -2178,7 +2211,7 @@ impl AmbeStream {
                 .collect();
             self.e.set_lowband_gate_b1(gate_b1);
         }
-        // (5) feed raw frames to the Encoder; each emission is the next source.
+        // (7) feed raw frames to the Encoder; each emission is the next source.
         //     Route A's two-frame look-ahead means emission `s` (analyze frame
         //     `s`) lands only after frame `s + 2` is fed, so to have sources up
         //     to `emit_src_max` in `pend` we must feed through `emit_src_max + 3`
@@ -2205,7 +2238,7 @@ impl AmbeStream {
                 self.pend.push_back((s, r33));
             }
         }
-        // (6) pack + emit finalised frames in order; drop source-0 (the dropped
+        // (8) pack + emit finalised frames in order; drop source-0 (the dropped
         //     look-ahead placeholder — whole-buffer `frames.remove(0)`). Hold a
         //     frame back until its lagged voicing `b1[s + BLAG]` is final (the
         //     tail at flush keeps the Encoder's own b1, as whole-buffer does).
@@ -2256,14 +2289,6 @@ impl AmbeStream {
     }
 }
 
-/// Frames of warm-up context a bounded `b1_track` window carries before its
-/// first finalised frame. `b1_track` is causal with bounded look-ahead, so a
-/// window that starts this far back reproduces the whole-buffer answer for
-/// every frame it finalises. Measured: 4 diverges on one frame of the 1273-frame
-/// DVSI speech vector, 8 and above are clean.
-#[cfg(feature = "encode")]
-const B1_CTX: usize = 8;
-
 /// Single-pass stateful IMBE streamer — byte-exact to whole-buffer
 /// [`Vocoder::encode`] at ~`B1_RESERVE`-frame latency.
 ///
@@ -2279,8 +2304,10 @@ const B1_CTX: usize = 8;
 /// * `reference` — the persistent [`B0Audio`] tracker, advanced one frame at a
 ///   time with the same masks `encode_pcm_b0` uses → byte-exact `b0`.
 /// * `e` — one persistent [`Encoder`], fed in order → byte-exact amplitudes.
-/// * `hdr` — the persistent hdr30 producer, the one slow-converging
-///   `b1_track` state.
+/// * `carry` + `la` — the b1 chain's own cross-frame state, advanced frame by
+///   frame over the analysis logs of a persistent second [`Encoder`], so it runs
+///   the same recurrence the whole-buffer call runs rather than a warmed-up
+///   window of it. `hdr` is one of its inputs, supplied on the same footing.
 ///
 /// Unlike [`AmbeStream`], no source frame is dropped: `nf` input frames yield
 /// `nf` output frames, matching whole-buffer `encode`.
@@ -2289,6 +2316,16 @@ struct ImbeStream {
     /// `Imbe4400x4400` ships the 88 info bits without the FEC parity.
     info_only: bool,
     e: blip25_codec::enc::Encoder,
+    /// The analysis-log encoder: the streaming counterpart of the throwaway pass
+    /// whole-buffer `encode` runs to populate the gap2 logs `b1_track` reads.
+    /// Fed one source frame at a time, in order, so its logs are the same rows.
+    la: blip25_codec::enc::Encoder,
+    la_fed: usize,
+    /// The b1 chain's cross-frame state, carried instead of re-derived.
+    carry: blip25_codec::enc::b1_audio::B1Carry,
+    /// Every analysed frame's band-voicing mask; the reference pitch tracker
+    /// reads the previous frame's, which is behind the current batch.
+    masks: Vec<u16>,
     reference: blip25_codec::enc::b0_audio::B0Audio,
     pref_state: blip25_codec::enc::audio_prefilter::PrefilterState,
     pref: Vec<i16>,
@@ -2311,7 +2348,7 @@ struct ImbeStream {
     forced_imbe_voicing: Vec<u16>,
     /// The packer voicing search's winning index per ANALYSIS frame, and the
     /// 16-bit codeword carry behind it. Persistent because the carry is a
-    /// frame-to-frame recurrence: a bounded analysis window cannot restart it.
+    /// frame-to-frame recurrence.
     imbe_v: Vec<u16>,
     imbe_v_prev: u16,
     horizon: usize,
@@ -2337,6 +2374,10 @@ impl ImbeStream {
         Self {
             info_only,
             e,
+            la: blip25_codec::enc::Encoder::new(),
+            la_fed: 0,
+            carry: blip25_codec::enc::b1_audio::B1Carry::default(),
+            masks: Vec::new(),
             reference: blip25_codec::enc::b0_audio::B0Audio::new(),
             pref_state: blip25_codec::enc::audio_prefilter::PrefilterState::default(),
             pref: Vec::new(),
@@ -2427,7 +2468,7 @@ impl ImbeStream {
     /// Advance every chain as far as the buffer allows and return the newly
     /// final output frames in order. See the struct docs.
     fn pump(&mut self, flush: bool) -> Vec<Vec<u8>> {
-        use blip25_codec::enc::b1_audio::{b1_track_hdr30, RingRefineMode};
+        use blip25_codec::enc::b1_audio::{b1_track_next, RingRefineMode};
         let n = FRAME_SAMPLES;
         let avail = self.raw.len() / n;
         let mut out: Vec<Vec<u8>> = Vec::new();
@@ -2451,21 +2492,37 @@ impl ImbeStream {
         if !flush && new_horizon.saturating_sub(self.horizon) < B1_MIN_BATCH {
             return out;
         }
-        // (1) b1_track on a BOUNDED window carrying `B1_CTX` frames of warm-up.
-        //     `bt[k]` is global frame `win_start + k`.
-        let win_start = self.horizon.saturating_sub(B1_CTX);
-        let win_nframes = (avail - win_start).saturating_sub(1);
+        // (1) advance the b1 chain over the newly-final analysis frames, resuming
+        //     `carry` rather than re-deriving a warm-up window: `bt[k]` is global
+        //     frame `self.horizon + k`. The chain reads the gap2 logs of the
+        //     analysis-log encoder, fed the same source frames in the same order
+        //     as whole-buffer's throwaway pass, so both index the same rows.
         self.advance_hdr30(avail);
-        let bt = b1_track_hdr30(
-            &self.pref[win_start * n..],
-            &self.raw[win_start * n..],
-            win_nframes,
+        while self.la_fed < avail {
+            let fr: [i16; FRAME_SAMPLES] = self.raw[self.la_fed * n..self.la_fed * n + n]
+                .try_into()
+                .unwrap();
+            let _ = self.la.encode_frame_r33(&fr);
+            self.la_fed += 1;
+        }
+        let bt = b1_track_next(
+            &mut self.carry,
+            self.la.gap2_mid_log(),
+            self.la.gap2_slot1_log(),
+            self.la.gap2_slot2_log(),
+            &self.pref,
+            &self.raw,
+            new_horizon - self.horizon,
             RingRefineMode::Off,
-            &self.hdr30[win_start..win_start + win_nframes],
+            &self.hdr30,
+            None,
+            None,
         );
+        let win_start = self.horizon;
         // (2) finalise the voicing word for the newly-final analysis frames.
         for f in self.horizon..new_horizon {
             self.b1.push(bt[f - win_start].b1);
+            self.masks.push(bt[f - win_start].mask);
         }
         // (3) advance the persistent reference-pitch tracker (final masks only).
         let reference_target = if flush { nframes } else { new_horizon };
@@ -2474,7 +2531,7 @@ impl ImbeStream {
             let a11 = if cf == 0 {
                 0
             } else {
-                i32::from(bt[cf - 1 - win_start].mask)
+                i32::from(self.masks[cf - 1])
             };
             let b0 = self
                 .reference
@@ -2485,7 +2542,7 @@ impl ImbeStream {
         }
         // (3b) the packer's voicing search, on the analysis frames whose pitch
         //      word is now final. Its 16-bit carry lives on `self` because it is
-        //      a recurrence: the bounded `bt` window cannot re-derive it.
+        //      a recurrence.
         if imbe_next_enabled() && imbe_voice_enabled() {
             use blip25_codec::enc::imbe_voicing::{advance, search, search_bands};
             while self.imbe_v.len() < new_horizon {

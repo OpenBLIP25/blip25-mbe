@@ -324,8 +324,9 @@ fn a5_pcm_arms(pre: &[i16], f: usize, c: usize) -> Option<(Vec<i16>, Vec<i16>, i
 /// own band_voicing_mask) -> gate -> `pq_driver` -> cross-frame T/S ring (with
 /// the `repair_gate_f0` reference) -> `a_writer_band`.
 ///
-/// `pre` is the caller's prefiltered stream and `fr` its front end, both
-/// starting at the same sample as the frame index. The chain reads no raw PCM
+/// Covers global frames `first .. first + nframes`, continuing `carry`. `pre` is
+/// the caller's whole prefiltered stream, indexed globally; `fr` is its front
+/// end for this batch alone. The chain reads no raw PCM
 /// and starts no filter of its own: every stage here is a block-floating-point
 /// cascade over `pre`, and the prefilter is an integer IIR whose state error
 /// does not decay to zero, so re-deriving `pre` from a window of raw samples
@@ -334,106 +335,130 @@ fn a5_pcm_arms(pre: &[i16], f: usize, c: usize) -> Option<(Vec<i16>, Vec<i16>, i
 /// The raw `a_writer` output is nonzero on ~85 voiced / ~48 mark NON-lever
 /// frames (the zeros-trap: the off-lever T/S ring is only lever-validated).
 /// `a5` is emitted verbatim here; the caller applies whatever voicing gate it
-/// wants. Returns one `[i16;16]` per frame (index 0..nframes) alongside the
-/// per-call `repair_gate_f0` log (index 0..2*nframes).
-fn a5_track_from_pre(pre: &[i16], fr: &[FrameIn], nframes: usize) -> (Vec<[i16; 16]>, Vec<i16>) {
-    use crate::enc::a5_assemble::{pq_driver, RingState};
-    use crate::enc::windowed_complex_correlation::windowed_complex_correlation;
+/// wants. Returns one `[i16;16]` per batch frame alongside the per-call
+/// `repair_gate_f0` log, two entries per frame, both batch-relative.
+fn a5_track_from_pre(
+    pre: &[i16],
+    fr: &[FrameIn],
+    first: usize,
+    nframes: usize,
+    carry: &mut A5Carry,
+) -> (Vec<[i16; 16]>, Vec<i16>) {
+    use crate::enc::a5_assemble::pq_driver;
     use crate::enc::t_ring::repair_gate_f0;
     use crate::enc::w_builder::w_builder;
+    use crate::enc::windowed_complex_correlation::windowed_complex_correlation;
 
-    // Per-frame w_builder inputs (thresh8, exp_arg, table8) via the lib's own
-    // band_voicing_mask ring -- NO captured band_voicing_mask CSV. table8 = the
-    // FRESH heap_src this frame (`table8[N] == heap_src[N+1]`, r54 `w_builder`
-    // doc).
-    let mut win_in: Vec<([i16; 8], i16, [i16; 8])> = Vec::with_capacity(nframes);
-    {
-        let mut ring = Ring90 { w: [0i16; 90] };
-        let mut exp_hist = [0i16; 4];
-        for f in 0..nframes {
-            let fi = &fr[f];
-            let _mask = band_voicing_mask(&mut ring, &mut exp_hist, &fi.a3, fi.x, &fi.bandexp);
-            let thresh8 = ring.slot(0, 0);
-            let exp_arg = exp_hist[0];
-            let x = fi.x;
-            let x_hi: i32 = (x as i32) << 16;
-            let v1 = ((((x_hi >> 10).wrapping_add(0x10000)) >> 16) & 0xffff) as u16 as i16;
-            let v2 = ((((x_hi >> 11).wrapping_add(0x10000)) >> 16) & 0xffff) as u16 as i16;
-            let mut table8 = [0i16; 8];
-            for k in 0..8 {
-                table8[k] = band_voicing_heap_src(&fi.a3[k], x, v1, v2);
-            }
-            win_in.push((thresh8, exp_arg, table8));
-        }
-    }
-
-    // Per-call (oldgen, s_new) and the repair-gate reference f0, fully from PCM.
-    let ncalls = nframes * 2;
-    let mut og: Vec<[i16; 8]> = vec![[0; 8]; ncalls];
-    let mut sn: Vec<i16> = vec![0; ncalls];
-    let mut valid: Vec<bool> = vec![false; ncalls];
-    let mut f0v: Vec<i16> = vec![0; ncalls];
-    for f in 0..nframes {
-        for c in 0..2 {
-            let k = f * 2 + c;
-            let Some((y, x, exp_y, sc)) = a5_pcm_arms(pre, f, c) else {
-                continue;
-            };
-            // w with the one-call delay: c=1 uses this frame's band_voicing_mask; c=0 the
-            // previous frame's.
-            let g = if c == 0 {
-                if f == 0 {
-                    continue;
-                }
-                f - 1
-            } else {
-                f
-            };
-            let (th, ea, tb) = win_in[g];
-            let w = w_builder(ea, th, tb);
-            let (o0, o1, rr) = windowed_complex_correlation(
-                &w[..127],
-                &y[..254],
-                &x[..254],
-                127,
-                exp_y as i32,
-                sc as i32,
-            );
-            f0v[k] = repair_gate_f0(o0, o1, rr);
-            let (ph0, ph1, expx) = a5_gate_tail(o0, o1, rr, sc as i32, &x[..254]);
-            let (o, s) = pq_driver(&y[..254], &x[..254], ph0, ph1, expx, exp_y);
-            og[k] = o;
-            sn[k] = s;
-            valid[k] = true;
-        }
-    }
-
-    // Cross-frame T/S ring; repair gate = (prev-call f0 > 0) && (this-call f0 < 0).
-    let mut rs = RingState::default();
     let mut a5_out: Vec<[i16; 16]> = vec![[0i16; 16]; nframes];
-    for f in 0..nframes {
+    let mut f0v: Vec<i16> = vec![0i16; nframes * 2];
+    for f in first..first + nframes {
+        // This frame's w_builder inputs (thresh8, exp_arg, table8) via the lib's
+        // own band_voicing_mask ring -- NO captured band_voicing_mask CSV.
+        // table8 = the FRESH heap_src this frame (`table8[N] == heap_src[N+1]`,
+        // r54 `w_builder` doc).
+        let fi = &fr[f - first];
+        let _mask = band_voicing_mask(
+            &mut carry.ring,
+            &mut carry.exp_hist,
+            &fi.a3,
+            fi.x,
+            &fi.bandexp,
+        );
+        let x = fi.x;
+        let x_hi: i32 = (x as i32) << 16;
+        let v1 = ((((x_hi >> 10).wrapping_add(0x10000)) >> 16) & 0xffff) as u16 as i16;
+        let v2 = ((((x_hi >> 11).wrapping_add(0x10000)) >> 16) & 0xffff) as u16 as i16;
+        let mut table8 = [0i16; 8];
+        for k in 0..8 {
+            table8[k] = band_voicing_heap_src(&fi.a3[k], x, v1, v2);
+        }
+        let win_in = (carry.ring.slot(0, 0), carry.exp_hist[0], table8);
+
+        // Per-call (oldgen, s_new) and the repair-gate reference f0, fully from
+        // PCM, then the cross-frame T/S ring: repair gate = (prev-call f0 > 0)
+        // && (this-call f0 < 0).
         for c in 0..2 {
-            let k = f * 2 + c;
-            let prev_f0 = if k == 0 { 0 } else { f0v[k - 1] };
-            let gate = valid[k] && prev_f0 > 0 && f0v[k] < 0;
-            rs.push_call(og[k], sn[k], gate);
+            let k = (f - first) * 2 + c;
+            let mut og = [0i16; 8];
+            let mut sn = 0i16;
+            let mut valid = false;
+            if let Some((y, xa, exp_y, sc)) = a5_pcm_arms(pre, f, c) {
+                // w with the one-call delay: c=1 uses this frame's
+                // band_voicing_mask; c=0 the previous frame's.
+                let g = if c == 0 {
+                    carry.prev_win_in
+                } else {
+                    Some(win_in)
+                };
+                if let Some((th, ea, tb)) = g {
+                    let w = w_builder(ea, th, tb);
+                    let (o0, o1, rr) = windowed_complex_correlation(
+                        &w[..127],
+                        &y[..254],
+                        &xa[..254],
+                        127,
+                        exp_y as i32,
+                        sc as i32,
+                    );
+                    f0v[k] = repair_gate_f0(o0, o1, rr);
+                    let (ph0, ph1, expx) = a5_gate_tail(o0, o1, rr, sc as i32, &xa[..254]);
+                    let (o, s) = pq_driver(&y[..254], &xa[..254], ph0, ph1, expx, exp_y);
+                    og = o;
+                    sn = s;
+                    valid = true;
+                }
+            }
+            let gate = valid && carry.prev_f0 > 0 && f0v[k] < 0;
+            carry.prev_f0 = f0v[k];
+            carry.rs.push_call(og, sn, gate);
             if c == 1 {
-                let ((g1, sa), (g2, sc2)) = rs.a_writer_inputs();
+                let ((g1, sa), (g2, sc2)) = carry.rs.a_writer_inputs();
                 let p1 = a_writer_band(g1, sa, false);
                 let p2 = a_writer_band(g2, sc2, false);
                 let mut a = [0i16; 16];
                 a[..8].copy_from_slice(&p1);
                 a[8..].copy_from_slice(&p2);
-                a5_out[f] = a;
+                a5_out[f - first] = a;
             }
         }
+        carry.prev_win_in = Some(win_in);
     }
     (a5_out, f0v)
+}
+
+/// Everything [`a5_track_from_pre`] threads from one frame to the next.
+#[derive(Clone)]
+struct A5Carry {
+    /// The chain's own band_voicing_mask ring, separate from the driver's.
+    ring: Ring90,
+    exp_hist: [i16; 4],
+    /// The previous frame's w_builder inputs, which its `c == 0` call reads.
+    prev_win_in: Option<([i16; 8], i16, [i16; 8])>,
+    rs: crate::enc::a5_assemble::RingState,
+    /// The previous CALL's `repair_gate_f0`, the repair gate's first disjunct.
+    prev_f0: i16,
+}
+
+impl Default for A5Carry {
+    fn default() -> Self {
+        Self {
+            ring: Ring90 { w: [0i16; 90] },
+            exp_hist: [0i16; 4],
+            prev_win_in: None,
+            rs: crate::enc::a5_assemble::RingState::default(),
+            prev_f0: 0,
+        }
+    }
 }
 
 /// Source of the r34 encoder gap2 logs `precompute_from_logs` needs.
 /// `FromPcm` runs the encoder internally; `Supplied` reuses logs a caller
 /// already captured from its own encoder pass, so no encoder run is repeated.
+///
+/// `base` is the global frame index the window's frame 0 sits at: the logs are
+/// indexed globally, so a window starting mid-clip reads the same rows the
+/// whole-buffer run reads for those frames instead of restarting the gap
+/// alignment (and, with `FromPcm`, the encoder that produces it) from cold.
 #[derive(Clone, Copy)]
 enum EncLogs<'a> {
     FromPcm,
@@ -441,6 +466,7 @@ enum EncLogs<'a> {
         gap0: &'a [[i16; GAP2_LEN]],
         gap1: &'a [[i16; GAP2_LEN]],
         gap2w: &'a [[i16; GAP2_LEN_WIDE]],
+        base: usize,
     },
 }
 
@@ -463,6 +489,7 @@ pub(crate) fn b1_track(
         None,
         None,
         None,
+        &mut B1Carry::default(),
     )
 }
 
@@ -489,6 +516,7 @@ pub(crate) fn b1_track_lb(
         None,
         st.as_deref(),
         None,
+        &mut B1Carry::default(),
     );
     let Some(lb) = lb_inputs(pref, nframes, &first) else {
         return first;
@@ -502,6 +530,7 @@ pub(crate) fn b1_track_lb(
         None,
         st.as_deref(),
         Some(&lb),
+        &mut B1Carry::default(),
     )
 }
 
@@ -523,10 +552,11 @@ fn noise_windows(pref: &[i16], nframes: usize) -> Option<Vec<[i16; ST_WORDS]>> {
     )
 }
 
-/// As [`b1_track`], but with a caller-supplied hdr30 VAD (one `i32` per frame).
-/// A streaming caller tracks the VAD's adaptive noise floor persistently — the
-/// single slow-converging state a bounded analysis window can't reproduce — so
-/// a short window plus this override is byte-exact for the finalised frames.
+/// As [`b1_track`], but with a caller-supplied hdr30 VAD (one `i32` per frame),
+/// for a caller that already tracks the VAD's adaptive noise floor and would
+/// otherwise restart it. Whole-buffer: it analyses frames `0..nframes` from a
+/// cold chain. A streaming caller wants [`b1_track_next`], which resumes every
+/// chain rather than only this one.
 pub fn b1_track_hdr30(
     pref: &[i16],
     raw_pcm: &[i16],
@@ -543,14 +573,14 @@ pub fn b1_track_hdr30(
         Some(hdr30),
         None,
         None,
+        &mut B1Carry::default(),
     )
 }
 
 /// [`b1_track_hdr30`] with the low-band noise rewrite's per-frame inputs
-/// supplied by the caller -- the streaming form, where the pitch tracker and the
-/// noise tracker are persistent and a bounded window cannot rebuild them.
-/// `st[k]` and `lb[k]` belong to the same frame as `hdr30[k]`. Each is a no-op
-/// with its own flag off.
+/// supplied by the caller, for a caller that already tracks the pitch and noise
+/// trackers those inputs come from. `st[k]` and `lb[k]` belong to the same frame
+/// as `hdr30[k]`. Each is a no-op with its own flag off.
 pub fn b1_track_hdr30_lb(
     pref: &[i16],
     raw_pcm: &[i16],
@@ -569,6 +599,50 @@ pub fn b1_track_hdr30_lb(
         Some(hdr30),
         st,
         lb,
+        &mut B1Carry::default(),
+    )
+}
+
+/// The streaming form of [`b1_track_from_logs`]: analyse the next `nframes`
+/// frames, continuing `carry`. Returns those frames only; frame `carry.done` of
+/// the previous call is the first one here.
+///
+/// Nothing is re-derived over a window. `pref` and `raw_pcm` are the caller's
+/// whole streams, indexed globally; the gap2 logs come from the caller's own
+/// persistent encoder, also indexed globally; `hdr30` (and `st`/`lb`, each a
+/// no-op with its stage off) from its persistent producers. Every remaining
+/// chain lives in `carry`, so the frames returned here are the frames a single
+/// whole-buffer [`b1_track_from_logs`] over the same audio produces.
+#[allow(clippy::too_many_arguments)]
+pub fn b1_track_next(
+    carry: &mut B1Carry,
+    gap0: &[[i16; GAP2_LEN]],
+    gap1: &[[i16; GAP2_LEN]],
+    gap2w: &[[i16; GAP2_LEN_WIDE]],
+    pref: &[i16],
+    raw_pcm: &[i16],
+    nframes: usize,
+    c820mode: RingRefineMode,
+    hdr30: &[i32],
+    st: Option<&[[i16; ST_WORDS]]>,
+    lb: Option<&[LbNoiseIn]>,
+) -> Vec<B1Frame> {
+    let base = carry.done;
+    b1_track_core(
+        pref,
+        raw_pcm,
+        nframes,
+        c820mode,
+        EncLogs::Supplied {
+            gap0,
+            gap1,
+            gap2w,
+            base,
+        },
+        Some(hdr30),
+        st,
+        lb,
+        carry,
     )
 }
 
@@ -610,10 +684,16 @@ pub fn b1_track_from_logs(
         raw_pcm,
         nframes,
         c820mode,
-        EncLogs::Supplied { gap0, gap1, gap2w },
+        EncLogs::Supplied {
+            gap0,
+            gap1,
+            gap2w,
+            base: 0,
+        },
         None,
         None,
         None,
+        &mut B1Carry::default(),
     )
 }
 
@@ -646,10 +726,16 @@ pub fn b1_track_from_logs_lb(
         raw_pcm,
         nframes,
         c820mode,
-        EncLogs::Supplied { gap0, gap1, gap2w },
+        EncLogs::Supplied {
+            gap0,
+            gap1,
+            gap2w,
+            base: 0,
+        },
         None,
         st.as_deref(),
         None,
+        &mut B1Carry::default(),
     );
     let Some(lb) = lb_inputs(&pref, nframes, &first) else {
         return first;
@@ -659,10 +745,16 @@ pub fn b1_track_from_logs_lb(
         raw_pcm,
         nframes,
         c820mode,
-        EncLogs::Supplied { gap0, gap1, gap2w },
+        EncLogs::Supplied {
+            gap0,
+            gap1,
+            gap2w,
+            base: 0,
+        },
         None,
         st.as_deref(),
         Some(&lb),
+        &mut B1Carry::default(),
     )
 }
 
@@ -704,6 +796,35 @@ fn lb_inputs(pref: &[i16], nframes: usize, first: &[B1Frame]) -> Option<Vec<LbNo
     )
 }
 
+/// Every cross-frame chain [`b1_track_core`] threads between frames, so a
+/// streaming caller can resume the analysis instead of restarting it over a
+/// warm-up window. Default is the cold start a whole-buffer run makes.
+#[derive(Clone, Default)]
+pub struct B1Carry {
+    fe: FeCarry,
+    a5: A5Carry,
+    /// The driver's own band_voicing_mask ring and its exponent history.
+    ring: Ring90,
+    exp_hist: [i16; 4],
+    /// The band-voicing masks of the two frames before the next one, which the
+    /// low-band noise rewrite reads.
+    prev_mask: [u16; 2],
+    /// The previous frame's second analysis call's `repair_gate_f0`, which the
+    /// next frame reports as the older half of its `f0_ring`.
+    prev_f0_last: i16,
+    /// Frames already analysed: the global index of the next one.
+    done: usize,
+}
+
+/// Analyse `nframes` frames starting where `carry` left off. Every cross-frame
+/// chain lives in `carry`, so a caller that hands the same one back frame after
+/// frame gets exactly what a single whole-buffer call produces — the two are the
+/// same recurrence, not a recurrence and a warmed-up approximation of it.
+///
+/// `pref` and `raw_pcm` are indexed globally: frame `f` is at sample `160 * f`
+/// however many batches ago it arrived. The per-frame side inputs `hdr30`, `st`
+/// and `lb` are global too; `a9v`/`wide` are derived per batch.
+#[allow(clippy::too_many_arguments)]
 fn b1_track_core(
     pref: &[i16],
     raw_pcm: &[i16],
@@ -713,14 +834,28 @@ fn b1_track_core(
     hdr30_override: Option<&[i32]>,
     st: Option<&[[i16; ST_WORDS]]>,
     lb: Option<&[LbNoiseIn]>,
+    carry: &mut B1Carry,
 ) -> Vec<B1Frame> {
-    let fr = front_end(pref, nframes, st.filter(|_| bv_next_enabled()));
+    if nframes == 0 {
+        return Vec::new();
+    }
+    let first = carry.done;
+    let fr = front_end(
+        pref,
+        first,
+        nframes,
+        st.filter(|_| bv_next_enabled()),
+        &mut carry.fe,
+    );
     let (a9v, wide) = match logs {
         EncLogs::FromPcm => precompute_from_ring(raw_pcm, nframes),
-        EncLogs::Supplied { gap0, gap1, gap2w } => precompute_from_logs(gap0, gap1, gap2w, nframes),
+        EncLogs::Supplied {
+            gap0,
+            gap1,
+            gap2w,
+            base,
+        } => precompute_from_logs(gap0, gap1, gap2w, base, nframes),
     };
-    let mut ring = Ring90 { w: [0i16; 90] };
-    let mut exp_hist = [0i16; 4];
     let mut out: Vec<B1Frame> = Vec::with_capacity(nframes);
 
     // `Off` models the gate's second disjunct as unknown. It is not: the local
@@ -738,9 +873,9 @@ fn b1_track_core(
     let hdr30_deriv: Vec<i32> = if let Some(h) = hdr30_override {
         h.to_vec()
     } else if noisy_next_enabled() {
-        derive_hdr30_track(pref, nframes)
+        derive_hdr30_track(pref, first + nframes)
     } else {
-        derive_hdr30_vad(raw_pcm, nframes)
+        derive_hdr30_vad(raw_pcm, first + nframes)
     };
 
     // a5 (array A), the r64 chain, gated by the hdr30 VAD (a5=[0;16] off voiced
@@ -755,7 +890,7 @@ fn b1_track_core(
     let a5_pre_len = ((raw_pcm.len() / crate::synth::FRAME_SAMPLES) * crate::synth::FRAME_SAMPLES)
         .min(pref.len());
     let (a5_all, f0v): (Vec<[i16; 16]>, Vec<i16>) =
-        a5_track_from_pre(&pref[..a5_pre_len], &fr, nframes);
+        a5_track_from_pre(&pref[..a5_pre_len], &fr, first, nframes, &mut carry.a5);
     /// Startup-transient frames where the analysis chain is not yet warmed up
     /// and the real encoder emits a5=[0;16] (r40 f0/1/2 = 0; the chain is
     /// spuriously nonzero there). Zeroed to match. Principled (input-independent
@@ -764,7 +899,7 @@ fn b1_track_core(
     let a5_vad: Vec<i32> = if a5_all.is_empty() {
         Vec::new()
     } else if hdr30_deriv.is_empty() {
-        derive_hdr30_vad(raw_pcm, nframes)
+        derive_hdr30_vad(raw_pcm, first + nframes)
     } else {
         hdr30_deriv.clone()
     };
@@ -772,9 +907,12 @@ fn b1_track_core(
     // unreachable, so `onset` mode zeros them to avoid a wrong-a5 regression.
     const A5_ONSET_ZERO: [usize; 3] = [138, 143, 145];
 
-    for f in 0..nframes {
-        let fi = &fr[f];
-        let mask = band_voicing_mask(&mut ring, &mut exp_hist, &fi.a3, fi.x, &fi.bandexp);
+    for f in first..first + nframes {
+        let i = f - first;
+        let fi = &fr[i];
+        let ring = &mut carry.ring;
+        let exp_hist = &mut carry.exp_hist;
+        let mask = band_voicing_mask(ring, exp_hist, &fi.a3, fi.x, &fi.bandexp);
         // refine_ring_p0 gate: halve the pitch word if > 0x3759,
         // then call iff (x > 0x1000) || ([esi] != 0). `[esi]` is the gate's own arg
         // and is NOT modelled -- hence RingRefineMode.
@@ -785,14 +923,23 @@ fn b1_track_core(
             RingRefineMode::Gate => xh > 0x1000,
         };
         if fire {
-            c820m::refine_ring_p0(&mut ring.w, xh, &wide[f]);
+            c820m::refine_ring_p0(&mut ring.w, xh, &wide[i]);
         }
         // The low-band noise rewrite of p0 slot 0 words 0..2, between the ring
         // refine and the a4 measurement -- the reference's own order. It reads
         // the mask this frame and the one two frames back, both already stored.
         if let Some(lbv) = lb.filter(|_| crate::enc::lb_noise::enabled()) {
             if let Some(l) = lbv.get(f) {
-                let m2 = if f >= 2 { out[f - 2].mask } else { 0 };
+                // `prev_mask` is [mask(first - 2), mask(first - 1)], so the
+                // first two frames of a batch read it at their own offset.
+                let m2 = if f >= 2 {
+                    match i.checked_sub(2) {
+                        Some(j) => out[j].mask,
+                        None => carry.prev_mask[i],
+                    }
+                } else {
+                    0
+                };
                 let mut row: [i16; 8] = std::array::from_fn(|k| ring.p0(0, k));
                 crate::enc::lb_noise::apply(&mut row, &l.st, l.q0, l.q2, mask, m2);
                 for k in 0..3 {
@@ -800,7 +947,7 @@ fn b1_track_core(
                 }
             }
         }
-        let a9 = a9v[f].unwrap_or(0);
+        let a9 = a9v[i].unwrap_or(0);
         let (p0s0, p0s2) = (ring.slot(0, 0), ring.slot(0, 2));
         let (p1s0, p1s2) = (ring.slot(1, 0), ring.slot(1, 2));
         let (mut o2, mut o5) = ([0i16; 8], [0i16; 8]);
@@ -810,16 +957,16 @@ fn b1_track_core(
             ring.set_p0(1, k, o2[k]);
             ring.set_p1(1, k, o5[k]);
         }
-        let mut a4 = pitch_predictor_from_ring(&ring);
+        let mut a4 = pitch_predictor_from_ring(ring);
         if !hdr30_deriv.is_empty() {
             a4 = pitch_predictor_gate(a4, hdr30_deriv[f]);
         }
-        let a6 = stable_counter_from_ring(&ring);
+        let a6 = stable_counter_from_ring(ring);
         let a5: [i16; 16] = if a5_all.is_empty() || f < A5_WARMUP {
             // warmup startup transient -> a5=0 (matches r40 f0/1/2 = 0).
             [0i16; 16]
         } else {
-            a5_all[f]
+            a5_all[i]
         };
         let _ = (&a5_vad, &A5_ONSET_ZERO); // retained for reference; unused in the default path
         let b1 = voicing_b1_vq(&a4, &a5, &a6);
@@ -846,15 +993,26 @@ fn b1_track_core(
             p0_flat,
             p1_flat,
             f0_ring: (
-                f0v.get(2 * f).copied().unwrap_or(0),
+                f0v.get(2 * i).copied().unwrap_or(0),
                 if f == 0 {
                     0
+                } else if i == 0 {
+                    carry.prev_f0_last
                 } else {
-                    f0v.get(2 * f - 1).copied().unwrap_or(0)
+                    f0v.get(2 * i - 1).copied().unwrap_or(0)
                 },
             ),
         });
     }
+    match out.len() {
+        0 => {}
+        1 => carry.prev_mask = [carry.prev_mask[1], out[0].mask],
+        n => carry.prev_mask = [out[n - 2].mask, out[n - 1].mask],
+    }
+    if let Some(&last) = f0v.last() {
+        carry.prev_f0_last = last;
+    }
+    carry.done = first + nframes;
     out
 }
 
@@ -1888,6 +2046,10 @@ fn ring_median_divide(ctr: i32, a7: i32, c626: i32) -> i32 {
 }
 
 // ======================= octave clamp + bd30 c624 tail =======================
+// The live copies of both are in `b0_audio`, on the pitch chain that emits b0;
+// these are the b1 chain's own ports of the same two DLL routines, kept beside
+// the rest of that chain.
+#[allow(dead_code)]
 fn octave_clamp(r622_pre: i32) -> i32 {
     let v = r622_pre as i16;
     if v > 0x3759 {
@@ -1898,6 +2060,7 @@ fn octave_clamp(r622_pre: i32) -> i32 {
 }
 // continuity_smoother: bit-exact c624/c62e continuity smoother (100/100 both files).
 // Q0=r622, Q2=c626, P0=c62c, P2=c630(=prev c62c). Returns (c624, c62e).
+#[allow(dead_code)]
 fn continuity_smoother(q0: i32, q2: i32, p0: i32, p2: i32) -> (i32, i32) {
     const DD: i32 = 0x3333;
     const BB: i32 = 0x1999;
@@ -2784,6 +2947,7 @@ fn precompute_from_ring(pcm: &[i16], nframes: usize) -> (Vec<Option<i16>>, Vec<[
         enc.gap2_mid_log(),
         enc.gap2_slot1_log(),
         enc.gap2_slot2_log(),
+        0,
         nframes,
     )
 }
@@ -2798,6 +2962,7 @@ fn precompute_from_logs(
     gap0: &[[i16; GAP2_LEN]],
     gap1: &[[i16; GAP2_LEN]],
     gap2w: &[[i16; GAP2_LEN_WIDE]],
+    base: usize,
     nframes: usize,
 ) -> (Vec<Option<i16>>, Vec<[i32; 129]>) {
     if gap0.is_empty() || gap1.is_empty() || gap2w.is_empty() {
@@ -2806,7 +2971,7 @@ fn precompute_from_logs(
     let mut a9 = vec![None; nframes];
     let mut wide = vec![[0i32; 129]; nframes];
     for f in 0..nframes {
-        let gi = f as i64 - 1; // measured alignment
+        let gi = (base + f) as i64 - 1; // measured alignment
         if gi >= 0 && (gi as usize) < gap0.len() && (gi as usize) < gap1.len() {
             let (b1, e1) = cepstral_transform_narrow(&gap1[gi as usize]);
             let (b2, e2) = cepstral_transform_narrow(&gap0[gi as usize]);
@@ -2849,6 +3014,11 @@ fn renorm16(v: i16, sh: i16) -> i16 {
 #[derive(Clone, PartialEq, Eq, Debug)]
 struct Ring90 {
     w: [i16; 90],
+}
+impl Default for Ring90 {
+    fn default() -> Self {
+        Ring90 { w: [0i16; 90] }
+    }
 }
 impl Ring90 {
     fn p0(&self, s: usize, k: usize) -> i16 {
@@ -3284,10 +3454,9 @@ pub const HDR30_HANG: usize = 1;
 
 /// Incremental, frame-serial form of [`derive_hdr30_vad`] for streaming callers.
 ///
-/// The adaptive noise floor is the one slow-converging state a bounded analysis
-/// window cannot reproduce, so a streamer carries this across pumps and hands the
-/// accumulated register to [`b1_track_hdr30`]. Pushing frames `0..n` in order
-/// yields exactly `derive_hdr30_vad(pcm, n)`.
+/// A streamer carries this across pumps and hands the accumulated register to
+/// [`b1_track_next`]. Pushing frames `0..n` in order yields exactly
+/// `derive_hdr30_vad(pcm, n)`.
 #[derive(Clone, Debug, Default)]
 pub struct Hdr30Vad {
     nf: Option<f64>,
@@ -3366,10 +3535,9 @@ pub fn bv_next_enabled() -> bool {
 /// callers.
 ///
 /// The tracker is causal — frame `f` reads the prefiltered stream over
-/// `[160f - 28, 160f + 160)` — but slow-converging (a warm-up counter and
-/// sixteen per-band floors), so a bounded analysis window cannot reproduce it.
-/// A streamer carries one of these across pumps and hands the accumulated
-/// values to [`b1_track_hdr30`], the same contract [`Hdr30Vad`] has.
+/// `[160f - 28, 160f + 160)`. A streamer carries one of these across pumps and
+/// hands the accumulated values to [`b1_track_next`], the same contract
+/// [`Hdr30Vad`] has.
 #[derive(Clone, Default)]
 pub struct Hdr30Track {
     nt: crate::enc::noise_track::NoiseTracker,
@@ -3472,6 +3640,32 @@ struct FrameIn {
     x: i16,
 }
 
+/// Everything [`front_end`] threads from one frame to the next.
+#[derive(Clone)]
+struct FeCarry {
+    ab80: fe::PassAccumulatorState,
+    prev_pass1: [[i64; 10]; 16],
+    e530_hist: [[i64; 50]; 16],
+    /// The previous frame's fit error `c62c`; absent before frame 0, where the
+    /// tracker reads the saturated 32767.
+    last_c62c: Option<i32>,
+    prev_raw_r622: i32,
+    trk: PitchTrackerState,
+}
+
+impl Default for FeCarry {
+    fn default() -> Self {
+        Self {
+            ab80: fe::PassAccumulatorState::default(),
+            prev_pass1: [[0i64; 10]; 16],
+            e530_hist: [[0i64; 50]; 16],
+            last_c62c: None,
+            prev_raw_r622: 0,
+            trk: PitchTrackerState::default(),
+        }
+    }
+}
+
 /// The AUDIO-ONLY front end, additionally emitting a3/bandexp. No capture
 /// branches: this is the arithmetic that scores x at 199/199 and 194/199.
 ///
@@ -3479,22 +3673,34 @@ struct FrameIn {
 /// weighting on. Supplied, band 0 of `a3` — and only band 0, the pair of rows
 /// that call writes back — carries the weighting, and the DP score it emits is
 /// the weighted accumulation. Absent, both are the unweighted form.
-fn front_end(pref: &[i16], nframes: usize, st: Option<&[[i16; ST_WORDS]]>) -> Vec<FrameIn> {
-    let mut ab80 = fe::PassAccumulatorState::default();
-    let mut prev_pass1 = [[0i64; 10]; 16];
-    let mut e530_hist = [[0i64; 50]; 16];
-    let (mut r622h, mut c624h, mut c62eh, mut c62ch): (Vec<i32>, Vec<i32>, Vec<i32>, Vec<i32>) =
-        (vec![], vec![], vec![], vec![]);
-    let mut prev_raw_r622 = 0i32;
-    let mut trk = PitchTrackerState::default();
-    let mut prev_voicing_mask: i32 = 0;
+///
+/// `first` is the global index of the first frame to emit and `carry` holds
+/// everything the loop threads between frames, so a caller can resume where it
+/// stopped instead of restarting the chain. `pref` is indexed globally either
+/// way — `run_pass` and `pass_be` read the window around frame `f` directly.
+fn front_end(
+    pref: &[i16],
+    first: usize,
+    nframes: usize,
+    st: Option<&[[i16; ST_WORDS]]>,
+    carry: &mut FeCarry,
+) -> Vec<FrameIn> {
+    let FeCarry {
+        ab80,
+        prev_pass1,
+        e530_hist,
+        last_c62c,
+        prev_raw_r622,
+        trk,
+    } = carry;
+    let prev_voicing_mask: i32 = 0;
     const K: usize = 20;
     let mut out: Vec<FrameIn> = Vec::new();
-    for f in 0..nframes as i64 {
+    for f in first as i64..(first + nframes) as i64 {
         let pass0 = ab80.run_pass(pref, f, 0);
         let pass1 = ab80.run_pass(pref, f, 1);
         if f == 0 {
-            e530_hist = [[0i64; 50]; 16];
+            *e530_hist = [[0i64; 50]; 16];
         } else {
             for b in 0..16usize {
                 let mut app = [0i64; 20];
@@ -3508,7 +3714,7 @@ fn front_end(pref: &[i16], nframes: usize, st: Option<&[[i16; ST_WORDS]]>) -> Ve
                 e530_hist[b] = nb;
             }
         }
-        prev_pass1 = pass1;
+        *prev_pass1 = pass1;
         let mut p4: [[i16; 10]; 16] = [[0; 10]; 16];
         for b in 0..16usize {
             p4[b] = std::array::from_fn(|i| pass1[b][i] as i16);
@@ -3559,8 +3765,8 @@ fn front_end(pref: &[i16], nframes: usize, st: Option<&[[i16; ST_WORDS]]>) -> Ve
         for i in 0..32 {
             score[i] = score32[i] as i32;
         }
-        let c626 = prev_raw_r622;
-        let c630 = *c62ch.last().unwrap_or(&32767);
+        let c626 = *prev_raw_r622;
+        let c630 = last_c62c.unwrap_or(32767);
         let a11 = prev_voicing_mask;
         if a11 == 0 {
             trk.wc = 0;
@@ -3576,23 +3782,14 @@ fn front_end(pref: &[i16], nframes: usize, st: Option<&[[i16; ST_WORDS]]>) -> Ve
         let a: [i32; 8] = [trk.w8, trk.wa, trk.wc, trk.w4, a8_derived, c626, c630, a11];
         let (raw_r622, halved) =
             b980m::octave_halve_decide(a1, &score, a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]);
-        let r622_post = octave_clamp(raw_r622);
         let c62c = if halved {
             b980m::conf5(a1, &score)
         } else {
             b980m::conf6(a1, &score)
         };
-        pitch_tracker_update(&mut trk, raw_r622, c62c, c626, c630);
-        let (c624, c62e) = {
-            let (aa, bb) = continuity_smoother(r622_post, c626, c62c, c630);
-            (aa & 0xffff, bb & 0xffff)
-        };
-        r622h.push(r622_post);
-        c624h.push(c624);
-        c62eh.push(c62e);
-        c62ch.push(c62c);
-        prev_raw_r622 = raw_r622;
-        prev_voicing_mask = 0; // overwritten by the caller's real band_voicing_mask mask (see drive_b1)
+        pitch_tracker_update(trk, raw_r622, c62c, c626, c630);
+        *last_c62c = Some(c62c);
+        *prev_raw_r622 = raw_r622;
         out.push(FrameIn {
             a3,
             bandexp,
