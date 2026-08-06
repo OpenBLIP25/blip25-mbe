@@ -786,6 +786,9 @@ impl Vocoder {
                                 e.set_imbe_ref_backend(
                                     imbe_amp_enabled() && imbe_ref_backend_enabled(),
                                 );
+                                e.set_imbe_amp_step_word(
+                                    imbe_amp_enabled() && imbe_amp_step_word_enabled(),
+                                );
                             }
                         }
                     }
@@ -1729,6 +1732,24 @@ fn imbe_ref_backend_enabled() -> bool {
     *ON.get_or_init(|| std::env::var("BLIP25_IMBE_BACKEND").as_deref() == Ok("1"))
 }
 
+/// Opt-in for keying the IMBE amplitude back end's unvoiced-band log offset on
+/// the params block's `+0xc` word (`BLIP25_IMBE_PWSTEP=1`), read once. Same
+/// rationale for the env read living here as [`lowband_floor_enabled`]. Off,
+/// every rate's emitted bits are byte-identical to a build without it.
+///
+/// On, `blip25_codec::enc::Encoder::set_imbe_amp_step_word` hands the back end
+/// the word the packer writes into the params block — the same one
+/// `band_decompress` is stepped with — instead of the prequantiser word `b̂₀`
+/// was quantized from. The two agree on 38-65% of frames; the step matches the
+/// reference's captured `params[+0xc]` on 9348/9350.
+///
+/// Needs [`imbe_amp_enabled`]: the offset only exists on that path.
+#[cfg(feature = "encode")]
+fn imbe_amp_step_word_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("BLIP25_IMBE_PWSTEP").as_deref() == Ok("1"))
+}
+
 /// Opt-in for the IMBE packer's all-unvoiced `b̂₀` override
 /// (`BLIP25_IMBE_UV=1`), read once. Same rationale for the env read living here
 /// as [`lowband_floor_enabled`]. Off, every rate's emitted bits are
@@ -2641,6 +2662,8 @@ impl ImbeStream {
                 .set_imbe_lowband_floor(imbe_amp_enabled() && imbe_lowband_floor_enabled());
             self.e
                 .set_imbe_ref_backend(imbe_amp_enabled() && imbe_ref_backend_enabled());
+            self.e
+                .set_imbe_amp_step_word(imbe_amp_enabled() && imbe_amp_step_word_enabled());
         }
         // (5) feed. The two-frame look-ahead means feeding source `k` emits
         //     analysis frame `k - 2`, so covering analysis frames `< covered`

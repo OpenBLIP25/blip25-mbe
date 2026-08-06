@@ -136,10 +136,10 @@ pub struct Encoder {
     /// prequantiser pitch word onto each grid independently
     /// ([`crate::imbe::quantize::imbe_b0_from_pitch_word`]).
     forced_imbe_b0: Option<Vec<u8>>,
-    /// The prequantiser pitch word `params[+0xc]` behind each
-    /// [`Self::forced_imbe_b0`] entry. The IMBE amplitude back end's
-    /// unvoiced-band log offset is keyed on the WORD, not on the index it
-    /// quantizes to. See [`Self::set_forced_imbe_word`].
+    /// The prequantiser pitch word behind each [`Self::forced_imbe_b0`] entry.
+    /// The IMBE amplitude back end's unvoiced-band log offset is keyed on a
+    /// word rather than on an index, but on the params block's own `+0xc` word
+    /// rather than on this one — see [`Self::set_imbe_amp_step_word`].
     forced_imbe_word: Option<Vec<u16>>,
     /// Quantize IMBE amplitudes from the reference's own log-domain band vector.
     /// See [`Self::set_imbe_ref_amps`].
@@ -158,6 +158,9 @@ pub struct Encoder {
     /// Run the reference encoder's own IMBE amplitude back end.
     /// See [`Self::set_imbe_ref_backend`].
     imbe_ref_backend: bool,
+    /// Key the IMBE amplitude back end's unvoiced-band log offset on the params
+    /// block's own `+0xc` word. See [`Self::set_imbe_amp_step_word`].
+    imbe_amp_step_word: bool,
     /// The reference amplitude back end's predictor memory. Held here rather
     /// than inside the quantizer because it replaces `imbe_enc`'s decoder mirror
     /// only on the frames the back end actually runs on.
@@ -758,6 +761,7 @@ impl Encoder {
             imbe_lowband_floor: false,
             imbe_lb_l0: band_decompress::LOWBAND_L0_INIT,
             imbe_ref_backend: false,
+            imbe_amp_step_word: false,
             imbe_ref_state: crate::imbe::ref_amp::RefAmpState::new(),
             imbe_uv_pin: false,
             imbe_packer_voicing: None,
@@ -1025,6 +1029,26 @@ impl Encoder {
     /// log-domain band vector, and a frame without one keeps the shipped path.
     pub fn set_imbe_ref_backend(&mut self, on: bool) {
         self.imbe_ref_backend = on;
+    }
+
+    /// Take the IMBE amplitude back end's pitch word from the params block the
+    /// packer builds rather than from the prequantiser word behind `b̂₀`.
+    ///
+    /// The reference's amplitude arm reads `params[+0xc]`, and the packer fills
+    /// that field by re-deriving it from the index it just wrote — it is the
+    /// same word `band_decompress` is stepped with, not the prequantiser word
+    /// the index was quantized from. Measured against the reference's own params
+    /// header on its captured IMBE frames: [`Self::set_imbe_ref_amps`]'s step
+    /// equals `params[+0xc]` on 3685/3685 clean, 1266/1266 dam, 913/914 mark and
+    /// 3484/3485 noisy L-matching frames, while the prequantiser word equals it
+    /// on 38-65%.
+    ///
+    /// The field feeds [`crate::imbe::quantize::unvoiced_log_offset`], which is
+    /// subtracted from every unvoiced band's log amplitude both on this frame's
+    /// vector and, with that frame's own word, on the predictor's memory of the
+    /// previous one. Needs [`Self::set_imbe_ref_amps`].
+    pub fn set_imbe_amp_step_word(&mut self, on: bool) {
+        self.imbe_amp_step_word = on;
     }
 
     /// Apply the IMBE packer's all-unvoiced `b̂₀` override (`FUN_1030bda0`).
@@ -2629,6 +2653,12 @@ impl Encoder {
         // gain-DC bias regime in `quantize_frame` (the two amplitude sources sit
         // at different absolute levels).
         let mech = self.live_gap2_amps;
+        // Reference-exact per-frame band_decompress step from the quantized IMBE
+        // pitch index: STEP = fund_freq(b0) >> 13 (pure truncation on the
+        // Q1.31 fundamental), reproducing the reference DLL's captured step.
+        // step_for_omega (round of the continuous omega_0) is off by tens on
+        // the live path and stays reserved for the frozen AMBE+2 path.
+        let step = (crate::imbe::pitch_cell(b0_imbe as i16).0 >> 13) as i16;
         // The pitch word behind this frame's `b̂₀`, when the caller supplied it.
         // Also the gate on the reference amplitude vector: without the word its
         // unvoiced-band offset cannot be formed.
@@ -2637,7 +2667,12 @@ impl Encoder {
             .as_ref()
             .and_then(|s| s.get(f).copied())
             .map(|w| {
-                if uv_pin {
+                if self.imbe_amp_step_word {
+                    // `params[+0xc]` is the band_decompress step, re-derived from
+                    // the index the packer wrote — not the prequantiser word the
+                    // index came from. See [`Self::set_imbe_amp_step_word`].
+                    step as u16
+                } else if uv_pin {
                     crate::imbe::quantize::packer_pitch_word(b0_imbe)
                 } else {
                     w
@@ -2645,12 +2680,6 @@ impl Encoder {
             })
             .filter(|_| self.imbe_ref_amps && mech);
         let (amplitudes, band_words) = if mech {
-            // Reference-exact per-frame band_decompress step from the quantized IMBE
-            // pitch index: STEP = fund_freq(b0) >> 13 (pure truncation on the
-            // Q1.31 fundamental), reproducing the reference DLL's captured step.
-            // step_for_omega (round of the continuous omega_0) is off by tens on
-            // the live path and stays reserved for the frozen AMBE+2 path.
-            let step = (crate::imbe::pitch_cell(b0_imbe as i16).0 >> 13) as i16;
             let (m, raw) =
                 loudness_fixed::amps_from_mechanism_bins_step(&self.gap2_mid, l_us, step);
             let words = pitch_word.map(|_| {
