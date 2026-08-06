@@ -45,7 +45,7 @@ fn mul16pow(v: i64) -> i64 {
 
 /// Build the per-band hypothesis-energy arrays `A1/A2/A3` (code 1/2/0-or-3)
 /// from `a4` (norm) and `a5`. Read in reverse (word `15-k` for band `k`).
-fn build_arrays(a4: &[i16; 16], a5: &[i16; 16]) -> ([i64; 16], [i64; 16], [i64; 16]) {
+pub(crate) fn build_arrays(a4: &[i16; 16], a5: &[i16; 16]) -> ([i64; 16], [i64; 16], [i64; 16]) {
     let mut a1 = [0i64; 16];
     let mut a2 = [0i64; 16];
     let mut a3 = [0i64; 16];
@@ -143,7 +143,7 @@ pub(crate) fn voicing_b1_vq(a4: &[i16; 16], a5: &[i16; 16], a6: &[i16; 16]) -> u
 /// leading-sign normalize. Returns `(neg_exp, mant)`. This is the SINGLE source of
 /// truth for candidate scoring -- [`voicing_b1_vq_cb`] calls it, so a diagnostic that
 /// calls it cannot silently fork from the scoring the headline chain actually runs.
-fn score_one(
+pub(crate) fn score_one(
     aa1: &[i64; 16],
     aa2: &[i64; 16],
     aa3: &[i64; 16],

@@ -44,6 +44,7 @@ pub(crate) mod noise_track;
 pub use crate::shared::encode_frame;
 pub(crate) mod lb_noise;
 pub mod history_ring;
+pub mod imbe_voicing;
 pub mod loudness_fixed;
 pub use crate::shared::loudness_transform;
 pub mod main_loop;
@@ -157,6 +158,10 @@ pub struct Encoder {
     /// Apply the IMBE packer's all-unvoiced `b̂₀` override.
     /// See [`Self::set_imbe_uv_pin`].
     imbe_uv_pin: bool,
+    /// The packer's own per-band voicing word for each analysis frame — the
+    /// transmitted `b̂₁`, MSB-first from band 0. See
+    /// [`Self::set_imbe_packer_voicing`].
+    imbe_packer_voicing: Option<Vec<u16>>,
     /// When set, a forced vector that does not cover the frame being analysed is
     /// a debug-build panic rather than a silent fall back to the estimator.
     /// See [`Self::set_forced_strict`].
@@ -746,6 +751,7 @@ impl Encoder {
             imbe_lowband_floor: false,
             imbe_lb_l0: band_decompress::LOWBAND_L0_INIT,
             imbe_uv_pin: false,
+            imbe_packer_voicing: None,
             forced_strict: false,
             live_gap2_amps: false,
             bias_raw_state: 0,
@@ -1008,6 +1014,25 @@ impl Encoder {
     /// silence gate pinned them.
     pub fn set_imbe_uv_pin(&mut self, on: bool) {
         self.imbe_uv_pin = on;
+    }
+
+    /// Supply the packer's own voicing word per analysis frame — the field it
+    /// transmits as `b̂₁`, MSB-first from band 0.
+    ///
+    /// [`crate::enc::imbe_voicing`] runs the search the full-rate packer runs
+    /// and maps its winning index to this word; two of the packer's three arms
+    /// transmit zero. The harmonic voicing vector is then read straight off it,
+    /// band `b` covering harmonics `3b..3b+2` and the last band the remainder,
+    /// in place of expanding the AMBE+2 five-bit index through the decoder's
+    /// VMASK codebook — a different codec's table.
+    ///
+    /// Setting it also hands the `b̂₀` decision to the caller outright: the
+    /// energy-threshold silence pin and the voiced-tail release, both of which
+    /// approximate the packer's override arms from the audio, stand down. The
+    /// caller's [`Self::set_forced_imbe_b0`] / [`Self::set_forced_imbe_word`]
+    /// pair is then the whole of the pitch decision.
+    pub fn set_imbe_packer_voicing(&mut self, seq: Vec<u16>) {
+        self.imbe_packer_voicing = Some(seq);
     }
 
     /// Require the forced vectors to cover every frame that is analysed.
@@ -2469,6 +2494,20 @@ impl Encoder {
             voiced
         };
 
+        // The packer's own voicing word, when the caller supplies it. Applied
+        // after the energy gate because it is the frame's whole voicing
+        // decision, reached from the search rather than from the audio level.
+        let packer_voicing = self
+            .imbe_packer_voicing
+            .as_ref()
+            .map(|s| s.get(f).copied().unwrap_or(0));
+        if let Some(w) = packer_voicing {
+            let nb = crate::imbe::num_bands(num_harms).max(1);
+            voiced = (0..l_us)
+                .map(|h| (w >> (nb - 1 - (h / 3).min(nb - 1))) & 1 != 0)
+                .collect();
+        }
+
         // Release-edge alignment. the reference implementation releases the amplitude and pitch to the
         // silence default one frame BEFORE our per-frame source energy actually
         // collapses: at a word's trailing edge our boundary frame still carries
@@ -2501,7 +2540,8 @@ impl Encoder {
             // force a release, so the final real frame is never truncated.
             f32::INFINITY
         };
-        let force_release = self.imbe_prev_voiced
+        let force_release = packer_voicing.is_none()
+            && self.imbe_prev_voiced
             && fully_unvoiced
             && src_rms >= crate::imbe::quantize::IMBE_SILENCE_RMS
             && src_rms_next < crate::imbe::quantize::IMBE_SILENCE_RMS;
@@ -2535,7 +2575,8 @@ impl Encoder {
         // offset is keyed on, and the voicing vector's own length all move with
         // it — this is the pitch chain being discarded for the frame, not a
         // relabelling of its answer.
-        let uv_pin = self.imbe_uv_pin && l_us > 0 && voiced.iter().all(|&v| !v);
+        let uv_pin =
+            packer_voicing.is_none() && self.imbe_uv_pin && l_us > 0 && voiced.iter().all(|&v| !v);
         if uv_pin {
             b0_imbe = IMBE_SILENCE_IMBE_B0;
             num_harms = crate::imbe::quantize::packer_num_harms(b0_imbe);

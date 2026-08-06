@@ -706,11 +706,16 @@ impl Vocoder {
                 // spectral-DP pitch that fixed AMBE+2; owner-confirmed better).
                 // The packer tone branch is half-rate only, so this uses the
                 // variant without it and matches `ImbeStream`.
+                // The prequantiser pitch words, kept past the block below: the
+                // packer's voicing search needs each frame's own word to know how
+                // many bands to search over.
+                let imbe_words: Vec<u16>;
                 {
                     let track = blip25_codec::enc::pcm_encode::encode_pcm_pitch_no_tone_branch(
                         pcm,
                         blip25_codec::enc::pcm_encode::EncodeOpts::default(),
                     );
+                    imbe_words = track.word.clone();
                     let reference_b0 = track.b0;
                     if !reference_b0.is_empty() {
                         let nf = pcm.len() / FRAME_SAMPLES;
@@ -817,6 +822,30 @@ impl Vocoder {
                                 .collect();
                             if let Some(e) = enc.w_enc.as_mut() {
                                 e.set_forced_b1(forced_b1);
+                            }
+                        }
+                        // The packer's own voicing search, on the same analysis
+                        // frames and the same (f+2) injection as the pitch above.
+                        if imbe_next_enabled() && imbe_voice_enabled() {
+                            let v = imbe_voicing_indices(&bt, &imbe_words);
+                            if !v.is_empty() {
+                                let n = pcm.len() / FRAME_SAMPLES;
+                                let mut fb0 = Vec::with_capacity(n);
+                                let mut fw = Vec::with_capacity(n);
+                                let mut fv = Vec::with_capacity(n);
+                                for f in 0..n {
+                                    let a = (f + 2).min(v.len() - 1);
+                                    let w = imbe_words[a.min(imbe_words.len() - 1)];
+                                    let (b0, word, b1) = imbe_packer_arm(v[a], w);
+                                    fb0.push(b0);
+                                    fw.push(word);
+                                    fv.push(b1);
+                                }
+                                if let Some(e) = enc.w_enc.as_mut() {
+                                    e.set_forced_imbe_b0(fb0);
+                                    e.set_forced_imbe_word(fw);
+                                    e.set_imbe_packer_voicing(fv);
+                                }
                             }
                         }
                     }
@@ -1692,6 +1721,71 @@ fn imbe_uv_pin_enabled() -> bool {
     *ON.get_or_init(|| std::env::var("BLIP25_IMBE_UV").as_deref() == Ok("1"))
 }
 
+/// Opt-in for the IMBE packer's own voicing search deciding `b̂₀`
+/// (`BLIP25_IMBE_VOICE=1`), read once. Same rationale for the env read living
+/// here as [`lowband_floor_enabled`]. Off, every rate's emitted bits are
+/// byte-identical to a build without it.
+///
+/// On, [`blip25_codec::enc::imbe_voicing::search`] runs over the same
+/// `a4`/`a5`/`a6` measurement the AMBE+2 voicing quantizer reads, and its
+/// winning index — not the pitch chain and not an energy threshold — selects
+/// which of the packer's three arms writes `b̂₀`. Two of those arms transmit no
+/// pitch at all: one writes the all-unvoiced index, the other writes a voicing
+/// codebook entry offset into the pitch range. Supersedes
+/// [`imbe_uv_pin_enabled`], whose override is the middle arm of the same
+/// mechanism reached from the audio instead of from the search.
+#[cfg(feature = "encode")]
+fn imbe_voice_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("BLIP25_IMBE_VOICE").as_deref() == Ok("1"))
+}
+
+/// The packer's three arms, resolved per analysis frame from the voicing
+/// search's winning index and this frame's prequantiser pitch word.
+///
+/// Returns `(b̂₀, the pitch word the amplitude back end is keyed on, b̂₁)`. On
+/// the two override arms the reference re-derives the params block from the
+/// index it wrote, so the word must move with it or the frame's unvoiced-band
+/// log offset belongs to a pitch the frame no longer carries; `b̂₁` is zero
+/// there. On the pitch arm the voicing field is the index's own low bits,
+/// spread over the harmonic count's bands when there are more than eight.
+#[cfg(feature = "encode")]
+fn imbe_packer_arm(idx: u16, word: u16) -> (u8, u16, u16) {
+    use blip25_codec::enc::imbe_voicing::{packer_fields, spread_bands, IMBE_DIRECT_BASE};
+    let pitch_b0 = blip25_codec::imbe::quantize::imbe_b0_from_pitch_word(word);
+    let (b0, b1) = packer_fields(idx, pitch_b0);
+    if idx > IMBE_DIRECT_BASE {
+        let l = blip25_codec::imbe::quantize::packer_num_harms(b0);
+        let k = blip25_codec::imbe::num_bands(l) as u16;
+        let b1 = if k > 8 { spread_bands(b1, k, l) } else { b1 };
+        (b0, word, b1)
+    } else {
+        (b0, blip25_codec::imbe::quantize::packer_pitch_word(b0), 0)
+    }
+}
+
+/// The packer's voicing-search verdict for every analysis frame of a `b1_track`,
+/// carrying the 16-bit codeword state from frame to frame.
+///
+/// `words[f]` is analysis frame `f`'s prequantiser pitch word; the harmonic
+/// count it quantizes to sets the search's band count, so a frame with no word
+/// cannot be resolved and stops the walk.
+#[cfg(feature = "encode")]
+fn imbe_voicing_indices(bt: &[blip25_codec::enc::b1_audio::B1Frame], words: &[u16]) -> Vec<u16> {
+    use blip25_codec::enc::imbe_voicing::{advance, search, search_bands};
+    let mut prev = 0u16;
+    let mut out = Vec::with_capacity(bt.len());
+    for (f, fr) in bt.iter().enumerate() {
+        let Some(&w) = words.get(f) else { break };
+        let b0 = blip25_codec::imbe::quantize::imbe_b0_from_pitch_word(w);
+        let k = search_bands(blip25_codec::imbe::quantize::packer_num_harms(b0));
+        let v = search(&fr.a4, &fr.a5, &fr.a6, prev, k);
+        prev = advance(v, prev, k);
+        out.push(v);
+    }
+    out
+}
+
 /// The same offset on the OUTPUT-frame axis. Output frame `i` is source frame
 /// `i + 1` (the dropped look-ahead placeholder), so the two constants differ by
 /// exactly that one frame.
@@ -2213,6 +2307,13 @@ struct ImbeStream {
     forced_imbe_b0: Vec<u8>,
     /// The pitch word behind each `forced_imbe_b0` entry, on the same index.
     forced_imbe_word: Vec<u16>,
+    /// The packer's voicing word for each emitted frame.
+    forced_imbe_voicing: Vec<u16>,
+    /// The packer voicing search's winning index per ANALYSIS frame, and the
+    /// 16-bit codeword carry behind it. Persistent because the carry is a
+    /// frame-to-frame recurrence: a bounded analysis window cannot restart it.
+    imbe_v: Vec<u16>,
+    imbe_v_prev: u16,
     horizon: usize,
     fed: usize,
     out_count: usize,
@@ -2250,6 +2351,9 @@ impl ImbeStream {
             forced_b1: Vec::new(),
             forced_imbe_b0: Vec::new(),
             forced_imbe_word: Vec::new(),
+            forced_imbe_voicing: Vec::new(),
+            imbe_v: Vec::new(),
+            imbe_v_prev: 0,
             horizon: 0,
             fed: 0,
             out_count: 0,
@@ -2379,6 +2483,22 @@ impl ImbeStream {
             self.reference_word.push(self.reference.last_pitch_word());
             self.reference_frame += 1;
         }
+        // (3b) the packer's voicing search, on the analysis frames whose pitch
+        //      word is now final. Its 16-bit carry lives on `self` because it is
+        //      a recurrence: the bounded `bt` window cannot re-derive it.
+        if imbe_next_enabled() && imbe_voice_enabled() {
+            use blip25_codec::enc::imbe_voicing::{advance, search, search_bands};
+            while self.imbe_v.len() < new_horizon {
+                let f = self.imbe_v.len();
+                let w = self.reference_word[f];
+                let b0 = blip25_codec::imbe::quantize::imbe_b0_from_pitch_word(w);
+                let k = search_bands(blip25_codec::imbe::quantize::packer_num_harms(b0));
+                let fr = &bt[f - win_start];
+                let v = search(&fr.a4, &fr.a5, &fr.a6, self.imbe_v_prev, k);
+                self.imbe_v_prev = advance(v, self.imbe_v_prev, k);
+                self.imbe_v.push(v);
+            }
+        }
         // (4) grow the forced vectors over the analysis frames whose inputs are
         //     final. Whole-buffer reads frame f's OWN audio for the silence gate
         //     but frame f+2 for the pitch and voicing; reproduce that asymmetry
@@ -2407,6 +2527,14 @@ impl ImbeStream {
             self.forced_b1.push(self.b1[(f + 2).min(self.b1.len() - 1)]);
             let word = self.reference_word[(f + 2).min(self.reference_word.len() - 1)];
             let silent = rms < IMBE_SILENCE_RMS;
+            if imbe_next_enabled() && imbe_voice_enabled() {
+                let a = (f + 2).min(self.imbe_v.len() - 1);
+                let (b0, w, b1) = imbe_packer_arm(self.imbe_v[a], word);
+                self.forced_imbe_b0.push(b0);
+                self.forced_imbe_word.push(w);
+                self.forced_imbe_voicing.push(b1);
+                continue;
+            }
             self.forced_imbe_b0.push(if silent {
                 IMBE_SILENCE_IMBE_B0
             } else {
@@ -2423,6 +2551,10 @@ impl ImbeStream {
         if imbe_next_enabled() {
             self.e.set_forced_imbe_b0(self.forced_imbe_b0.clone());
             self.e.set_forced_imbe_word(self.forced_imbe_word.clone());
+            if imbe_voice_enabled() {
+                self.e
+                    .set_imbe_packer_voicing(self.forced_imbe_voicing.clone());
+            }
             self.e.set_imbe_ref_amps(imbe_amp_enabled());
             self.e
                 .set_imbe_lowband_floor(imbe_amp_enabled() && imbe_lowband_floor_enabled());

@@ -164,6 +164,10 @@ pub struct B1Frame {
     /// The VQ's compand measurement. NOTE the name collision:
     /// this is NOT band_voicing_mask's own `a4[8]` (that one is `bandexp`).
     pub a4: [i16; 16],
+    /// The VQ's second measurement array (the r64 chain), as
+    /// `voicing_b1_vq` consumes it. The IMBE packer's own voicing search reads
+    /// the same three arrays.
+    pub a5: [i16; 16],
     pub a6: [i16; 16],
     /// **The voicing byte, from audio alone.**
     pub b1: u16,
@@ -835,6 +839,7 @@ fn b1_track_core(
             o2,
             o5,
             a4,
+            a5,
             a6,
             b1,
             mask,
