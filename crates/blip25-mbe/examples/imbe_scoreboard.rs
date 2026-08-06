@@ -279,9 +279,30 @@ fn main() {
             amp_all += 1;
         }
     }
+    // The same aggregate WITHOUT the L condition. Conditioning on L selects a
+    // population, so the conditioned figure moves when `L` moves even if no
+    // amplitude decision changed; the unconditional one scores every reference
+    // coefficient, counting an L-mismatched frame's whole amplitude block wrong.
+    let (mut unum, mut uden) = (0usize, 0usize);
+    for (o, r) in pairs.iter() {
+        if !o.valid || !r.valid {
+            continue;
+        }
+        let same_l = o.l == r.l;
+        for p in r.amp_range() {
+            uden += 1;
+            if same_l && o.b[p] == r.b[p] {
+                unum += 1;
+            }
+        }
+    }
     println!(
         "  amps agg  {:>7.2}%   ({aden} coefficients, L-matching frames)",
         pc(anum, aden)
+    );
+    println!(
+        "  amps unc  {:>7.2}%   ({uden} coefficients, ALL both-valid frames)",
+        pc(unum, uden)
     );
     println!(
         "  amps all  {:>7.2}%   (every b̂₃..b̂_{{L+1}} correct in the frame)",

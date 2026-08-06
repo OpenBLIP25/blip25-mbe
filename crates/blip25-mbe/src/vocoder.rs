@@ -774,6 +774,9 @@ impl Vocoder {
                                 e.set_forced_imbe_b0(forced_imbe);
                                 e.set_forced_imbe_word(words);
                                 e.set_imbe_ref_amps(imbe_amp_enabled());
+                                e.set_imbe_lowband_floor(
+                                    imbe_amp_enabled() && imbe_lowband_floor_enabled(),
+                                );
                             }
                         }
                     }
@@ -1659,6 +1662,19 @@ fn imbe_amp_enabled() -> bool {
     *ON.get_or_init(|| std::env::var("BLIP25_IMBE_AMP").as_deref() == Ok("1"))
 }
 
+/// Opt-in for the gated low-band spectral floor on the IMBE amplitude vector
+/// (`BLIP25_IMBE_LBFLOOR=1`), read once. Same rationale for the env read living
+/// here as [`lowband_floor_enabled`]. Off, every rate's emitted bits are
+/// byte-identical to a build without it.
+///
+/// Needs [`imbe_amp_enabled`]: the floor acts on the reference's log-domain band
+/// vector, which only that path carries.
+#[cfg(feature = "encode")]
+fn imbe_lowband_floor_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("BLIP25_IMBE_LBFLOOR").as_deref() == Ok("1"))
+}
+
 /// The same offset on the OUTPUT-frame axis. Output frame `i` is source frame
 /// `i + 1` (the dropped look-ahead placeholder), so the two constants differ by
 /// exactly that one frame.
@@ -2390,6 +2406,8 @@ impl ImbeStream {
             self.e.set_forced_imbe_b0(self.forced_imbe_b0.clone());
             self.e.set_forced_imbe_word(self.forced_imbe_word.clone());
             self.e.set_imbe_ref_amps(imbe_amp_enabled());
+            self.e
+                .set_imbe_lowband_floor(imbe_amp_enabled() && imbe_lowband_floor_enabled());
         }
         // (5) feed. The two-frame look-ahead means feeding source `k` emits
         //     analysis frame `k - 2`, so covering analysis frames `< covered`

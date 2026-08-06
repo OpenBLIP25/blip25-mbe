@@ -146,6 +146,14 @@ pub struct Encoder {
     /// Emit `b̂_{L+2}` as the reference's per-frame toggle rather than a constant
     /// zero. See [`Self::set_imbe_sync_toggle`].
     imbe_sync_toggle: bool,
+    /// Apply the gated low-band spectral floor to the IMBE amplitude vector.
+    /// See [`Self::set_imbe_lowband_floor`].
+    imbe_lowband_floor: bool,
+    /// The IMBE amplitude vector's own low-band floor `L0` state
+    /// ([`band_decompress::LOWBAND_L0_INIT`]). Separate from the AMBE+2 path's:
+    /// the two are different encoder instances in the reference and each carries
+    /// its own recursive state.
+    imbe_lb_l0: i16,
     /// When set, a forced vector that does not cover the frame being analysed is
     /// a debug-build panic rather than a silent fall back to the estimator.
     /// See [`Self::set_forced_strict`].
@@ -732,6 +740,8 @@ impl Encoder {
             forced_imbe_word: None,
             imbe_ref_amps: false,
             imbe_sync_toggle: false,
+            imbe_lowband_floor: false,
+            imbe_lb_l0: band_decompress::LOWBAND_L0_INIT,
             forced_strict: false,
             live_gap2_amps: false,
             bias_raw_state: 0,
@@ -963,6 +973,22 @@ impl Encoder {
     /// strict toggle on the emit index — instead of pinning it to zero.
     pub fn set_imbe_sync_toggle(&mut self, on: bool) {
         self.imbe_sync_toggle = on;
+    }
+
+    /// Apply the gated low-band spectral floor
+    /// ([`band_decompress::lowband_floor`]) to the IMBE amplitude vector, between
+    /// the bias clamp and the quantizer's unvoiced-band offset.
+    ///
+    /// The reference reaches `band_decompress` for BOTH codecs through one
+    /// wrapper, and that wrapper's tail is the floor, gated on bit 0 of the
+    /// params block's voicing word. Its caller is reached unconditionally from
+    /// the packer dispatcher, before either codec's amplitude arm, so the IMBE
+    /// amplitude vector is floored exactly as the AMBE+2 one is.
+    ///
+    /// Needs [`Self::set_imbe_ref_amps`]: only that path carries the reference's
+    /// log-domain band vector for the floor to act on.
+    pub fn set_imbe_lowband_floor(&mut self, on: bool) {
+        self.imbe_lowband_floor = on;
     }
 
     /// Require the forced vectors to cover every frame that is analysed.
@@ -2521,9 +2547,20 @@ impl Encoder {
             let (m, raw) =
                 loudness_fixed::amps_from_mechanism_bins_step(&self.gap2_mid, l_us, step);
             let words = pitch_word.map(|_| {
-                raw.iter()
+                let mut w = raw
+                    .iter()
                     .map(|&v| band_decompress::bias_clamp_one(v))
-                    .collect::<Vec<i16>>()
+                    .collect::<Vec<i16>>();
+                // The floor's gate is bit 0 of the reference's params voicing
+                // word, which is the first harmonic's V/UV decision — measured
+                // against the captured params header on 9477 reference IMBE
+                // frames, 100.00% on all four vectors. `l0` is a recursive
+                // integrator that must not advance on a gated-off frame, so the
+                // gate wraps the whole call.
+                if self.imbe_lowband_floor && voiced.first().copied().unwrap_or(false) {
+                    band_decompress::lowband_floor(&mut w, step, &mut self.imbe_lb_l0);
+                }
+                w
             });
             (m, words)
         } else {
