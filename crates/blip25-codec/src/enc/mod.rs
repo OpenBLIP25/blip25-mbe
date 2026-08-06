@@ -135,6 +135,14 @@ pub struct Encoder {
     /// prequantiser pitch word onto each grid independently
     /// ([`crate::imbe::quantize::imbe_b0_from_pitch_word`]).
     forced_imbe_b0: Option<Vec<u8>>,
+    /// The prequantiser pitch word `params[+0xc]` behind each
+    /// [`Self::forced_imbe_b0`] entry. The IMBE amplitude back end's
+    /// unvoiced-band log offset is keyed on the WORD, not on the index it
+    /// quantizes to. See [`Self::set_forced_imbe_word`].
+    forced_imbe_word: Option<Vec<u16>>,
+    /// Quantize IMBE amplitudes from the reference's own log-domain band vector.
+    /// See [`Self::set_imbe_ref_amps`].
+    imbe_ref_amps: bool,
     /// Emit `b̂_{L+2}` as the reference's per-frame toggle rather than a constant
     /// zero. See [`Self::set_imbe_sync_toggle`].
     imbe_sync_toggle: bool,
@@ -721,6 +729,8 @@ impl Encoder {
             forced_l56: None,
             forced_b1: None,
             forced_imbe_b0: None,
+            forced_imbe_word: None,
+            imbe_ref_amps: false,
             imbe_sync_toggle: false,
             forced_strict: false,
             live_gap2_amps: false,
@@ -928,6 +938,25 @@ impl Encoder {
     /// back to re-quantizing the [`Self::set_forced_b0`] fundamental.
     pub fn set_forced_imbe_b0(&mut self, seq: Vec<u8>) {
         self.forced_imbe_b0 = Some(seq);
+    }
+
+    /// Supply the prequantiser pitch word behind each [`Self::set_forced_imbe_b0`]
+    /// entry, indexed the same way (see `forced_imbe_word`). Required by
+    /// [`Self::set_imbe_ref_amps`]; without it that mode falls back to the
+    /// shipped amplitude source for the uncovered frames.
+    pub fn set_forced_imbe_word(&mut self, seq: Vec<u16>) {
+        self.forced_imbe_word = Some(seq);
+    }
+
+    /// Quantize IMBE amplitudes from the reference's own log-domain band vector —
+    /// the bias-clamped `band_decompress` words — instead of relinearising them
+    /// to `M_l`, rounding to Q14.2 and taking `log2` back.
+    ///
+    /// Needs the pitch-aligned mechanism spectrum ([`Self::set_live_gap2_amps`])
+    /// and the pitch words ([`Self::set_forced_imbe_word`]); a frame missing
+    /// either keeps the shipped path.
+    pub fn set_imbe_ref_amps(&mut self, on: bool) {
+        self.imbe_ref_amps = on;
     }
 
     /// Emit the IMBE synchronisation bit `b̂_{L+2}` as the reference does — a
@@ -2474,16 +2503,31 @@ impl Encoder {
         // gain-DC bias regime in `quantize_frame` (the two amplitude sources sit
         // at different absolute levels).
         let mech = self.live_gap2_amps;
-        let amplitudes = if mech {
+        // The pitch word behind this frame's `b̂₀`, when the caller supplied it.
+        // Also the gate on the reference amplitude vector: without the word its
+        // unvoiced-band offset cannot be formed.
+        let pitch_word = self
+            .forced_imbe_word
+            .as_ref()
+            .and_then(|s| s.get(f).copied())
+            .filter(|_| self.imbe_ref_amps && mech);
+        let (amplitudes, band_words) = if mech {
             // Reference-exact per-frame band_decompress step from the quantized IMBE
             // pitch index: STEP = fund_freq(b0) >> 13 (pure truncation on the
             // Q1.31 fundamental), reproducing the reference DLL's captured step.
             // step_for_omega (round of the continuous omega_0) is off by tens on
             // the live path and stays reserved for the frozen AMBE+2 path.
             let step = (crate::imbe::pitch_cell(b0_imbe as i16).0 >> 13) as i16;
-            loudness_fixed::amps_from_mechanism_bins_step(&self.gap2_mid, l_us, step).0
+            let (m, raw) =
+                loudness_fixed::amps_from_mechanism_bins_step(&self.gap2_mid, l_us, step);
+            let words = pitch_word.map(|_| {
+                raw.iter()
+                    .map(|&v| band_decompress::bias_clamp_one(v))
+                    .collect::<Vec<i16>>()
+            });
+            (m, words)
         } else {
-            loudness_fixed::amps_from_bins(spec, l_us)
+            (loudness_fixed::amps_from_bins(spec, l_us), None)
         };
         let sa_q142: Vec<i16> = amplitudes
             .iter()
@@ -2500,16 +2544,28 @@ impl Encoder {
         } else {
             0
         };
-        let bytes = crate::imbe::quantize::quantize_frame_mech(
-            &mut self.imbe_enc,
-            b0_imbe,
-            num_harms,
-            &voiced,
-            &sa_q142,
-            mech,
-            eff_rms,
-            sync,
-        );
+        let bytes = match (band_words, pitch_word) {
+            (Some(words), Some(pw)) => crate::imbe::quantize::quantize_frame_ref_amps(
+                &mut self.imbe_enc,
+                b0_imbe,
+                num_harms,
+                &voiced,
+                &words,
+                pw,
+                eff_rms,
+                sync,
+            ),
+            _ => crate::imbe::quantize::quantize_frame_mech(
+                &mut self.imbe_enc,
+                b0_imbe,
+                num_harms,
+                &voiced,
+                &sa_q142,
+                mech,
+                eff_rms,
+                sync,
+            ),
+        };
 
         self.next_emit += 1;
         self.analyzer.discard_before(self.next_emit);

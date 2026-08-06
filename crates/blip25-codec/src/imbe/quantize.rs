@@ -12,8 +12,8 @@ use super::fixp::*;
 use super::frame::{enframe, ImbeFrame, U_WIDTHS};
 use super::math::{cos_fxp, l_mpy_ls};
 use super::tables::{
-    BIT_ALLOCATION_OFFSET_TBL, BIT_ALLOCATION_TBL, GAIN_STEP_SIZE_TBL, HI_ORD_STD_TBL,
-    HI_ORD_STEP_SIZE_TBL, LMPRBL_TBL, MONO65_ENCODE,
+    BIT_ALLOCATION_OFFSET_TBL, BIT_ALLOCATION_TBL, GAIN_QNT_TBL, GAIN_STEP_SIZE_TBL,
+    HI_ORD_STD_TBL, HI_ORD_STEP_SIZE_TBL, LMPRBL_TBL, MONO65_ENCODE,
 };
 
 const NUM_HARMS_MAX: usize = 56;
@@ -84,6 +84,87 @@ fn qnt_by_step(val: i16, step_size: u16, bit_num: i16) -> i16 {
         (1i16 << bit_num) - 1
     } else {
         max_val + q_index
+    }
+}
+
+/// `L_sub` in the reference's Q16-promoted form: both operands are promoted to
+/// the high half of a 32-bit accumulator, subtracted with overflow saturation,
+/// and the high half taken back. Used by the amplitude back end's two
+/// saturating `i16` differences.
+fn sat_sub_q16(a: i16, b: i16) -> i16 {
+    let ua = (a as i32) << 16;
+    let ub = (b as i32) << 16;
+    let r = ua.wrapping_sub(ub);
+    let r = if (((!ub) ^ r) & (r ^ ua)) < 0 {
+        if ua < 0 {
+            i32::MIN
+        } else {
+            i32::MAX
+        }
+    } else {
+        r
+    };
+    (r >> 16) as i16
+}
+
+/// The reference's gain-DC quantizer (`FUN_10312330`): an unweighted linear scan
+/// over the 64-entry decode ladder minimising the squared saturating difference,
+/// with a strict `<` so a tie keeps the LOWER index.
+///
+/// The scan is not the same map as [`tbl_quant`] over [`MONO65_ENCODE`]: that one
+/// breaks ties toward the higher index and can address the encoder-only 65th
+/// level, which `b̂₂`'s six bits cannot carry.
+fn ref_gain_dc_quant(val: i16) -> i16 {
+    // Index 0's metric is computed WITHOUT the `-0x8000` guard the loop applies
+    // to indices 1..63, so a saturating difference of -32768 wraps its square to
+    // a large negative and wins. Reproduced rather than normalised.
+    let metric = |c: i16, guard: bool| -> i32 {
+        let d = sat_sub_q16(val, c);
+        if guard && d == i16::MIN {
+            i32::MAX
+        } else {
+            (d as i32).wrapping_mul(d as i32).wrapping_mul(2)
+        }
+    };
+    let mut best = 0i16;
+    let mut best_metric = metric(GAIN_QNT_TBL[0], false);
+    for k in 1..GAIN_QNT_TBL.len() {
+        let m = metric(GAIN_QNT_TBL[k], true);
+        if m < best_metric {
+            best_metric = m;
+            best = k as i16;
+        }
+    }
+    best
+}
+
+/// The reference's per-frame unvoiced-band log offset (`FUN_10316f40`), Q11.
+///
+/// A pure function of the prequantiser pitch word — the same `params[+0xc]`
+/// [`imbe_b0_from_pitch_word`] quantizes — through the encoder's shared
+/// [`crate::enc::band_decompress::log2_fn`].
+pub fn unvoiced_log_offset(pitch_word: u16) -> i16 {
+    let lg = crate::enc::band_decompress::log2_fn(pitch_word as i16, 4) as i32;
+    let acc = lg.wrapping_mul(0x400).wrapping_sub(0x0314_FC01);
+    ((acc as u32) >> 16) as u16 as i16
+}
+
+/// Subtract [`unvoiced_log_offset`] from every UNVOICED band's log-amplitude
+/// words in place (`FUN_10316f40` with its sign flag clear).
+///
+/// Bands run three harmonics wide; the top band (`K-1`) covers everything from
+/// `3(K-1)` up. `voic` is the packed per-band V/UV word `b̂₁`, band 0 in its most
+/// significant bit.
+fn apply_unvoiced_offset(words: &mut [i16], num_harms: i16, voic: i16, delta: i16) {
+    let k = num_bands(num_harms);
+    if k == 0 {
+        return;
+    }
+    for (i, w) in words.iter_mut().enumerate() {
+        let band = (i / 3).min(k - 1);
+        if (voic >> (k - 1 - band)) & 1 == 0 {
+            *w = sat_sub_q16(*w, delta).clamp(-0x7800, 0x77ff);
+        }
     }
 }
 
@@ -179,6 +260,7 @@ fn sa_encode(
     b_vec: &mut [i16],
     mech: bool,
     src_rms: f32,
+    ref_gain: bool,
 ) {
     let nh = num_harms;
     let nhp = num_harms_prev;
@@ -284,6 +366,18 @@ fn sa_encode(
         NUM_PRED_RES_BLKS as i16,
         &mut gain_r,
     );
+    // On the reference's own log-domain amplitude vector the gain DC needs no
+    // level correction: the ladder is the reference's own, addressed by its own
+    // nearest-neighbour scan, so neither the biases nor the energy gate below
+    // apply.
+    if ref_gain {
+        b_vec[2] = ref_gain_dc_quant(gain_r[0]);
+        let gss = &GAIN_STEP_SIZE_TBL[index * 5..];
+        for j in 1..6 {
+            b_vec[2 + j] = qnt_by_step(gain_r[j], gss[j - 1], bit_alloc[j - 1]);
+        }
+        return;
+    }
     // Gain-DC bias, regime-dependent on the amplitude source (`mech`):
     //
     //  - `mech` (whole-buffer, reference fixed-point spectrum mechanism): the
@@ -477,7 +571,7 @@ pub fn quantize_to_u(
         b0,
         num_harms,
         voiced,
-        la,
+        AmpInput::Log2Q1022(la),
         sa_prev,
         num_harms_prev,
         false,
@@ -486,9 +580,22 @@ pub fn quantize_to_u(
     )
 }
 
+/// The amplitude vector the quantizer works from.
+pub(crate) enum AmpInput<'a> {
+    /// Log2 amplitudes in Q10.22, taken from the relinearised `M_l` envelope back
+    /// through [`log2`].
+    Log2Q1022(&'a [i32]),
+    /// The reference's own log-domain band vector (`params[+0x10]`): the
+    /// encoder's `band_decompress` words, bias-clamped, in Q11 — plus the
+    /// prequantiser pitch word keying the unvoiced-band offset
+    /// [`unvoiced_log_offset`].
+    RefBandWords { words: &'a [i16], pitch_word: u16 },
+}
+
 /// As [`quantize_to_u`], with `mech` selecting the gain-DC bias regime in
 /// [`sa_encode`]: `true` for the mechanism-sourced (pitch-aligned fixed-point
 /// spectrum) amplitude level, `false` for the synthesized-DFT proxy level.
+/// [`AmpInput::RefBandWords`] supersedes both regimes.
 ///
 /// `sync` is `b̂_{L+2}`, the frame's synchronisation bit.
 #[allow(clippy::too_many_arguments)]
@@ -496,7 +603,7 @@ pub(crate) fn quantize_to_u_mech(
     b0: u8,
     num_harms: i16,
     voiced: &[bool],
-    la: &[i32],
+    amps: AmpInput<'_>,
     sa_prev: &[i32; NUM_HARMS_MAX + 2],
     num_harms_prev: i16,
     mech: bool,
@@ -523,6 +630,20 @@ pub(crate) fn quantize_to_u_mech(
     }
     b_vec[1] = b1;
 
+    // The reference band vector is already the log-domain quantity `sa_encode`
+    // wants; it only needs the unvoiced-band offset (which is keyed on `b̂₁`,
+    // hence applied here rather than at the source) and a Q11 -> Q10.22 shift.
+    let la_owned: Vec<i32>;
+    let (la, ref_gain): (&[i32], bool) = match amps {
+        AmpInput::Log2Q1022(v) => (v, false),
+        AmpInput::RefBandWords { words, pitch_word } => {
+            let mut w = words[..nh as usize].to_vec();
+            apply_unvoiced_offset(&mut w, nh, b1, unvoiced_log_offset(pitch_word));
+            la_owned = w.iter().map(|&x| (x as i32) << 11).collect();
+            (&la_owned, true)
+        }
+    };
+
     sa_encode(
         la,
         nh,
@@ -532,6 +653,7 @@ pub(crate) fn quantize_to_u_mech(
         &mut b_vec,
         mech,
         src_rms,
+        ref_gain,
     );
     b_vec[nh as usize + 2] = i16::from(sync & 1);
     encode_frame_vector(&b_vec, nh, num_bands, &bit_alloc)
@@ -610,6 +732,37 @@ pub fn imbe_b0_from_pitch_word(word: u16) -> u8 {
     (v as i16).clamp(0, 0xCF) as u8
 }
 
+/// A prequantiser pitch word that [`imbe_b0_from_pitch_word`] maps back to `b0`.
+///
+/// The inverse is a cell, not a point, so this returns the cell's midpoint. It
+/// exists for callers that OVERRIDE `b̂₀` and therefore hold no word of their own:
+/// the amplitude back end's unvoiced-band offset ([`unvoiced_log_offset`]) is
+/// keyed on the word, and a word from a different pitch than the transmitted
+/// index puts the two halves of the frame out of step. A cell is about 1% wide,
+/// so the residual offset error from taking the midpoint is a few Q11 units.
+pub fn pitch_word_for_b0(b0: u8) -> u16 {
+    // `b0` is non-increasing in the word, so both cell edges are binary-searchable.
+    let first_at_or_below = |target: u8| -> u32 {
+        let (mut lo, mut hi) = (1u32, 65536u32);
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if imbe_b0_from_pitch_word(mid as u16) <= target {
+                hi = mid;
+            } else {
+                lo = mid + 1;
+            }
+        }
+        lo
+    };
+    let lo = first_at_or_below(b0);
+    let hi = if b0 == 0 {
+        65536
+    } else {
+        first_at_or_below(b0 - 1)
+    };
+    ((lo + hi - 1) / 2).min(65535) as u16
+}
+
 /// Quantize an analysis fundamental frequency `omega_0` (rad/sample) to the
 /// nearest IMBE pitch index `b0`, returning `(b0, num_harms)` where `num_harms`
 /// is exactly the decoder's harmonic count for that `b0`. Only voice cells whose
@@ -668,9 +821,56 @@ pub(crate) fn quantize_frame_mech(
     let snap = enc.st.snapshot();
     let la = amps_to_la(sa_q142);
     let u = quantize_to_u_mech(
-        b0, num_harms, voiced, &la, &snap.0, snap.1, mech, src_rms, sync,
+        b0,
+        num_harms,
+        voiced,
+        AmpInput::Log2Q1022(&la),
+        &snap.0,
+        snap.1,
+        mech,
+        src_rms,
+        sync,
     );
-    // Advance the encoder state to mirror the decoder on the produced bits.
+    finish(enc, u)
+}
+
+/// As [`quantize_frame_mech`], from the reference's own log-domain amplitude
+/// vector: the encoder's bias-clamped `band_decompress` words (Q11, one per
+/// harmonic) and the prequantiser pitch word `params[+0xc]`.
+///
+/// This is the vector the reference quantizes; the `M_l` round trip
+/// [`quantize_frame_mech`] takes (relinearise, round to Q14.2, `log2` back) is a
+/// lossy detour around it. The gain-DC level corrections that detour needs do not
+/// apply here — see `sa_encode`'s `ref_gain`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn quantize_frame_ref_amps(
+    enc: &mut ImbeEncState,
+    b0: u8,
+    num_harms: i16,
+    voiced: &[bool],
+    words: &[i16],
+    pitch_word: u16,
+    src_rms: f32,
+    sync: u8,
+) -> [u8; super::frame::FRAME_BYTES] {
+    let snap = enc.st.snapshot();
+    let u = quantize_to_u_mech(
+        b0,
+        num_harms,
+        voiced,
+        AmpInput::RefBandWords { words, pitch_word },
+        &snap.0,
+        snap.1,
+        true,
+        src_rms,
+        sync,
+    );
+    finish(enc, u)
+}
+
+/// Advance the encoder's prediction state on the produced words and frame them.
+fn finish(enc: &mut ImbeEncState, u: [u16; 8]) -> [u8; super::frame::FRAME_BYTES] {
+    // Mirror the decoder on the produced bits.
     let fr = ImbeFrame { u, errors: [0; 8] };
     let _ = super::dequantize::decode_params(&fr, &mut enc.st);
     debug_assert!(u
@@ -678,6 +878,92 @@ pub(crate) fn quantize_frame_mech(
         .zip(U_WIDTHS.iter())
         .all(|(&v, &w)| (v as u32) < (1 << w)));
     enframe(&u)
+}
+
+#[cfg(test)]
+mod amplitude_backend_tests {
+    use super::*;
+
+    /// `(prequantiser pitch word, unvoiced log offset)` pairs recovered from the
+    /// reference encoder's own `FUN_10316f40` under a live hook, as the per-frame
+    /// difference between its amplitude vector before and after the call. The
+    /// full capture is 9477 frames over mark/dam/clean/noisy; these span the
+    /// observed word range.
+    const REFERENCE_OFFSET: [(u16, i16); 15] = [
+        (4712, 442),
+        (4798, 468),
+        (4888, 496),
+        (4981, 524),
+        (5077, 552),
+        (5178, 581),
+        (5282, 610),
+        (5391, 640),
+        (5504, 671),
+        (5622, 702),
+        (5745, 734),
+        (5874, 767),
+        (6009, 801),
+        (6150, 835),
+        (16256, 2269),
+    ];
+
+    #[test]
+    fn unvoiced_offset_matches_the_reference() {
+        for (w, d) in REFERENCE_OFFSET {
+            assert_eq!(unvoiced_log_offset(w), d, "word {w}");
+        }
+    }
+
+    /// The offset is applied to UNVOICED bands only, three harmonics wide, with
+    /// the top band covering everything above `3(K-1)` and band 0 in `b̂₁`'s most
+    /// significant bit.
+    #[test]
+    fn unvoiced_offset_lands_on_the_unvoiced_bands_only() {
+        let nh = 14i16;
+        let k = num_bands(nh);
+        assert_eq!(k, 5);
+        // Band 0 voiced, all others unvoiced: b1 = 1 << (k - 1).
+        let b1 = 1i16 << (k - 1);
+        let mut w = vec![1000i16; nh as usize];
+        apply_unvoiced_offset(&mut w, nh, b1, 100);
+        for (i, &v) in w.iter().enumerate() {
+            let want = if i < 3 { 1000 } else { 900 };
+            assert_eq!(v, want, "harmonic {i}");
+        }
+    }
+
+    /// The reference's ladder search keeps the LOWER index on a tie; the shipped
+    /// `tbl_quant` keeps the higher one.
+    #[test]
+    fn gain_dc_ties_go_to_the_lower_index() {
+        // Midpoint of cells 17 (57) and 18 (433).
+        let mid = (GAIN_QNT_TBL[17] + GAIN_QNT_TBL[18]) / 2;
+        assert_eq!(
+            GAIN_QNT_TBL[17] + GAIN_QNT_TBL[18],
+            2 * mid,
+            "exact midpoint"
+        );
+        assert_eq!(ref_gain_dc_quant(mid), 17);
+        assert_eq!(tbl_quant(mid, &MONO65_ENCODE), 18);
+    }
+
+    /// The search never leaves the six bits `b̂₂` carries.
+    #[test]
+    fn gain_dc_stays_in_six_bits() {
+        for v in [i16::MIN, -20000, 0, 17809, 20000, i16::MAX] {
+            let i = ref_gain_dc_quant(v);
+            assert!((0..64).contains(&i), "value {v} gave index {i}");
+        }
+    }
+
+    /// Every index the grid can address has a word that maps back to it.
+    #[test]
+    fn pitch_word_for_b0_round_trips() {
+        for b0 in 0..=207u8 {
+            let w = pitch_word_for_b0(b0);
+            assert_eq!(imbe_b0_from_pitch_word(w), b0, "b0 {b0} -> word {w}");
+        }
+    }
 }
 
 #[cfg(test)]

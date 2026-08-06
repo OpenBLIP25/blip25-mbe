@@ -739,23 +739,41 @@ impl Vocoder {
                         // tracker's own pitch word rather than re-deriving a
                         // fundamental from the AMBE+2 index.
                         if imbe && imbe_next_enabled() {
-                            let forced_imbe: Vec<u8> = (0..nf)
+                            // The gate produces a PAIR: the transmitted index and
+                            // the pitch word the amplitude back end's unvoiced-band
+                            // offset is keyed on. Both have to move together — the
+                            // reference's word and index are the same pitch, so a
+                            // gated frame that transmits the silence index must
+                            // offset its amplitudes by that index's pitch and not
+                            // by the tracker's.
+                            let (forced_imbe, words): (Vec<u8>, Vec<u16>) = (0..nf)
                                 .map(|f| {
                                     let chunk = &pcm[f * FRAME_SAMPLES..(f + 1) * FRAME_SAMPLES];
                                     let ss: f64 =
                                         chunk.iter().map(|&x| (x as f64) * (x as f64)).sum();
                                     let rms = (ss / FRAME_SAMPLES as f64).sqrt();
+                                    let word = track.word[(f + 2).min(track.word.len() - 1)];
                                     if rms < IMBE_SILENCE_RMS {
-                                        IMBE_SILENCE_IMBE_B0
+                                        (
+                                            IMBE_SILENCE_IMBE_B0,
+                                            blip25_codec::imbe::quantize::pitch_word_for_b0(
+                                                IMBE_SILENCE_IMBE_B0,
+                                            ),
+                                        )
                                     } else {
-                                        blip25_codec::imbe::quantize::imbe_b0_from_pitch_word(
-                                            track.word[(f + 2).min(track.word.len() - 1)],
+                                        (
+                                            blip25_codec::imbe::quantize::imbe_b0_from_pitch_word(
+                                                word,
+                                            ),
+                                            word,
                                         )
                                     }
                                 })
-                                .collect();
+                                .unzip();
                             if let Some(e) = enc.w_enc.as_mut() {
                                 e.set_forced_imbe_b0(forced_imbe);
+                                e.set_forced_imbe_word(words);
+                                e.set_imbe_ref_amps(imbe_amp_enabled());
                             }
                         }
                     }
@@ -1622,6 +1640,25 @@ fn imbe_next_enabled() -> bool {
     *ON.get_or_init(|| std::env::var("BLIP25_IMBE_NEXT").as_deref() == Ok("1"))
 }
 
+/// Opt-in for the IMBE amplitude back end's reference log-domain input
+/// (`BLIP25_IMBE_AMP=1`), read once. Same rationale for the env read living here
+/// as [`lowband_floor_enabled`]. Off, IMBE keeps the `M_l` round trip and every
+/// rate's emitted bits are byte-identical to a build without it.
+///
+/// On, the quantizer works from the encoder's own bias-clamped `band_decompress`
+/// words — the reference's `params[+0x10]` vector — with the reference's
+/// unvoiced-band log offset and its own gain-DC ladder search, in place of
+/// relinearising that vector to `M_l`, rounding it to Q14.2 and taking `log2`
+/// back. The gain-DC level corrections the round trip needed go with it.
+///
+/// Needs [`imbe_next_enabled`]: the offset is keyed on the prequantiser pitch
+/// word, which only the IMBE pitch path carries.
+#[cfg(feature = "encode")]
+fn imbe_amp_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("BLIP25_IMBE_AMP").as_deref() == Ok("1"))
+}
+
 /// The same offset on the OUTPUT-frame axis. Output frame `i` is source frame
 /// `i + 1` (the dropped look-ahead placeholder), so the two constants differ by
 /// exactly that one frame.
@@ -2141,6 +2178,8 @@ struct ImbeStream {
     forced_b0: Vec<u8>,
     forced_b1: Vec<u16>,
     forced_imbe_b0: Vec<u8>,
+    /// The pitch word behind each `forced_imbe_b0` entry, on the same index.
+    forced_imbe_word: Vec<u16>,
     horizon: usize,
     fed: usize,
     out_count: usize,
@@ -2176,6 +2215,7 @@ impl ImbeStream {
             forced_b0: Vec::new(),
             forced_b1: Vec::new(),
             forced_imbe_b0: Vec::new(),
+            forced_imbe_word: Vec::new(),
             horizon: 0,
             fed: 0,
             out_count: 0,
@@ -2331,18 +2371,25 @@ impl ImbeStream {
             };
             self.forced_b0.push(b0);
             self.forced_b1.push(self.b1[(f + 2).min(self.b1.len() - 1)]);
-            self.forced_imbe_b0.push(if rms < IMBE_SILENCE_RMS {
+            let word = self.reference_word[(f + 2).min(self.reference_word.len() - 1)];
+            let silent = rms < IMBE_SILENCE_RMS;
+            self.forced_imbe_b0.push(if silent {
                 IMBE_SILENCE_IMBE_B0
             } else {
-                blip25_codec::imbe::quantize::imbe_b0_from_pitch_word(
-                    self.reference_word[(f + 2).min(self.reference_word.len() - 1)],
-                )
+                blip25_codec::imbe::quantize::imbe_b0_from_pitch_word(word)
+            });
+            self.forced_imbe_word.push(if silent {
+                blip25_codec::imbe::quantize::pitch_word_for_b0(IMBE_SILENCE_IMBE_B0)
+            } else {
+                word
             });
         }
         self.e.set_forced_b0(self.forced_b0.clone());
         self.e.set_forced_b1(self.forced_b1.clone());
         if imbe_next_enabled() {
             self.e.set_forced_imbe_b0(self.forced_imbe_b0.clone());
+            self.e.set_forced_imbe_word(self.forced_imbe_word.clone());
+            self.e.set_imbe_ref_amps(imbe_amp_enabled());
         }
         // (5) feed. The two-frame look-ahead means feeding source `k` emits
         //     analysis frame `k - 2`, so covering analysis frames `< covered`
