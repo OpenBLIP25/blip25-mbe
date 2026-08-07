@@ -802,7 +802,9 @@ impl Vocoder {
                 // populate them, then align to the same (f+2) source-frame index as
                 // the forced reference pitch above.
                 if imbe {
-                    use blip25_codec::enc::b1_audio::{b1_track_from_logs, RingRefineMode};
+                    use blip25_codec::enc::b1_audio::{
+                        b1_track_from_logs, b1_track_from_logs_lb, RingRefineMode,
+                    };
                     let nframes = (pcm.len() / FRAME_SAMPLES).saturating_sub(1);
                     if nframes > 0 {
                         let mut la = blip25_codec::enc::Encoder::new();
@@ -811,7 +813,12 @@ impl Vocoder {
                             let _ = la.encode_frame_r33(a);
                         }
                         let _ = la.flush_r33();
-                        let bt = b1_track_from_logs(
+                        let track_from_logs = if imbe_bv_enabled() {
+                            b1_track_from_logs_lb
+                        } else {
+                            b1_track_from_logs
+                        };
+                        let bt = track_from_logs(
                             la.gap2_mid_log(),
                             la.gap2_slot1_log(),
                             la.gap2_slot2_log(),
@@ -1785,6 +1792,25 @@ fn imbe_voice_enabled() -> bool {
     *ON.get_or_init(|| std::env::var("BLIP25_IMBE_VOICE").as_deref() == Ok("1"))
 }
 
+/// Opt-in for the IMBE voicing chain reading the noise-tracker window and the
+/// low-band noise rewrite (`BLIP25_IMBE_BV=1`), read once. Same rationale for
+/// the env read living here as [`lowband_floor_enabled`]. Off, every rate's
+/// emitted bits are byte-identical to a build without it.
+///
+/// The AMBE+2 arm derives `a4`/`a5`/`a6` through
+/// [`blip25_codec::enc::b1_audio::b1_track_from_logs_lb`], which hands the chain
+/// the `ctx+0x938` noise-tracker window (so `FUN_1030e100`'s row-0/1 write-back
+/// scales band 0 of the spectrum the band-voicing row reads) and the low-band
+/// noise rewrite's per-frame inputs. The IMBE arm called the variant that
+/// supplies neither, so its band-0 measurement was the unweighted one. Both
+/// stages remain gated on their own flags, so this selects between them rather
+/// than adding a third.
+#[cfg(feature = "encode")]
+fn imbe_bv_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("BLIP25_IMBE_BV").as_deref() == Ok("1"))
+}
+
 /// The packer's three arms, resolved per analysis frame from the voicing
 /// search's winning index and this frame's prequantiser pitch word.
 ///
@@ -2334,6 +2360,50 @@ impl AmbeStream {
     }
 }
 
+/// The IMBE voicing chain's own cross-frame state, when it is not the same
+/// recurrence as the pitch chain.
+///
+/// Whole-buffer derives IMBE pitch through a `b1_track` that reads neither the
+/// noise-tracker window nor the low-band noise rewrite, and IMBE voicing through
+/// a separate `b1_track_from_logs*`. The two are the same computation until the
+/// voicing one starts reading those stages ([`imbe_bv_enabled`]); from then on
+/// they are different chains and a stream has to run both. `masks` are this
+/// chain's own first-pass masks and `trk` the fit-error tracker they drive — the
+/// pair `lb_inputs` builds the rewrite's per-frame inputs from, and never the
+/// pitch chain's.
+#[cfg(feature = "encode")]
+struct VoiceChain {
+    carry: blip25_codec::enc::b1_audio::B1Carry,
+    hdr: blip25_codec::enc::b1_audio::Hdr30Track,
+    win: Vec<[i16; 168]>,
+    masks: Vec<u16>,
+    trk: blip25_codec::enc::b0_audio::B0Audio,
+    lb_in: Vec<blip25_codec::enc::b1_audio::LbNoiseIn>,
+    frame: usize,
+}
+
+#[cfg(feature = "encode")]
+impl VoiceChain {
+    /// Whether the two chains have parted, i.e. whether this state is live.
+    fn wanted() -> bool {
+        imbe_bv_enabled()
+            && (blip25_codec::enc::b1_audio::bv_next_enabled()
+                || blip25_codec::enc::b1_audio::lb_noise_enabled())
+    }
+
+    fn new() -> Self {
+        Self {
+            carry: blip25_codec::enc::b1_audio::B1Carry::default(),
+            hdr: blip25_codec::enc::b1_audio::Hdr30Track::new(),
+            win: Vec::new(),
+            masks: Vec::new(),
+            trk: blip25_codec::enc::b0_audio::B0Audio::new(),
+            lb_in: Vec::new(),
+            frame: 0,
+        }
+    }
+}
+
 /// Single-pass stateful IMBE streamer — byte-exact to whole-buffer
 /// [`Vocoder::encode`] at ~`B1_RESERVE`-frame latency.
 ///
@@ -2353,6 +2423,7 @@ impl AmbeStream {
 ///   frame over the analysis logs of a persistent second [`Encoder`], so it runs
 ///   the same recurrence the whole-buffer call runs rather than a warmed-up
 ///   window of it. `hdr` is one of its inputs, supplied on the same footing.
+/// * `bv` — the voicing chain, when it is a second recurrence ([`VoiceChain`]).
 ///
 /// Unlike [`AmbeStream`], no source frame is dropped: `nf` input frames yield
 /// `nf` output frames, matching whole-buffer `encode`.
@@ -2377,6 +2448,9 @@ struct ImbeStream {
     raw: Vec<i16>,
     hdr: Hdr30State,
     hdr30: Vec<i32>,
+    /// The voicing chain, present only when it is a different recurrence from
+    /// the pitch chain above ([`VoiceChain`]).
+    bv: Option<Box<VoiceChain>>,
     reference_b0: Vec<u8>,
     /// The prequantiser pitch word behind each `reference_b0` entry, carried so
     /// the IMBE grid can be addressed directly rather than through that index.
@@ -2429,6 +2503,7 @@ impl ImbeStream {
             raw: Vec::new(),
             hdr: Hdr30State::new(),
             hdr30: Vec::new(),
+            bv: VoiceChain::wanted().then(|| Box::new(VoiceChain::new())),
             reference_b0: Vec::new(),
             reference_word: Vec::new(),
             reference_frame: 0,
@@ -2550,6 +2625,7 @@ impl ImbeStream {
             let _ = self.la.encode_frame_r33(&fr);
             self.la_fed += 1;
         }
+        let batch = new_horizon - self.horizon;
         let bt = b1_track_next(
             &mut self.carry,
             self.la.gap2_mid_log(),
@@ -2557,16 +2633,77 @@ impl ImbeStream {
             self.la.gap2_slot2_log(),
             &self.pref,
             &self.raw,
-            new_horizon - self.horizon,
+            batch,
             RingRefineMode::Off,
             &self.hdr30,
             None,
             None,
         );
         let win_start = self.horizon;
+        // (1b) the voicing chain, when [`VoiceChain`] says it has parted from the
+        //      pitch chain. Two passes, exactly as `b1_track_from_logs_lb` runs
+        //      them: one for the masks the low-band rewrite's inputs are derived
+        //      from, one with those inputs applied.
+        let (pref, raw, la, hdr30) = (&self.pref, &self.raw, &self.la, &self.hdr30);
+        let btv = self.bv.as_mut().map(|bv| {
+            let st_all: Option<&[[i16; 168]]> =
+                blip25_codec::enc::b1_audio::bv_next_enabled().then_some(&bv.win[..]);
+            let saved = blip25_codec::enc::b1_audio::lb_noise_enabled().then(|| bv.carry.clone());
+            let first = b1_track_next(
+                &mut bv.carry,
+                la.gap2_mid_log(),
+                la.gap2_slot1_log(),
+                la.gap2_slot2_log(),
+                pref,
+                raw,
+                batch,
+                RingRefineMode::Off,
+                hdr30,
+                st_all,
+                None,
+            );
+            let Some(before) = saved.filter(|_| !first.is_empty()) else {
+                return first;
+            };
+            for fr in &first {
+                bv.masks.push(fr.mask);
+            }
+            while bv.frame < new_horizon {
+                let cf = bv.frame;
+                let a11 = if cf == 0 {
+                    0
+                } else {
+                    i32::from(bv.masks[cf - 1])
+                };
+                let _ = bv.trk.push_pcm_frame_with_prev_mask(pref, a11);
+                bv.lb_in.push(blip25_codec::enc::b1_audio::LbNoiseIn {
+                    st: bv.win[cf],
+                    q0: bv.trk.last_c62c(),
+                    q2: bv.trk.prev_c62c(),
+                });
+                bv.frame += 1;
+            }
+            bv.carry = before;
+            b1_track_next(
+                &mut bv.carry,
+                la.gap2_mid_log(),
+                la.gap2_slot1_log(),
+                la.gap2_slot2_log(),
+                pref,
+                raw,
+                batch,
+                RingRefineMode::Off,
+                hdr30,
+                st_all,
+                Some(&bv.lb_in),
+            )
+        });
+        // The voicing word and the packer search's inputs come off that chain
+        // when it runs; the pitch tracker's masks never do.
+        let btb: &[blip25_codec::enc::b1_audio::B1Frame] = btv.as_deref().unwrap_or(&bt);
         // (2) finalise the voicing word for the newly-final analysis frames.
         for f in self.horizon..new_horizon {
-            self.b1.push(bt[f - win_start].b1);
+            self.b1.push(btb[f - win_start].b1);
             self.masks.push(bt[f - win_start].mask);
         }
         // (3) advance the persistent reference-pitch tracker (final masks only).
@@ -2595,7 +2732,7 @@ impl ImbeStream {
                 let w = self.reference_word[f];
                 let b0 = blip25_codec::imbe::quantize::imbe_b0_from_pitch_word(w);
                 let k = search_bands(blip25_codec::imbe::quantize::packer_num_harms(b0));
-                let fr = &bt[f - win_start];
+                let fr = &btb[f - win_start];
                 let v = search(&fr.a4, &fr.a5, &fr.a6, self.imbe_v_prev, k);
                 self.imbe_v_prev = advance(v, self.imbe_v_prev, k);
                 self.imbe_v.push(v);
@@ -2680,6 +2817,12 @@ impl ImbeStream {
 
     fn advance_hdr30(&mut self, upto: usize) {
         advance_hdr30(&mut self.hdr, &mut self.hdr30, &self.raw, &self.pref, upto);
+        if let Some(bv) = self.bv.as_mut() {
+            while bv.win.len() < upto {
+                let _ = bv.hdr.push_frame(&self.pref);
+                bv.win.push(bv.hdr.window());
+            }
+        }
     }
 }
 
